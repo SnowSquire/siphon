@@ -1,0 +1,46 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug executable 'twitch-hls-client2'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["run", "--bin=twitch-hls-client2", "--package=twitch-hls-client2"]
+      },
+      "env": {
+        "RUST_LOG": "info,twitch_hls_client2=debug,ureq=off,ureq_proto=off",
+        "RUST_BACKTRACE": "1",
+        "RUST_LIB_BACKTRACE": "1"
+      },
+      "args": ["-c", "cinna", "-l"]
+    },
+    {
+      "name": "Debug unit tests in executable 'twitch-hls-client2'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--bin=twitch-hls-client2", "--package=twitch-hls-client2"]
+      }
+    },
+    {
+      "name": "Debug unit tests in library 'wait_on_address'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--package=wait_on_address"]
+      }
+    },
+    {
+      "name": "Debug integration test 'test'",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--test=test", "--package=wait_on_address"]
+      }
+    }
+  ]
+}
