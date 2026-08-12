@@ -13,6 +13,7 @@ pub struct SegmentWriter {
     pub tail_offset: usize, // bytes written into tail
     pub handle: Arc<Stream>,
     pub closed: bool,
+    pub written_len: usize,
 }
 
 impl SegmentWriter {
@@ -36,18 +37,20 @@ impl SegmentWriter {
     pub fn commit(&mut self, n: usize) {
         assert!(n <= CHUNK_SIZE - self.tail_offset, "commit past slice");
         self.tail_offset += n;
+        self.written_len += n;
+    }
 
-        // Just use 'n' directly since we publish every time
-        self.handle.written_len.fetch_add(n, Ordering::Release);
-        self.handle.written_len.notify_all();
+    pub fn publish(&mut self) {
+        self.handle
+            .published_len
+            .store(self.written_len, Ordering::Release);
+
+        self.handle.published_len.notify_all();
     }
 
     fn link_new_chunk(&mut self) {
         debug_assert!(
-            self.handle
-                .written_len
-                .load(Ordering::Acquire)
-                .is_multiple_of(CHUNK_SIZE),
+            self.written_len.is_multiple_of(CHUNK_SIZE),
             "you forgot to commit at some point"
         );
 
@@ -70,7 +73,7 @@ impl SegmentWriter {
         self.closed = true;
         self.handle.closed.store(true, Ordering::Release);
         // Unconditional: sleepers may be waiting for len that never comes.
-        self.handle.written_len.notify_all();
+        self.handle.published_len.notify_all();
     }
 }
 

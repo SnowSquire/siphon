@@ -1,13 +1,14 @@
 use std::{
+    io::{self, Write},
     num::{ParseFloatError, ParseIntError},
-    thread,
+    ptr, thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use kanal::{Receiver, Sender};
 use thiserror::Error;
 use tracing::{Level, debug, debug_span, error, info, instrument, span};
-use ureq::Agent;
+use ureq::{Agent, http};
 
 use crate::{downloader::ToDownloader, stream::Stream, stream_reader::SegmentReader};
 
@@ -125,7 +126,10 @@ impl StreamScheduler {
             match self.mainloop() {
                 Ok(_) => {}
                 Err(err) => match err {
-                    SchedulerError::Offline => return,
+                    SchedulerError::Offline => {
+                        info!("stream ended");
+                        return;
+                    }
                     _ => self.reset(),
                 },
             };
@@ -189,12 +193,12 @@ impl StreamScheduler {
         self.prefetches
             .retain_unordered(|p| p.expected_id >= self.segment_tail);
 
-        const MIN_EDGE_POLL: Duration = Duration::from_millis(750);
+        const MIN_EDGE_POLL: Duration = Duration::from_millis(200);
         const MAX_EDGE_POLL: Duration = Duration::from_secs(5);
         const CATCHUP_POLL: Duration = Duration::from_millis(100);
 
         let sleep_dur = match new_segments == 0 {
-            true => (self.last_segment_dur / 2).clamp(MIN_EDGE_POLL, MAX_EDGE_POLL),
+            true => (self.last_segment_dur / 4).clamp(MIN_EDGE_POLL, MAX_EDGE_POLL),
             false => CATCHUP_POLL,
         };
         self.handle_new_readers();
@@ -229,6 +233,7 @@ impl StreamScheduler {
             %is_ad,
             duration = duration.as_secs_f64(),
         );
+
         let _guard = span.enter();
         debug!("new main segment");
         if is_ad {
@@ -237,6 +242,7 @@ impl StreamScheduler {
 
         match prefetch {
             Some(prefetch) => {
+                error!("no more of this");
                 let segment = Segment {
                     sequence_num: expected_sequence,
                     reader: prefetch.reader,
@@ -263,8 +269,9 @@ impl StreamScheduler {
 
                 self.downloaders
                     .send(ToDownloader::FetchURL {
-                        url: Box::from(url),
+                        url: as_http(url),
                         writer,
+
                         span: span.clone(),
                     })
                     .unwrap(); // if this send fails i genuinely have no idea how to handle it just leave it
@@ -293,22 +300,23 @@ impl StreamScheduler {
         if prefetch.is_some() {
             return Err(());
         };
-        let span = debug_span!("main segment", sequence_id = expected_sequence);
+        let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
 
         let _guard = span.enter();
         let (writer, reader) = Stream::new();
-
+        let url = as_http(url);
         self.downloaders
             .send(ToDownloader::FetchURL {
-                url: url.into(),
+                url: url.clone(),
                 writer,
+
                 span: span.clone(),
             })
             .unwrap();
 
         self.prefetches.push(PrefetchSegment {
             expected_id: expected_sequence,
-            url: url.into(),
+            url: url.clone(),
             reader,
         });
         Ok(())
@@ -323,16 +331,7 @@ impl StreamScheduler {
             .call()?
             .into_body()
             .read_to_string()?;
-        // {
-        //     let unix_time = std::time::SystemTime::now()
-        //         .duration_since(std::time::UNIX_EPOCH)
-        //         .map_err(|_| SchedulerError::Write)?
-        //         .as_secs();
 
-        //     std::fs::create_dir_all("manifest").map_err(|_| SchedulerError::Write)?;
-        //     std::fs::write(format!("manifest/{unix_time}.m3u8"), &manifest)
-        //         .map_err(|_| SchedulerError::Write)?;
-        // }
         if manifest
             .lines()
             .next()
@@ -364,6 +363,7 @@ impl StreamScheduler {
                     //     });
                     // }
                     sequence_number = front;
+                    debug!("new front {}", sequence_number);
 
                     self.segments.retain(|s| s.sequence_num >= front);
                 }
@@ -403,7 +403,7 @@ impl StreamScheduler {
                         && let Some(url) = lines.next()
                     {
                         self.segment_tail = sequence_number;
-                        self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
+                        // self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
 
                         self.dispatch_main(url, sequence_number, value)
                             .map_err(|_| SchedulerError::Dispatch)?;
@@ -411,11 +411,13 @@ impl StreamScheduler {
                 }
                 "#EXT-X-TWITCH-PREFETCH" | "#EXT-X-PREFETCH" => {
                     sequence_number += 1;
-                    prefetches += 1;
+                    mains += 1; // TODO: testing just pass prefetches directly
+                    // prefetches += 1;
 
-                    if sequence_number > self.prefetch_tail {
-                        self.prefetch_tail = sequence_number;
-                        self.dispatch_prefetch(value, sequence_number)
+                    if sequence_number > self.segment_tail {
+                        // self.prefetch_tail = sequence_number;
+                        self.segment_tail = sequence_number;
+                        self.dispatch_main(value, sequence_number, "2.000,live")
                             .map_err(|_| SchedulerError::Dispatch)?;
                     }
                 }
@@ -423,7 +425,7 @@ impl StreamScheduler {
             }
         }
 
-        info!(new_segments = self.prefetch_tail - original_prefetch_tail, %mains, %prefetches);
+        // info!(new_segments = self.prefetch_tail - original_prefetch_tail, %mains, %prefetches);
         Ok(self.prefetch_tail - original_prefetch_tail)
     }
 }
@@ -451,5 +453,21 @@ impl<T> RetainUnordered<T> for Vec<T> {
             }
         }
         self.truncate(n);
+    }
+}
+
+fn as_http(url: &str) -> Box<str> {
+    if let Some(rest) = url.strip_prefix("https://") {
+        const HTTP_PREFIX: &[u8; 7] = b"http://";
+        let mut buffer = Box::<[u8]>::new_uninit_slice(url.len() - 1);
+
+        let dest = buffer.as_mut_ptr().cast::<u8>();
+        unsafe {
+            ptr::copy_nonoverlapping(HTTP_PREFIX.as_ptr(), dest, HTTP_PREFIX.len());
+            ptr::copy_nonoverlapping(rest.as_ptr(), dest.add(HTTP_PREFIX.len()), rest.len());
+            std::mem::transmute::<Box<[u8]>, Box<str>>(buffer.assume_init())
+        }
+    } else {
+        Box::from(url)
     }
 }

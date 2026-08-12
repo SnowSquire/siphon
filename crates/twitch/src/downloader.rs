@@ -1,8 +1,8 @@
-use std::io::{self, Read};
-
+use curl::easy::Easy;
 use kanal::Receiver;
+use std::io::{self, Read, Write};
 use thiserror::Error;
-use tracing::{Span, debug, info};
+use tracing::{Span, debug, info, trace};
 use ureq::Agent;
 
 use crate::{
@@ -19,6 +19,9 @@ pub enum ToDownloader {
     },
 }
 pub fn download_worker(rx: Receiver<ToDownloader>, agent: Agent) {
+    let mut handle = Easy::new();
+    _ = handle.accept_encoding("");
+
     for msg in rx {
         match msg {
             FetchURL {
@@ -27,7 +30,7 @@ pub fn download_worker(rx: Receiver<ToDownloader>, agent: Agent) {
                 span,
             } => {
                 let _guard = span.enter();
-                let _ = launch_download(url.as_ref(), &mut writer, &agent);
+                let _ = launch_download(url.as_ref(), &mut writer, &mut handle);
             }
         }
     }
@@ -43,28 +46,37 @@ enum DownloadError {
 fn launch_download(
     url: &str,
     writer: &mut SegmentWriter,
-    agent: &Agent,
+    handle: &mut Easy,
 ) -> Result<(), DownloadError> {
     info!("starting download");
-    let mut reader = agent.get(url).call()?.into_body().into_reader();
-    let mut uncommitedbytes = 0;
-    loop {
-        let readbytes = {
-            let dst = writer.writable_slice();
-            reader.read(dst)?
-        };
+    handle.url(url);
+    let mut total_size = 0;
+    let result = {
+        let mut transfer = handle.transfer();
 
-        if readbytes == 0 {
-            writer.commit(uncommitedbytes);
-            break;
-        }
-        uncommitedbytes += readbytes;
-        if uncommitedbytes >= MPEG_TS_PACKET_SIZE.into() {
-            let rounded = round_chunk_size(uncommitedbytes);
+        transfer
+            .write_function(|src| {
+                let mut remaining = src;
 
-            writer.commit(rounded);
-            uncommitedbytes -= rounded;
-        }
+                while !remaining.is_empty() {
+                    let mut dst = writer.writable_slice();
+
+                    let n = dst.write(remaining).unwrap();
+
+                    writer.commit(n);
+                    remaining = &remaining[n..];
+                }
+                total_size += src.len();
+                trace!("added {} bytes", src.len());
+                writer.publish();
+                Ok(src.len())
+            })
+            .unwrap();
+
+        transfer.perform()
     }
+    .unwrap();
+    writer.close();
+    debug!("finished download with {} bytes", total_size);
     Ok(())
 }

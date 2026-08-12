@@ -18,5 +18,6 @@ pub const fn round_chunk_size(size: usize) -> usize {
     size / MPEG_TS_PACKET_SIZE as usize * MPEG_TS_PACKET_SIZE as usize
 }
 
+pub const DEFAULT_PORT: u16 = 7417;
 // LCM(16384, 188) twitch sends each chunk in 16KiB, or at least ureq buffers to this size
 pub const CHUNK_SIZE: usize = 770_048;

@@ -16,7 +16,7 @@
         "RUST_BACKTRACE": "1",
         "RUST_LIB_BACKTRACE": "1"
       },
-      "args": ["-c", "cinna", "-l"]
+      "args": ["-c", "santipulgaz", "-l"]
     },
     {
       "name": "Debug unit tests in executable 'twitch-hls-client2'",

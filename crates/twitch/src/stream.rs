@@ -72,8 +72,8 @@ unsafe impl Sync for Chunk {}
 #[derive(Debug)]
 pub struct Stream {
     // used for HLS segments
-    pub written_len: AtomicUsize, // monotonic published frontier
-    pub closed: AtomicBool,       // EOF: writer finished
+    pub published_len: AtomicUsize, // monotonic published frontier
+    pub closed: AtomicBool,         // EOF: writer finished
 }
 
 impl Stream {
@@ -82,7 +82,7 @@ impl Stream {
     /// (readers cannot join midstream).
     pub fn new() -> (SegmentWriter, SegmentReader) {
         let handle = Arc::new(Stream {
-            written_len: AtomicUsize::new(0),
+            published_len: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         });
 
@@ -91,7 +91,7 @@ impl Stream {
         let writer = SegmentWriter {
             tail: head.clone(),
             tail_offset: 0,
-
+            written_len: 0,
             handle: handle.clone(),
             closed: false,
         };
@@ -105,7 +105,7 @@ impl Stream {
     }
     #[inline(always)]
     pub fn frontier(&self) -> usize {
-        self.written_len.load(Ordering::Acquire)
+        self.published_len.load(Ordering::Acquire)
     }
     #[inline(always)]
     pub fn is_closed(&self) -> bool {
