@@ -1,4 +1,5 @@
 #![allow(unused)]
+#![feature(offset_of_enum)]
 use bytes::Buf;
 use mimalloc::MiMalloc;
 
@@ -7,10 +8,11 @@ use clap::Parser;
 use sonic_rs::{PointerTree, get, get_from_bytes, get_many, pointer};
 use std::borrow::Cow;
 use std::fmt::format;
-use std::io::{IoSlice, Write};
+use std::fs::File;
+use std::io::{self, IoSlice, Seek, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::subscriber::NoSubscriber;
 use tracing::{Level, debug, debug_span, dispatcher, error, info, trace};
 use tracing_subscriber::EnvFilter;
@@ -18,8 +20,8 @@ use ureq::ResponseExt;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 use std::{array, thread};
-
 mod downloader;
+mod file;
 mod helpers;
 mod hls_parser;
 mod scheduler;
@@ -33,6 +35,7 @@ use ureq::{Agent, http::header::AUTHORIZATION};
 
 mod constants;
 use crate::downloader::download_worker;
+use crate::file::run_mpegts_writer;
 use crate::helpers::{fetch_master_manifest, select_track};
 use crate::scheduler::{SegmentMessage, StreamScheduler};
 
@@ -172,12 +175,12 @@ fn main() {
     let download_threads: [JoinHandle<()>; 8] = spawn_downloaders::<8>(&agent, rx_downloaders);
     let scheduler_thread: JoinHandle<()> =
         spawn_scheduler(agent.clone(), track_url, tx_downloaders, rx_readers);
-    // let file_thread: JoinHandle<()> = spawn_mpegts_writer(&add_readers);
+    let file_thread: JoinHandle<()> = spawn_mpegts_writer(&add_readers);
     let tcp_listener_thread: JoinHandle<()> = spawn_tcp_listener(add_readers.clone(), start);
 
     let _ = scheduler_thread.join();
     let _ = tcp_listener_thread.join();
-    // let _ = file_thread.join();
+    let _ = file_thread.join();
     for thread in download_threads {
         let _ = thread.join();
     }
@@ -269,47 +272,100 @@ fn spawn_tcp_client_thread(
     (reader_rx, handle)
 }
 
-fn spawn_mpegts_writer(
+#[derive(Debug, thiserror::Error)]
+pub enum FileWriterError {
+    #[error("failed to register MPEG-TS reader")]
+    RegisterReader {
+        #[source]
+        source: kanal::SendError,
+    },
+
+    #[error("failed to spawn MPEG-TS writer thread")]
+    SpawnThread {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to create manifest directory")]
+    CreateManifestDirectory {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to create MPEG-TS file at {path}")]
+    CreateTsFile {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to create segment-boundary file at {path}")]
+    CreateBoundariesFile {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write segment-boundary file header")]
+    WriteBoundariesHeader {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to get MPEG-TS file position")]
+    GetTsFilePosition {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write MPEG-TS data")]
+    WriteTsData {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to flush MPEG-TS file")]
+    FlushTsFile {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write segment boundary")]
+    WriteBoundary {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to flush segment-boundary file")]
+    FlushBoundariesFile {
+        #[source]
+        source: io::Error,
+    },
+}
+
+pub fn spawn_mpegts_writer(
     add_readers: &kanal::Sender<kanal::Sender<SegmentMessage>>,
 ) -> JoinHandle<()> {
     let (reader_rx, reader_tx): (
         kanal::Sender<SegmentMessage>,
         kanal::Receiver<SegmentMessage>,
     ) = kanal::unbounded();
-    add_readers.send(reader_rx);
 
-    thread::Builder::new()
-        .name(format!("file writer"))
+    add_readers
+        .send(reader_rx)
+        .map_err(|source| FileWriterError::RegisterReader { source })
+        .expect("fuuuuuuuuuu");
+
+    let handle = thread::Builder::new()
+        .name("file writer".to_owned())
         .spawn(move || {
-            let reader_tx = reader_tx;
-            for msg in reader_tx {
-                match msg {
-                    SegmentMessage::Segment {
-                        sequence_num,
-                        mut reader,
-                    } => {
-                        debug_span!("writing file", sequence = sequence_num);
-                        std::fs::create_dir_all("manifest").unwrap();
-                        let mut f =
-                            std::fs::File::create(format!("manifest/{}.ts", sequence_num)).unwrap();
-                        info!("created file");
-                        loop {
-                            let buf = reader.chunk();
-
-                            let written = f.write(buf).unwrap();
-                            trace!("wrote {} bytes", written);
-                            reader.advance(written);
-                            reader.wait_for_data();
-                            if reader.closed() {
-                                break;
-                            }
-                        }
-                    }
-                    SegmentMessage::Init { reader } => {}
-                }
+            if let Err(error) = run_mpegts_writer(reader_tx) {
+                error!(?error, "MPEG-TS writer stopped");
             }
         })
-        .expect("failed to spawn file writer")
+        .expect("failed to spawn file writer");
+
+    handle
 }
 
 fn spawn_downloaders<const N: usize>(

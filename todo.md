@@ -7,6 +7,7 @@ clean up logging and error handling
 
 fix tcp corruption (have a hunch the downloading is sound but the listenre is not) nvm it's def the downloaders (actually might be that the chunks are getting dropped  too earlier)
 // doesn't corrupt with curl, ???
+// no still corrupts with curl, just less. maybe some kind of atomics issues?
 
 
 
@@ -20,7 +21,22 @@ bring down binary size
 
 add vod support
 
-optimzie manifest refetch algo (poll at ~50ms for phase of new segments and  use round trip latency and other stuff to get even closer)
+<!-- optimzie manifest refetch algo (poll at ~50ms for phase of new segments and  use round trip latency and other stuff to get even closer) -->
+not needed since we're already grabbing the prefetch before they start transmitting
 
 
-optimize startup time (current ~2.5seconds) start - first bytes over tcp
+
+
+store timestamp within stream in boundaries file
+
+http server to reserve from disk?
+
+
+use slotmap/arena whatever instead of generic allocator (instrusive ref counts)
+
+
+change segment record structure to include resolution (2 u16s) (framerate rational, 2 u16), mute status (1 bit, bool)
+
+add discontinuity record
+
+add init record

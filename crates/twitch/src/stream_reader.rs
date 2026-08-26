@@ -22,10 +22,7 @@ impl SegmentReader {
         self.cursor.base + self.offset
     }
 
-    pub fn closed(&self) -> bool {
-        self.handle.is_closed()
-    }
-
+    // returns false when no more data, returns true when data
     pub fn wait_for_data(&self) -> bool {
         const SPIN: u32 = 100;
         let pos = self.position();
