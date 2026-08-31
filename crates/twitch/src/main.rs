@@ -1,21 +1,24 @@
-#![allow(unused)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![deny(unused_imports)]
 use bytes::Buf;
 use mimalloc::MiMalloc;
 
 use clap::Parser;
 
-use sonic_rs::{PointerTree, get, get_from_bytes, get_many, pointer};
+use sonic_rs::pointer;
 use std::borrow::Cow;
-use std::fmt::format;
-use std::fs::File;
-use std::io::{self, IoSlice, Seek, Write};
+use ureq::Agent;
+use ureq::http::header::AUTHORIZATION;
+
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::subscriber::NoSubscriber;
-use tracing::{Level, debug, debug_span, dispatcher, error, info, trace};
+use std::time::Instant;
+
+use tracing::error;
 use tracing_subscriber::EnvFilter;
-use ureq::ResponseExt;
+
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 use std::{array, thread};
@@ -24,13 +27,7 @@ mod file;
 mod helpers;
 mod hls_parser;
 mod scheduler;
-mod stream;
-mod stream_reader;
-mod stream_writer;
-use base64::engine::general_purpose::STANDARD;
-use rand::{RngExt, distr::Alphanumeric};
-
-use ureq::{Agent, http::header::AUTHORIZATION};
+mod segment;
 
 mod constants;
 use crate::downloader::download_worker;
@@ -38,10 +35,7 @@ use crate::file::run_mpegts_writer;
 use crate::helpers::{fetch_master_manifest, select_track};
 use crate::scheduler::{Segment, SegmentMessage, StreamScheduler};
 
-use crate::constants::{
-    DEFAULT_CLIENT_ID, DEFAULT_PORT, DOWNLOAD_THREADS, PLAYER_VERSION, TWITCH_GQL_ENDPOINT,
-    TWITCH_HLS_BASE, TWITCH_OAUTH_ENDPOINT,
-};
+use crate::constants::{DEFAULT_CLIENT_ID, DEFAULT_PORT, TWITCH_OAUTH_ENDPOINT};
 
 use thiserror::Error;
 
@@ -101,6 +95,8 @@ struct Config {
 
     #[arg(short, long)]
     quality: Option<String>,
+    #[arg(short, long)]
+    debug: bool,
 }
 
 // impl Default for Config {
@@ -153,19 +149,24 @@ fn main() {
     let cfg = Config::parse();
 
     let track_url = {
-        let client_id =
-            choose_client_id(&agent, cfg.client_id.as_deref(), cfg.auth_token.as_deref()).unwrap();
+        if cfg.debug {
+            Box::from("http://127.0.0.2:8000/index.m3u8")
+        } else {
+            let client_id =
+                choose_client_id(&agent, cfg.client_id.as_deref(), cfg.auth_token.as_deref())
+                    .unwrap();
 
-        let master_manifest = fetch_master_manifest(
-            &agent,
-            &cfg.channel,
-            &client_id,
-            cfg.auth_token.as_deref(),
-            cfg.low_latency,
-        )
-        .unwrap();
+            let master_manifest = fetch_master_manifest(
+                &agent,
+                &cfg.channel,
+                &client_id,
+                cfg.auth_token.as_deref(),
+                cfg.low_latency,
+            )
+            .unwrap();
 
-        select_track(&master_manifest, cfg.quality.as_deref()).unwrap()
+            select_track(&master_manifest, cfg.quality.as_deref()).unwrap()
+        }
     };
 
     let (tx_downloaders, rx_downloaders) = kanal::unbounded();
@@ -174,12 +175,12 @@ fn main() {
     let download_threads: [JoinHandle<()>; 8] = spawn_downloaders::<8>(&agent, rx_downloaders);
     let scheduler_thread: JoinHandle<()> =
         spawn_scheduler(agent.clone(), track_url, tx_downloaders, rx_readers);
-    let file_thread: JoinHandle<()> = spawn_mpegts_writer(&add_readers);
+    // let file_thread: JoinHandle<()> = spawn_mpegts_writer(&add_readers);
     let tcp_listener_thread: JoinHandle<()> = spawn_tcp_listener(add_readers.clone(), start);
 
     let _ = scheduler_thread.join();
     let _ = tcp_listener_thread.join();
-    let _ = file_thread.join();
+    // let _ = file_thread.join();
     for thread in download_threads {
         let _ = thread.join();
     }
@@ -234,7 +235,9 @@ fn spawn_tcp_client_thread(
         ))
         .spawn(move || {
             let mut stream = stream;
-            stream.set_nodelay(true);
+            stream
+                .set_nodelay(true)
+                .expect("Failed to set TCP no delay");
 
             let mut last_sequence_num = 0;
             for msg in reader_tx {
@@ -262,19 +265,15 @@ fn spawn_tcp_client_thread(
                         mut reader,
                         sequence_num,
                         ..
-                    })
-                    | SegmentMessage::Prefetch {
-                        mut reader,
-                        expected_sequence: sequence_num,
-                    } => {
-                        if (last_sequence_num >= sequence_num) {
+                    }) => {
+                        if last_sequence_num >= sequence_num {
                             continue;
                         }
                         last_sequence_num = sequence_num;
-                        while reader.wait_for_data() {
+                        loop {
                             let buf = reader.chunk();
 
-                            let written = match stream.write(buf) {
+                            let written = match stream.write_all(buf) {
                                 Ok(w) => w,
                                 Err(e) => {
                                     eprintln!("Write error: {e}");
@@ -282,11 +281,35 @@ fn spawn_tcp_client_thread(
                                 }
                             };
 
-                            if written == 0 {
+                            reader.advance(buf.len());
+                            if !reader.wait_for_data() {
                                 break;
                             }
+                        }
+                    }
+                    SegmentMessage::Prefetch {
+                        expected_sequence,
+                        mut reader,
+                    } => {
+                        if last_sequence_num >= expected_sequence {
+                            continue;
+                        }
+                        last_sequence_num = expected_sequence;
+                        loop {
+                            let buf = reader.chunk();
 
-                            reader.advance(written);
+                            let written = match stream.write_all(buf) {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    eprintln!("Write error: {e}");
+                                    return;
+                                }
+                            };
+
+                            reader.advance(buf.len());
+                            if !reader.wait_for_data() {
+                                break;
+                            }
                         }
                     }
                     SegmentMessage::Discontinuity() => last_sequence_num = 0,

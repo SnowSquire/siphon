@@ -4,10 +4,9 @@ use crate::{
 };
 use base64::engine::general_purpose::STANDARD;
 use rand::{RngExt, distr::Alphanumeric};
-use sonic_rs::{JsonInput, JsonValueTrait, PointerTree, pointer};
-use std::ops::Range;
+use sonic_rs::{JsonValueTrait, PointerTree, pointer};
 use tracing::info;
-use ureq::{Agent, ResponseExt};
+use ureq::Agent;
 
 pub fn fetch_master_manifest(
     agent: &Agent,

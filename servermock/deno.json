@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "dev": "deno run --watch --allow-net main.ts"
+  },
+  "imports": {
+    "@node-rs/xxhash": "npm:@node-rs/xxhash@^1.7.7",
+    "@std/assert": "jsr:@std/assert@1",
+    "xxhash-wasm": "npm:xxhash-wasm@^1.1.0"
+  }
+}

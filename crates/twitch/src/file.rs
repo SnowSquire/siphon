@@ -1,41 +1,24 @@
 use bytes::Buf;
-use mimalloc::MiMalloc;
+use ffmpeg_next::format::context::StreamIo;
 
-use clap::Parser;
-
-use sonic_rs::{PointerTree, get, get_from_bytes, get_many, pointer};
-use std::borrow::Cow;
-use std::fmt::format;
 use std::fs::File;
-use std::hint::unreachable_unchecked;
-use std::io::{self, IoSlice, Read, Seek, Write};
-use std::mem::{MaybeUninit, align_of, size_of, transmute};
-use std::mem::{discriminant, offset_of};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
-use std::ptr::addr_of;
-use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::{array, thread};
-use tracing::subscriber::NoSubscriber;
-use tracing::{Level, debug, debug_span, dispatcher, error, info, trace};
-use tracing_subscriber::EnvFilter;
-use ureq::ResponseExt;
 
-use base64::engine::general_purpose::STANDARD;
-use rand::{RngExt, distr::Alphanumeric};
+use std::io::{self, Read, Seek, Write};
 
-use ureq::{Agent, http::header::AUTHORIZATION};
+use std::num::NonZeroU16;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::FileWriterError;
-use crate::downloader::download_worker;
-use crate::helpers::{fetch_master_manifest, select_track};
-use crate::scheduler::SegmentMessage;
+use tracing::{debug, debug_span};
+
+use crate::{FileWriterError, scheduler::SegmentMessage};
+use ffmpeg_next as ffmpeg;
+use xxhash_rust::xxh3::Xxh3;
 
 const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
 const INDEX_VERSION: u64 = 1;
 
-#[repr(C)]
 struct Segment {
+    hash: u128,
     sequence_number: u64,
     byte_offset: u64,
     byte_length: u32,
@@ -43,7 +26,6 @@ struct Segment {
     muted: bool,
 }
 
-#[repr(C)]
 struct StreamIndexHeader {
     magic: [u8; 8],
     version: u64,
@@ -56,8 +38,8 @@ enum StreamRecord {
     Discontinuity {
         width: u16,
         height: u16,
-        rate_num: u16,
-        rate_denom: u16,
+        rate_num: Option<NonZeroU16>,
+        rate_denom: Option<NonZeroU16>,
     } = 2,
     Init {
         counter: u64, // doesn't need to be a u64 but no harm
@@ -79,9 +61,9 @@ fn write_record<W: Write>(file: &mut W, record: StreamRecord) -> io::Result<()> 
             // (5) +2 bytes
             file.write_all(&height.to_le_bytes())?;
             // (7) +2 bytes
-            file.write_all(&rate_num.to_le_bytes())?;
+            file.write_all(&rate_num.map(|v| v.get()).unwrap_or(0).to_le_bytes())?;
             // (9) +2 bytes
-            file.write_all(&rate_denom.to_le_bytes())?;
+            file.write_all(&rate_denom.map(|v| v.get()).unwrap_or(0).to_le_bytes())?;
         }
         StreamRecord::Init { counter } => {
             // 1 byte
@@ -93,6 +75,7 @@ fn write_record<W: Write>(file: &mut W, record: StreamRecord) -> io::Result<()> 
             // 1 byte
             file.write_all(&[0])?;
             // (9) +8 bytes
+            file.write_all(&segment.hash.to_le_bytes())?;
             file.write_all(&segment.sequence_number.to_le_bytes())?;
             // (17) +8 bytes
             file.write_all(&segment.byte_offset.to_le_bytes())?;
@@ -106,6 +89,7 @@ fn write_record<W: Write>(file: &mut W, record: StreamRecord) -> io::Result<()> 
         StreamRecord::FMp4(segment) => {
             // 1 byte
             file.write_all(&[1])?;
+            file.write_all(&segment.hash.to_le_bytes())?;
             // (9) +8 bytes
             file.write_all(&segment.sequence_number.to_le_bytes())?;
             // (17) +8 bytes
@@ -127,6 +111,7 @@ fn read_record<R: Read>(reader: &mut R) -> io::Result<StreamRecord> {
 
     match tag[0] {
         0 | 1 => {
+            let hash = read_u128(reader)?;
             let sequence_number = read_u64(reader)?;
             let byte_offset = read_u64(reader)?;
             let byte_length = read_u32(reader)?;
@@ -139,6 +124,7 @@ fn read_record<R: Read>(reader: &mut R) -> io::Result<StreamRecord> {
                 byte_length,
                 timestamp_ms,
                 muted,
+                hash,
             };
 
             if tag[0] == 0 {
@@ -157,8 +143,8 @@ fn read_record<R: Read>(reader: &mut R) -> io::Result<StreamRecord> {
             Ok(StreamRecord::Discontinuity {
                 width,
                 height,
-                rate_num,
-                rate_denom,
+                rate_num: NonZeroU16::new(rate_num),
+                rate_denom: NonZeroU16::new(rate_denom),
             })
         }
 
@@ -193,6 +179,12 @@ fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn read_u128<R: Read>(reader: &mut R) -> io::Result<u128> {
+    let mut bytes = [0u8; 16];
+    reader.read_exact(&mut bytes)?;
+    Ok(u128::from_le_bytes(bytes))
+}
+
 fn read_bool<R: Read>(reader: &mut R) -> io::Result<bool> {
     let mut byte = [0u8; 1];
     reader.read_exact(&mut byte)?;
@@ -216,6 +208,7 @@ fn write_stream_index_header<W: Write>(file: &mut W) -> io::Result<()> {
 pub fn run_mpegts_writer(
     reader_tx: kanal::Receiver<SegmentMessage>,
 ) -> Result<(), FileWriterError> {
+    ffmpeg::init().unwrap();
     let file_timestamp = unix_timestamp_nanos();
 
     std::fs::create_dir_all("manifest")
@@ -240,22 +233,30 @@ pub fn run_mpegts_writer(
         .map_err(|source| FileWriterError::WriteBoundariesHeader { source })?;
 
     let mut probed_stream = false;
+    let mut hasher = Xxh3::new();
     for msg in reader_tx {
+        debug!("message: {:#?}", msg);
         match msg {
             SegmentMessage::Segment(mut segment) => {
+                hasher.reset();
+
                 let segment_start = ts_file
                     .stream_position()
                     .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
 
                 let _span = debug_span!("writing file", sequence = segment.sequence_num).entered();
-
+                let ffmpeg_reader = if !probed_stream {
+                    Some(segment.reader.clone().reader())
+                } else {
+                    None
+                };
                 loop {
                     let buf = segment.reader.chunk();
 
                     ts_file
                         .write_all(buf)
                         .map_err(|source| FileWriterError::WriteTsData { source })?;
-
+                    hasher.update(buf);
                     segment.reader.advance(buf.len());
 
                     if !segment.reader.wait_for_data() {
@@ -263,7 +264,6 @@ pub fn run_mpegts_writer(
                     }
                 }
 
-                // PROBE STREAM FOR INFO HERE
                 ts_file
                     .flush()
                     .map_err(|source| FileWriterError::FlushTsFile { source })?;
@@ -275,9 +275,50 @@ pub fn run_mpegts_writer(
                 let segment_size = segment_end - segment_start;
                 let completed_at = unix_timestamp_nanos();
 
-                write_record(
+                if let Some(reader) = ffmpeg_reader {
+                    let input_ctx = ffmpeg::format::input_from_stream(
+                        StreamIo::from_read(reader).unwrap(),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+
+                    let video_stream = input_ctx
+                        .streams()
+                        .best(ffmpeg::media::Type::Video)
+                        .unwrap();
+
+                    let decoder =
+                        ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())
+                            .unwrap();
+                    let video_decoder = decoder.decoder().video().unwrap();
+
+                    let width = video_decoder.width();
+                    let height = video_decoder.height();
+                    let framerate = video_decoder
+                        .frame_rate()
+                        .into_iter()
+                        .chain([video_stream.avg_frame_rate(), video_stream.rate()])
+                        .find(|r| r.numerator() > 0 && r.denominator() > 0);
+
+                    _ = write_record(
+                        &mut index_file,
+                        StreamRecord::Discontinuity {
+                            width: width as u16,
+                            height: height as u16,
+                            rate_num: framerate.and_then(|f| NonZeroU16::new(f.numerator() as u16)),
+                            rate_denom: framerate
+                                .and_then(|f| NonZeroU16::new(f.denominator() as u16)),
+                        },
+                    );
+
+                    probed_stream = true
+                }
+
+                _ = write_record(
                     &mut index_file,
                     StreamRecord::MpegTS(Segment {
+                        hash: hasher.digest128(),
                         sequence_number: segment.sequence_num,
                         byte_offset: segment_start,
                         byte_length: segment_size.try_into().unwrap(),

@@ -1,42 +1,52 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::{
+    mem::MaybeUninit,
+    sync::{Arc, atomic::Ordering},
+};
 
-use tracing::debug;
 use wait_on_address::AtomicWait;
 
 use crate::{
     constants::CHUNK_SIZE,
-    stream::{Chunk, Stream},
+    segment::{Chunk, SegmentStream},
 };
 
 pub struct SegmentWriter {
-    pub tail: Arc<Chunk>,
-    pub tail_offset: usize, // bytes written into tail
-    pub handle: Arc<Stream>,
-    pub closed: bool,
-    pub written_len: usize,
+    tail: Arc<Chunk>,
+    handle: Arc<SegmentStream>,
+    closed: bool,
+    written_len: usize,
 }
 
 impl SegmentWriter {
+    fn tail_offset(&self) -> usize {
+        self.written_len - self.tail.base
+    }
+    pub(super) fn new(tail: Arc<Chunk>, handle: Arc<SegmentStream>) -> Self {
+        Self {
+            tail,
+            // tail_offset: 0,
+            handle,
+            closed: false,
+            written_len: 0,
+        }
+    }
     /// Writable remainder of the tail chunk, linking a fresh chunk if the
     /// tail is full. Returns at most CHUNK_SIZE bytes per call.
-    pub fn writable_slice(&mut self) -> &mut [u8] {
-        if self.tail_offset == CHUNK_SIZE {
+    pub fn writable_slice(&mut self) -> &mut [MaybeUninit<u8>] {
+        if self.tail_offset() == CHUNK_SIZE {
             self.link_new_chunk();
         }
         // SAFETY: single writer with exclusive access to unpublished tail
         // bytes; readers never read at/above `written_len`.
-        let base = self.tail.data.get().cast::<u8>();
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                base.add(self.tail_offset),
-                CHUNK_SIZE - self.tail_offset,
-            )
-        }
+        unsafe { self.tail.data.get().as_mut_unchecked()[self.tail_offset()..].as_mut() }
     }
 
-    pub fn commit(&mut self, n: usize) {
-        assert!(n <= CHUNK_SIZE - self.tail_offset, "commit past slice");
-        self.tail_offset += n;
+    pub unsafe fn commit(&mut self, n: usize) {
+        assert!(
+            self.written_len + n <= self.tail.base + CHUNK_SIZE,
+            "commit past slice"
+        );
+
         self.written_len += n;
     }
 
@@ -49,8 +59,9 @@ impl SegmentWriter {
     }
 
     fn link_new_chunk(&mut self) {
-        debug_assert!(
-            self.written_len.is_multiple_of(CHUNK_SIZE),
+        debug_assert_eq!(
+            self.written_len,
+            self.tail.base + CHUNK_SIZE,
             "you forgot to commit at some point"
         );
 
@@ -61,8 +72,8 @@ impl SegmentWriter {
             .next
             .set(next.clone())
             .expect("single writer links exactly once");
+
         self.tail = next;
-        self.tail_offset = 0;
     }
 
     /// Signal EOF and wake everyone. Idempotent.

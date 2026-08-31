@@ -1,5 +1,4 @@
 use std::{
-    io::{self, Write},
     num::{ParseFloatError, ParseIntError},
     ptr, thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -7,12 +6,13 @@ use std::{
 
 use kanal::{Receiver, Sender};
 use thiserror::Error;
-use tracing::{Level, debug, debug_span, error, info, instrument, span};
-use ureq::{Agent, http};
+use tracing::{Level, debug, debug_span, error, info, span};
+use ureq::Agent;
 
 use crate::{
-    downloader::ToDownloader, scheduler::ManifestParseError::Split, stream::Stream,
-    stream_reader::SegmentReader,
+    downloader::ToDownloader,
+    scheduler::ManifestParseError::Split,
+    segment::{SegmentStream, reader::SegmentReader},
 };
 
 struct PrefetchSegment {
@@ -20,13 +20,14 @@ struct PrefetchSegment {
     url: Box<str>,
     reader: SegmentReader,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Segment {
     pub timestamp_ms: u64,
     pub sequence_num: u64,
     pub reader: SegmentReader,
 }
 
+#[derive(Debug)]
 pub enum SegmentMessage {
     Segment(Segment),
     Prefetch {
@@ -246,7 +247,6 @@ impl StreamScheduler {
 
         match prefetch {
             Some(prefetch) => {
-                error!("no more of this");
                 let segment = Segment {
                     sequence_num: expected_sequence,
                     reader: prefetch.reader,
@@ -265,7 +265,7 @@ impl StreamScheduler {
                 });
             }
             None => {
-                let (writer, segmentreader) = Stream::new();
+                let (writer, segmentreader) = SegmentStream::new();
                 let segment = Segment {
                     sequence_num: expected_sequence,
                     reader: segmentreader,
@@ -308,7 +308,7 @@ impl StreamScheduler {
         };
         let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
 
-        let (writer, reader) = Stream::new();
+        let (writer, reader) = SegmentStream::new();
         let url = as_http(url);
         self.downloaders
             .send(ToDownloader::FetchURL {
@@ -400,7 +400,7 @@ impl StreamScheduler {
 
                         None => {
                             let span = debug_span!("init segment");
-                            let (writer, reader) = Stream::new();
+                            let (writer, reader) = SegmentStream::new();
                             self.downloaders.send(ToDownloader::FetchURL {
                                 url: new_init.into(),
                                 writer: writer,
@@ -411,18 +411,16 @@ impl StreamScheduler {
                     }
                 }
                 "#EXTINF" => {
-                    sequence_number += 1;
-
-                    if sequence_number > self.segment_tail
+                    if sequence_number >= self.segment_tail
                         && let Some(url) = lines.next()
                     {
-                        self.segment_tail = sequence_number;
+                        self.segment_tail = sequence_number + 1;
                         self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
 
                         self.dispatch_main(url, sequence_number, value, segment_time_ms)
                             .map_err(|_| SchedulerError::Dispatch)?;
                     }
-
+                    sequence_number += 1;
                     let segment_len = parse_millis(
                         value
                             .split_once(',')
@@ -430,18 +428,16 @@ impl StreamScheduler {
                             .0,
                     )
                     .ok_or(SchedulerError::Parse(Split()))?;
-
                     segment_time_ms += segment_len
                 }
                 "#EXT-X-TWITCH-PREFETCH" | "#EXT-X-PREFETCH" => {
-                    sequence_number += 1;
-
-                    if sequence_number > self.prefetch_tail {
-                        self.prefetch_tail = sequence_number;
+                    if sequence_number >= self.prefetch_tail {
+                        self.prefetch_tail = sequence_number + 1;
 
                         self.dispatch_prefetch(value, sequence_number)
                             .map_err(|_| SchedulerError::Dispatch)?;
                     }
+                    sequence_number += 1;
                 }
                 _ => (),
             }
