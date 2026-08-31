@@ -1,5 +1,4 @@
 #![allow(unused)]
-#![feature(offset_of_enum)]
 use bytes::Buf;
 use mimalloc::MiMalloc;
 
@@ -37,7 +36,7 @@ mod constants;
 use crate::downloader::download_worker;
 use crate::file::run_mpegts_writer;
 use crate::helpers::{fetch_master_manifest, select_track};
-use crate::scheduler::{SegmentMessage, StreamScheduler};
+use crate::scheduler::{Segment, SegmentMessage, StreamScheduler};
 
 use crate::constants::{
     DEFAULT_CLIENT_ID, DEFAULT_PORT, DOWNLOAD_THREADS, PLAYER_VERSION, TWITCH_GQL_ENDPOINT,
@@ -236,11 +235,11 @@ fn spawn_tcp_client_thread(
         .spawn(move || {
             let mut stream = stream;
             stream.set_nodelay(true);
-            let mut sent = false;
+
+            let mut last_sequence_num = 0;
             for msg in reader_tx {
                 match msg {
-                    SegmentMessage::Init { mut reader }
-                    | SegmentMessage::Segment { mut reader, .. } => {
+                    SegmentMessage::Init { mut reader } => {
                         while reader.wait_for_data() {
                             let buf = reader.chunk();
 
@@ -252,11 +251,6 @@ fn spawn_tcp_client_thread(
                                 }
                             };
 
-                            if (!sent) {
-                                sent = true;
-
-                                println!("{}", start.elapsed().as_secs_f64())
-                            }
                             if written == 0 {
                                 break;
                             }
@@ -264,6 +258,38 @@ fn spawn_tcp_client_thread(
                             reader.advance(written);
                         }
                     }
+                    SegmentMessage::Segment(Segment {
+                        mut reader,
+                        sequence_num,
+                        ..
+                    })
+                    | SegmentMessage::Prefetch {
+                        mut reader,
+                        expected_sequence: sequence_num,
+                    } => {
+                        if (last_sequence_num >= sequence_num) {
+                            continue;
+                        }
+                        last_sequence_num = sequence_num;
+                        while reader.wait_for_data() {
+                            let buf = reader.chunk();
+
+                            let written = match stream.write(buf) {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    eprintln!("Write error: {e}");
+                                    return;
+                                }
+                            };
+
+                            if written == 0 {
+                                break;
+                            }
+
+                            reader.advance(written);
+                        }
+                    }
+                    SegmentMessage::Discontinuity() => last_sequence_num = 0,
                 }
             }
         })

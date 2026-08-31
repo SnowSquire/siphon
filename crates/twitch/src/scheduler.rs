@@ -10,24 +10,30 @@ use thiserror::Error;
 use tracing::{Level, debug, debug_span, error, info, instrument, span};
 use ureq::{Agent, http};
 
-use crate::{downloader::ToDownloader, stream::Stream, stream_reader::SegmentReader};
+use crate::{
+    downloader::ToDownloader, scheduler::ManifestParseError::Split, stream::Stream,
+    stream_reader::SegmentReader,
+};
 
 struct PrefetchSegment {
-    expected_id: usize,
+    expected_id: u64,
     url: Box<str>,
     reader: SegmentReader,
 }
 #[derive(Clone)]
 pub struct Segment {
-    sequence_num: usize,
+    pub timestamp_ms: u64,
+    pub sequence_num: u64,
     pub reader: SegmentReader,
 }
 
 pub enum SegmentMessage {
-    Segment {
-        sequence_num: usize,
+    Segment(Segment),
+    Prefetch {
+        expected_sequence: u64,
         reader: SegmentReader,
     },
+    Discontinuity(),
     Init {
         reader: SegmentReader,
     },
@@ -35,10 +41,7 @@ pub enum SegmentMessage {
 
 impl From<Segment> for SegmentMessage {
     fn from(value: Segment) -> Self {
-        SegmentMessage::Segment {
-            reader: value.reader,
-            sequence_num: value.sequence_num,
-        }
+        Self::Segment(value)
     }
 }
 
@@ -86,8 +89,8 @@ pub struct StreamScheduler {
 
     readers: Vec<Sender<SegmentMessage>>,
 
-    segment_tail: usize,
-    prefetch_tail: usize,
+    segment_tail: u64,
+    prefetch_tail: u64,
     last_segment_dur: Duration,
 }
 
@@ -213,8 +216,9 @@ impl StreamScheduler {
     fn dispatch_main(
         &mut self,
         url: &str,
-        expected_sequence: usize,
+        expected_sequence: u64,
         infoline: &str,
+        timestamp_ms: u64,
     ) -> Result<Duration, Box<dyn std::error::Error>> {
         let prefetch = self
             .prefetches
@@ -246,6 +250,7 @@ impl StreamScheduler {
                 let segment = Segment {
                     sequence_num: expected_sequence,
                     reader: prefetch.reader,
+                    timestamp_ms,
                 };
                 self.segments.push(segment.clone());
 
@@ -264,6 +269,7 @@ impl StreamScheduler {
                 let segment = Segment {
                     sequence_num: expected_sequence,
                     reader: segmentreader,
+                    timestamp_ms,
                 };
                 self.segments.push(segment.clone());
 
@@ -291,7 +297,7 @@ impl StreamScheduler {
         Ok(duration)
     }
 
-    fn dispatch_prefetch(&mut self, url: &str, expected_sequence: usize) -> Result<(), ()> {
+    fn dispatch_prefetch(&mut self, url: &str, expected_sequence: u64) -> Result<(), ()> {
         let prefetch = self
             .prefetches
             .iter()
@@ -302,7 +308,6 @@ impl StreamScheduler {
         };
         let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
 
-        let _guard = span.enter();
         let (writer, reader) = Stream::new();
         let url = as_http(url);
         self.downloaders
@@ -310,19 +315,32 @@ impl StreamScheduler {
                 url: url.clone(),
                 writer,
 
-                span: span.clone(),
+                span: span,
             })
             .unwrap();
 
+        self.readers.retain_unordered(|segmentreader| {
+            match segmentreader.try_send(SegmentMessage::Prefetch {
+                expected_sequence,
+                reader: reader.clone(),
+            }) {
+                Ok(true) => true,
+                Ok(false) | Err(_) => {
+                    let _ = segmentreader.close();
+                    false
+                }
+            }
+        });
         self.prefetches.push(PrefetchSegment {
             expected_id: expected_sequence,
-            url: url.clone(),
-            reader,
+            url: url,
+            reader: reader,
         });
+
         Ok(())
     }
 
-    fn reload(&mut self) -> Result<usize, SchedulerError> {
+    fn reload(&mut self) -> Result<u64, SchedulerError> {
         let span = span!(Level::INFO, "manifest");
         let _guard = span.enter();
         let manifest = self
@@ -345,23 +363,20 @@ impl StreamScheduler {
         let mut sequence_number = 0;
 
         let mut lines = manifest.lines();
-        let mut mains = 0;
-        let mut prefetches = 0;
+
+        let mut segment_time_ms = 0;
         while let Some(line) = lines.next() {
             let Some((tag, value)) = line.split_once(':') else {
                 continue;
             };
 
             match tag {
+                "#EXT-X-TWITCH-ELAPSED-SECS" => {
+                    segment_time_ms = parse_millis(value).ok_or(SchedulerError::Parse(Split()))?;
+                }
                 "#EXT-X-MEDIA-SEQUENCE" => {
-                    let front: usize = value.parse().map_err(ManifestParseError::Int)?;
+                    let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
 
-                    // if front < self.sequence_front {
-                    //     return Err(SchedulerError::NonMonotonic {
-                    //         old: self.sequence_front,
-                    //         new: front,
-                    //     });
-                    // }
                     sequence_number = front;
                     debug!("new front {}", sequence_number);
 
@@ -397,27 +412,34 @@ impl StreamScheduler {
                 }
                 "#EXTINF" => {
                     sequence_number += 1;
-                    mains += 1;
 
                     if sequence_number > self.segment_tail
                         && let Some(url) = lines.next()
                     {
                         self.segment_tail = sequence_number;
-                        // self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
+                        self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
 
-                        self.dispatch_main(url, sequence_number, value)
+                        self.dispatch_main(url, sequence_number, value, segment_time_ms)
                             .map_err(|_| SchedulerError::Dispatch)?;
                     }
+
+                    let segment_len = parse_millis(
+                        value
+                            .split_once(',')
+                            .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?
+                            .0,
+                    )
+                    .ok_or(SchedulerError::Parse(Split()))?;
+
+                    segment_time_ms += segment_len
                 }
                 "#EXT-X-TWITCH-PREFETCH" | "#EXT-X-PREFETCH" => {
                     sequence_number += 1;
-                    mains += 1; // TODO: testing just pass prefetches directly
-                    // prefetches += 1;
 
-                    if sequence_number > self.segment_tail {
-                        // self.prefetch_tail = sequence_number;
-                        self.segment_tail = sequence_number;
-                        self.dispatch_main(value, sequence_number, "2.000,live")
+                    if sequence_number > self.prefetch_tail {
+                        self.prefetch_tail = sequence_number;
+
+                        self.dispatch_prefetch(value, sequence_number)
                             .map_err(|_| SchedulerError::Dispatch)?;
                     }
                 }
@@ -470,4 +492,14 @@ fn as_http(url: &str) -> Box<str> {
     } else {
         Box::from(url)
     }
+}
+
+fn parse_millis(s: &str) -> Option<u64> {
+    let (secs, frac) = s.split_once('.').unwrap_or((s, "0"));
+    let frac = if frac.is_empty() { "0" } else { frac };
+
+    let digits = frac.len().min(3) as u32;
+    let frac_ms: u64 = frac.get(..digits as usize)?.parse().ok()?;
+
+    Some(secs.parse::<u64>().ok()? * 1000 + frac_ms * 10u64.pow(3 - digits))
 }

@@ -40,36 +40,7 @@ struct Segment {
     byte_offset: u64,
     byte_length: u32,
     timestamp_ms: u32,
-    flags: u8,
-}
-
-impl Segment {
-    const MUTED: u8 = 1 << 0;
-    const FMP4: u8 = 1 << 1;
-
-    pub fn muted(&self) -> bool {
-        self.flags & Self::MUTED != 0
-    }
-
-    pub fn set_muted(&mut self, value: bool) {
-        self.set_flag(Self::MUTED, value);
-    }
-
-    pub fn fmp4(&self) -> bool {
-        self.flags & Self::FMP4 != 0
-    }
-
-    pub fn set_fmp4(&mut self, value: bool) {
-        self.set_flag(Self::FMP4, value);
-    }
-
-    fn set_flag(&mut self, flag: u8, value: bool) {
-        if value {
-            self.flags |= flag;
-        } else {
-            self.flags &= !flag;
-        }
-    }
+    muted: bool,
 }
 
 #[repr(C)]
@@ -80,51 +51,20 @@ struct StreamIndexHeader {
 
 #[repr(C, u8)]
 enum StreamRecord {
-    Segment(Segment) = 0,
+    MpegTS(Segment) = 0,
+    FMp4(Segment) = 1,
     Discontinuity {
         width: u16,
         height: u16,
         rate_num: u16,
         rate_denom: u16,
-    } = 1,
+    } = 2,
     Init {
         counter: u64, // doesn't need to be a u64 but no harm
-    } = 2,
+    } = 3,
 }
-#[repr(C)]
-struct Init {
-    counter: u64,
-}
-const FAST: bool = cfg!(target_endian = "little")
-    && size_of::<StreamIndexHeader>() % align_of::<StreamRecord>() == 0
-    && size_of::<StreamRecord>() % align_of::<StreamRecord>() == 0
-    && size_of::<u8>() == 1
-    && align_of::<u8>() == 1
-    && size_of::<u16>() == 2
-    && align_of::<u16>() == 2
-    && size_of::<u32>() == 4
-    && align_of::<u32>() == 4
-    && size_of::<u64>() == 8
-    && align_of::<u64>() == 8
-    && size_of::<Segment>() == 32
-    && align_of::<Segment>() == 8
-    && offset_of!(Segment, sequence_number) == 0
-    && offset_of!(Segment, byte_offset) == 8
-    && offset_of!(Segment, byte_length) == 16
-    && offset_of!(Segment, timestamp_ms) == 20
-    && offset_of!(Segment, flags) == 24
-    && size_of::<StreamRecord>() == 40
-    && align_of::<StreamRecord>() == 8
-    && offset_of!(StreamRecord, Segment.0) == 8
-    && offset_of!(StreamRecord, Discontinuity.width) == 8
-    && offset_of!(StreamRecord, Discontinuity.height) == 10
-    && offset_of!(StreamRecord, Discontinuity.rate_num) == 12
-    && offset_of!(StreamRecord, Discontinuity.rate_denom) == 14
-    && offset_of!(StreamRecord, Init.counter) == 8;
 
-const _: () = assert!(FAST);
-
-fn write_record(file: &mut File, record: StreamRecord) -> io::Result<()> {
+fn write_record<W: Write>(file: &mut W, record: StreamRecord) -> io::Result<()> {
     match record {
         StreamRecord::Discontinuity {
             width,
@@ -132,94 +72,145 @@ fn write_record(file: &mut File, record: StreamRecord) -> io::Result<()> {
             rate_num,
             rate_denom,
         } => {
-            file.write_all(&[1, 0, 0, 0, 0, 0, 0, 0])?;
+            // 1 byte
+            file.write_all(&[2])?;
+            // (3) +2 bytes
             file.write_all(&width.to_le_bytes())?;
+            // (5) +2 bytes
             file.write_all(&height.to_le_bytes())?;
+            // (7) +2 bytes
             file.write_all(&rate_num.to_le_bytes())?;
+            // (9) +2 bytes
             file.write_all(&rate_denom.to_le_bytes())?;
-            file.write_all(&[0u8; 24])?;
         }
-        StreamRecord::Segment(segment) => {
-            file.write_all(&[0, 0, 0, 0, 0, 0, 0, 0])?;
-            file.write_all(&segment.sequence_number.to_le_bytes())?;
-            file.write_all(&segment.byte_offset.to_le_bytes())?;
-            file.write_all(&segment.byte_length.to_le_bytes())?;
-            file.write_all(&segment.timestamp_ms.to_le_bytes())?;
-            file.write_all(&segment.flags.to_le_bytes())?;
-            file.write_all(&[0u8; 7])?;
-        }
-
         StreamRecord::Init { counter } => {
-            file.write_all(&[2, 0, 0, 0, 0, 0, 0, 0])?;
+            // 1 byte
+            file.write_all(&[3])?;
+            // (5) + 8 bytes
             file.write_all(&counter.to_le_bytes())?;
-            file.write_all(&[0u8; 24])?;
+        }
+        StreamRecord::MpegTS(segment) => {
+            // 1 byte
+            file.write_all(&[0])?;
+            // (9) +8 bytes
+            file.write_all(&segment.sequence_number.to_le_bytes())?;
+            // (17) +8 bytes
+            file.write_all(&segment.byte_offset.to_le_bytes())?;
+            // (21) +4 bytes
+            file.write_all(&segment.byte_length.to_le_bytes())?;
+            // (25) +4 bytes
+            file.write_all(&segment.timestamp_ms.to_le_bytes())?;
+            // (26) +1 bytes
+            file.write_all(&u8::from(segment.muted).to_le_bytes())?;
+        }
+        StreamRecord::FMp4(segment) => {
+            // 1 byte
+            file.write_all(&[1])?;
+            // (9) +8 bytes
+            file.write_all(&segment.sequence_number.to_le_bytes())?;
+            // (17) +8 bytes
+            file.write_all(&segment.byte_offset.to_le_bytes())?;
+            // (21) +4 bytes
+            file.write_all(&segment.byte_length.to_le_bytes())?;
+            // (25) +4 bytes
+            file.write_all(&segment.timestamp_ms.to_le_bytes())?;
+            // (26) +1 bytes
+            file.write_all(&u8::from(segment.muted).to_le_bytes())?;
         }
     }
     Ok(())
 }
 
-fn read_record_fast(file: &mut File) -> io::Result<StreamRecord> {
-    // FAST guarantees this size and alignment.
-    let mut record = MaybeUninit::<StreamRecord>::uninit();
+fn read_record<R: Read>(reader: &mut R) -> io::Result<StreamRecord> {
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
 
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(record.as_mut_ptr().cast::<u8>(), size_of::<StreamRecord>())
-    };
+    match tag[0] {
+        0 | 1 => {
+            let sequence_number = read_u64(reader)?;
+            let byte_offset = read_u64(reader)?;
+            let byte_length = read_u32(reader)?;
+            let timestamp_ms = read_u32(reader)?;
+            let muted = read_bool(reader)?;
 
-    file.read_exact(bytes)?;
-
-    // Do not assume_init until the discriminant has been validated. An
-    // arbitrary discriminant would make the enum value invalid.
-    match bytes[0] {
-        0 | 1 | 2 => {
-            // FAST also guarantees the target is little-endian and that the
-            // serialized offsets match the Rust representation.
-            Ok(unsafe { record.assume_init() })
-        }
-        _ => unreachable!("invalid stream record discriminant"),
-    }
-}
-
-fn read_record(file: &mut File) -> io::Result<StreamRecord> {
-    if FAST {
-        return read_record_fast(file);
-    }
-
-    read_record_slow(file)
-}
-
-fn read_record_slow(file: &mut File) -> io::Result<StreamRecord> {
-    let mut bytes = [0u8; 40];
-    file.read_exact(&mut bytes)?;
-
-    let tag = bytes[0];
-
-    match tag {
-        0 => {
             let segment = Segment {
-                sequence_number: read_u64(&bytes, 8),
-                byte_offset: read_u64(&bytes, 16),
-                byte_length: read_u32(&bytes, 24),
-                timestamp_ms: read_u32(&bytes, 28),
-                flags: bytes[32],
+                sequence_number,
+                byte_offset,
+                byte_length,
+                timestamp_ms,
+                muted,
             };
 
-            Ok(StreamRecord::Segment(segment))
+            if tag[0] == 0 {
+                Ok(StreamRecord::MpegTS(segment))
+            } else {
+                Ok(StreamRecord::FMp4(segment))
+            }
         }
 
-        1 => Ok(StreamRecord::Discontinuity {
-            width: read_u16(&bytes, 8),
-            height: read_u16(&bytes, 10),
-            rate_num: read_u16(&bytes, 12),
-            rate_denom: read_u16(&bytes, 14),
-        }),
+        2 => {
+            let width = read_u16(reader)?;
+            let height = read_u16(reader)?;
+            let rate_num = read_u16(reader)?;
+            let rate_denom = read_u16(reader)?;
 
-        2 => Ok(StreamRecord::Init {
-            counter: read_u64(&bytes, 8),
-        }),
+            Ok(StreamRecord::Discontinuity {
+                width,
+                height,
+                rate_num,
+                rate_denom,
+            })
+        }
 
-        _ => unreachable!("invalid stream record discriminant"),
+        3 => {
+            let counter = read_u64(reader)?;
+
+            Ok(StreamRecord::Init { counter })
+        }
+
+        tag => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown stream record tag: {tag}"),
+        )),
     }
+}
+
+fn read_u16<R: Read>(reader: &mut R) -> io::Result<u16> {
+    let mut bytes = [0u8; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_bool<R: Read>(reader: &mut R) -> io::Result<bool> {
+    let mut byte = [0u8; 1];
+    reader.read_exact(&mut byte)?;
+
+    match byte[0] {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid boolean value: {value}"),
+        )),
+    }
+}
+
+fn write_stream_index_header<W: Write>(file: &mut W) -> io::Result<()> {
+    file.write_all(&INDEX_MAGIC)?;
+    file.write_all(&INDEX_VERSION.to_le_bytes())?;
+    Ok(())
 }
 
 pub fn run_mpegts_writer(
@@ -230,6 +221,7 @@ pub fn run_mpegts_writer(
     std::fs::create_dir_all("manifest")
         .map_err(|source| FileWriterError::CreateManifestDirectory { source })?;
 
+    // this can technically be concatted fmp4 but idgaf
     let ts_path = format!("manifest/{file_timestamp}.ts");
     let index_path = format!("manifest/{file_timestamp}.index");
 
@@ -244,41 +236,34 @@ pub fn run_mpegts_writer(
             source,
         })?;
 
-    let mut header = [0u8; 24];
-    header[0..8].copy_from_slice(b"OZENIKEN");
-    header[8..16].copy_from_slice(&1u64.to_le_bytes());
-    header[16..24].copy_from_slice(&32u64.to_le_bytes());
-
-    index_file
-        .write_all(&header)
+    write_stream_index_header(&mut index_file)
         .map_err(|source| FileWriterError::WriteBoundariesHeader { source })?;
 
+    let mut probed_stream = false;
     for msg in reader_tx {
         match msg {
-            SegmentMessage::Segment {
-                sequence_num,
-                mut reader,
-            } => {
+            SegmentMessage::Segment(mut segment) => {
                 let segment_start = ts_file
                     .stream_position()
                     .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
 
-                let _span = debug_span!("writing file", sequence = sequence_num).entered();
+                let _span = debug_span!("writing file", sequence = segment.sequence_num).entered();
 
                 loop {
-                    let buf = reader.chunk();
+                    let buf = segment.reader.chunk();
 
                     ts_file
                         .write_all(buf)
                         .map_err(|source| FileWriterError::WriteTsData { source })?;
 
-                    reader.advance(buf.len());
+                    segment.reader.advance(buf.len());
 
-                    if !reader.wait_for_data() {
+                    if !segment.reader.wait_for_data() {
                         break;
                     }
                 }
 
+                // PROBE STREAM FOR INFO HERE
                 ts_file
                     .flush()
                     .map_err(|source| FileWriterError::FlushTsFile { source })?;
@@ -290,22 +275,24 @@ pub fn run_mpegts_writer(
                 let segment_size = segment_end - segment_start;
                 let completed_at = unix_timestamp_nanos();
 
-                let mut boundary_record = [0u8; 32];
-                boundary_record[0..8].copy_from_slice(&sequence_num.to_le_bytes());
-                boundary_record[8..16].copy_from_slice(&completed_at.to_le_bytes());
-                boundary_record[16..24].copy_from_slice(&segment_size.to_le_bytes());
-                boundary_record[24..32].copy_from_slice(&segment_start.to_le_bytes());
-
-                index_file
-                    .write_all(&boundary_record)
-                    .map_err(|source| FileWriterError::WriteBoundary { source })?;
+                write_record(
+                    &mut index_file,
+                    StreamRecord::MpegTS(Segment {
+                        sequence_number: segment.sequence_num,
+                        byte_offset: segment_start,
+                        byte_length: segment_size.try_into().unwrap(),
+                        timestamp_ms: segment.timestamp_ms.try_into().unwrap(),
+                        muted: false,
+                    }),
+                );
 
                 index_file
                     .flush()
                     .map_err(|source| FileWriterError::FlushBoundariesFile { source })?;
             }
-
-            SegmentMessage::Init { reader: _ } => {}
+            SegmentMessage::Prefetch { .. } => {}
+            SegmentMessage::Discontinuity {} => probed_stream = false,
+            SegmentMessage::Init { .. } => {}
         }
     }
 
