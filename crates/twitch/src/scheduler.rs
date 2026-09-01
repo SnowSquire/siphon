@@ -226,8 +226,8 @@ impl StreamScheduler {
             .iter()
             .position(|s| s.expected_id == expected_sequence && s.url.as_ref() == url)
             .map(|idx| self.prefetches.swap_remove(idx));
-
-        let is_ad = infoline.contains('|');
+        // more specifically if the title in the extinf is not 'live' but not 100% sure on that
+        let is_ad: bool = infoline.contains('|');
 
         let duration =
             Duration::try_from_secs_f64(infoline.split_once(',').map(|d| d.0).unwrap().parse()?)?;
@@ -365,6 +365,15 @@ impl StreamScheduler {
         let mut lines = manifest.lines();
 
         let mut segment_time_ms = 0;
+        // this is so dumb but twitch has a bug where multiple disconnect protections in one playlist all have the same value (being of the final sequence)
+        // since we don't care about downloading & persisting ads, we don't have to worry about their sequence number conflict with the real segments
+
+        // the order of tags in the playlist is typically XMS\nTLS\T-ELAPSED-SECS, unless first segments is an ad. in which case there's no TLS (until the first real segment)
+        // this means that we can trust the tls after xms, as long as we invalidate it after the TES.
+        // we can also trust tls after ads since ads don't have disconnect protection
+        // if there are other possible discontinuties then these assumptions don't hold. ¯\_(ツ)_/¯
+        let mut trust_next_tls_val = false;
+
         while let Some(line) = lines.next() {
             let Some((tag, value)) = line.split_once(':') else {
                 continue;
@@ -373,14 +382,23 @@ impl StreamScheduler {
             match tag {
                 "#EXT-X-TWITCH-ELAPSED-SECS" => {
                     segment_time_ms = parse_millis(value).ok_or(SchedulerError::Parse(Split()))?;
+                    trust_next_tls_val = false
                 }
                 "#EXT-X-MEDIA-SEQUENCE" => {
+                    trust_next_tls_val = true;
                     let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
 
                     sequence_number = front;
                     debug!("new front {}", sequence_number);
 
                     self.segments.retain(|s| s.sequence_num >= front);
+                }
+                "#EXT-X-TWITCH-LIVE-SEQUENCE" => {
+                    if trust_next_tls_val {
+                        let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
+                        sequence_number = front;
+                        trust_next_tls_val = false
+                    }
                 }
                 "#EXT-X-DISCONTINUITY" => return Err(SchedulerError::Discontinuity),
                 "#EXT-X-MAP" => {
@@ -411,7 +429,10 @@ impl StreamScheduler {
                     }
                 }
                 "#EXTINF" => {
-                    if sequence_number >= self.segment_tail
+                    trust_next_tls_val = false;
+                    if value.contains('|') {
+                        trust_next_tls_val = true;
+                    } else if sequence_number >= self.segment_tail
                         && let Some(url) = lines.next()
                     {
                         self.segment_tail = sequence_number + 1;
@@ -420,6 +441,7 @@ impl StreamScheduler {
                         self.dispatch_main(url, sequence_number, value, segment_time_ms)
                             .map_err(|_| SchedulerError::Dispatch)?;
                     }
+
                     sequence_number += 1;
                     let segment_len = parse_millis(
                         value

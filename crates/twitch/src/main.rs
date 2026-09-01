@@ -2,12 +2,12 @@
 #![allow(dead_code)]
 #![deny(unused_imports)]
 use bytes::Buf;
-use mimalloc::MiMalloc;
-
 use clap::Parser;
+use mimalloc::MiMalloc;
 
 use sonic_rs::pointer;
 use std::borrow::Cow;
+
 use ureq::Agent;
 use ureq::http::header::AUTHORIZATION;
 
@@ -24,53 +24,18 @@ static GLOBAL: MiMalloc = MiMalloc;
 use std::{array, thread};
 mod downloader;
 mod file;
-mod helpers;
 mod hls_parser;
 mod scheduler;
 mod segment;
+mod variant;
 
 mod constants;
 use crate::downloader::download_worker;
 use crate::file::run_mpegts_writer;
-use crate::helpers::{fetch_master_manifest, select_track};
 use crate::scheduler::{Segment, SegmentMessage, StreamScheduler};
+use crate::variant::fetch_variant_playist;
 
 use crate::constants::{DEFAULT_CLIENT_ID, DEFAULT_PORT, TWITCH_OAUTH_ENDPOINT};
-
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum ManifestError {
-    #[error("failed to get playback access token: {0}")]
-    AccessTokenRequest(#[source] ureq::Error),
-
-    #[error("failed to parse access token response: {0}")]
-    AccessTokenParse(#[source] ureq::Error),
-
-    #[error("token value is null or missing in response")]
-    TokenMissing,
-
-    #[error("signature is missing in response")]
-    SignatureMissing,
-
-    #[error("token value is not valid JSON: {0}")]
-    TokenJsonInvalid(#[from] sonic_rs::Error),
-
-    #[error("broski")]
-    IDK,
-    #[error("channel field is missing from token")]
-    ChannelMissing,
-
-    #[error("failed to fetch HLS manifest: {source}, {url}")]
-    ManifestRequest {
-        #[source]
-        source: ureq::Error,
-        url: String,
-    },
-
-    #[error("failed to read manifest body: {0}")]
-    ManifestRead(#[source] ureq::Error),
-}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Twitch Manifest Fetcher")]
@@ -156,7 +121,7 @@ fn main() {
                 choose_client_id(&agent, cfg.client_id.as_deref(), cfg.auth_token.as_deref())
                     .unwrap();
 
-            let master_manifest = fetch_master_manifest(
+            let master_manifest = fetch_variant_playist(
                 &agent,
                 &cfg.channel,
                 &client_id,
@@ -165,7 +130,7 @@ fn main() {
             )
             .unwrap();
 
-            select_track(&master_manifest, cfg.quality.as_deref()).unwrap()
+            parse_variant_playlist(&master_manifest, cfg.quality.as_deref(), false).unwrap()
         }
     };
 
@@ -175,12 +140,12 @@ fn main() {
     let download_threads: [JoinHandle<()>; 8] = spawn_downloaders::<8>(&agent, rx_downloaders);
     let scheduler_thread: JoinHandle<()> =
         spawn_scheduler(agent.clone(), track_url, tx_downloaders, rx_readers);
-    // let file_thread: JoinHandle<()> = spawn_mpegts_writer(&add_readers);
+    let file_thread: JoinHandle<()> = spawn_mpegts_writer(&add_readers);
     let tcp_listener_thread: JoinHandle<()> = spawn_tcp_listener(add_readers.clone(), start);
 
     let _ = scheduler_thread.join();
     let _ = tcp_listener_thread.join();
-    // let _ = file_thread.join();
+    let _ = file_thread.join();
     for thread in download_threads {
         let _ = thread.join();
     }

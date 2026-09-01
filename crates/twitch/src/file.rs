@@ -15,7 +15,7 @@ use ffmpeg_next as ffmpeg;
 use xxhash_rust::xxh3::Xxh3;
 
 const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
-const INDEX_VERSION: u64 = 1;
+const INDEX_VERSION: u64 = 2;
 
 struct Segment {
     hash: u128,
@@ -43,6 +43,9 @@ enum StreamRecord {
     } = 2,
     Init {
         counter: u64, // doesn't need to be a u64 but no harm
+        byte_offset: u64,
+        byte_length: u32,
+        hash: u128,
     } = 3,
 }
 
@@ -65,11 +68,19 @@ fn write_record<W: Write>(file: &mut W, record: StreamRecord) -> io::Result<()> 
             // (9) +2 bytes
             file.write_all(&rate_denom.map(|v| v.get()).unwrap_or(0).to_le_bytes())?;
         }
-        StreamRecord::Init { counter } => {
+        StreamRecord::Init {
+            counter,
+            hash,
+            byte_length,
+            byte_offset,
+        } => {
             // 1 byte
             file.write_all(&[3])?;
             // (5) + 8 bytes
             file.write_all(&counter.to_le_bytes())?;
+            file.write_all(&hash.to_le_bytes())?;
+            file.write_all(&byte_length.to_le_bytes())?;
+            file.write_all(&byte_offset.to_le_bytes())?;
         }
         StreamRecord::MpegTS(segment) => {
             // 1 byte
@@ -150,8 +161,16 @@ fn read_record<R: Read>(reader: &mut R) -> io::Result<StreamRecord> {
 
         3 => {
             let counter = read_u64(reader)?;
+            let hash = read_u128(reader)?;
+            let byte_offset = read_u64(reader)?;
+            let byte_length = read_u32(reader)?;
 
-            Ok(StreamRecord::Init { counter })
+            Ok(StreamRecord::Init {
+                counter,
+                hash,
+                byte_length,
+                byte_offset,
+            })
         }
 
         tag => Err(io::Error::new(
@@ -214,14 +233,14 @@ pub fn run_mpegts_writer(
     std::fs::create_dir_all("manifest")
         .map_err(|source| FileWriterError::CreateManifestDirectory { source })?;
 
-    // this can technically be concatted fmp4 but idgaf
-    let ts_path = format!("manifest/{file_timestamp}.ts");
+    let segment_path = format!("manifest/{file_timestamp}.segs");
     let index_path = format!("manifest/{file_timestamp}.index");
 
-    let mut ts_file = File::create(&ts_path).map_err(|source| FileWriterError::CreateTsFile {
-        path: ts_path.clone(),
-        source,
-    })?;
+    let mut segment_file =
+        File::create(&segment_path).map_err(|source| FileWriterError::CreateTsFile {
+            path: segment_path.clone(),
+            source,
+        })?;
 
     let mut index_file =
         File::create(&index_path).map_err(|source| FileWriterError::CreateBoundariesFile {
@@ -234,13 +253,15 @@ pub fn run_mpegts_writer(
 
     let mut probed_stream = false;
     let mut hasher = Xxh3::new();
+    let mut index_sequence = 0;
+
     for msg in reader_tx {
         debug!("message: {:#?}", msg);
         match msg {
             SegmentMessage::Segment(mut segment) => {
                 hasher.reset();
 
-                let segment_start = ts_file
+                let segment_start = segment_file
                     .stream_position()
                     .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
 
@@ -253,7 +274,7 @@ pub fn run_mpegts_writer(
                 loop {
                     let buf = segment.reader.chunk();
 
-                    ts_file
+                    segment_file
                         .write_all(buf)
                         .map_err(|source| FileWriterError::WriteTsData { source })?;
                     hasher.update(buf);
@@ -264,16 +285,15 @@ pub fn run_mpegts_writer(
                     }
                 }
 
-                ts_file
+                segment_file
                     .flush()
                     .map_err(|source| FileWriterError::FlushTsFile { source })?;
 
-                let segment_end = ts_file
+                let segment_end = segment_file
                     .stream_position()
                     .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
 
                 let segment_size = segment_end - segment_start;
-                let completed_at = unix_timestamp_nanos();
 
                 if let Some(reader) = ffmpeg_reader {
                     let input_ctx = ffmpeg::format::input_from_stream(
@@ -333,7 +353,59 @@ pub fn run_mpegts_writer(
             }
             SegmentMessage::Prefetch { .. } => {}
             SegmentMessage::Discontinuity {} => probed_stream = false,
-            SegmentMessage::Init { .. } => {}
+            SegmentMessage::Init { mut reader } => {
+                hasher.reset();
+                // let init_path = format!("manifest/{file_timestamp}_{index_sequence}.init.mp4");
+
+                // let mut init_file =
+                //     File::create(&init_path).map_err(|source| FileWriterError::CreateTsFile {
+                //         path: init_path.clone(),
+                //         source,
+                //     })?;
+                let segment_start = segment_file
+                    .stream_position()
+                    .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
+                loop {
+                    let buf = reader.chunk();
+
+                    segment_file
+                        .write_all(buf)
+                        .map_err(|source| FileWriterError::WriteTsData { source })?;
+
+                    hasher.update(buf);
+                    reader.advance(buf.len());
+                    if !reader.wait_for_data() {
+                        break;
+                    }
+                }
+
+                segment_file
+                    .flush()
+                    .map_err(|source| FileWriterError::FlushTsFile { source })?;
+
+                let segment_end = segment_file
+                    .stream_position()
+                    .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
+
+                let segment_size = segment_end - segment_start;
+
+                _ = write_record(
+                    &mut index_file,
+                    StreamRecord::Init {
+                        counter: index_sequence,
+                        hash: hasher.digest128(),
+                        byte_length: segment_size.try_into().unwrap(),
+                        byte_offset: segment_size,
+                    },
+                );
+
+                index_file
+                    .flush()
+                    .map_err(|source| FileWriterError::FlushBoundariesFile { source })?;
+
+                index_sequence += 1;
+                probed_stream = true;
+            }
         }
     }
 

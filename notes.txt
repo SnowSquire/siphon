@@ -1,0 +1,15 @@
+discontinuities are so fucked up. #EXT-X-TWITCH-LIVE-SEQUENCE gets inserted multiple times during dropout protection. only the last value is to be trusted. 
+
+
+#EXT-X-TWITCH-LIVE-SEQUENCE & #EXT-X-MEDIA-SEQUENCE are in sync until ads (dropout protection is buggy but the doesn't desync).
+
+THANK FUCKING GOD THAT THEY AT LEAST KEEP THE ELAPSED TIME + DURATIONS IN SYNC, by just cutting off the final ad segment SOB
+
+my recommendation is only trust the TLS if it's 1 line after #EXT-X-MEDIA-SEQUENCE
+or an ad segment. TLS should be prioritized over media sequence in these cases. twitch-hls-client 1 does not handle this correctly, which doesn't matter cause they don't persist the sequence id but i use it to split the stream back into fragments
+
+
+disconnect protection can't upgrade from a mpegts stream to fmp4
+you can't go from fmp4 to mpegts
+
+nice
