@@ -34,6 +34,8 @@ struct Init {
 struct Header {
     char magic[8];
     u64 version;
+    u64 stream_id;
+    u64 index_sequence;
 } [[packed]];
 
 struct Record {

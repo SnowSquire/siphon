@@ -1,7 +1,7 @@
 use bytes::Buf;
 use ffmpeg_next::format::context::StreamIo;
 
-use std::fs::File;
+use std::fs::OpenOptions;
 
 use std::io::{self, Read, Seek, Write};
 
@@ -10,12 +10,83 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, debug_span};
 
-use crate::{FileWriterError, scheduler::SegmentMessage};
+use crate::scheduler::SegmentMessage;
 use ffmpeg_next as ffmpeg;
 use xxhash_rust::xxh3::Xxh3;
 
 const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
 const INDEX_VERSION: u64 = 2;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DiskWriterError {
+    #[error("failed to register MPEG-TS reader")]
+    RegisterReader {
+        #[source]
+        source: kanal::SendError,
+    },
+
+    #[error("failed to spawn MPEG-TS writer thread")]
+    SpawnThread {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to create manifest directory")]
+    CreateManifestDirectory {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to create MPEG-TS file at {path}")]
+    CreateTsFile {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to create segment-boundary file at {path}")]
+    CreateBoundariesFile {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write segment-boundary file header")]
+    WriteBoundariesHeader {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to get MPEG-TS file position")]
+    GetTsFilePosition {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write MPEG-TS data")]
+    WriteTsData {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to flush MPEG-TS file")]
+    FlushTsFile {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write segment boundary")]
+    WriteBoundary {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to flush segment-boundary file")]
+    FlushBoundariesFile {
+        #[source]
+        source: io::Error,
+    },
+}
 
 struct Segment {
     hash: u128,
@@ -24,11 +95,6 @@ struct Segment {
     byte_length: u32,
     timestamp_ms: u32,
     muted: bool,
-}
-
-struct StreamIndexHeader {
-    magic: [u8; 8],
-    version: u64,
 }
 
 #[repr(C, u8)]
@@ -218,41 +284,56 @@ fn read_bool<R: Read>(reader: &mut R) -> io::Result<bool> {
     }
 }
 
-fn write_stream_index_header<W: Write>(file: &mut W) -> io::Result<()> {
+fn write_stream_index_header<W: Write>(file: &mut W, stream_id: u64) -> io::Result<()> {
     file.write_all(&INDEX_MAGIC)?;
     file.write_all(&INDEX_VERSION.to_le_bytes())?;
+    file.write_all(&stream_id.to_le_bytes())?;
     Ok(())
 }
 
-pub fn run_mpegts_writer(
+pub fn run_disk_writer(
     reader_tx: kanal::Receiver<SegmentMessage>,
-) -> Result<(), FileWriterError> {
+    stream_id: u64,
+) -> Result<(), DiskWriterError> {
     ffmpeg::init().unwrap();
     let file_timestamp = unix_timestamp_nanos();
 
     std::fs::create_dir_all("manifest")
-        .map_err(|source| FileWriterError::CreateManifestDirectory { source })?;
+        .map_err(|source| DiskWriterError::CreateManifestDirectory { source })?;
 
-    let segment_path = format!("manifest/{file_timestamp}.segs");
-    let index_path = format!("manifest/{file_timestamp}.index");
+    let segment_path = format!("manifest/{stream_id}.segs");
+    let index_path = format!("manifest/{stream_id}.index");
 
-    let mut segment_file =
-        File::create(&segment_path).map_err(|source| FileWriterError::CreateTsFile {
+    let mut segment_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&segment_path)
+        .map_err(|source| DiskWriterError::CreateTsFile {
             path: segment_path.clone(),
             source,
         })?;
 
-    let mut index_file =
-        File::create(&index_path).map_err(|source| FileWriterError::CreateBoundariesFile {
+    let mut index_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index_path)
+        .map_err(|source| DiskWriterError::CreateBoundariesFile {
             path: index_path.clone(),
             source,
         })?;
 
-    write_stream_index_header(&mut index_file)
-        .map_err(|source| FileWriterError::WriteBoundariesHeader { source })?;
+    if !std::fs::metadata(&index_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        write_stream_index_header(&mut index_file, stream_id)
+            .map_err(|source| DiskWriterError::WriteBoundariesHeader { source })?;
+    }
 
     let mut probed_stream = false;
     let mut hasher = Xxh3::new();
+
+    // this needs to be initialized from the stream header but i dont wanna do that right now
     let mut index_sequence = 0;
 
     for msg in reader_tx {
@@ -263,7 +344,7 @@ pub fn run_mpegts_writer(
 
                 let segment_start = segment_file
                     .stream_position()
-                    .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
+                    .map_err(|source| DiskWriterError::GetTsFilePosition { source })?;
 
                 let _span = debug_span!("writing file", sequence = segment.sequence_num).entered();
                 let ffmpeg_reader = if !probed_stream {
@@ -276,7 +357,7 @@ pub fn run_mpegts_writer(
 
                     segment_file
                         .write_all(buf)
-                        .map_err(|source| FileWriterError::WriteTsData { source })?;
+                        .map_err(|source| DiskWriterError::WriteTsData { source })?;
                     hasher.update(buf);
                     segment.reader.advance(buf.len());
 
@@ -287,11 +368,11 @@ pub fn run_mpegts_writer(
 
                 segment_file
                     .flush()
-                    .map_err(|source| FileWriterError::FlushTsFile { source })?;
+                    .map_err(|source| DiskWriterError::FlushTsFile { source })?;
 
                 let segment_end = segment_file
                     .stream_position()
-                    .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
+                    .map_err(|source| DiskWriterError::GetTsFilePosition { source })?;
 
                 let segment_size = segment_end - segment_start;
 
@@ -349,28 +430,21 @@ pub fn run_mpegts_writer(
 
                 index_file
                     .flush()
-                    .map_err(|source| FileWriterError::FlushBoundariesFile { source })?;
+                    .map_err(|source| DiskWriterError::FlushBoundariesFile { source })?;
             }
             SegmentMessage::Prefetch { .. } => {}
             SegmentMessage::Discontinuity {} => probed_stream = false,
             SegmentMessage::Init { mut reader } => {
                 hasher.reset();
-                // let init_path = format!("manifest/{file_timestamp}_{index_sequence}.init.mp4");
-
-                // let mut init_file =
-                //     File::create(&init_path).map_err(|source| FileWriterError::CreateTsFile {
-                //         path: init_path.clone(),
-                //         source,
-                //     })?;
                 let segment_start = segment_file
                     .stream_position()
-                    .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
+                    .map_err(|source| DiskWriterError::GetTsFilePosition { source })?;
                 loop {
                     let buf = reader.chunk();
 
                     segment_file
                         .write_all(buf)
-                        .map_err(|source| FileWriterError::WriteTsData { source })?;
+                        .map_err(|source| DiskWriterError::WriteTsData { source })?;
 
                     hasher.update(buf);
                     reader.advance(buf.len());
@@ -381,11 +455,11 @@ pub fn run_mpegts_writer(
 
                 segment_file
                     .flush()
-                    .map_err(|source| FileWriterError::FlushTsFile { source })?;
+                    .map_err(|source| DiskWriterError::FlushTsFile { source })?;
 
                 let segment_end = segment_file
                     .stream_position()
-                    .map_err(|source| FileWriterError::GetTsFilePosition { source })?;
+                    .map_err(|source| DiskWriterError::GetTsFilePosition { source })?;
 
                 let segment_size = segment_end - segment_start;
 
@@ -401,7 +475,7 @@ pub fn run_mpegts_writer(
 
                 index_file
                     .flush()
-                    .map_err(|source| FileWriterError::FlushBoundariesFile { source })?;
+                    .map_err(|source| DiskWriterError::FlushBoundariesFile { source })?;
 
                 index_sequence += 1;
                 probed_stream = true;

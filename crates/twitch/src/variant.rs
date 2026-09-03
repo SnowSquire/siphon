@@ -1,11 +1,13 @@
-use crate::constants::{PLAYER_VERSION, TWITCH_GQL_ENDPOINT, TWITCH_HLS_BASE};
+use crate::constants::{
+    DEFAULT_CLIENT_ID, PLAYER_VERSION, TWITCH_GQL_ENDPOINT, TWITCH_HLS_BASE, TWITCH_OAUTH_ENDPOINT,
+};
 
-use std::num::NonZeroU16;
+use std::{borrow::Cow, num::NonZeroU16};
 
 use rand::{RngExt, distr::Alphanumeric};
 use sonic_rs::{JsonValueTrait, PointerTree, pointer};
 use tracing::info;
-use ureq::Agent;
+use ureq::{Agent, http::header::AUTHORIZATION};
 
 use thiserror::Error;
 
@@ -41,7 +43,9 @@ pub enum VariantPlaylistError {
     #[error("failed to read manifest body: {0}")]
     ManifestRead(#[source] ureq::Error),
 }
-
+fn get_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+    attributes(tag).find(|(k, _)| *k == key).map(|(_, v)| v)
+}
 pub fn fetch_variant_playist(
     agent: &Agent,
     channel: &str,
@@ -197,60 +201,14 @@ fn attributes(tag: &str) -> impl Iterator<Item = (&str, &str)> {
         Some((key, value))
     })
 }
-
-fn get_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
-    attributes(tag).find(|(k, _)| *k == key).map(|(_, v)| v)
-}
-
-// variant naming
-// audio only track 'audio_only'
-// {shortestsideres}[p{integer framerate}][-portrait]
-fn parse_name<'a>(stream_inf: &'a str) -> Option<&'a str> {
-    get_attr(stream_inf, "STABLE-VARIANT-ID")
-}
-
-// using NaN as a sentinel value even tho it's no idomatic
-fn parse_score(stream_inf: &str) -> f32 {
-    get_attr(stream_inf, "SCORE")
-        .unwrap_or("")
-        .parse::<f32>()
-        .unwrap_or(f32::NAN)
-}
-
-fn parse_resolution(stream_inf: &str) -> Option<(NonZeroU16, NonZeroU16)> {
-    let (w, h) = get_attr(stream_inf, "RESOLUTION")?.split_once('x')?;
-    Some((w.parse().ok()?, h.parse().ok()?))
-}
-
-// using NaN as a sentinel value even tho it's no idomatic
-fn parse_framerate(stream_inf: &str) -> f32 {
-    get_attr(stream_inf, "FRAME-RATE")
-        .unwrap_or("")
-        .parse::<f32>()
-        .unwrap_or(f32::NAN)
-}
-
-fn parse_codec(stream_inf: &str) -> Option<Codec> {
-    match get_attr(stream_inf, "CODECS")?.get(..4)? {
-        "avc1" => Some(Codec::H264),
-        "mp4a" => Some(Codec::AAC),
-        "av01" => Some(Codec::AV1),
-        "hvc1" | "hev1" => Some(Codec::H265),
-        _ => None,
-    }
-}
-struct Candidate<'a> {
-    url_range: &'a str,
-    score: f32,
-}
-
+#[derive(Clone)]
 pub enum VariantKind {
     Landscape,
     Portrait,
     Audio,
     ERMTP, // ertmpaudio1, don't know how to access it as it's always unavailable
 }
-
+#[derive(Clone)]
 pub enum Codec {
     H265,
     H264,
@@ -318,6 +276,7 @@ fn parse_stream_inf(line: &str) -> Option<TempVariant<'_>> {
     })
 }
 
+#[derive(Clone)]
 pub struct Variant {
     pub score: Option<NonZeroU16>,
     pub url: Box<str>,
@@ -337,10 +296,11 @@ fn scaled_nonzero(v: f32) -> Option<NonZeroU16> {
         .then(|| NonZeroU16::new(scaled as u16))
         .flatten()
 }
-pub fn parse_variant_playlist(buffer: &str) -> Vec<Variant> {
+pub fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
     let mut stream_inf: Option<TempVariant> = None;
 
     let mut var_vec = Vec::with_capacity(2); // always at least 2 tracks (source and audio_only)
+    let mut stream_id = None;
     for line in buffer.lines() {
         if line.starts_with("#EXT-X-STREAM-INF") {
             stream_inf = parse_stream_inf(line);
@@ -358,8 +318,14 @@ pub fn parse_variant_playlist(buffer: &str) -> Vec<Variant> {
                 url: line.into(),
                 variant_id: variant.variant_id.into(),
             });
+        } else if let Some(value) = line
+            .strip_prefix("#EXT-X-SESSION-DATA:DATA-ID=\"BROADCAST-ID\",VALUE=\"")
+            .and_then(|v| v.strip_suffix("\""))
+        {
+            stream_id = value.parse::<u64>().ok()
         }
     }
+
     var_vec.sort_by(|a, b| {
         b.score
             .map_or(0, |nz| nz.get())
@@ -368,5 +334,27 @@ pub fn parse_variant_playlist(buffer: &str) -> Vec<Variant> {
 
     var_vec.shrink_to_fit();
 
-    var_vec
+    (var_vec, stream_id.unwrap())
+}
+
+pub fn choose_client_id<'a>(
+    agent: &Agent,
+    client_id: Option<&'a str>,
+    auth_token: Option<&str>,
+) -> Result<Cow<'a, str>, Box<dyn std::error::Error>> {
+    match (client_id, auth_token) {
+        (None, None) => Ok(DEFAULT_CLIENT_ID.into()),
+        (Some(client_id), _) => Ok(client_id.into()),
+        (None, Some(auth_token)) => {
+            let response = agent
+                .get(TWITCH_OAUTH_ENDPOINT)
+                .header(AUTHORIZATION, format!("OAuth {auth_token}"))
+                .call()?
+                .into_body()
+                .read_to_vec()?;
+            Ok(sonic_rs::get(response.as_slice(), pointer!["client_id"])?
+                .to_string()
+                .into())
+        }
+    }
 }
