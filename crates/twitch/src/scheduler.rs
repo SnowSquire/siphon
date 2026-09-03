@@ -1,20 +1,15 @@
-use std::{
-    num::{ParseFloatError, ParseIntError},
-    ptr,
-    thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::num::{ParseFloatError, ParseIntError};
+use std::ptr;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kanal::{Receiver, Sender};
 use thiserror::Error;
 use tracing::{Level, debug, debug_span, error, info, span};
 use ureq::Agent;
 
-use crate::{
-    downloader::{self, ToDownloader},
-    scheduler::ManifestParseError::Split,
-    segment::{SegmentStream, reader::SegmentReader},
-};
+use crate::downloader::{self, ToDownloader};
+use crate::segment::{SegmentReader, SegmentStream};
 
 struct PrefetchSegment {
     expected_id: u64,
@@ -184,6 +179,7 @@ impl StreamScheduler {
             self.readers.push(tx);
         }
     }
+
     fn mainloop(&mut self) -> Result<(), SchedulerError> {
         let start = Instant::now();
         let now: u64 = SystemTime::now()
@@ -316,7 +312,7 @@ impl StreamScheduler {
                 url: url.clone(),
                 writer,
 
-                span: span,
+                span,
             })
             .unwrap();
 
@@ -334,8 +330,8 @@ impl StreamScheduler {
         });
         self.prefetches.push(PrefetchSegment {
             expected_id: expected_sequence,
-            url: url,
-            reader: reader,
+            url,
+            reader,
         });
 
         Ok(())
@@ -382,7 +378,8 @@ impl StreamScheduler {
 
             match tag {
                 "#EXT-X-TWITCH-ELAPSED-SECS" => {
-                    segment_time_ms = parse_millis(value).ok_or(SchedulerError::Parse(Split()))?;
+                    segment_time_ms = parse_millis(value)
+                        .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
                     trust_next_tls_val = false
                 }
                 "#EXT-X-MEDIA-SEQUENCE" => {
@@ -401,7 +398,17 @@ impl StreamScheduler {
                         trust_next_tls_val = false
                     }
                 }
-                "#EXT-X-DISCONTINUITY" => return Err(SchedulerError::Discontinuity),
+                "#EXT-X-DISCONTINUITY" => {
+                    self.readers.retain_unordered(|reader| {
+                        match reader.try_send(SegmentMessage::Discontinuity()) {
+                            Ok(true) => true, // success, keep
+                            Ok(false) | Err(_) => {
+                                let _ = reader.close(); // close it
+                                false
+                            }
+                        }
+                    });
+                }
                 "#EXT-X-MAP" => {
                     //#EXT-X-MAP:URI="main.mp4",BYTERANGE="560@0", this code doesn't handle having multiple values after the URI, should probably write a better m3u8 parser
                     let new_init = value
@@ -422,7 +429,7 @@ impl StreamScheduler {
                             let (writer, reader) = SegmentStream::new();
                             self.downloaders.send(ToDownloader::FetchURL {
                                 url: new_init.into(),
-                                writer: writer,
+                                writer,
                                 span: span.clone(),
                             })?;
                             self.init = Some((new_init.into(), reader))
@@ -450,7 +457,7 @@ impl StreamScheduler {
                             .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?
                             .0,
                     )
-                    .ok_or(SchedulerError::Parse(Split()))?;
+                    .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
                     segment_time_ms += segment_len
                 }
                 "#EXT-X-TWITCH-PREFETCH" | "#EXT-X-PREFETCH" => {

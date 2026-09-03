@@ -26,3 +26,7 @@ use slotmap/arena whatever instead of generic allocator (instrusive ref counts)
 bring down binary size
 
 figure out how big the unbounded channels actually get, and bound them
+
+miri? or some other unsafe verifier? i use unsafe a lot so....
+
+move from clap to bpaf (evaluate first)

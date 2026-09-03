@@ -1,15 +1,15 @@
-use curl::easy::Easy;
-use kanal::Receiver;
-
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 use std::{array, io};
+
+use curl::easy::Easy;
+use kanal::Receiver;
 use thiserror::Error;
 use tracing::{Span, debug, info, trace, warn};
 use ureq::Agent;
 
 use crate::downloader::ToDownloader::FetchURL;
-use crate::segment::writer::SegmentWriter;
+use crate::segment::SegmentWriter;
 
 const MAX_RETRIES: u32 = 4;
 

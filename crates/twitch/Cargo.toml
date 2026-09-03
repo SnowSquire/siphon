@@ -26,3 +26,14 @@ ureq-proto = { version = "0.6.1", features = ["client"] }
 
 wait_on_address = { path = "../wait_on_address" }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+
+[lints.clippy]
+# Enable entire lint groups
+pedantic = "warn"
+cargo = "warn"
+nursery = "warn"
+suspicious = "warn"
+# Optional: catch upcoming rules
+missing_errors_doc = "allow" # Turn off another noisy pedantic lint
+unreachable_pub = "warn"

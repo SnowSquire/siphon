@@ -1,5 +1,4 @@
 #![allow(unused_variables)]
-#![allow(dead_code)]
 #![deny(unused_imports)]
 mod constants;
 mod disk;
@@ -9,12 +8,11 @@ mod segment;
 mod tcp;
 mod variant;
 
-use clap::Parser;
-use mimalloc::MiMalloc;
-
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use clap::Parser;
+use mimalloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
 
 use crate::disk::spawn_disk_writer;
@@ -103,7 +101,7 @@ fn main() {
     );
 
     let disk_thread: JoinHandle<()> = spawn_disk_writer(&add_readers, stream_id);
-    let tcp_listener_thread: JoinHandle<()> = spawn_tcp_listener(add_readers.clone(), start);
+    let tcp_listener_thread: JoinHandle<()> = spawn_tcp_listener(add_readers, start);
 
     let _ = scheduler_thread.join();
     let _ = tcp_listener_thread.join();

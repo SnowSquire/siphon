@@ -1,19 +1,18 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 use bytes::Buf;
 use wait_on_address::AtomicWait;
 
 use crate::constants::CHUNK_SIZE;
 use crate::segment::{Chunk, SegmentStream};
 
-use std::sync::atomic::Ordering;
-
-use std::sync::Arc;
-use std::time::Duration;
-
 #[derive(Clone, Debug)]
 pub struct SegmentReader {
-    pub(super) cursor: Arc<Chunk>, // pins the suffix from here onward; frees the prefix
-    pub(super) position: usize,
-    pub(super) handle: Arc<SegmentStream>,
+    cursor: Arc<Chunk>, // pins the suffix from here onward; frees the prefix
+    position: usize,
+    handle: Arc<SegmentStream>,
 }
 
 impl SegmentReader {
@@ -24,6 +23,7 @@ impl SegmentReader {
             position: 0,
         }
     }
+
     #[inline(always)]
     fn offset(&self) -> usize {
         debug_assert!(self.position >= self.cursor.base);

@@ -1,14 +1,14 @@
 use std::cell::UnsafeCell;
-
 use std::mem::MaybeUninit;
-pub mod reader;
-pub mod writer;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 
+mod reader;
+mod writer;
+
 use crate::constants::CHUNK_SIZE;
-use crate::segment::reader::SegmentReader;
-use crate::segment::writer::SegmentWriter;
+pub use crate::segment::reader::SegmentReader;
+pub use crate::segment::writer::SegmentWriter;
 
 #[derive(Debug)]
 #[repr(align(64))]

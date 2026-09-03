@@ -1,19 +1,16 @@
-use bytes::Buf;
-use ffmpeg_next::format::context::StreamIo;
-
 use std::fs::OpenOptions;
-
 use std::io::{self, Read, Seek, Write};
 use std::num::NonZeroU16;
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::error;
 
-use tracing::{debug, debug_span};
+use bytes::Buf;
+use ffmpeg_next as ffmpeg;
+use ffmpeg_next::format::context::StreamIo;
+use tracing::{debug, debug_span, error};
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::scheduler::SegmentMessage;
-use ffmpeg_next as ffmpeg;
-use xxhash_rust::xxh3::Xxh3;
 
 const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
 const INDEX_VERSION: u64 = 2;
