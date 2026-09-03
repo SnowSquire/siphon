@@ -4,9 +4,10 @@ use ffmpeg_next::format::context::StreamIo;
 use std::fs::OpenOptions;
 
 use std::io::{self, Read, Seek, Write};
-
 use std::num::NonZeroU16;
+use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::error;
 
 use tracing::{debug, debug_span};
 
@@ -86,6 +87,32 @@ pub enum DiskWriterError {
         #[source]
         source: io::Error,
     },
+}
+
+pub fn spawn_disk_writer(
+    add_readers: &kanal::Sender<kanal::Sender<SegmentMessage>>,
+    stream_id: u64,
+) -> JoinHandle<()> {
+    let (reader_rx, reader_tx): (
+        kanal::Sender<SegmentMessage>,
+        kanal::Receiver<SegmentMessage>,
+    ) = kanal::unbounded();
+
+    add_readers
+        .send(reader_rx)
+        .map_err(|source| DiskWriterError::RegisterReader { source })
+        .expect("fuuuuuuuuuu");
+
+    let handle = thread::Builder::new()
+        .name(format!("disk writer stream id:{stream_id}"))
+        .spawn(move || {
+            if let Err(error) = run_disk_writer(reader_tx, stream_id) {
+                error!(?error, "disk writer stopped");
+            }
+        })
+        .expect("failed to spawn disk writer");
+
+    handle
 }
 
 struct Segment {

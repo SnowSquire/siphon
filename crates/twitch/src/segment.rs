@@ -49,20 +49,13 @@ unsafe impl Sync for Chunk {}
 
 // ---------------------------------------------------------------- handle --
 
-/// Shared coordination state. Deliberately holds NO reference to any chunk:
-/// reclamation is driven purely by refcounts, so an anchor here would pin
-/// the whole chain forever.
 #[derive(Debug)]
 pub struct SegmentStream {
-    // used for HLS segments
     pub published_len: AtomicUsize, // monotonic published frontier
     pub closed: AtomicBool,         // EOF: writer finished
 }
 
 impl SegmentStream {
-    /// Creates the stream: a writer and a reader prototype. Clone the
-    /// prototype for each additional reader BEFORE writing starts
-    /// (readers cannot join midstream).
     pub fn new() -> (SegmentWriter, SegmentReader) {
         let handle = Arc::new(SegmentStream {
             published_len: AtomicUsize::new(0),

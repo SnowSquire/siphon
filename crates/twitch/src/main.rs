@@ -12,21 +12,16 @@ mod variant;
 use clap::Parser;
 use mimalloc::MiMalloc;
 
-use ureq::Agent;
-
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use std::{array, thread};
-
-use crate::disk::{DiskWriterError, run_disk_writer};
-use crate::downloader::download_worker;
-use crate::scheduler::{SegmentMessage, StreamScheduler};
+use crate::disk::spawn_disk_writer;
+use crate::downloader::spawn_downloaders;
+use crate::scheduler::spawn_scheduler;
 use crate::tcp::spawn_tcp_listener;
-use crate::variant::{Variant, choose_client_id, fetch_variant_playist, parse_variant_playlist};
+use crate::variant::{Variant, get_variants};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -73,36 +68,27 @@ fn main() {
 
     let cfg = Config::parse();
 
-    let (variants, stream_id) = {
-        if cfg.debug {
-            (
-                vec![Variant {
-                    codec: None,
-                    frame_rate: None,
-                    kind: variant::VariantKind::Landscape,
-                    res: None,
-                    score: None,
-                    url: "http://127.0.0.2:8000/index.m3u8".into(),
-                    variant_id: "1080p".into(),
-                }],
-                rand::random::<u64>(),
-            )
-        } else {
-            let client_id =
-                choose_client_id(&agent, cfg.client_id.as_deref(), cfg.auth_token.as_deref())
-                    .unwrap();
-
-            let master_manifest = fetch_variant_playist(
-                &agent,
-                &cfg.channel,
-                &client_id,
-                cfg.auth_token.as_deref(),
-                cfg.low_latency,
-            )
-            .unwrap();
-
-            parse_variant_playlist(&master_manifest)
-        }
+    let (variants, stream_id) = if cfg.debug {
+        (
+            vec![Variant {
+                codec: None,
+                frame_rate: None,
+                kind: variant::VariantKind::Landscape,
+                res: None,
+                score: None,
+                url: "http://127.0.0.2:8000/index.m3u8".into(),
+                variant_id: "1080p".into(),
+            }],
+            rand::random::<u64>(),
+        )
+    } else {
+        get_variants(
+            &agent,
+            cfg.client_id.as_deref(),
+            cfg.auth_token.as_deref(),
+            &cfg.channel,
+            cfg.low_latency,
+        )
     };
 
     let (tx_downloaders, rx_downloaders) = kanal::unbounded();
@@ -125,56 +111,4 @@ fn main() {
     for thread in download_threads {
         let _ = thread.join();
     }
-}
-
-fn spawn_disk_writer(
-    add_readers: &kanal::Sender<kanal::Sender<SegmentMessage>>,
-    stream_id: u64,
-) -> JoinHandle<()> {
-    let (reader_rx, reader_tx): (
-        kanal::Sender<SegmentMessage>,
-        kanal::Receiver<SegmentMessage>,
-    ) = kanal::unbounded();
-
-    add_readers
-        .send(reader_rx)
-        .map_err(|source| DiskWriterError::RegisterReader { source })
-        .expect("fuuuuuuuuuu");
-
-    let handle = thread::Builder::new()
-        .name(format!("disk writer stream id:{stream_id}"))
-        .spawn(move || {
-            if let Err(error) = run_disk_writer(reader_tx, stream_id) {
-                error!(?error, "disk writer stopped");
-            }
-        })
-        .expect("failed to spawn disk writer");
-
-    handle
-}
-
-fn spawn_downloaders<const N: usize>(
-    agent: &Agent,
-    rx: kanal::Receiver<downloader::ToDownloader>,
-) -> [JoinHandle<()>; N] {
-    array::from_fn(|index| {
-        let rx = rx.clone();
-        let agent = agent.clone();
-        std::thread::Builder::new()
-            .name(format!("downloader {index}"))
-            .spawn(move || download_worker(rx, agent))
-            .expect("failed to spawn downloader thread")
-    })
-}
-
-fn spawn_scheduler(
-    agent: Agent,
-    track_url: Box<str>,
-    tx: kanal::Sender<downloader::ToDownloader>,
-    srx: kanal::Receiver<kanal::Sender<SegmentMessage>>,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name(format!("scheduler"))
-        .spawn(move || StreamScheduler::new(agent, track_url, tx, srx).main())
-        .expect("failed to spawn scheduler")
 }

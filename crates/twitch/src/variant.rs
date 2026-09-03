@@ -296,7 +296,7 @@ fn scaled_nonzero(v: f32) -> Option<NonZeroU16> {
         .then(|| NonZeroU16::new(scaled as u16))
         .flatten()
 }
-pub fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
+fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
     let mut stream_inf: Option<TempVariant> = None;
 
     let mut var_vec = Vec::with_capacity(2); // always at least 2 tracks (source and audio_only)
@@ -337,7 +337,7 @@ pub fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
     (var_vec, stream_id.unwrap())
 }
 
-pub fn choose_client_id<'a>(
+fn choose_client_id<'a>(
     agent: &Agent,
     client_id: Option<&'a str>,
     auth_token: Option<&str>,
@@ -357,4 +357,19 @@ pub fn choose_client_id<'a>(
                 .into())
         }
     }
+}
+
+pub fn get_variants<'a>(
+    agent: &Agent,
+    client_id: Option<&'a str>,
+    auth_token: Option<&str>,
+    channel: &str,
+    low_latency: bool,
+) -> (Vec<Variant>, u64) {
+    let client_id = choose_client_id(agent, client_id, auth_token).unwrap();
+
+    let master_manifest =
+        fetch_variant_playist(&agent, &channel, &client_id, auth_token, low_latency).unwrap();
+
+    parse_variant_playlist(&master_manifest)
 }

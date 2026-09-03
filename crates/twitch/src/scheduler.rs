@@ -1,6 +1,7 @@
 use std::{
     num::{ParseFloatError, ParseIntError},
-    ptr, thread,
+    ptr,
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,7 +11,7 @@ use tracing::{Level, debug, debug_span, error, info, span};
 use ureq::Agent;
 
 use crate::{
-    downloader::ToDownloader,
+    downloader::{self, ToDownloader},
     scheduler::ManifestParseError::Split,
     segment::{SegmentStream, reader::SegmentReader},
 };
@@ -76,7 +77,7 @@ enum SchedulerError {
 }
 
 /// copied and modified from twitch-hls-client directly
-pub struct StreamScheduler {
+struct StreamScheduler {
     agent: Agent,
     stream_url: Box<str>,
     downloaders: Sender<ToDownloader>,
@@ -520,4 +521,16 @@ fn parse_millis(s: &str) -> Option<u64> {
     let frac_ms: u64 = frac.get(..digits as usize)?.parse().ok()?;
 
     Some(secs.parse::<u64>().ok()? * 1000 + frac_ms * 10u64.pow(3 - digits))
+}
+
+pub fn spawn_scheduler(
+    agent: Agent,
+    track_url: Box<str>,
+    tx: kanal::Sender<downloader::ToDownloader>,
+    srx: kanal::Receiver<kanal::Sender<SegmentMessage>>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("scheduler"))
+        .spawn(move || StreamScheduler::new(agent, track_url, tx, srx).main())
+        .expect("failed to spawn scheduler")
 }

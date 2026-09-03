@@ -1,9 +1,9 @@
 use curl::easy::Easy;
 use kanal::Receiver;
 
-use std::io;
-use std::thread::sleep;
+use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
+use std::{array, io};
 use thiserror::Error;
 use tracing::{Span, debug, info, trace, warn};
 use ureq::Agent;
@@ -19,6 +19,20 @@ pub enum ToDownloader {
         writer: SegmentWriter,
         span: Span,
     },
+}
+
+pub fn spawn_downloaders<const N: usize>(
+    agent: &Agent,
+    rx: kanal::Receiver<ToDownloader>,
+) -> [JoinHandle<()>; N] {
+    array::from_fn(|index| {
+        let rx = rx.clone();
+        let agent = agent.clone();
+        std::thread::Builder::new()
+            .name(format!("downloader {index}"))
+            .spawn(move || download_worker(rx, agent))
+            .expect("failed to spawn downloader thread")
+    })
 }
 
 pub fn download_worker(rx: Receiver<ToDownloader>, agent: Agent) {
