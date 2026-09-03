@@ -2,3 +2,6 @@
 manifest/
 servermock/segments
 servermock/denosegs
+servermock/output
+servermock/tokens.json
+servermock/node_modules

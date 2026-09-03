@@ -1,15 +1,21 @@
-use crate::constants::{
-    DEFAULT_CLIENT_ID, PLAYER_VERSION, TWITCH_GQL_ENDPOINT, TWITCH_HLS_BASE, TWITCH_OAUTH_ENDPOINT,
-};
+use std::borrow::Cow;
+use std::num::NonZeroU16;
 
-use std::{borrow::Cow, num::NonZeroU16};
-
-use rand::{RngExt, distr::Alphanumeric};
-use sonic_rs::{JsonValueTrait, PointerTree, pointer};
-use tracing::info;
-use ureq::{Agent, http::header::AUTHORIZATION};
-
+use rand::RngExt;
+use rand::distr::Alphanumeric;
+use sonic_rs::JsonValueTrait;
+use sonic_rs::PointerTree;
+use sonic_rs::pointer;
 use thiserror::Error;
+use tracing::info;
+use ureq::Agent;
+use ureq::http::header::AUTHORIZATION;
+
+use crate::constants::DEFAULT_CLIENT_ID;
+use crate::constants::PLAYER_VERSION;
+use crate::constants::TWITCH_GQL_ENDPOINT;
+use crate::constants::TWITCH_HLS_BASE;
+use crate::constants::TWITCH_OAUTH_ENDPOINT;
 
 #[derive(Debug, Error)]
 pub enum VariantPlaylistError {
@@ -43,9 +49,7 @@ pub enum VariantPlaylistError {
     #[error("failed to read manifest body: {0}")]
     ManifestRead(#[source] ureq::Error),
 }
-fn get_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
-    attributes(tag).find(|(k, _)| *k == key).map(|(_, v)| v)
-}
+
 pub fn fetch_variant_playist(
     agent: &Agent,
     channel: &str,
@@ -275,7 +279,7 @@ fn parse_stream_inf(line: &str) -> Option<TempVariant<'_>> {
         frame_rate,
     })
 }
-
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct Variant {
     pub score: Option<NonZeroU16>,

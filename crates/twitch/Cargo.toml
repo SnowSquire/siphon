@@ -5,27 +5,30 @@ name = "twitch-hls-client2"
 version = "0.1.0"
 edition = "2024"
 authors = ["Ozeniken"]
+
+
 [dependencies]
-
-
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
-curl = "0.4.50"
+curl = { version = "0.4.50", optional = true }
+enumflags2 = "0.7.12"
 ffmpeg-next = "9.0.0"
 kanal = "0.1.1"
 mimalloc = "0.1.52"
 rand = "0.10.2"
-
-
 sonic-rs = "0.5.8"
 thiserror = "2.0.20"
 tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = { version = "3.3.0", features = ["rustls"] }
 ureq-proto = { version = "0.6.1", features = ["client"] }
-
-wait_on_address = { path = "../wait_on_address" }
+wait_on_address = { git = "https://github.com/DouglasDwyer/wait_on_address.git", rev = "71ea457950bed173ee4039c8fd5bc45ad1e3aa17" }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+
+[features]
+default = []
+curl-download = ["dep:curl"]
 
 
 [lints.clippy]
@@ -34,6 +37,7 @@ pedantic = "warn"
 cargo = "warn"
 nursery = "warn"
 suspicious = "warn"
+
 # Optional: catch upcoming rules
 missing_errors_doc = "allow" # Turn off another noisy pedantic lint
 unreachable_pub = "warn"

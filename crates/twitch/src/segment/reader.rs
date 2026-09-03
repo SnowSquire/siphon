@@ -1,16 +1,16 @@
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::{self};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-
-use bytes::Buf;
-use wait_on_address::AtomicWait;
 
 use crate::constants::CHUNK_SIZE;
-use crate::segment::{Chunk, SegmentStream};
+use crate::segment::Chunk;
+use crate::segment::SegmentStream;
 
 #[derive(Clone, Debug)]
 pub struct SegmentReader {
-    cursor: Arc<Chunk>, // pins the suffix from here onward; frees the prefix
+    cursor: Arc<Chunk>,
     position: usize,
     handle: Arc<SegmentStream>,
 }
@@ -30,77 +30,141 @@ impl SegmentReader {
         self.position - self.cursor.base
     }
 
-    // returns false when no more data, returns true when data
-    pub fn wait_for_data(&self) -> bool {
+    fn wait_for_data(&self) -> Option<usize> {
         const SPIN: u32 = 100;
-        const TIMEOUT_DUR: Duration = Duration::from_secs(1);
         loop {
             for _ in 0..SPIN {
-                let closed = self.handle.closed.load(Ordering::Acquire);
-                let published_len = self.handle.published_len.load(Ordering::Acquire);
+                let (published_len, closed) = self.handle.load();
                 if published_len > self.position {
-                    return true;
+                    return Some(published_len);
                 };
                 if closed {
-                    return false;
+                    return None;
                 }
-
                 std::hint::spin_loop();
             }
 
-            self.handle
-                .published_len
-                .wait_timeout(self.position, TIMEOUT_DUR);
+            self.handle.wait(self.position);
         }
     }
-}
 
-impl Buf for SegmentReader {
-    fn remaining(&self) -> usize {
-        self.handle
-            .published_len
-            .load(Ordering::Acquire)
-            .checked_sub(self.position)
-            .expect("reader is beyond the published frontier")
-    }
-
-    fn chunk(&self) -> &[u8] {
-        let published = self.handle.published_len.load(Ordering::Acquire);
-        debug_assert!(published >= self.position);
-
-        let (cursor, offset) = match self.offset() {
-            CHUNK_SIZE if published == self.position => return &[],
-            CHUNK_SIZE => (
-                self.cursor
+    pub fn chunk(&mut self) -> Option<&[u8]> {
+        // If the current chunk is exhausted, follow the chain. If the
+        // writer hasn't linked the next chunk yet, block until it
+        // publishes more data or closes the stream.
+        let (offset, published) = match (self.offset(), self.wait_for_data()?) {
+            (CHUNK_SIZE, published) => {
+                self.cursor = self
+                    .cursor
                     .next
                     .get()
-                    .expect("published data without a linked next chunk"),
-                0,
-            ),
-            offset => {
+                    .expect("published data without a linked next chunk")
+                    .clone();
+                (0, published)
+            }
+            (offset, published) => {
                 debug_assert!(offset < CHUNK_SIZE);
-                (&self.cursor, offset)
+                (offset, published)
             }
         };
 
-        let end = (published - cursor.base).min(CHUNK_SIZE);
-
-        debug_assert!(offset <= end);
+        let end = (published - self.cursor.base).min(CHUNK_SIZE);
+        debug_assert!(offset < end);
 
         // SAFETY: the Acquire load synchronizes with the writer's Release
         // publication, so [0, end) is initialized. The chunk chain keeps
         // `cursor` alive for the returned borrow.
-        unsafe { cursor.data.get().as_ref_unchecked()[offset..end].assume_init_ref() }
+        let slice =
+            unsafe { self.cursor.data.get().as_ref_unchecked()[offset..end].assume_init_ref() };
+
+        // Implicit advance: consume the entire returned region.
+        self.position = self.cursor.base + end;
+
+        return Some(slice);
+    }
+}
+
+pub struct SeekableSegmentReader {
+    chunks: Vec<Arc<Chunk>>,
+    length: usize,
+    position: usize,
+}
+
+impl SeekableSegmentReader {
+    fn chunk(&self, pos: usize) -> &Arc<Chunk> {
+        &self.chunks[pos / CHUNK_SIZE]
     }
 
-    fn advance(&mut self, cnt: usize) {
-        assert!(cnt <= self.remaining(), "advance past published frontier");
-        self.position += cnt;
-        while let Some(next) = self.cursor.next.get() {
-            if self.position < next.base {
-                break;
+    pub fn new(mut reader: SegmentReader) -> Self {
+        let mut vec = Vec::new();
+
+        while let Some(size) = reader.wait_for_data() {
+            reader.position = size;
+            while (vec.len() + 1) * CHUNK_SIZE <= reader.position {
+                let next = reader
+                    .cursor
+                    .next
+                    .get()
+                    .expect("published data without a linked next chunk")
+                    .clone();
+                vec.push(std::mem::replace(&mut reader.cursor, next));
             }
-            self.cursor = next.clone();
         }
+        if reader.offset() != 0 {
+            vec.push(reader.cursor);
+        }
+
+        Self {
+            chunks: vec,
+            length: reader.position,
+            position: 0,
+        }
+    }
+}
+
+impl Read for SeekableSegmentReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.length {
+            return Ok(0);
+        }
+
+        let chunk = self.chunk(self.position);
+        let offset = self.position - chunk.base;
+        // Data is initialized up to `end_pos`, so clamp the slice end.
+        let end = (self.length - chunk.base).min(CHUNK_SIZE);
+
+        // SAFETY: bytes in `chunk.base..chunk.base + end` are initialized
+        // (guaranteed by the caller's invariant that data is initialized up
+        // to `end_pos`), and `offset < end` since position < end_pos.
+        let data: &[u8] = unsafe {
+            let ptr = chunk.data.get() as *const u8;
+            std::slice::from_raw_parts(ptr.add(offset), end - offset)
+        };
+
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        self.position += n;
+        Ok(n)
+    }
+}
+
+impl Seek for SeekableSegmentReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let end = self.length as i64;
+        let new = match pos {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::End(n) => end + n,
+            SeekFrom::Current(n) => self.position as i64 + n,
+        };
+
+        if new < 0 || new > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek position out of bounds",
+            ));
+        }
+
+        self.position = new as usize;
+        Ok(self.position as u64)
     }
 }

@@ -1,12 +1,19 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::u64;
 
 mod reader;
 mod writer;
 
+use wait_on_address::AtomicWait;
+
 use crate::constants::CHUNK_SIZE;
+pub use crate::segment::reader::SeekableSegmentReader;
 pub use crate::segment::reader::SegmentReader;
 pub use crate::segment::writer::SegmentWriter;
 
@@ -51,15 +58,46 @@ unsafe impl Sync for Chunk {}
 
 #[derive(Debug)]
 pub struct SegmentStream {
-    pub published_len: AtomicUsize, // monotonic published frontier
-    pub closed: AtomicBool,         // EOF: writer finished
+    inner: AtomicU64, // monotonic published frontier
 }
 
 impl SegmentStream {
+    const CLOSED_BIT: u64 = 1 << 63;
+    const LEN_MASK: u64 = !Self::CLOSED_BIT;
+
+    fn load(&self) -> (usize, bool) {
+        let val = self.inner.load(Ordering::Acquire);
+        (
+            (val & Self::LEN_MASK) as usize,
+            (val & Self::CLOSED_BIT) != 0,
+        )
+    }
+
+    fn set(&self, len: usize, closed: bool) {
+        let len = len.try_into().unwrap_or(u64::MAX);
+        debug_assert!(len <= Self::LEN_MASK, "len exceeds 63-bit maximum");
+        self.inner.store(
+            (len & Self::LEN_MASK) | ((closed as u64) * Self::CLOSED_BIT),
+            Ordering::Release,
+        );
+    }
+
+    /// If the value is `value`, wait until woken up.
+    ///
+    /// This function might also return spuriously,
+    /// without a corresponding wake operation.
+    fn wait(&self, value: usize) {
+        let value = value.try_into().unwrap_or(u64::MAX);
+        assert!(
+            value <= Self::LEN_MASK,
+            "wait value cannot exceed 63-bit maximum"
+        );
+        self.inner.wait(value);
+    }
+
     pub fn new() -> (SegmentWriter, SegmentReader) {
         let handle = Arc::new(SegmentStream {
-            published_len: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
+            inner: AtomicU64::new(0),
         });
 
         let head = Chunk::new(0);

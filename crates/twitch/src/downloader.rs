@@ -1,11 +1,18 @@
-use std::thread::{JoinHandle, sleep};
+use std::array;
+use std::io::Read;
+use std::io::{self};
+use std::thread::JoinHandle;
+use std::thread::sleep;
 use std::time::Duration;
-use std::{array, io};
 
+#[cfg(feature = "curl-download")]
 use curl::easy::Easy;
 use kanal::Receiver;
 use thiserror::Error;
-use tracing::{Span, debug, info, trace, warn};
+use tracing::Span;
+use tracing::info;
+use tracing::trace;
+use tracing::warn;
 use ureq::Agent;
 
 use crate::downloader::ToDownloader::FetchURL;
@@ -36,8 +43,12 @@ pub fn spawn_downloaders<const N: usize>(
 }
 
 pub fn download_worker(rx: Receiver<ToDownloader>, agent: Agent) {
-    let mut handle = Easy::new();
-    _ = handle.accept_encoding("");
+    #[cfg(feature = "curl-download")]
+    let mut handle = {
+        let mut handle = Easy::new();
+        _ = handle.accept_encoding("");
+        handle
+    };
 
     for msg in rx {
         match msg {
@@ -50,7 +61,13 @@ pub fn download_worker(rx: Receiver<ToDownloader>, agent: Agent) {
                 let mut attempt = 0;
 
                 loop {
-                    match launch_download(url.as_ref(), &mut writer, &mut handle) {
+                    #[cfg(feature = "curl-download")]
+                    let result = launch_download_curl(&mut handle, url.as_ref(), &mut writer);
+
+                    #[cfg(not(feature = "curl-download"))]
+                    let result = launch_download_ureq(&agent, url.as_ref(), &mut writer);
+
+                    match result {
                         Ok(()) => break,
                         Err(e) => {
                             attempt += 1;
@@ -59,7 +76,6 @@ pub fn download_worker(rx: Receiver<ToDownloader>, agent: Agent) {
                                     "download of {} failed after {} attempts: {}. giving up",
                                     url, attempt, e
                                 );
-                                writer.close();
                                 break;
                             }
                             let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
@@ -78,22 +94,50 @@ pub fn download_worker(rx: Receiver<ToDownloader>, agent: Agent) {
 
 #[derive(Error, Debug)]
 enum DownloadError {
+    #[cfg(feature = "curl-download")]
     #[error("curl error: {0}")]
     Curl(#[from] curl::Error),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    #[error("ureq error: {0}")]
+    Ureq(#[from] ureq::Error),
 }
 
-fn launch_download(
+fn launch_download_ureq(
+    agent: &Agent,
     url: &str,
     writer: &mut SegmentWriter,
+) -> Result<(), DownloadError> {
+    let mut reader = agent
+        .get(url)
+        .header("Accept-Encoding", "")
+        .call()?
+        .into_body()
+        .into_reader();
+
+    loop {
+        let dst = unsafe { writer.writable_slice().assume_init_mut() };
+        let written = reader.read(dst)?;
+        if written == 0 {
+            break;
+        }
+        unsafe { writer.commit(written) };
+
+        writer.publish();
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "curl-download")]
+fn launch_download_curl(
     handle: &mut Easy,
+    url: &str,
+    writer: &mut SegmentWriter,
 ) -> Result<(), DownloadError> {
     info!("starting download");
     handle.reset();
     handle.url(url)?;
-
-    let total_size = &mut 0usize;
 
     let result = {
         let mut transfer = handle.transfer();
@@ -117,7 +161,6 @@ fn launch_download(
                 remaining = &remaining[to_write..];
             }
 
-            *total_size += src.len();
             trace!("added {} bytes", src.len());
             writer.publish();
             Ok(src.len())
@@ -131,6 +174,6 @@ fn launch_download(
 
     result?;
     writer.close();
-    debug!("finished download with {} bytes", total_size);
+
     Ok(())
 }

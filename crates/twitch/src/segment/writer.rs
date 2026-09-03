@@ -1,35 +1,40 @@
-use std::{
-    mem::MaybeUninit,
-    sync::{Arc, atomic::Ordering},
-};
+use std::mem::MaybeUninit;
+use std::sync::Arc;
 
 use wait_on_address::AtomicWait;
 
-use crate::{
-    constants::CHUNK_SIZE,
-    segment::{Chunk, SegmentStream},
-};
+use crate::constants::CHUNK_SIZE;
+use crate::segment::Chunk;
+use crate::segment::SegmentStream;
 
 pub struct SegmentWriter {
     tail: Arc<Chunk>,
     handle: Arc<SegmentStream>,
-    closed: bool,
     written_len: usize,
+}
+
+impl Drop for SegmentWriter {
+    fn drop(&mut self) {
+        {
+            self.handle.set(self.written_len, true);
+            self.handle.inner.notify_all();
+        }; // never leave readers parked forever
+    }
 }
 
 impl SegmentWriter {
     fn tail_offset(&self) -> usize {
         self.written_len - self.tail.base
     }
+
     pub(super) fn new(tail: Arc<Chunk>, handle: Arc<SegmentStream>) -> Self {
         Self {
             tail,
-            // tail_offset: 0,
             handle,
-            closed: false,
             written_len: 0,
         }
     }
+
     /// Writable remainder of the tail chunk, linking a fresh chunk if the
     /// tail is full. Returns at most CHUNK_SIZE bytes per call.
     pub fn writable_slice(&mut self) -> &mut [MaybeUninit<u8>] {
@@ -51,11 +56,8 @@ impl SegmentWriter {
     }
 
     pub fn publish(&mut self) {
-        self.handle
-            .published_len
-            .store(self.written_len, Ordering::Release);
-
-        self.handle.published_len.notify_all();
+        self.handle.set(self.written_len, false);
+        self.handle.inner.notify_all();
     }
 
     fn link_new_chunk(&mut self) {
@@ -74,22 +76,5 @@ impl SegmentWriter {
             .expect("single writer links exactly once");
 
         self.tail = next;
-    }
-
-    /// Signal EOF and wake everyone. Idempotent.
-    pub fn close(&mut self) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        self.handle.closed.store(true, Ordering::Release);
-        // Unconditional: sleepers may be waiting for len that never comes.
-        self.handle.published_len.notify_all();
-    }
-}
-
-impl Drop for SegmentWriter {
-    fn drop(&mut self) {
-        self.close(); // never leave readers parked forever
     }
 }

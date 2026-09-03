@@ -1,8 +1,4 @@
-initialize index_sequence in run_ts_writer
-
 clean up logging and error handling
-
-probably rip out libcurl and use own http client at least for segment fetch
 
 add vod support
 

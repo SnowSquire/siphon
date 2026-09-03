@@ -1,15 +1,16 @@
-use bytes::Buf;
-
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
+use std::net::TcpListener;
 use std::thread::JoinHandle;
+use std::thread::{self};
 use std::time::Instant;
 
-use std::thread;
-
-use crate::scheduler::{Segment, SegmentMessage};
-
 use crate::constants::DEFAULT_PORT;
+use crate::scheduler::Segment;
+use crate::scheduler::SegmentMessage;
 
 pub fn spawn_tcp_listener(
     add_readers: kanal::Sender<kanal::Sender<SegmentMessage>>,
@@ -68,22 +69,10 @@ fn spawn_tcp_client_thread(
             for msg in reader_tx {
                 match msg {
                     SegmentMessage::Init { mut reader } => {
-                        while reader.wait_for_data() {
-                            let buf = reader.chunk();
-
-                            let written = match stream.write(buf) {
-                                Ok(w) => w,
-                                Err(e) => {
-                                    eprintln!("Write error: {e}");
-                                    return;
-                                }
+                        while let Some(buf) = reader.chunk() {
+                            if stream.write_all(buf).is_err() {
+                                continue;
                             };
-
-                            if written == 0 {
-                                break;
-                            }
-
-                            reader.advance(written);
                         }
                     }
                     SegmentMessage::Segment(Segment {
@@ -95,21 +84,10 @@ fn spawn_tcp_client_thread(
                             continue;
                         }
                         last_sequence_num = sequence_num;
-                        loop {
-                            let buf = reader.chunk();
-
-                            let written = match stream.write_all(buf) {
-                                Ok(w) => w,
-                                Err(e) => {
-                                    eprintln!("Write error: {e}");
-                                    return;
-                                }
+                        while let Some(buf) = reader.chunk() {
+                            if stream.write_all(buf).is_err() {
+                                continue;
                             };
-
-                            reader.advance(buf.len());
-                            if !reader.wait_for_data() {
-                                break;
-                            }
                         }
                     }
                     SegmentMessage::Prefetch {
@@ -120,21 +98,10 @@ fn spawn_tcp_client_thread(
                             continue;
                         }
                         last_sequence_num = expected_sequence;
-                        loop {
-                            let buf = reader.chunk();
-
-                            let written = match stream.write_all(buf) {
-                                Ok(w) => w,
-                                Err(e) => {
-                                    eprintln!("Write error: {e}");
-                                    return;
-                                }
+                        while let Some(buf) = reader.chunk() {
+                            if stream.write_all(buf).is_err() {
+                                continue;
                             };
-
-                            reader.advance(buf.len());
-                            if !reader.wait_for_data() {
-                                break;
-                            }
                         }
                     }
                     SegmentMessage::Discontinuity() => last_sequence_num = 0,

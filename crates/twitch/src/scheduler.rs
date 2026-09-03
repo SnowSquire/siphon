@@ -1,15 +1,30 @@
-use std::num::{ParseFloatError, ParseIntError};
-use std::ptr;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::num::ParseFloatError;
+use std::num::ParseIntError;
+use std::thread::JoinHandle;
+use std::thread::{self};
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use kanal::{Receiver, Sender};
+use kanal::Receiver;
+use kanal::Sender;
 use thiserror::Error;
-use tracing::{Level, debug, debug_span, error, info, span};
+use tracing::Level;
+use tracing::debug;
+use tracing::debug_span;
+use tracing::error;
+use tracing::info;
+use tracing::span;
 use ureq::Agent;
 
-use crate::downloader::{self, ToDownloader};
-use crate::segment::{SegmentReader, SegmentStream};
+use crate::downloader::ToDownloader;
+use crate::downloader::{self};
+use crate::segment::SegmentReader;
+use crate::segment::SegmentStream;
+use crate::utils::RetainUnordered;
+use crate::utils::float_string_to_millis;
+use crate::utils::httpify_url;
 
 struct PrefetchSegment {
     expected_id: u64,
@@ -69,6 +84,18 @@ enum SchedulerError {
     Send(#[from] kanal::SendError),
     #[error("writer error")]
     Write,
+}
+
+pub fn spawn_scheduler(
+    agent: Agent,
+    track_url: Box<str>,
+    tx: kanal::Sender<downloader::ToDownloader>,
+    srx: kanal::Receiver<kanal::Sender<SegmentMessage>>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("scheduler"))
+        .spawn(move || StreamScheduler::new(agent, track_url, tx, srx).main())
+        .expect("failed to spawn scheduler")
 }
 
 /// copied and modified from twitch-hls-client directly
@@ -272,7 +299,7 @@ impl StreamScheduler {
 
                 self.downloaders
                     .send(ToDownloader::FetchURL {
-                        url: as_http(url),
+                        url: httpify_url(url),
                         writer,
 
                         span: span.clone(),
@@ -306,7 +333,7 @@ impl StreamScheduler {
         let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
 
         let (writer, reader) = SegmentStream::new();
-        let url = as_http(url);
+        let url = httpify_url(url);
         self.downloaders
             .send(ToDownloader::FetchURL {
                 url: url.clone(),
@@ -365,7 +392,7 @@ impl StreamScheduler {
         // this is so dumb but twitch has a bug where multiple disconnect protections in one playlist all have the same value (being of the final sequence)
         // since we don't care about downloading & persisting ads, we don't have to worry about their sequence number conflict with the real segments
 
-        // the order of tags in the playlist is typically XMS\nTLS\T-ELAPSED-SECS, unless first segments is an ad. in which case there's no TLS (until the first real segment)
+        // the order of tags in the playlist is typically XMS\nTLS\nT-ELAPSED-SECS, unless first segments is an ad. in which case there's no TLS (until the first real segment)
         // this means that we can trust the tls after xms, as long as we invalidate it after the TES.
         // we can also trust tls after ads since ads don't have disconnect protection
         // if there are other possible discontinuties then these assumptions don't hold. ¯\_(ツ)_/¯
@@ -378,7 +405,7 @@ impl StreamScheduler {
 
             match tag {
                 "#EXT-X-TWITCH-ELAPSED-SECS" => {
-                    segment_time_ms = parse_millis(value)
+                    segment_time_ms = float_string_to_millis(value)
                         .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
                     trust_next_tls_val = false
                 }
@@ -451,7 +478,7 @@ impl StreamScheduler {
                     }
 
                     sequence_number += 1;
-                    let segment_len = parse_millis(
+                    let segment_len = float_string_to_millis(
                         value
                             .split_once(',')
                             .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?
@@ -476,68 +503,4 @@ impl StreamScheduler {
         // info!(new_segments = self.prefetch_tail - original_prefetch_tail, %mains, %prefetches);
         Ok(self.prefetch_tail - original_prefetch_tail)
     }
-}
-
-pub trait RetainUnordered<T> {
-    /// Keeps elements for which `f` returns `true`; order of survivors is not preserved.
-    fn retain_unordered<F>(&mut self, f: F)
-    where
-        F: FnMut(&T) -> bool;
-}
-
-impl<T> RetainUnordered<T> for Vec<T> {
-    fn retain_unordered<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&T) -> bool,
-    {
-        let mut i = 0;
-        let mut n = self.len();
-        while i < n {
-            if f(&self[i]) {
-                i += 1;
-            } else {
-                n -= 1;
-                self.swap(i, n);
-            }
-        }
-        self.truncate(n);
-    }
-}
-
-fn as_http(url: &str) -> Box<str> {
-    if let Some(rest) = url.strip_prefix("https://") {
-        const HTTP_PREFIX: &[u8; 7] = b"http://";
-        let mut buffer = Box::<[u8]>::new_uninit_slice(url.len() - 1);
-
-        let dest = buffer.as_mut_ptr().cast::<u8>();
-        unsafe {
-            ptr::copy_nonoverlapping(HTTP_PREFIX.as_ptr(), dest, HTTP_PREFIX.len());
-            ptr::copy_nonoverlapping(rest.as_ptr(), dest.add(HTTP_PREFIX.len()), rest.len());
-            std::mem::transmute::<Box<[u8]>, Box<str>>(buffer.assume_init())
-        }
-    } else {
-        Box::from(url)
-    }
-}
-
-fn parse_millis(s: &str) -> Option<u64> {
-    let (secs, frac) = s.split_once('.').unwrap_or((s, "0"));
-    let frac = if frac.is_empty() { "0" } else { frac };
-
-    let digits = frac.len().min(3) as u32;
-    let frac_ms: u64 = frac.get(..digits as usize)?.parse().ok()?;
-
-    Some(secs.parse::<u64>().ok()? * 1000 + frac_ms * 10u64.pow(3 - digits))
-}
-
-pub fn spawn_scheduler(
-    agent: Agent,
-    track_url: Box<str>,
-    tx: kanal::Sender<downloader::ToDownloader>,
-    srx: kanal::Receiver<kanal::Sender<SegmentMessage>>,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name(format!("scheduler"))
-        .spawn(move || StreamScheduler::new(agent, track_url, tx, srx).main())
-        .expect("failed to spawn scheduler")
 }

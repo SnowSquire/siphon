@@ -1,25 +1,26 @@
 #![allow(unused_variables)]
-#![deny(unused_imports)]
+
 mod constants;
 mod disk;
 mod downloader;
 mod scheduler;
 mod segment;
 mod tcp;
+mod utils;
 mod variant;
 
-use std::thread::JoinHandle;
 use std::time::Instant;
 
 use clap::Parser;
 use mimalloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
 
-use crate::disk::spawn_disk_writer;
+use crate::disk::spawn_disk_output;
 use crate::downloader::spawn_downloaders;
 use crate::scheduler::spawn_scheduler;
 use crate::tcp::spawn_tcp_listener;
-use crate::variant::{Variant, get_variants};
+use crate::variant::Variant;
+use crate::variant::get_variants;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -49,6 +50,10 @@ struct Config {
     quality: Option<String>,
     #[arg(short, long)]
     debug: bool,
+}
+
+enum Output {
+    Disk,
 }
 
 fn main() {
@@ -90,18 +95,19 @@ fn main() {
     };
 
     let (tx_downloaders, rx_downloaders) = kanal::unbounded();
-    let (add_readers, rx_readers) = kanal::unbounded();
+    let (add_output, rx_outputs) = kanal::unbounded();
 
-    let download_threads: [JoinHandle<()>; 8] = spawn_downloaders::<8>(&agent, rx_downloaders);
-    let scheduler_thread: JoinHandle<()> = spawn_scheduler(
+    let download_threads =
+        spawn_downloaders::<{ constants::DOWNLOAD_THREADS }>(&agent, rx_downloaders);
+    let scheduler_thread = spawn_scheduler(
         agent.clone(),
         variants.first().unwrap().url.clone(),
         tx_downloaders,
-        rx_readers,
+        rx_outputs,
     );
 
-    let disk_thread: JoinHandle<()> = spawn_disk_writer(&add_readers, stream_id);
-    let tcp_listener_thread: JoinHandle<()> = spawn_tcp_listener(add_readers, start);
+    let disk_thread = spawn_disk_output(&add_output, stream_id);
+    let tcp_listener_thread = spawn_tcp_listener(add_output, start);
 
     let _ = scheduler_thread.join();
     let _ = tcp_listener_thread.join();

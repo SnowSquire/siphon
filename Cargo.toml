@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/twitch", "crates/wait_on_address"]
+members = ["crates/twitch"]
 resolver = "2"
 
 [profile.release]
