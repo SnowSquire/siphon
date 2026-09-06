@@ -21,7 +21,7 @@ struct Segment {
 } [[packed]];
 
 struct Discontinuity {
-    u16 width;f
+    u16 width;
     u16 height;
     u16 rate_num;
     u16 rate_denom;
@@ -29,13 +29,15 @@ struct Discontinuity {
 
 struct Init {
     u64 counter;
+    u128 hash;
+    u64 byte_offset;
+    u32 byte_length;
 } [[packed]];
 
 struct Header {
     char magic[8];
     u64 version;
     u64 stream_id;
-    u64 index_sequence;
 } [[packed]];
 
 struct Record {

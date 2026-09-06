@@ -1,14 +1,13 @@
 {
-  "include": ["**/*.js", "**/*.ts", "src/server.ts.nvm", "output/129721.ts"],
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", "unused"],
   "compilerOptions": {
     "target": "esnext",
-    "jsx": "preserve",
     "module": "ESNext",
-    "lib": ["esnext", "DOM", "DOM.Iterable", "DOM.AsyncIterable", "ESNext.Iterator"],
+    "lib": ["esnext", "DOM"],
     "types": ["node"],
-    "checkJs": true,
-    /* Bundler mode */
     "moduleResolution": "bundler",
+    "resolveJsonModule": true,
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,

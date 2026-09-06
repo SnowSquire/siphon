@@ -1,3 +1,5 @@
+import { readFile } from "node:fs";
+import { createServer } from "node:http";
 import { xxh3 } from "@node-rs/xxhash";
 import segments from "./segments.json" with { type: "json" };
 
@@ -11,7 +13,7 @@ function generatePlaylist(
   spark_time_ms: number,
   segments: Segment[],
   origin: string,
-): string | null | undefined {
+): string | undefined {
   const now = Date.now();
   const sim_now = spark_time_ms + (now - spark_time_ms) * 8;
   const lead_segment_index = segments.findIndex(
@@ -59,28 +61,29 @@ ${origin}/${segment.filename}`;
   return m3u8;
 }
 
-async function main() {
-  const spark_time_ms = Date.now();
+const spark_time_ms = Date.now();
 
-  async function handler(req: Request): Promise<Response> {
-    const url = new URL(req.url);
+const server = createServer((req, res) => {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
-    if (url.pathname === "/index.m3u8") {
-      return new Response(generatePlaylist(spark_time_ms, segments, `http://${url.host}`), {});
-    }
-    try {
-      const lol = await Deno.open(`segments${url.pathname}`);
-      const bytes = await Deno.readFile(`segments${url.pathname}`);
-      console.log(url.pathname);
-      console.log(xxh3.xxh128(bytes).toString(16).padStart(32, "0"));
-      return new Response(lol.readable, {});
-    } catch {
-      return new Response("dummy", { status: 404 });
-    }
+  if (url.pathname === "/index.m3u8") {
+    res.setHeader("content-type", "application/vnd.apple.mpegurl");
+    res.end(generatePlaylist(spark_time_ms, segments, `http://${url.host}`));
+    return;
   }
-  const server = Deno.serve(handler);
-}
 
-if (import.meta.main) {
-  main();
-}
+  readFile(`segments${url.pathname}`, (err, bytes) => {
+    if (err) {
+      res.statusCode = 404;
+      res.end("dummy");
+      return;
+    }
+    console.log(url.pathname);
+    console.log(xxh3.xxh128(bytes).toString(16).padStart(32, "0"));
+    res.end(bytes);
+  });
+});
+
+server.listen(8000, () => {
+  console.log("mock server listening on http://127.0.0.1:8000");
+});

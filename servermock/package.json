@@ -1,16 +1,16 @@
 {
   "name": "servermock",
   "version": "1.0.0",
-  "description": "",
-  "keywords": [],
-  "license": "ISC",
-  "author": "",
+  "description": "Mock Twitch HLS edge server",
+  "private": true,
   "type": "module",
-  "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "node --watch main.ts"
+  },
+  "dependencies": {
+    "@node-rs/xxhash": "^1.7.7"
   },
   "devDependencies": {
-    "@types/node": "^26.4.1"
+    "@types/node": "^26.0.0"
   }
 }
