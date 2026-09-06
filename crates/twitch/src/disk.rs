@@ -6,8 +6,6 @@ use std::io::{self};
 use std::num::NonZeroU16;
 use std::thread::JoinHandle;
 use std::thread::{self};
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use ffmpeg_next::format::context::StreamIo;
 use ffmpeg_next::{self as ffmpeg};
@@ -350,7 +348,6 @@ pub fn run_disk_output(
     stream_id: u64,
 ) -> Result<(), DiskOutputError> {
     ffmpeg::init().unwrap();
-    let file_timestamp = unix_timestamp_nanos();
 
     std::fs::create_dir_all("manifest")
         .map_err(|source| DiskOutputError::CreateManifestDirectory { source })?;
@@ -564,13 +561,4 @@ pub fn run_disk_output(
     }
 
     Ok(())
-}
-
-fn unix_timestamp_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before UNIX epoch")
-        .as_nanos()
-        .try_into()
-        .expect("timestamp does not fit in u64")
 }

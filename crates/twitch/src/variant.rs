@@ -16,6 +16,7 @@ use crate::constants::PLAYER_VERSION;
 use crate::constants::TWITCH_GQL_ENDPOINT;
 use crate::constants::TWITCH_HLS_BASE;
 use crate::constants::TWITCH_OAUTH_ENDPOINT;
+use crate::utils::float_string_to_centis;
 
 #[derive(Debug, Error)]
 pub enum VariantPlaylistError {
@@ -34,8 +35,6 @@ pub enum VariantPlaylistError {
     #[error("token value is not valid JSON: {0}")]
     TokenJsonInvalid(#[from] sonic_rs::Error),
 
-    #[error("broski")]
-    Idk,
     #[error("channel field is missing from token")]
     ChannelMissing,
 
@@ -160,7 +159,7 @@ pub fn fetch_variant_playist(
         .call()
         .map_err(|e| VariantPlaylistError::ManifestRequest {
             source: e,
-            url: "".into(),
+            url: String::new(),
         })?
         .into_body()
         .read_to_string()
@@ -194,7 +193,7 @@ fn attributes(tag: &str) -> impl Iterator<Item = (&str, &str)> {
         } else {
             after_eq
                 .split_once(',')
-                .map_or((after_eq.trim(), ""), |(v, t)| (v.trim(), t))
+                .map_or_else(|| (after_eq.trim(), ""), |(v, t)| (v.trim(), t))
         };
 
         rest = tail;
@@ -226,27 +225,27 @@ fn parse_kind(variant_id: &str) -> VariantKind {
 }
 
 struct TempVariant<'a> {
-    score: f32,
+    score: Option<NonZeroU16>,
 
     variant_id: &'a str,
     kind: VariantKind,
     codec: Option<Codec>,
     res: Option<(NonZeroU16, NonZeroU16)>,
-    frame_rate: f32,
+    frame_rate: Option<NonZeroU16>,
 }
 
 fn parse_stream_inf(line: &str) -> Option<TempVariant<'_>> {
     let mut variant_id = None;
-    let mut score = f32::NAN;
-    let mut frame_rate = f32::NAN;
+    let mut score = None;
+    let mut frame_rate = None;
     let mut codec = None;
     let mut res = None;
 
     for (key, value) in attributes(line) {
         match key {
             "STABLE-VARIANT-ID" => variant_id = Some(value),
-            "SCORE" => score = value.parse().unwrap_or(f32::NAN),
-            "FRAME-RATE" => frame_rate = value.parse().unwrap_or(f32::NAN),
+            "SCORE" => score = float_string_to_centis(value),
+            "FRAME-RATE" => frame_rate = float_string_to_centis(value),
             "CODECS" => {
                 codec = match value.get(..4)? {
                     "avc1" => Some(Codec::H264),
@@ -280,22 +279,13 @@ fn parse_stream_inf(line: &str) -> Option<TempVariant<'_>> {
 pub struct Variant {
     pub score: Option<NonZeroU16>,
     pub url: Box<str>,
-    pub variant_id: Box<str>,
+    pub id: Box<str>,
     pub kind: VariantKind,
     pub codec: Option<Codec>,
     pub res: Option<(NonZeroU16, NonZeroU16)>,
     pub frame_rate: Option<NonZeroU16>,
 }
 
-fn scaled_nonzero(v: f32) -> Option<NonZeroU16> {
-    if !v.is_finite() || v <= 0.0 {
-        return None;
-    }
-    let scaled = (v * 100.0).round();
-    (scaled <= u16::MAX as f32)
-        .then(|| NonZeroU16::new(scaled as u16))
-        .flatten()
-}
 fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
     let mut stream_inf: Option<TempVariant<'_>> = None;
 
@@ -311,25 +301,25 @@ fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
 
             var_vec.push(Variant {
                 codec: variant.codec,
-                frame_rate: scaled_nonzero(variant.frame_rate),
+                frame_rate: variant.frame_rate,
                 kind: variant.kind,
                 res: variant.res,
-                score: scaled_nonzero(variant.score),
+                score: variant.score,
                 url: line.into(),
-                variant_id: variant.variant_id.into(),
+                id: variant.variant_id.into(),
             });
         } else if let Some(value) = line
             .strip_prefix("#EXT-X-SESSION-DATA:DATA-ID=\"BROADCAST-ID\",VALUE=\"")
             .and_then(|v| v.strip_suffix("\""))
         {
-            stream_id = value.parse::<u64>().ok()
+            stream_id = value.parse::<u64>().ok();
         }
     }
 
     var_vec.sort_by(|a, b| {
         b.score
-            .map_or(0, |nz| nz.get())
-            .cmp(&a.score.map_or(0, |nz| nz.get()))
+            .map_or(0, NonZeroU16::get)
+            .cmp(&a.score.map_or(0, NonZeroU16::get))
     });
 
     var_vec.shrink_to_fit();

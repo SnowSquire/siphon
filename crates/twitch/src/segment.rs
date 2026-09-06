@@ -27,11 +27,22 @@ impl Chunk {
     pub fn new(base: usize) -> Arc<Self> {
         let mut chunk = Arc::<Self>::new_uninit();
 
+        // SAFETY: `chunk` was just created with refcount 1 and no aliases,
+        // so `get_mut` succeeds; `unwrap_unchecked` is valid for the same reason.
         let uninit = unsafe { Arc::get_mut(&mut chunk).unwrap_unchecked() };
         let ptr = uninit.as_mut_ptr();
 
-        unsafe { (&raw mut (*ptr).base).write(base) }
-        unsafe { (&raw mut (*ptr).next).write(OnceLock::new()) }
+        // SAFETY: `ptr` points to a valid, exclusively-owned `Chunk` allocation;
+        // `addr_of_mut!` creates the field pointer without forming a reference.
+        let base_ptr = unsafe { std::ptr::addr_of_mut!((*ptr).base) };
+        // SAFETY: initializes `base` exactly once before `assume_init`, single writer.
+        unsafe { base_ptr.write(base) }
+        // SAFETY: same allocation; creates `next` field pointer without a reference.
+        let next_ptr = unsafe { std::ptr::addr_of_mut!((*ptr).next) };
+        // SAFETY: initializes `next` exactly once before `assume_init`.
+        unsafe { next_ptr.write(OnceLock::new()) }
+        // SAFETY: `base` and `next` are now initialized; `data` is
+        // `MaybeUninit` and intentionally left uninitialized.
         unsafe { chunk.assume_init() }
     }
 }
@@ -49,6 +60,8 @@ impl Drop for Chunk {
 // published via Release on `next` / `written_len`, and only read after a
 // corresponding Acquire. No mutable aliasing by construction.
 unsafe impl Send for Chunk {}
+// SAFETY: same as `Send` above; `data` is only accessed via raw pointers
+// synchronized by the `Stream` frontier, `base` is immutable after init.
 unsafe impl Sync for Chunk {}
 
 // ---------------------------------------------------------------- handle --

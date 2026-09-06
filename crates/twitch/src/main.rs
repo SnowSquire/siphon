@@ -1,4 +1,3 @@
-use enumflags2::bitflags;
 mod constants;
 mod disk;
 mod downloader;
@@ -49,16 +48,6 @@ struct Config {
     debug: bool,
 }
 
-#[bitflags]
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum Output {
-    Disk,
-    Tcp,
-    // Rtsp
-    // Moq
-}
-
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -81,7 +70,7 @@ fn main() {
                 res: None,
                 score: None,
                 url: "http://127.0.0.2:8000/index.m3u8".into(),
-                variant_id: "1080p".into(),
+                id: "1080p".into(),
             }],
             rand::random::<u64>(),
         )

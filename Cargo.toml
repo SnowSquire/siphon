@@ -32,6 +32,10 @@ str_to_string = "warn"
 missing_errors_doc = "allow" # Turn off another noisy pedantic lint
 # unreachable_pub = "warn"
 
+# Bad rules for this project (see badrules.md for rationale)
+too_many_lines = "allow"
+
+
 [profile.release]
 opt-level = 3
 codegen-units = 1

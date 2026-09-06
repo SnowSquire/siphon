@@ -71,10 +71,9 @@ impl Reader {
         let end = (published - self.cursor.base).min(CHUNK_SIZE);
         debug_assert!(offset < end);
 
-        // SAFETY: the Acquire load synchronizes with the writer's Release
-        // publication, so [0, end) is initialized. The chunk chain keeps
-        // `cursor` alive for the returned borrow.
+        // SAFETY: Acquire load syncs with writer Release; [0, end) initialized, chunk alive via chain.
         let slice = unsafe { self.cursor.data.get().as_ref_unchecked() };
+        // SAFETY: `offset..end` within initialized region per Acquire sync above.
         let slice = unsafe { slice[offset..end].assume_init_ref() };
 
         // Implicit advance: consume the entire returned region.
@@ -133,11 +132,10 @@ impl Read for SeekableReader {
         // Data is initialized up to `end_pos`, so clamp the slice end.
         let end = (self.length - chunk.base).min(CHUNK_SIZE);
 
-        // SAFETY: bytes in `chunk.base..chunk.base + end` are initialized
-        // (guaranteed by the caller's invariant that data is initialized up
-        // to `end_pos`), and `offset < end` since position < end_pos.
+        // SAFETY: `offset < end <= CHUNK_SIZE`, chunk alive in `self.chunks`, pointer in-bounds.
         let ptr = unsafe { (chunk.data.get() as *const u8).add(offset) };
 
+        // SAFETY: `ptr` points to `end - offset` initialized bytes per SeekableReader invariant.
         let data: &[u8] = unsafe { std::slice::from_raw_parts(ptr, end - offset) };
 
         let n = data.len().min(buf.len());

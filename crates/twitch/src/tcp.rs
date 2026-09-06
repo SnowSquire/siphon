@@ -15,9 +15,8 @@ pub fn spawn_tcp_listener(
     add_readers: kanal::Sender<kanal::Sender<SegmentMessage>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
-        .name(format!("tcp listener"))
+        .name("tcp listener".to_owned())
         .spawn(move || {
-            let mut client_threads = Vec::new();
             const ADDRS: [SocketAddr; 4] = [
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), DEFAULT_PORT),
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
@@ -31,11 +30,10 @@ pub fn spawn_tcp_listener(
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        let (reader_rx, handle) = spawn_tcp_client_thread(stream);
+                        let (reader_rx, _handle) = spawn_tcp_client_thread(stream);
                         _ = add_readers.send(reader_rx);
-                        client_threads.push(handle);
                     }
-                    Err(e) => eprintln!("Connection failed: {}", e),
+                    Err(e) => eprintln!("Connection failed: {e}"),
                 }
             }
         })
@@ -63,9 +61,7 @@ fn spawn_tcp_client_thread(
                 match msg {
                     SegmentMessage::Init { mut reader } => {
                         while let Some(buf) = reader.chunk() {
-                            if stream.write_all(buf).is_err() {
-                                continue;
-                            };
+                            let _ = stream.write_all(buf);
                         }
                     }
                     SegmentMessage::Segment(Segment {
@@ -78,9 +74,7 @@ fn spawn_tcp_client_thread(
                         }
                         last_sequence_num = sequence_num;
                         while let Some(buf) = reader.chunk() {
-                            if stream.write_all(buf).is_err() {
-                                continue;
-                            };
+                            let _ = stream.write_all(buf);
                         }
                     }
                     SegmentMessage::Prefetch {
@@ -92,9 +86,7 @@ fn spawn_tcp_client_thread(
                         }
                         last_sequence_num = expected_sequence;
                         while let Some(buf) = reader.chunk() {
-                            if stream.write_all(buf).is_err() {
-                                continue;
-                            };
+                            let _ = stream.write_all(buf);
                         }
                     }
                     SegmentMessage::Discontinuity() => last_sequence_num = 0,

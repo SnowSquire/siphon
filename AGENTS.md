@@ -4,7 +4,7 @@ Twitch HLS live-stream client (Rust) + `servermock/` (Node mock Twitch edge serv
 
 ## Commands
 
-- Build/check: `cargo check -p twitch-hls-client2`, `cargo build -p twitch-hls-client2`
+- Build/check: `cargo clippy -p twitch-hls-client2`, `cargo build -p twitch-hls-client2`
 - Lint: `cargo clippy -p twitch-hls-client2` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean.
 - Format: `crates/twitch/rustfmt.toml` uses **unstable** rustfmt options (`group_imports`, `imports_granularity`, `imports_layout`, `format_code_in_doc_comments`, `reorder_impl_items`); stable `cargo fmt` silently ignores them. Use `cargo +nightly fmt`.
 - No Rust tests exist. `servermock/unused/main_test.ts` is stale boilerplate — don't rely on it.

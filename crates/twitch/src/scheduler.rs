@@ -77,12 +77,8 @@ enum SchedulerError {
 
     #[error("dispatch error")]
     Dispatch,
-    #[error("discontinuity error")]
-    Discontinuity,
     #[error("send error")]
     Send(#[from] kanal::SendError),
-    #[error("writer error")]
-    Write,
 }
 
 pub fn spawn_scheduler(
@@ -150,7 +146,7 @@ impl StreamScheduler {
         info!("{}", self.stream_url.to_string());
         loop {
             match self.mainloop() {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(err) => match err {
                     SchedulerError::Offline => {
                         info!("stream ended");
@@ -158,7 +154,7 @@ impl StreamScheduler {
                     }
                     _ => self.reset(),
                 },
-            };
+            }
         }
     }
 
@@ -175,30 +171,29 @@ impl StreamScheduler {
         'readers: while let Ok(Some(tx)) = self.receive.try_recv() {
             debug!("new sender");
             if let Some(init) = &self.init {
-                match tx.try_send(SegmentMessage::Init {
-                    reader: init.1.clone(),
-                }) {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => {
-                        error!(url = init.0, "failed to send init to new reader");
-                        let _ = tx.close();
-                        continue 'readers;
-                    }
+                if tx
+                    .try_send(SegmentMessage::Init {
+                        reader: init.1.clone(),
+                    })
+                    .is_ok_and(|v| v)
+                {
+                } else {
+                    error!(url = init.0, "failed to send init to new reader");
+                    let _ = tx.close();
+                    continue 'readers;
                 }
             }
 
             // self.segments.sort_by_key(|f| f.sequence_num);
             for segment in &self.segments {
-                match tx.try_send(segment.clone().into()) {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => {
-                        error!(
-                            segment_id = segment.sequence_num,
-                            "failed to send init to new reader"
-                        );
-                        let _ = tx.close();
-                        continue 'readers;
-                    }
+                if tx.try_send(segment.clone().into()).is_ok_and(|v| v) {
+                } else {
+                    error!(
+                        segment_id = segment.sequence_num,
+                        "failed to send init to new reader"
+                    );
+                    let _ = tx.close();
+                    continue 'readers;
                 }
             }
 
@@ -207,6 +202,10 @@ impl StreamScheduler {
     }
 
     fn mainloop(&mut self) -> Result<(), SchedulerError> {
+        const MIN_EDGE_POLL: Duration = Duration::from_millis(200);
+        const MAX_EDGE_POLL: Duration = Duration::from_secs(5);
+        const CATCHUP_POLL: Duration = Duration::from_millis(100);
+
         let start = Instant::now();
         let now: u64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -220,13 +219,10 @@ impl StreamScheduler {
         self.prefetches
             .retain_unordered(|p| p.expected_id >= self.segment_tail);
 
-        const MIN_EDGE_POLL: Duration = Duration::from_millis(200);
-        const MAX_EDGE_POLL: Duration = Duration::from_secs(5);
-        const CATCHUP_POLL: Duration = Duration::from_millis(100);
-
-        let sleep_dur = match new_segments == 0 {
-            true => (self.last_segment_dur / 4).clamp(MIN_EDGE_POLL, MAX_EDGE_POLL),
-            false => CATCHUP_POLL,
+        let sleep_dur = if new_segments == 0 {
+            (self.last_segment_dur / 4).clamp(MIN_EDGE_POLL, MAX_EDGE_POLL)
+        } else {
+            CATCHUP_POLL
         };
         self.handle_new_readers();
 
@@ -266,54 +262,49 @@ impl StreamScheduler {
         debug!("new main segment");
         if is_ad {
             return Ok(duration);
-        };
+        }
 
-        match prefetch {
-            Some(prefetch) => {
-                let segment = Segment {
-                    sequence_num: expected_sequence,
-                    reader: prefetch.reader,
-                    timestamp_ms,
-                };
-                self.segments.push(segment.clone());
+        if let Some(prefetch) = prefetch {
+            let segment = Segment {
+                sequence_num: expected_sequence,
+                reader: prefetch.reader,
+                timestamp_ms,
+            };
+            self.segments.push(segment.clone());
 
-                self.readers.retain_unordered(|reader| {
-                    match reader.try_send(segment.clone().into()) {
-                        Ok(true) => true, // success, keep
-                        Ok(false) | Err(_) => {
-                            let _ = reader.close(); // close it
-                            false
-                        }
-                    }
-                });
-            }
-            None => {
-                let (writer, segmentreader) = Stream::new_stream();
-                let segment = Segment {
-                    sequence_num: expected_sequence,
-                    reader: segmentreader,
-                    timestamp_ms,
-                };
-                self.segments.push(segment.clone());
+            self.readers.retain_unordered(|reader| {
+                if reader.try_send(segment.clone().into()).is_ok_and(|v| v) {
+                    true // success, keep
+                } else {
+                    let _ = reader.close(); // close it
+                    false
+                }
+            });
+        } else {
+            let (writer, segmentreader) = Stream::new_stream();
+            let segment = Segment {
+                sequence_num: expected_sequence,
+                reader: segmentreader,
+                timestamp_ms,
+            };
+            self.segments.push(segment.clone());
 
-                self.downloaders
-                    .send(ToDownloader::FetchURL {
-                        url: httpify_url(url),
-                        writer,
+            self.downloaders
+                .send(ToDownloader::FetchURL {
+                    url: httpify_url(url),
+                    writer,
 
-                        span: span.clone(),
-                    })
-                    .unwrap(); // if this send fails i genuinely have no idea how to handle it just leave it
-                self.readers.retain_unordered(|reader| {
-                    match reader.try_send(segment.clone().into()) {
-                        Ok(true) => true, // success, keep
-                        Ok(false) | Err(_) => {
-                            let _ = reader.close(); // close it
-                            false
-                        }
-                    }
-                });
-            }
+                    span: span.clone(),
+                })
+                .unwrap(); // if this send fails i genuinely have no idea how to handle it just leave it
+            self.readers.retain_unordered(|reader| {
+                if reader.try_send(segment.clone().into()).is_ok_and(|v| v) {
+                    true // success, keep
+                } else {
+                    let _ = reader.close(); // close it
+                    false
+                }
+            });
         }
 
         self.last_segment_dur = duration;
@@ -328,7 +319,7 @@ impl StreamScheduler {
 
         if prefetch.is_some() {
             return Err(());
-        };
+        }
         let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
 
         let (writer, reader) = Stream::new_stream();
@@ -343,15 +334,17 @@ impl StreamScheduler {
             .unwrap();
 
         self.readers.retain_unordered(|segmentreader| {
-            match segmentreader.try_send(SegmentMessage::Prefetch {
-                expected_sequence,
-                reader: reader.clone(),
-            }) {
-                Ok(true) => true,
-                Ok(false) | Err(_) => {
-                    let _ = segmentreader.close();
-                    false
-                }
+            if segmentreader
+                .try_send(SegmentMessage::Prefetch {
+                    expected_sequence,
+                    reader: reader.clone(),
+                })
+                .is_ok_and(|v| v)
+            {
+                true
+            } else {
+                let _ = segmentreader.close();
+                false
             }
         });
         self.prefetches.push(PrefetchSegment {
@@ -406,7 +399,7 @@ impl StreamScheduler {
                 "#EXT-X-TWITCH-ELAPSED-SECS" => {
                     segment_time_ms = float_string_to_millis(value)
                         .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
-                    trust_next_tls_val = false
+                    trust_next_tls_val = false;
                 }
                 "#EXT-X-MEDIA-SEQUENCE" => {
                     trust_next_tls_val = true;
@@ -421,17 +414,19 @@ impl StreamScheduler {
                     if trust_next_tls_val {
                         let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
                         sequence_number = front;
-                        trust_next_tls_val = false
+                        trust_next_tls_val = false;
                     }
                 }
                 "#EXT-X-DISCONTINUITY" => {
                     self.readers.retain_unordered(|reader| {
-                        match reader.try_send(SegmentMessage::Discontinuity()) {
-                            Ok(true) => true, // success, keep
-                            Ok(false) | Err(_) => {
-                                let _ = reader.close(); // close it
-                                false
-                            }
+                        if reader
+                            .try_send(SegmentMessage::Discontinuity())
+                            .is_ok_and(|v| v)
+                        {
+                            true // success, keep
+                        } else {
+                            let _ = reader.close(); // close it
+                            false
                         }
                     });
                 }
@@ -443,23 +438,19 @@ impl StreamScheduler {
                         .1
                         .trim_matches('"');
 
-                    match &self.init {
-                        Some(old_init) => {
-                            if new_init != old_init.0 {
-                                // TODO: log
-                            }
+                    if let Some(old_init) = &self.init {
+                        if new_init != old_init.0 {
+                            // TODO: log
                         }
-
-                        None => {
-                            let span = debug_span!("init segment");
-                            let (writer, reader) = Stream::new_stream();
-                            self.downloaders.send(ToDownloader::FetchURL {
-                                url: new_init.into(),
-                                writer,
-                                span: span.clone(),
-                            })?;
-                            self.init = Some((new_init.into(), reader))
-                        }
+                    } else {
+                        let span = debug_span!("init segment");
+                        let (writer, reader) = Stream::new_stream();
+                        self.downloaders.send(ToDownloader::FetchURL {
+                            url: new_init.into(),
+                            writer,
+                            span: span.clone(),
+                        })?;
+                        self.init = Some((new_init.into(), reader));
                     }
                 }
                 "#EXTINF" => {
@@ -484,14 +475,14 @@ impl StreamScheduler {
                             .0,
                     )
                     .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
-                    segment_time_ms += segment_len
+                    segment_time_ms += segment_len;
                 }
                 "#EXT-X-TWITCH-PREFETCH" | "#EXT-X-PREFETCH" => {
                     if sequence_number >= self.prefetch_tail {
                         self.prefetch_tail = sequence_number + 1;
 
                         self.dispatch_prefetch(value, sequence_number)
-                            .map_err(|_| SchedulerError::Dispatch)?;
+                            .map_err(|()| SchedulerError::Dispatch)?;
                     }
                     sequence_number += 1;
                 }
