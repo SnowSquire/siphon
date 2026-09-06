@@ -19,9 +19,8 @@ use tracing::span;
 use ureq::Agent;
 
 use crate::downloader::ToDownloader;
-use crate::downloader::{self};
-use crate::segment::SegmentReader;
-use crate::segment::SegmentStream;
+use crate::segment::Reader;
+use crate::segment::Stream;
 use crate::utils::RetainUnordered;
 use crate::utils::float_string_to_millis;
 use crate::utils::httpify_url;
@@ -29,13 +28,13 @@ use crate::utils::httpify_url;
 struct PrefetchSegment {
     expected_id: u64,
     url: Box<str>,
-    reader: SegmentReader,
+    reader: Reader,
 }
 #[derive(Clone, Debug)]
 pub struct Segment {
     pub timestamp_ms: u64,
     pub sequence_num: u64,
-    pub reader: SegmentReader,
+    pub reader: Reader,
 }
 
 #[derive(Debug)]
@@ -43,11 +42,11 @@ pub enum SegmentMessage {
     Segment(Segment),
     Prefetch {
         expected_sequence: u64,
-        reader: SegmentReader,
+        reader: Reader,
     },
     Discontinuity(),
     Init {
-        reader: SegmentReader,
+        reader: Reader,
     },
 }
 
@@ -89,11 +88,11 @@ enum SchedulerError {
 pub fn spawn_scheduler(
     agent: Agent,
     track_url: Box<str>,
-    tx: kanal::Sender<downloader::ToDownloader>,
-    srx: kanal::Receiver<kanal::Sender<SegmentMessage>>,
+    tx: Sender<ToDownloader>,
+    srx: Receiver<Sender<SegmentMessage>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
-        .name(format!("scheduler"))
+        .name("scheduler".to_owned())
         .spawn(move || StreamScheduler::new(agent, track_url, tx, srx).main())
         .expect("failed to spawn scheduler")
 }
@@ -106,7 +105,7 @@ struct StreamScheduler {
     receive: Receiver<Sender<SegmentMessage>>,
 
     /// hls fmp4 init header, doesn't reqire a discontinuity
-    init: Option<(String, SegmentReader)>,
+    init: Option<(String, Reader)>,
 
     segments: Vec<Segment>,
     prefetches: Vec<PrefetchSegment>,
@@ -119,7 +118,7 @@ struct StreamScheduler {
 }
 
 impl StreamScheduler {
-    pub fn new(
+    pub const fn new(
         agent: Agent,
         stream_url: Box<str>,
         downloaders: Sender<ToDownloader>,
@@ -131,7 +130,7 @@ impl StreamScheduler {
             downloaders,
             receive,
 
-            init: Option::None,
+            init: None,
 
             segments: Vec::new(),
             prefetches: Vec::new(),
@@ -167,7 +166,7 @@ impl StreamScheduler {
         self.segment_tail = 0;
         self.prefetch_tail = 0;
         self.last_segment_dur = Duration::from_secs(5);
-        self.init = Option::None;
+        self.init = None;
         self.segments.clear();
         self.prefetches.clear();
     }
@@ -289,7 +288,7 @@ impl StreamScheduler {
                 });
             }
             None => {
-                let (writer, segmentreader) = SegmentStream::new();
+                let (writer, segmentreader) = Stream::new_stream();
                 let segment = Segment {
                     sequence_num: expected_sequence,
                     reader: segmentreader,
@@ -332,7 +331,7 @@ impl StreamScheduler {
         };
         let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
 
-        let (writer, reader) = SegmentStream::new();
+        let (writer, reader) = Stream::new_stream();
         let url = httpify_url(url);
         self.downloaders
             .send(ToDownloader::FetchURL {
@@ -453,7 +452,7 @@ impl StreamScheduler {
 
                         None => {
                             let span = debug_span!("init segment");
-                            let (writer, reader) = SegmentStream::new();
+                            let (writer, reader) = Stream::new_stream();
                             self.downloaders.send(ToDownloader::FetchURL {
                                 url: new_init.into(),
                                 writer,

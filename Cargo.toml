@@ -2,6 +2,36 @@
 members = ["crates/twitch"]
 resolver = "2"
 
+[workspace.lints.rust]
+warnings = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2021_compatibility = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+
+
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+variant_size_differences = "warn"
+
+[workspace.lints.clippy]
+# Enable entire lint groups
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+str_to_string = "warn"
+
+
+missing_errors_doc = "allow" # Turn off another noisy pedantic lint
+# unreachable_pub = "warn"
+
 [profile.release]
 opt-level = 3
 codegen-units = 1

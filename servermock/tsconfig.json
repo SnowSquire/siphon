@@ -1,6 +1,5 @@
 {
-  "include": ["**/*.ts"],
-  "exclude": ["node_modules", "unused"],
+  "include": ["main.ts"],
   "compilerOptions": {
     "target": "esnext",
     "module": "ESNext",

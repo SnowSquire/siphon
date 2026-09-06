@@ -1,5 +1,4 @@
-#![allow(unused_variables)]
-
+use enumflags2::bitflags;
 mod constants;
 mod disk;
 mod downloader;
@@ -8,8 +7,6 @@ mod segment;
 mod tcp;
 mod utils;
 mod variant;
-
-use std::time::Instant;
 
 use clap::Parser;
 use mimalloc::MiMalloc;
@@ -52,13 +49,17 @@ struct Config {
     debug: bool,
 }
 
+#[bitflags]
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 enum Output {
     Disk,
+    Tcp,
+    // Rtsp
+    // Moq
 }
 
 fn main() {
-    let start = Instant::now();
-
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_thread_names(true)
@@ -98,16 +99,16 @@ fn main() {
     let (add_output, rx_outputs) = kanal::unbounded();
 
     let download_threads =
-        spawn_downloaders::<{ constants::DOWNLOAD_THREADS }>(&agent, rx_downloaders);
+        spawn_downloaders::<{ constants::DOWNLOAD_THREADS }>(&agent, &rx_downloaders);
     let scheduler_thread = spawn_scheduler(
-        agent.clone(),
+        agent,
         variants.first().unwrap().url.clone(),
         tx_downloaders,
         rx_outputs,
     );
 
     let disk_thread = spawn_disk_output(&add_output, stream_id);
-    let tcp_listener_thread = spawn_tcp_listener(add_output, start);
+    let tcp_listener_thread = spawn_tcp_listener(add_output);
 
     let _ = scheduler_thread.join();
     let _ = tcp_listener_thread.join();

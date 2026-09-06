@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::u64;
 
 mod reader;
 mod writer;
@@ -13,15 +11,15 @@ mod writer;
 use wait_on_address::AtomicWait;
 
 use crate::constants::CHUNK_SIZE;
-pub use crate::segment::reader::SeekableSegmentReader;
-pub use crate::segment::reader::SegmentReader;
-pub use crate::segment::writer::SegmentWriter;
+pub use crate::segment::reader::Reader;
+pub use crate::segment::reader::SeekableReader;
+pub use crate::segment::writer::Writer;
 
 #[derive(Debug)]
 #[repr(align(64))]
 pub struct Chunk {
     pub(super) base: usize,
-    pub(super) next: OnceLock<Arc<Chunk>>,
+    pub(super) next: OnceLock<Arc<Self>>,
     pub(super) data: UnsafeCell<[MaybeUninit<u8>; CHUNK_SIZE]>,
 }
 
@@ -31,11 +29,10 @@ impl Chunk {
 
         let uninit = unsafe { Arc::get_mut(&mut chunk).unwrap_unchecked() };
         let ptr = uninit.as_mut_ptr();
-        unsafe {
-            (&raw mut (*ptr).base).write(base);
-            (&raw mut (*ptr).next).write(OnceLock::new());
-            chunk.assume_init()
-        }
+
+        unsafe { (&raw mut (*ptr).base).write(base) }
+        unsafe { (&raw mut (*ptr).next).write(OnceLock::new()) }
+        unsafe { chunk.assume_init() }
     }
 }
 
@@ -57,11 +54,11 @@ unsafe impl Sync for Chunk {}
 // ---------------------------------------------------------------- handle --
 
 #[derive(Debug)]
-pub struct SegmentStream {
+pub struct Stream {
     inner: AtomicU64, // monotonic published frontier
 }
 
-impl SegmentStream {
+impl Stream {
     const CLOSED_BIT: u64 = 1 << 63;
     const LEN_MASK: u64 = !Self::CLOSED_BIT;
 
@@ -77,7 +74,7 @@ impl SegmentStream {
         let len = len.try_into().unwrap_or(u64::MAX);
         debug_assert!(len <= Self::LEN_MASK, "len exceeds 63-bit maximum");
         self.inner.store(
-            (len & Self::LEN_MASK) | ((closed as u64) * Self::CLOSED_BIT),
+            (len & Self::LEN_MASK) | (u64::from(closed) * Self::CLOSED_BIT),
             Ordering::Release,
         );
     }
@@ -95,15 +92,15 @@ impl SegmentStream {
         self.inner.wait(value);
     }
 
-    pub fn new() -> (SegmentWriter, SegmentReader) {
-        let handle = Arc::new(SegmentStream {
+    pub fn new_stream() -> (Writer, Reader) {
+        let handle = Arc::new(Self {
             inner: AtomicU64::new(0),
         });
 
         let head = Chunk::new(0);
 
-        let writer = SegmentWriter::new(head.clone(), handle.clone());
-        let reader = SegmentReader::new(head, handle);
+        let writer = Writer::new(head.clone(), handle.clone());
+        let reader = Reader::new(head, handle);
 
         (writer, reader)
     }

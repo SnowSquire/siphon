@@ -21,7 +21,7 @@ Twitch HLS live-stream client (Rust) + `servermock/` (Node mock Twitch edge serv
 
 Thread-per-module, wired through unbounded `kanal` channels in `main.rs`:
 
-- `scheduler.rs` — polls the HLS manifest, parses Twitch tags, dispatches segment/prefetch/init fetches to downloaders, fans out segment data to registered readers (tcp + disk). `variant.rs` resolves master playlists via Twitch GQL + usher. `downloader.rs` — 8 worker threads (`constants::DOWNLOAD_THREADS`); retries with backoff; optional `curl-download` feature swaps ureq for curl.
+- `scheduler.rs` — polls the HLS manifest, parses Twitch tags, dispatches segment/prefetch/init fetches to downloaders, fans out segment data to registered readers (tcp + disk). `variant.rs` resolves master playlists via Twitch GQL + usher. `downloader.rs` — 8 worker threads (`constants::DOWNLOAD_THREADS`); retries with backoff;
 - `segment/` — lock-free chunked stream (`CHUNK_SIZE = 770_048 = LCM(16384, 188)`; ureq buffers 16 KiB, TS packets are 188 B). Uses **heavy `unsafe`** (`MaybeUninit` data, manual Send/Sync, `wait_on_address::AtomicWait`). Invariants documented inline in writer.rs/reader.rs — preserve them.
 - `disk.rs` — appends to `manifest/{stream_id}.segs`, appends records to `manifest/{stream_id}.index` (magic `"OZENIKEN"`, version 3, little-endian). Restarts resume by replaying the index. Requires native FFmpeg (`ffmpeg-next`) at build/runtime.
 
@@ -36,4 +36,3 @@ Thread-per-module, wired through unbounded `kanal` channels in `main.rs`:
 - Colocated `jj` (Jujutsu) + git repo; git shows a detached HEAD. Work with `jj`, not git.
 - jj workflow: open a new commit at the start of a task; commit each step and `jj squash` back down into it before moving on; `jj undo` recovers mistakes.
 - Style: write efficient code — don't slow things down just to appease the borrow checker. Avoid adding dependencies; the project is lean at MVP stage and already somewhat bloated.
-- `index.hexpat` vs `disk.rs` were recently reconciled; keep them in sync.

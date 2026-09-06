@@ -17,7 +17,7 @@ use tracing::error;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::scheduler::SegmentMessage;
-use crate::segment::SeekableSegmentReader;
+use crate::segment::SeekableReader;
 
 const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
 const INDEX_VERSION: u64 = 3;
@@ -104,16 +104,14 @@ pub fn spawn_disk_output(
         .map_err(|source| DiskOutputError::RegisterReader { source })
         .expect("fuuuuuuuuuu");
 
-    let handle = thread::Builder::new()
+    thread::Builder::new()
         .name(format!("disk output stream id:{stream_id}"))
         .spawn(move || {
             if let Err(error) = run_disk_output(ouput_tx, stream_id) {
                 error!(?error, "disk output stopped");
             }
         })
-        .expect("failed to spawn disk output");
-
-    handle
+        .expect("failed to spawn disk output")
 }
 
 struct IndexHeader {
@@ -151,7 +149,7 @@ enum StreamRecord {
 
 fn write_record<W: Write>(file: W, record: StreamRecord) -> Result<(), DiskOutputError> {
     fn internal<W: Write>(mut file: W, record: StreamRecord) -> io::Result<()> {
-        Ok(match record {
+        let _: () = match record {
             StreamRecord::Discontinuity {
                 width,
                 height,
@@ -165,9 +163,9 @@ fn write_record<W: Write>(file: W, record: StreamRecord) -> Result<(), DiskOutpu
                 // (5) +2 bytes
                 file.write_all(&height.to_le_bytes())?;
                 // (7) +2 bytes
-                file.write_all(&rate_num.map(|v| v.get()).unwrap_or(0).to_le_bytes())?;
+                file.write_all(&rate_num.map_or(0, std::num::NonZero::get).to_le_bytes())?;
                 // (9) +2 bytes
-                file.write_all(&rate_denom.map(|v| v.get()).unwrap_or(0).to_le_bytes())?;
+                file.write_all(&rate_denom.map_or(0, std::num::NonZero::get).to_le_bytes())?;
             }
             StreamRecord::Init {
                 counter,
@@ -213,7 +211,8 @@ fn write_record<W: Write>(file: W, record: StreamRecord) -> Result<(), DiskOutpu
                 // (26) +1 bytes
                 file.write_all(&u8::from(segment.muted).to_le_bytes())?;
             }
-        })
+        };
+        Ok(())
     }
 
     internal(file, record).map_err(|err| DiskOutputError::WriteIndex { source: err })
@@ -237,12 +236,12 @@ fn read_record<R: Read>(mut reader: R) -> io::Result<Option<StreamRecord>> {
             let muted = read_bool(&mut reader)?;
 
             let segment = Segment {
+                hash,
                 sequence_number,
                 byte_offset,
                 byte_length,
                 timestamp_ms,
                 muted,
-                hash,
             };
 
             if tag[0] == 0 {
@@ -380,11 +379,7 @@ pub fn run_disk_output(
             source,
         })?;
 
-    let mut index_sequence = if !index_file.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        write_stream_index_header(&mut index_file, stream_id)
-            .map_err(|source| DiskOutputError::WriteIndexHeader { source })?;
-        0
-    } else {
+    let mut index_sequence = if index_file.metadata().is_ok_and(|m| m.len() > 0) {
         index_file.seek(io::SeekFrom::Start(0))?;
 
         let header = read_stream_index_header(&index_file)?;
@@ -411,11 +406,15 @@ pub fn run_disk_output(
                 StreamRecord::MpegTS(_) => {
                     is_fmp4 = false;
                 }
-                _ => (),
+                StreamRecord::Discontinuity { .. } => (),
             }
         }
         index_file.seek(io::SeekFrom::End(0))?;
         next_init_counter
+    } else {
+        write_stream_index_header(&mut index_file, stream_id)
+            .map_err(|source| DiskOutputError::WriteIndexHeader { source })?;
+        0
     };
 
     let mut probed_stream = false;
@@ -434,10 +433,10 @@ pub fn run_disk_output(
                     .map_err(|source| DiskOutputError::GetSegmentPosition { source })?;
 
                 let _span = debug_span!("writing file", sequence = segment.sequence_num).entered();
-                let ffmpeg_reader = if !probed_stream {
-                    Some(segment.reader.clone())
-                } else {
+                let ffmpeg_reader = if probed_stream {
                     None
+                } else {
+                    Some(segment.reader.clone())
                 };
 
                 while let Some(buf) = segment.reader.chunk() {
@@ -460,7 +459,7 @@ pub fn run_disk_output(
                 if let Some(reader) = ffmpeg_reader {
                     // TODO:  create a better seekable struct for the reader (put all the Arc<Chunk> in an Vec & wrap it with read + seek)
                     let input_ctx = ffmpeg::format::input_from_stream(
-                        StreamIo::from_read_seek(SeekableSegmentReader::new(reader)).unwrap(),
+                        StreamIo::from_read_seek(SeekableReader::new(reader)).unwrap(),
                         None,
                         None,
                     )
@@ -487,15 +486,16 @@ pub fn run_disk_output(
                     write_record(
                         &mut index_file,
                         StreamRecord::Discontinuity {
-                            width: width as u16,
-                            height: height as u16,
-                            rate_num: framerate.and_then(|f| NonZeroU16::new(f.numerator() as u16)),
+                            width: width.try_into().unwrap(),
+                            height: height.try_into().unwrap(),
+                            rate_num: framerate
+                                .and_then(|f| NonZeroU16::new(f.numerator().try_into().unwrap())),
                             rate_denom: framerate
-                                .and_then(|f| NonZeroU16::new(f.denominator() as u16)),
+                                .and_then(|f| NonZeroU16::new(f.denominator().try_into().unwrap())),
                         },
                     )?;
 
-                    probed_stream = true
+                    probed_stream = true;
                 }
                 let segment = Segment {
                     hash: hasher.digest128(),
@@ -506,20 +506,17 @@ pub fn run_disk_output(
                     muted: false,
                 };
 
-                match is_fmp4 {
-                    true => {
-                        write_record(&mut index_file, StreamRecord::FMp4(segment))?;
-                    }
-                    false => {
-                        write_record(&mut index_file, StreamRecord::MpegTS(segment))?;
-                    }
+                if is_fmp4 {
+                    write_record(&mut index_file, StreamRecord::FMp4(segment))?;
+                } else {
+                    write_record(&mut index_file, StreamRecord::MpegTS(segment))?;
                 }
                 index_file
                     .flush()
                     .map_err(|source| DiskOutputError::FlushIndexFile { source })?;
             }
             SegmentMessage::Prefetch { .. } => {}
-            SegmentMessage::Discontinuity {} => probed_stream = false,
+            SegmentMessage::Discontinuity() => probed_stream = false,
             SegmentMessage::Init { mut reader } => {
                 // we should do the ffmpeg probing on these
                 hasher.reset();

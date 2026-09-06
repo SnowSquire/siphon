@@ -5,29 +5,29 @@ use wait_on_address::AtomicWait;
 
 use crate::constants::CHUNK_SIZE;
 use crate::segment::Chunk;
-use crate::segment::SegmentStream;
+use crate::segment::Stream;
 
-pub struct SegmentWriter {
+pub struct Writer {
     tail: Arc<Chunk>,
-    handle: Arc<SegmentStream>,
+    handle: Arc<Stream>,
     written_len: usize,
 }
 
-impl Drop for SegmentWriter {
+impl Drop for Writer {
     fn drop(&mut self) {
         {
             self.handle.set(self.written_len, true);
             self.handle.inner.notify_all();
-        }; // never leave readers parked forever
+        };
     }
 }
 
-impl SegmentWriter {
+impl Writer {
     fn tail_offset(&self) -> usize {
         self.written_len - self.tail.base
     }
 
-    pub(super) fn new(tail: Arc<Chunk>, handle: Arc<SegmentStream>) -> Self {
+    pub(super) const fn new(tail: Arc<Chunk>, handle: Arc<Stream>) -> Self {
         Self {
             tail,
             handle,
@@ -55,7 +55,7 @@ impl SegmentWriter {
         self.written_len += n;
     }
 
-    pub fn publish(&mut self) {
+    pub fn publish(&self) {
         self.handle.set(self.written_len, false);
         self.handle.inner.notify_all();
     }

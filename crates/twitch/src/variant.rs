@@ -35,7 +35,7 @@ pub enum VariantPlaylistError {
     TokenJsonInvalid(#[from] sonic_rs::Error),
 
     #[error("broski")]
-    IDK,
+    Idk,
     #[error("channel field is missing from token")]
     ChannelMissing,
 
@@ -86,7 +86,7 @@ pub fn fetch_variant_playist(
             "platform": "site",
             "vodID": ""
         }
-    })).map_err(|_|VariantPlaylistError::IDK)?).map_err(VariantPlaylistError::AccessTokenRequest)?;
+    }))?).map_err(VariantPlaylistError::AccessTokenRequest)?;
     info!("sent pat req");
     let res = res
         .into_body()
@@ -137,10 +137,7 @@ pub fn fetch_variant_playist(
             ("browser_version", "151.0"),
             ("cdm", "wv"),
             ("enable_score", "true"), // enables SCORE attribute in EXT-X-STREAM-INF
-            (
-                "fast_bread",
-                low_latency.then_some("true").unwrap_or("false"),
-            ),
+            ("fast_bread", if low_latency { "true" } else { "false" }),
             ("include_unavailable", "true"),
             ("lang", "en"),
             ("os_name", "Windows"),
@@ -157,7 +154,6 @@ pub fn fetch_variant_playist(
             ("token", token_value),
             ("transcode_mode", "cbr_v1"),
             ("multigroup_video", "true"), // enables vertical  variants
-                                          // ("warp", low_latency.then_some("true").unwrap_or("false")),
         ]);
 
     manifest
@@ -210,19 +206,19 @@ pub enum VariantKind {
     Landscape,
     Portrait,
     Audio,
-    ERMTP, // ertmpaudio1, don't know how to access it as it's always unavailable
+    ERmtp, // ertmpaudio1, don't know how to access it as it's always unavailable
 }
 #[derive(Clone)]
 pub enum Codec {
     H265,
     H264,
-    AV1,
-    AAC,
+    Av1,
+    Aac,
 }
 
 fn parse_kind(variant_id: &str) -> VariantKind {
     match variant_id {
-        "ertmpaudio1" => VariantKind::ERMTP,
+        "ertmpaudio1" => VariantKind::ERmtp,
         s if s.ends_with("-portrait") => VariantKind::Portrait,
         "audio_only" => VariantKind::Audio,
         _ => VariantKind::Landscape,
@@ -254,8 +250,8 @@ fn parse_stream_inf(line: &str) -> Option<TempVariant<'_>> {
             "CODECS" => {
                 codec = match value.get(..4)? {
                     "avc1" => Some(Codec::H264),
-                    "mp4a" => Some(Codec::AAC),
-                    "av01" => Some(Codec::AV1),
+                    "mp4a" => Some(Codec::Aac),
+                    "av01" => Some(Codec::Av1),
                     "hvc1" | "hev1" => Some(Codec::H265),
                     _ => None,
                 }
@@ -301,7 +297,7 @@ fn scaled_nonzero(v: f32) -> Option<NonZeroU16> {
         .flatten()
 }
 fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
-    let mut stream_inf: Option<TempVariant> = None;
+    let mut stream_inf: Option<TempVariant<'_>> = None;
 
     let mut var_vec = Vec::with_capacity(2); // always at least 2 tracks (source and audio_only)
     let mut stream_id = None;
@@ -363,9 +359,9 @@ fn choose_client_id<'a>(
     }
 }
 
-pub fn get_variants<'a>(
+pub fn get_variants(
     agent: &Agent,
-    client_id: Option<&'a str>,
+    client_id: Option<&str>,
     auth_token: Option<&str>,
     channel: &str,
     low_latency: bool,
@@ -373,7 +369,7 @@ pub fn get_variants<'a>(
     let client_id = choose_client_id(agent, client_id, auth_token).unwrap();
 
     let master_manifest =
-        fetch_variant_playist(&agent, &channel, &client_id, auth_token, low_latency).unwrap();
+        fetch_variant_playist(agent, channel, &client_id, auth_token, low_latency).unwrap();
 
     parse_variant_playlist(&master_manifest)
 }

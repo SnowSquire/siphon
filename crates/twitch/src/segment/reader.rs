@@ -6,17 +6,17 @@ use std::sync::Arc;
 
 use crate::constants::CHUNK_SIZE;
 use crate::segment::Chunk;
-use crate::segment::SegmentStream;
+use crate::segment::Stream;
 
 #[derive(Clone, Debug)]
-pub struct SegmentReader {
+pub struct Reader {
     cursor: Arc<Chunk>,
     position: usize,
-    handle: Arc<SegmentStream>,
+    handle: Arc<Stream>,
 }
 
-impl SegmentReader {
-    pub(super) fn new(cursor: Arc<Chunk>, handle: Arc<SegmentStream>) -> Self {
+impl Reader {
+    pub(super) const fn new(cursor: Arc<Chunk>, handle: Arc<Stream>) -> Self {
         Self {
             cursor,
             handle,
@@ -24,7 +24,7 @@ impl SegmentReader {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn offset(&self) -> usize {
         debug_assert!(self.position >= self.cursor.base);
         self.position - self.cursor.base
@@ -37,7 +37,7 @@ impl SegmentReader {
                 let (published_len, closed) = self.handle.load();
                 if published_len > self.position {
                     return Some(published_len);
-                };
+                }
                 if closed {
                     return None;
                 }
@@ -74,28 +74,28 @@ impl SegmentReader {
         // SAFETY: the Acquire load synchronizes with the writer's Release
         // publication, so [0, end) is initialized. The chunk chain keeps
         // `cursor` alive for the returned borrow.
-        let slice =
-            unsafe { self.cursor.data.get().as_ref_unchecked()[offset..end].assume_init_ref() };
+        let slice = unsafe { self.cursor.data.get().as_ref_unchecked() };
+        let slice = unsafe { slice[offset..end].assume_init_ref() };
 
         // Implicit advance: consume the entire returned region.
         self.position = self.cursor.base + end;
 
-        return Some(slice);
+        Some(slice)
     }
 }
 
-pub struct SeekableSegmentReader {
+pub struct SeekableReader {
     chunks: Vec<Arc<Chunk>>,
     length: usize,
     position: usize,
 }
 
-impl SeekableSegmentReader {
+impl SeekableReader {
     fn chunk(&self, pos: usize) -> &Arc<Chunk> {
         &self.chunks[pos / CHUNK_SIZE]
     }
 
-    pub fn new(mut reader: SegmentReader) -> Self {
+    pub fn new(mut reader: Reader) -> Self {
         let mut vec = Vec::new();
 
         while let Some(size) = reader.wait_for_data() {
@@ -122,7 +122,7 @@ impl SeekableSegmentReader {
     }
 }
 
-impl Read for SeekableSegmentReader {
+impl Read for SeekableReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.position >= self.length {
             return Ok(0);
@@ -136,10 +136,9 @@ impl Read for SeekableSegmentReader {
         // SAFETY: bytes in `chunk.base..chunk.base + end` are initialized
         // (guaranteed by the caller's invariant that data is initialized up
         // to `end_pos`), and `offset < end` since position < end_pos.
-        let data: &[u8] = unsafe {
-            let ptr = chunk.data.get() as *const u8;
-            std::slice::from_raw_parts(ptr.add(offset), end - offset)
-        };
+        let ptr = unsafe { (chunk.data.get() as *const u8).add(offset) };
+
+        let data: &[u8] = unsafe { std::slice::from_raw_parts(ptr, end - offset) };
 
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
@@ -148,23 +147,41 @@ impl Read for SeekableSegmentReader {
     }
 }
 
-impl Seek for SeekableSegmentReader {
+impl Seek for SeekableReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let end = self.length as i64;
-        let new = match pos {
-            SeekFrom::Start(n) => n as i64,
-            SeekFrom::End(n) => end + n,
-            SeekFrom::Current(n) => self.position as i64 + n,
+        let current = self.position as u64; // Infallible: usize always fits in u64
+        let end = self.length as u64; // Infallible: usize always fits in u64
+
+        let new_pos = match pos {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(n) => current.checked_add_signed(n),
+            SeekFrom::End(n) => end.checked_add_signed(n),
         };
 
-        if new < 0 || new > end {
+        // Handles underflow (< 0) or overflow (> u64::MAX)
+        let new_pos = new_pos.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            )
+        })?;
+
+        // Guard bounds (if your reader doesn't support seeking past EOF)
+        if new_pos > end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "seek position out of bounds",
             ));
         }
 
-        self.position = new as usize;
-        Ok(self.position as u64)
+        // Safely downcast u64 back to usize (only relevant on 32-bit/16-bit targets)
+        self.position = usize::try_from(new_pos).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek position exceeds target architecture address space",
+            )
+        })?;
+
+        Ok(new_pos)
     }
 }
