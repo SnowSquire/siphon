@@ -208,68 +208,44 @@ bounds `new_pos <= length` before storing.
 
 ## 4. Issues found
 
-### 4.1 Unsound `assume_init_mut` in the writer (`downloader.rs:104`) — real bug
+### 4.1 `assume_init_mut` in the writer (`downloader.rs`) — documented reliance
 
 ```rust
-// SAFETY: `writable_slice` yields exclusively-owned uninitialized tail
-// bytes; turning them into `&mut [u8]` is valid for `read` to fill, ...
 let dst = unsafe { writer.writable_slice().assume_init_mut() };
 let written = reader.read(dst)?;
 ```
 
 `writable_slice()` returns `&mut [MaybeUninit<u8>]` whose bytes are *not*
-initialized (I7). `assume_init_mut()` requires the values to be initialized, so
-this is UB even before `read` is called: it forms a `&mut [u8]` over
-uninitialized memory, and it passes that reference to `Read::read`, whose
-contract requires a buffer of valid `u8`s. The comment's claim that this is
-"valid for `read` to fill" is incorrect.
+initialized (I7). `assume_init_mut()` requires initialized values, so forming
+a `&mut [u8]` here strictly exceeds the `Read::read` contract (which requires a
+buffer of valid `u8`s). It is sound in practice only because `read`
+implementations purely write the buffer without reading it first. The zero-copy
+alternative, `Read::read_buf` with `BorrowedBuf`, is still unstable
+(rust-lang/rust#78485, #117693) and this crate is stable-only; a stable
+zero-copy fill of `MaybeUninit` via `Read` does not exist (a staging copy
+would cost one memcpy per read). The maintainer accepts this reliance, and the
+source comment now states it plainly instead of claiming validity. If
+`read_buf` stabilizes, prefer it.
 
-Fix (stable since Rust 1.87) — read directly into the uninitialized buffer with
-`Read::read_buf`:
+### 4.2 Misleading comment: `Send`/`Sync` impls — fixed
 
-```rust
-use std::io::BorrowedBuf;
+The old comment claimed data was "published via Release on `next` /
+`written_len`". Data visibility is synchronized **only** by the
+`Release`/`Acquire` pair on `written_len` (the `Stream` atomic). `next` is a
+separate `OnceLock` whose release publishes the *link*, not the bytes. The link
+still needs to precede publication (I10), but it is not a publication edge for
+`data` bytes. The comments now state the two mechanisms separately.
 
-let mut buf = BorrowedBuf::from(writer.writable_slice());
-reader.read_buf(buf.unfilled())?;
-let written = buf.len();
-if written == 0 { break; }
-// SAFETY: `read_buf` initialized exactly the first `written` bytes.
-unsafe { writer.commit(written) };
-writer.publish();
-```
-
-(Alternatively, move the read loop into `Writer` so the module owns the
-`unsafe` and `MaybeUninit` handling.)
-
-### 4.2 Misleading comment: `segment.rs:59-60`
+### 4.3 Debug-only overflow guard: `Stream::set`
 
 ```rust
-// SAFETY: bytes in `data` are written by the single writer before being
-// published via Release on `next` / `written_len`, ...
-```
-
-Data visibility is synchronized **only** by the `Release`/`Acquire` pair on
-`written_len` (the `Stream` atomic). `next` is a separate `OnceLock` whose
-release publishes the *link*, not the bytes. The link still needs to precede
-publication (I10), but it is not a publication edge for `data` bytes. Reword to:
-"bytes in `data` are written by the single writer and published via the
-`Release` store of `written_len` (acquired by readers); the `next` link is
-published separately and always precedes `written_len` crossing the chunk
-boundary."
-
-### 4.3 Dead conversion / debug-only overflow guard: `Stream::set`
-
-```rust
-let len = len.try_into().unwrap_or(u64::MAX);
+let len = len as u64;
 debug_assert!(len <= Self::LEN_MASK, ...);
 ```
 
-`usize → u64` is infallible on every supported target, so `unwrap_or(u64::MAX)`
-is dead code and the 63-bit overflow is only caught by the `debug_assert!` in
-debug builds (silently masked by `& LEN_MASK` in release). This is unreachable
-in practice (it would require an 8 EiB stream) and is not a soundness issue,
-but the fallback is misleading dead code.
+The 63-bit overflow is only caught by the `debug_assert!` in debug builds
+(silently masked by `& LEN_MASK` in release). Unreachable in practice (it would
+require an 8 EiB stream) and not a soundness issue; noted here for completeness.
 
 ### 4.4 Note: `Reader` is `Clone`, not shared-state `Sync`
 
@@ -284,9 +260,12 @@ read cursor across threads.
 
 ## 5. Summary
 
-The `segment` module's own concurrency design is sound: single-writer ownership
+The `segment` module's concurrency design is sound: single-writer ownership
 (I1), a monotonic release/acquire frontier (I8/I9), and link-before-publish
-(I10) collectively rule out data races and out-of-bounds reads. The one genuine
-memory-safety defect is in the *caller* (`downloader.rs:104`), which violates
-the `MaybeUninit` contract when converting the writer's uninitialized buffer
-into `&mut [u8]`; that must be replaced with `read_buf`.
+(I10) collectively rule out data races and out-of-bounds reads. The misleading
+`Send`/`Sync` comment has been corrected (§4.2). The download loop keeps its
+zero-copy `assume_init_mut` fill, whose reliance on write-only `read` behavior
+is now documented honestly (§4.1). All source comments in `segment.rs`,
+`segment/writer.rs`, `segment/reader.rs`, and the download loop have been
+brought in line with the invariants above; `cargo check`, `cargo clippy`
+(deny-level pedantic/nursery), and `cargo +nightly fmt --check` all pass.

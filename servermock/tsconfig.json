@@ -1,5 +1,5 @@
 {
-  "include": ["main.ts"],
+  "include": ["main.ts", "hermesnotifier.ts"],
   "compilerOptions": {
     "target": "esnext",
     "module": "ESNext",

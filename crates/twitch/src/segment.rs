@@ -27,22 +27,24 @@ impl Chunk {
     pub fn new(base: usize) -> Arc<Self> {
         let mut chunk = Arc::<Self>::new_uninit();
 
-        // SAFETY: `chunk` was just created with refcount 1 and no aliases,
-        // so `get_mut` succeeds; `unwrap_unchecked` is valid for the same reason.
+        // SAFETY: `chunk` is fresh from `new_uninit`: strong count 1, weak
+        // count 0, so `get_mut` returns `Some`.
         let uninit = unsafe { Arc::get_mut(&mut chunk).unwrap_unchecked() };
         let ptr = uninit.as_mut_ptr();
 
-        // SAFETY: `ptr` points to a valid, exclusively-owned `Chunk` allocation;
-        // `addr_of_mut!` creates the field pointer without forming a reference.
+        // SAFETY: `ptr` is the exclusively-owned allocation; `addr_of_mut!`
+        // forms a field pointer without creating a reference.
         let base_ptr = unsafe { std::ptr::addr_of_mut!((*ptr).base) };
-        // SAFETY: initializes `base` exactly once before `assume_init`, single writer.
+        // SAFETY: writes `base` exactly once, before `assume_init`, with no
+        // other aliases in existence.
         unsafe { base_ptr.write(base) }
-        // SAFETY: same allocation; creates `next` field pointer without a reference.
+        // SAFETY: same allocation and aliasing state as `base_ptr`.
         let next_ptr = unsafe { std::ptr::addr_of_mut!((*ptr).next) };
-        // SAFETY: initializes `next` exactly once before `assume_init`.
+        // SAFETY: writes `next` exactly once, before `assume_init`.
         unsafe { next_ptr.write(OnceLock::new()) }
-        // SAFETY: `base` and `next` are now initialized; `data` is
-        // `MaybeUninit` and intentionally left uninitialized.
+        // SAFETY: `base` and `next` are initialized. `data` is
+        // `[MaybeUninit<u8>; CHUNK_SIZE]`, valid for any bit pattern, so it
+        // needs no initialization before `assume_init`.
         unsafe { chunk.assume_init() }
     }
 }
@@ -56,19 +58,22 @@ impl Drop for Chunk {
     }
 }
 
-// SAFETY: bytes in `data` are written by the single writer before being
-// published via Release on `next` / `written_len`, and only read after a
-// corresponding Acquire. No mutable aliasing by construction.
+// SAFETY: only the single `Writer` writes `data`, and only in its
+// exclusively-owned tail. Readers only read bytes below the published
+// frontier, ordered by the `Release` store / `Acquire` load of `written_len`.
+// `base` is immutable after init, so no mutable aliasing is possible.
 unsafe impl Send for Chunk {}
-// SAFETY: same as `Send` above; `data` is only accessed via raw pointers
-// synchronized by the `Stream` frontier, `base` is immutable after init.
+// SAFETY: as for `Send`; shared access is read-only on published bytes, and
+// the `next` link is set once before publication crosses the chunk boundary.
 unsafe impl Sync for Chunk {}
 
 // ---------------------------------------------------------------- handle --
 
 #[derive(Debug)]
 pub struct Stream {
-    inner: AtomicU64, // monotonic published frontier
+    /// Packed frontier: low 63 bits are the published length, the top bit is
+    /// `closed`. Monotonic; the writer `Release`-stores, readers `Acquire`-load.
+    inner: AtomicU64,
 }
 
 impl Stream {
@@ -92,7 +97,8 @@ impl Stream {
         );
     }
 
-    /// If the value is `value`, wait until woken up.
+    /// Blocks while the packed frontier still equals `value`; returns once a
+    /// publish or close changes it.
     ///
     /// This function might also return spuriously,
     /// without a corresponding wake operation.

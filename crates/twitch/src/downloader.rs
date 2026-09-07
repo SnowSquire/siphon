@@ -98,16 +98,17 @@ fn launch_download_ureq(
         .into_reader();
 
     loop {
-        // SAFETY: `writable_slice` yields exclusively-owned uninitialized tail
-        // bytes; turning them into `&mut [u8]` is valid for `read` to fill,
-        // and `commit` below marks exactly `written` bytes initialized.
+        // SAFETY: `writable_slice` lends the exclusively-owned uninitialized
+        // tail. Handing it to `read` as `&mut [u8]` relies on `read` only ever
+        // writing (never reading) the buffer; `commit` below marks exactly the
+        // `written` bytes initialized.
         let dst = unsafe { writer.writable_slice().assume_init_mut() };
         let written = reader.read(dst)?;
         if written == 0 {
             break;
         }
-        // SAFETY: `written` bytes were just initialized by `read` and lie
-        // within the slice returned above; single writer, no aliasing.
+        // SAFETY: `written` bytes were just written by `read` and lie within
+        // the slice above; single writer, no aliasing.
         unsafe { writer.commit(written) };
 
         writer.publish();

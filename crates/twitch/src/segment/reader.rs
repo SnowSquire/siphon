@@ -49,9 +49,10 @@ impl Reader {
     }
 
     pub fn chunk(&mut self) -> Option<&[u8]> {
-        // If the current chunk is exhausted, follow the chain. If the
-        // writer hasn't linked the next chunk yet, block until it
-        // publishes more data or closes the stream.
+        // An exhausted cursor means `published` lies past its end, which the
+        // writer only publishes after linking the next chunk, so the link
+        // below always exists. Otherwise `wait_for_data` already blocked until
+        // new data arrived or the stream closed.
         let (offset, published) = match (self.offset(), self.wait_for_data()?) {
             (CHUNK_SIZE, published) => {
                 self.cursor = self
@@ -71,9 +72,12 @@ impl Reader {
         let end = (published - self.cursor.base).min(CHUNK_SIZE);
         debug_assert!(offset < end);
 
-        // SAFETY: Acquire load syncs with writer Release; [0, end) initialized, chunk alive via chain.
+        // SAFETY: the `Acquire` load in `wait_for_data` syncs with the writer's
+        // `Release` publish, so `[0, end)` is initialized; `self.cursor` keeps
+        // the chunk alive.
         let slice = unsafe { self.cursor.data.get().as_ref_unchecked() };
-        // SAFETY: `offset..end` within initialized region per Acquire sync above.
+        // SAFETY: `offset < end`, so `[offset, end)` is inside the initialized
+        // region above.
         let slice = unsafe { slice[offset..end].assume_init_ref() };
 
         // Implicit advance: consume the entire returned region.
@@ -97,6 +101,9 @@ impl SeekableReader {
     pub fn new(mut reader: Reader) -> Self {
         let mut vec = Vec::new();
 
+        // Drain the stream: each observed length advances `position`, and every
+        // fully covered chunk is pushed in order, so `chunks[i].base` is
+        // `i * CHUNK_SIZE`.
         while let Some(size) = reader.wait_for_data() {
             reader.position = size;
             while (vec.len() + 1) * CHUNK_SIZE <= reader.position {
@@ -109,6 +116,8 @@ impl SeekableReader {
                 vec.push(std::mem::replace(&mut reader.cursor, next));
             }
         }
+        // Keep the partially filled tail; at an exact chunk boundary there is
+        // nothing left to keep.
         if reader.offset() != 0 {
             vec.push(reader.cursor);
         }
@@ -129,13 +138,16 @@ impl Read for SeekableReader {
 
         let chunk = self.chunk(self.position);
         let offset = self.position - chunk.base;
-        // Data is initialized up to `end_pos`, so clamp the slice end.
+        // Bytes below `length` are initialized (the stream is closed), so clamp
+        // the slice end to them.
         let end = (self.length - chunk.base).min(CHUNK_SIZE);
 
-        // SAFETY: `offset < end <= CHUNK_SIZE`, chunk alive in `self.chunks`, pointer in-bounds.
+        // SAFETY: the chunk is kept alive by `self.chunks`, and
+        // `offset < end <= CHUNK_SIZE`, so `ptr` is in bounds.
         let ptr = unsafe { (chunk.data.get() as *const u8).add(offset) };
 
-        // SAFETY: `ptr` points to `end - offset` initialized bytes per SeekableReader invariant.
+        // SAFETY: `[offset, end)` lies below `length`, hence initialized and
+        // immutable; `from_raw_parts` with length `end - offset` is valid.
         let data: &[u8] = unsafe { std::slice::from_raw_parts(ptr, end - offset) };
 
         let n = data.len().min(buf.len());

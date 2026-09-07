@@ -132,6 +132,7 @@ pub fn fetch_variant_playist(
             // ("acmb", acmb_b64.as_str()),
             ("allow_source", "true"),     // enables source variant
             ("allow_audio_only", "true"), // enables audio only variant
+            ("allow_spectre", "true"), // idk what this adds but twtich-dlp has it, to inspect, maybe the fabled ertmpaudio1?
             ("browser_family", "chrome"),
             ("browser_version", "151.0"),
             ("cdm", "wv"),

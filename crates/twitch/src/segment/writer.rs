@@ -35,13 +35,16 @@ impl Writer {
         }
     }
 
-    /// Writable remainder of the tail chunk, linking a fresh chunk if the
-    /// tail is full. Returns at most `CHUNK_SIZE` bytes per call.
+    /// Unwritten remainder of the tail chunk. Links a fresh chunk first if the
+    /// tail is full, so the returned slice is never empty. Bytes stay
+    /// uninitialized until `commit`.
     pub fn writable_slice(&mut self) -> &mut [MaybeUninit<u8>] {
         if self.tail_offset() == CHUNK_SIZE {
             self.link_new_chunk();
         }
-        // SAFETY: single writer with exclusive unpublished tail access; readers stay below `written_len`.
+        // SAFETY: the single writer owns the tail exclusively; readers never
+        // touch bytes at or above `written_len`, and `tail_offset()` is within
+        // the chunk, so the range is in bounds.
         unsafe { self.tail.data.get().as_mut_unchecked()[self.tail_offset()..].as_mut() }
     }
 
@@ -60,6 +63,8 @@ impl Writer {
         self.written_len += n;
     }
 
+    /// Publishes `written_len` with a `Release` store, making all prior byte
+    /// writes visible to readers that `Acquire`-load the frontier.
     pub fn publish(&self) {
         self.handle.set(self.written_len, false);
         self.handle.inner.notify_all();
@@ -73,8 +78,8 @@ impl Writer {
         );
 
         let next = Chunk::new(self.tail.base + CHUNK_SIZE);
-        // Link BEFORE publish (invariant 3): any reader that observes
-        // written_len past this chunk is guaranteed to find this link.
+        // Link BEFORE any publish past this chunk: once a reader observes
+        // `written_len` past this chunk's end, this link must already exist.
         self.tail
             .next
             .set(next.clone())
