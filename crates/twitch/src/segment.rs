@@ -84,7 +84,7 @@ impl Stream {
     }
 
     fn set(&self, len: usize, closed: bool) {
-        let len = len.try_into().unwrap_or(u64::MAX);
+        let len = len as u64;
         debug_assert!(len <= Self::LEN_MASK, "len exceeds 63-bit maximum");
         self.inner.store(
             (len & Self::LEN_MASK) | (u64::from(closed) * Self::CLOSED_BIT),
