@@ -5,11 +5,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch main.ts"
+    "dev": "node --watch main.ts",
+    "build:notifier": "cargo build --release --manifest-path notifier-rs/Cargo.toml && node -e \"require('node:fs').copyFileSync('notifier-rs/target/release/notifier_rs.dll', 'notifier-rs/notifier_rs.node')\""
   },
   "dependencies": {
-    "@node-rs/xxhash": "^1.7.7",
-    "toasted-notifier": "^10.1.0"
+    "@node-rs/xxhash": "^1.7.7"
   },
   "devDependencies": {
     "@types/node": "^26.0.0",

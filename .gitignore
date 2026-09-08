@@ -4,3 +4,4 @@ servermock/segments
 servermock/output
 servermock/node_modules
 servermock/unused/
+servermock/config.json

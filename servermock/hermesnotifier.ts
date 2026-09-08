@@ -1,21 +1,78 @@
-import toasted from "toasted-notifier";
+import { execFileSync, spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join } from "node:path";
+
+const require = createRequire(import.meta.url);
+// Built from notifier-rs/ (notify-rust wrapped with napi): see "build:notifier" in package.json.
+const rawNotify = require("./notifier-rs/notifier_rs.node") as {
+  notify: (
+    summary: string,
+    body: string,
+    // napi-rs maps Rust snake_case fields to camelCase on the JS side.
+    options?: {
+      subtitle?: string | null;
+      appId?: string | null;
+      sound?: boolean | null;
+      timeoutMs?: number | null;
+    },
+    onClick?: () => void,
+  ) => void;
+};
+
+type Config = {
+  channels: string[];
+  channelIds: number[];
+  notifyTitleChanges: boolean;
+  sound: boolean;
+};
+
+const config: Config = {
+  channels: [],
+  channelIds: [],
+  notifyTitleChanges: true,
+  sound: true,
+  ...JSON.parse(readFileSync(join(import.meta.dirname, "config.json"), "utf8")),
+};
+
+// Windows toasts must be attributed to a registered AUMID, otherwise the addon
+// falls back to the PowerShell identity ("Windows PowerShell" on the toast).
+// https://learn.microsoft.com/en-us/windows/apps/design/shell/tiles-and-notifications/send-local-toast-other-apps
+const AUMID = "twitch-siphon";
+
+function openStream(channel: string) {
+  spawn("explorer", [`https://twitch.tv/${channel}`], { detached: true, stdio: "ignore" }).unref();
+}
+
+function notify(summary: string, body: string, channel?: string) {
+  rawNotify.notify(
+    summary,
+    body,
+    { appId: AUMID, sound: config.sound },
+    channel === undefined ? undefined : () => openStream(channel),
+  );
+}
+
+if (process.platform === "win32") {
+  execFileSync(
+    "reg",
+    [
+      "add",
+      `HKCU\\Software\\Classes\\AppUserModelId\\${AUMID}`,
+      "/v",
+      "DisplayName",
+      "/t",
+      "REG_EXPAND_SZ",
+      "/d",
+      "Siphon",
+      "/f",
+    ],
+    { stdio: "ignore" },
+  );
+}
 const HERMES_URL = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 const GQL_URL = "https://gql.twitch.tv/gql";
 const CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
-
-toasted.notify(
-  {
-    title: "Notification Title",
-    message: "This is a message",
-
-    sound: true, // Only Notification Center or Windows Toasters
-    wait: true, // Wait on callback until user interacts, does not apply to Windows Toasters as they always wait or notify-send as it does not support the wait option
-  },
-  (error, response, metadata) => {
-    // Response is response from notification
-    // Metadata contains activationType, activationAt, deliveredAt
-  },
-);
 
 const USERS_BY_IDS_QUERY = `query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}`;
 
@@ -104,6 +161,11 @@ function NanoId(e = 21) {
     );
 }
 
+type WelcomeMessage = {
+  type: "welcome";
+  welcome: { keepaliveSec: number; recoveryUrl: string; sessionId: string };
+};
+
 type HermesMessage =
   | {
       type: "subscribe";
@@ -129,23 +191,36 @@ type HermesMessage =
       unsubscribeResponse?: { subscription: { id: string }; result: "ok" };
       timestamp: string;
     }
+  | WelcomeMessage
+  | { type: "keepalive" }
   | PubSubNotification;
 
 class Hermes {
   subscriptions: Map<SubscriptionId, Subscription>;
-  ws: WebSocket;
+  ws!: WebSocket;
   ready: Promise<void>;
+
+  private resolveReady!: () => void;
+  private recoveryUrl: string | null = null;
+  private keepaliveSec = 15;
+  private keepaliveTimer: ReturnType<typeof setTimeout> | null = null;
+  private welcomeTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentUrl = HERMES_URL;
+  private gotWelcome = false;
+  private failedRecoveries = 0;
+  private reconnectAttempt = 0;
 
   constructor() {
     this.subscriptions = new Map();
-    this.ws = new WebSocket(HERMES_URL);
-    this.ready = new Promise((resolve) => this.ws.addEventListener("open", () => resolve()));
-    this.ws.addEventListener("message", (event) => this.onMessage(event));
+    this.ready = new Promise((resolve) => {
+      this.resolveReady = resolve;
+    });
+    this.connect(HERMES_URL, false);
   }
 
   async subscribe<T extends Topic>(topic: T, callback: Subscription<T>["callback"]) {
-    console.log("awaiting ready");
     await this.ready;
+    await this.whenOpen();
     const message_id = NanoId();
     const subscription_id = NanoId();
     this.subscriptions.set(subscription_id as SubscriptionId, {
@@ -153,7 +228,7 @@ class Hermes {
       state: "pending",
       callback: callback as Subscription["callback"],
     });
-    console.log("sent");
+
     this.ws.send(
       JSON.stringify({
         type: "subscribe",
@@ -183,8 +258,109 @@ class Hermes {
     }
   }
 
+  private connect(url: string, resubscribe: boolean) {
+    this.currentUrl = url;
+    this.gotWelcome = false;
+    if (this.welcomeTimer !== null) clearTimeout(this.welcomeTimer);
+    const ws = new WebSocket(url);
+    this.ws = ws;
+    // if the server never sends a welcome, treat the connection as dead
+    this.welcomeTimer = setTimeout(() => ws.close(), 10_000);
+    ws.addEventListener("message", (event) => this.onMessage(event));
+    ws.addEventListener("close", () => this.onClose());
+    if (resubscribe) ws.addEventListener("open", () => this.resubscribeAll());
+  }
+
+  private whenOpen(): Promise<void> {
+    if (this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      this.ws.addEventListener("open", () => resolve(), { once: true });
+      this.ws.addEventListener("close", () => reject(new Error("hermes closed")), { once: true });
+    });
+  }
+
+  private onClose() {
+    if (this.keepaliveTimer !== null) {
+      clearTimeout(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+    if (this.gotWelcome) {
+      // The server keeps the session's subscription set alive, so reconnecting
+      // through the recovery URL restores subscriptions without resubscribing.
+      // A fresh welcome (with a new recovery URL) arrives after recovery.
+      this.failedRecoveries = 0;
+      this.scheduleReconnect(this.recoveryUrl, false);
+      return;
+    }
+    if (this.currentUrl !== HERMES_URL) {
+      // recovery attempt failed before welcome; try the recovery URL once more
+      // before giving up on the session entirely
+      this.failedRecoveries++;
+      if (this.failedRecoveries < 2) {
+        this.scheduleReconnect(this.recoveryUrl, false);
+        return;
+      }
+    }
+    // no session to recover: start fresh and replay all subscriptions
+    this.scheduleReconnect(HERMES_URL, true);
+  }
+
+  private scheduleReconnect(url: string | null, resubscribe: boolean) {
+    this.reconnectAttempt++;
+    const delay = Math.min(500 * 2 ** (this.reconnectAttempt - 1), 15_000);
+    console.log(
+      `[hermes] disconnected, ${resubscribe ? "reconnecting fresh" : "recovering session"} in ${delay}ms`,
+    );
+    setTimeout(() => this.connect(url ?? HERMES_URL, resubscribe), delay);
+  }
+
+  private resubscribeAll() {
+    for (const [id, subscription] of this.subscriptions) {
+      if (subscription.state === "pendingUnsubscribe") {
+        this.subscriptions.delete(id);
+        continue;
+      }
+      subscription.state = "pending";
+      this.ws.send(
+        JSON.stringify({
+          type: "subscribe",
+          id: NanoId(),
+          subscribe: {
+            id: id,
+            type: "pubsub",
+            pubsub: { topic: subscription.topic },
+          },
+          timestamp: new Date().toISOString(),
+        }),
+      );
+    }
+  }
+
+  private bumpKeepalive() {
+    if (this.keepaliveTimer !== null) clearTimeout(this.keepaliveTimer);
+    // consider the connection dead after two missed keepalives
+    this.keepaliveTimer = setTimeout(() => this.ws.close(), this.keepaliveSec * 2_000);
+  }
+
   private onMessage(event: MessageEvent) {
     const message = JSON.parse(String(event.data)) as HermesMessage;
+    if (message.type === "welcome") {
+      if (this.welcomeTimer !== null) {
+        clearTimeout(this.welcomeTimer);
+        this.welcomeTimer = null;
+      }
+      this.gotWelcome = true;
+      this.reconnectAttempt = 0;
+      this.keepaliveSec = message.welcome.keepaliveSec;
+      this.recoveryUrl = message.welcome.recoveryUrl;
+      this.bumpKeepalive();
+      this.resolveReady();
+      return;
+    }
+    if (message.type === "keepalive") {
+      this.bumpKeepalive();
+      return;
+    }
     if (message.type === "subscribeResponse") {
       const id = message.subscribeResponse?.subscription.id as SubscriptionId | undefined;
       if (id === undefined) return;
@@ -291,44 +467,8 @@ function toStreamInfo(user: RawUser): StreamInfo {
   };
 }
 
-interface ChannelArg {
-  id: null | number;
-  name: null | string;
-}
-
-function parseChannelArgs(args: string[]): ChannelArg[] {
-  const channels: ChannelArg[] = [];
-  for (const arg of args) {
-    const separator = arg.lastIndexOf(":");
-    if (separator !== -1) {
-      const name = arg.slice(0, separator);
-      const id = Number(arg.slice(separator + 1));
-      if (!name || !Number.isInteger(id)) {
-        throw new Error(`bad channel arg "${arg}", expected name:id`);
-      }
-      channels.push({ id, name });
-    } else if (/^\d+$/.test(arg)) {
-      channels.push({ id: Number(arg), name: null });
-    } else if (arg) {
-      channels.push({ id: null, name: arg });
-    } else {
-      throw new Error(`bad channel arg "${arg}", expected name:id, name, or id`);
-    }
-  }
-  return channels;
-}
-
 async function main() {
-  const channels = parseChannelArgs(process.argv.slice(2));
-  if (channels.length === 0) {
-    console.error("usage: node hermesnotifier.ts (name:id | name | id) ...");
-    return;
-  }
-
-  const users = await fetchUsers(
-    channels.filter((c): c is ChannelArg & { id: number } => c.id !== null).map((c) => c.id),
-    channels.filter((c): c is ChannelArg & { name: string } => c.name !== null).map((c) => c.name),
-  );
+  const users = await fetchUsers(config.channelIds, config.channels);
 
   const idToStreamInfo = new Map<number, StreamInfo>();
   for (const rawuser of users) {
@@ -348,6 +488,20 @@ async function main() {
       const pubsub = e.notification.pubsub;
       const info2 = idToStreamInfo.get(info.channelId);
       if (info2) {
+        const titleChanged = pubsub.status !== info2.streamTitle;
+        const gameChanged = (pubsub.game || null) !== info2.gameName;
+        if (config.notifyTitleChanges && !info2.live && (titleChanged || gameChanged)) {
+          const lines = [];
+          if (titleChanged) lines.push(`${pubsub.old_status} → ${pubsub.status}`);
+          if (gameChanged) lines.push(`${pubsub.old_game} → ${pubsub.game}`);
+          notify(
+            `[${info2.channelDisplayName}] ${[titleChanged && "title", gameChanged && "game"]
+              .filter(Boolean)
+              .join(" & ")} changed`,
+            lines.join("\n"),
+            info2.channelName,
+          );
+        }
         info2.streamTitle = pubsub.status;
         info2.gameName = pubsub.game || null;
         info2.gameId = pubsub.game_id || null;
@@ -359,8 +513,14 @@ async function main() {
     await hermes.subscribe(`video-playback-by-id.${info.channelId}`, async (e) => {
       if (e.notification.pubsub.type === "stream-up") {
         const [user] = await fetchUsers([info.channelId], []);
-        idToStreamInfo.set(info.channelId, toStreamInfo(user));
-        console.log(`[${info.channelName}] stream-up | ${info.streamTitle} (${info.gameName})`);
+        const fresh = toStreamInfo(user);
+        idToStreamInfo.set(info.channelId, fresh);
+        notify(
+          `[${fresh.channelDisplayName}] is LIVE`,
+          `${fresh.streamTitle}${fresh.gameName ? ` — ${fresh.gameName}` : ""}`,
+          fresh.channelName,
+        );
+        console.log(`[${info.channelName}] stream-up | ${fresh.streamTitle} (${fresh.gameName})`);
       } else if (e.notification.pubsub.type === "stream-down") {
         const info2 = idToStreamInfo.get(info.channelId);
         if (info2) info2.live = false;

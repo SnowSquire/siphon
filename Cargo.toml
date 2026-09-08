@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/twitch"]
+members = ["crates/twitch", "crates/tray/src-tauri"]
 resolver = "2"
 
 [workspace.lints.rust]
