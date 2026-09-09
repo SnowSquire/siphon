@@ -1,9 +1,9 @@
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::logging::log;
 
-pub fn notify(app: &AppHandle, summary: &str, body: &str, sound: bool) {
+pub fn notify<R: Runtime>(app: &AppHandle<R>, summary: &str, body: &str, sound: bool) {
     let app = app.clone();
     let (summary, body) = (summary.to_owned(), body.to_owned());
     // showing a toast can block; keep that off the hermes thread

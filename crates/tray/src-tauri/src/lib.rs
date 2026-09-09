@@ -1,6 +1,6 @@
 mod config;
-pub mod gql;
-pub mod hermes;
+mod gql;
+mod hermes;
 mod logging;
 mod notifier;
 
@@ -39,7 +39,11 @@ fn save_config(state: State<'_, AppState>, config: Config) -> Result<(), String>
         format!(
             "saving config: {} channel(s) {:?}, title_changes={}, sound={}",
             config.channels.len(),
-            config.channels.iter().map(Channel::login).collect::<Vec<_>>(),
+            config
+                .channels
+                .iter()
+                .map(Channel::login)
+                .collect::<Vec<_>>(),
             config.notify_title_changes,
             config.sound,
         ),
@@ -70,9 +74,10 @@ fn resolve_config(config: &mut Config) {
             for channel in &mut config.channels {
                 match channel.id() {
                     None => {
-                        if let Some(user) = users.iter().find(|user| {
-                            user.channel_name.eq_ignore_ascii_case(channel.login())
-                        }) {
+                        if let Some(user) = users
+                            .iter()
+                            .find(|user| user.channel_name.eq_ignore_ascii_case(channel.login()))
+                        {
                             log(
                                 "config",
                                 format!(
@@ -97,9 +102,9 @@ fn resolve_config(config: &mut Config) {
                         }
                     }
                     Some(id) => {
-                        if let Some(user) =
-                            users.iter().find(|user| user.channel_id == id)
-                        {
+                        if let Some(user) = users.iter().find(|user| user.channel_id == id) {
+                            // the login changed if the channel was renamed
+                            channel.set_login(user.channel_name.clone());
                             channel.set_display_name(user.channel_display_name.clone());
                         }
                     }
@@ -131,6 +136,10 @@ fn send_settings(settings_tx: &kanal::Sender<Settings>, config: &Config) -> Resu
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // a second instance was launched: focus the existing window instead
+            show_window(app);
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -147,7 +156,11 @@ pub fn run() {
                     "loaded config from {}: {} channel(s) {:?}, title_changes={}, sound={}",
                     config_path.display(),
                     config.channels.len(),
-                    config.channels.iter().map(Channel::login).collect::<Vec<_>>(),
+                    config
+                        .channels
+                        .iter()
+                        .map(Channel::login)
+                        .collect::<Vec<_>>(),
                     config.notify_title_changes,
                     config.sound,
                 ),

@@ -46,8 +46,21 @@ impl Channel {
         };
     }
 
+    pub fn set_login(&mut self, login: String) {
+        match self {
+            Channel::Resolved {
+                login: existing, ..
+            } => *existing = login,
+            Channel::Unresolved(existing) => *existing = login,
+        }
+    }
+
     pub fn set_display_name(&mut self, display_name: String) {
-        if let Channel::Resolved { display_name: existing, .. } = self {
+        if let Channel::Resolved {
+            display_name: existing,
+            ..
+        } = self
+        {
             *existing = Some(display_name);
         }
     }
@@ -63,7 +76,11 @@ impl Serialize for Channel {
             display_name: Option<&'a str>,
         }
         match self {
-            Channel::Resolved { login, id, display_name } => Repr {
+            Channel::Resolved {
+                login,
+                id,
+                display_name,
+            } => Repr {
                 login,
                 id: Some(*id),
                 display_name: display_name.as_deref(),
@@ -93,7 +110,11 @@ impl<'de> Deserialize<'de> for Channel {
             Login(String),
         }
         match Repr::deserialize(deserializer)? {
-            Repr::Object { login, id: Some(id), display_name } => Ok(Channel::Resolved {
+            Repr::Object {
+                login,
+                id: Some(id),
+                display_name,
+            } => Ok(Channel::Resolved {
                 login,
                 id,
                 display_name,

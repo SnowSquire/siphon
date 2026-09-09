@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use kanal::Receiver;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
@@ -19,8 +19,7 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const KEEPALIVE_GRACE_MULTIPLIER: u64 = 2;
 const TOPIC_PREFIXES: [&str; 2] = ["broadcast-settings-update", "video-playback-by-id"];
-const ID_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const ID_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// A channel as configured. `id` is None when gql has not resolved the login
 /// yet; those entries cannot be subscribed and show up as unresolved.
@@ -108,15 +107,15 @@ impl StreamInfo {
 
 type WsStream = MaybeTlsStream<TcpStream>;
 
-pub fn spawn(app: AppHandle, settings_rx: Receiver<Settings>) {
+pub fn spawn<R: Runtime>(app: AppHandle<R>, settings_rx: Receiver<Settings>) {
     std::thread::Builder::new()
         .name("hermes".into())
         .spawn(move || Session::new(app, settings_rx).main_loop())
         .expect("failed to spawn hermes thread");
 }
 
-struct Session {
-    app: AppHandle,
+struct Session<R: Runtime> {
+    app: AppHandle<R>,
     settings_rx: Receiver<Settings>,
     settings: Settings,
     infos: Vec<StreamInfo>,
@@ -135,8 +134,8 @@ struct Session {
     rng: u64,
 }
 
-impl Session {
-    fn new(app: AppHandle, settings_rx: Receiver<Settings>) -> Self {
+impl<R: Runtime> Session<R> {
+    fn new(app: AppHandle<R>, settings_rx: Receiver<Settings>) -> Self {
         let rng = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0x9E37_79B9_7F4A_7C15, |elapsed| {
@@ -226,13 +225,7 @@ impl Session {
                 settings
                     .channels
                     .iter()
-                    .map(|entry| {
-                        (
-                            entry.login.clone(),
-                            entry.id,
-                            entry.display_name.clone(),
-                        )
-                    })
+                    .map(|entry| (entry.login.clone(), entry.id, entry.display_name.clone()))
                     .collect::<Vec<_>>(),
                 settings.notify_title_changes,
                 settings.sound,
@@ -245,17 +238,19 @@ impl Session {
         }
         log("hermes", "settings changed, applying to the live session");
 
-        // removals: unsubscribe their topics and drop their state
+        // removals: unsubscribe their topics and drop their state; matching
+        // is done by channel id so logins changing (renames) don't disturb
+        // existing subscriptions
+        let configured_ids: Vec<u64> = self
+            .settings
+            .channels
+            .iter()
+            .filter_map(|entry| entry.id)
+            .collect();
         let removed_ids: Vec<u64> = self
             .infos
             .iter()
-            .filter(|info| {
-                !self
-                    .settings
-                    .channels
-                    .iter()
-                    .any(|entry| entry.login == info.user.channel_name)
-            })
+            .filter(|info| !configured_ids.contains(&info.user.channel_id))
             .map(|info| info.user.channel_id)
             .collect();
         for id in removed_ids {
@@ -264,36 +259,34 @@ impl Session {
                 self.unsubscribe_topic(&format!("{prefix}.{id}"));
             }
         }
-        self.infos.retain(|info| {
-            self.settings
-                .channels
-                .iter()
-                .any(|entry| entry.login == info.user.channel_name)
-        });
+        self.infos
+            .retain(|info| configured_ids.contains(&info.user.channel_id));
 
         // additions (subscribe immediately when the session is live) and
-        // display name refreshes for channels we already track
+        // login/display name refreshes for channels we already track
         let entries: Vec<(String, u64, Option<String>)> = self
             .settings
             .channels
             .iter()
-            .filter_map(|entry| {
-                Some((entry.login.clone(), entry.id?, entry.display_name.clone()))
-            })
+            .filter_map(|entry| Some((entry.login.clone(), entry.id?, entry.display_name.clone())))
             .collect();
         for (login, id, display_name) in entries {
             match self
                 .infos
                 .iter_mut()
-                .find(|info| info.user.channel_name == login)
+                .find(|info| info.user.channel_id == id)
             {
                 Some(info) => {
+                    info.user.channel_name = login;
                     if let Some(display_name) = display_name {
                         info.user.channel_display_name = display_name;
                     }
                 }
                 None => {
-                    log("hermes", format!("channel {login}({id}) added, subscribing"));
+                    log(
+                        "hermes",
+                        format!("channel {login}({id}) added, subscribing"),
+                    );
                     self.infos.push(StreamInfo::from_entry(
                         &ChannelEntry {
                             login: login.clone(),
@@ -366,7 +359,10 @@ impl Session {
         if unknown.is_empty() {
             return;
         }
-        log("hermes", format!("resolving unknown logins via gql: {unknown:?}"));
+        log(
+            "hermes",
+            format!("resolving unknown logins via gql: {unknown:?}"),
+        );
         match gql::fetch_users(&[], &unknown) {
             Ok(users) => {
                 for entry in &mut self.settings.channels {
@@ -382,6 +378,7 @@ impl Session {
                                 "hermes",
                                 format!("resolved {} to id {}", entry.login, user.channel_id),
                             );
+                            entry.login = user.channel_name.clone();
                             entry.id = Some(user.channel_id);
                             entry.display_name = Some(user.channel_display_name.clone());
                         }
@@ -408,17 +405,16 @@ impl Session {
             .settings
             .channels
             .iter()
-            .filter_map(|entry| {
-                Some((entry.login.clone(), entry.id?, entry.display_name.clone()))
-            })
+            .filter_map(|entry| Some((entry.login.clone(), entry.id?, entry.display_name.clone())))
             .collect();
         for (login, id, display_name) in entries {
             match self
                 .infos
                 .iter_mut()
-                .find(|info| info.user.channel_name == login)
+                .find(|info| info.user.channel_id == id)
             {
                 Some(info) => {
+                    info.user.channel_name = login;
                     if let Some(display_name) = display_name {
                         info.user.channel_display_name = display_name;
                     }
@@ -615,20 +611,14 @@ impl Session {
                 };
                 self.emit_status(None);
             }
-            Some("unsubscribeResponse") => log(
-                "hermes",
-                format!("unsubscribe response: {text}"),
-            ),
+            Some("unsubscribeResponse") => log("hermes", format!("unsubscribe response: {text}")),
             Some("notification") => self.handle_notification(&message),
             _ => log("hermes", format!("unknown message: {text}")),
         }
     }
 
     fn resubscribe_all(&mut self) {
-        log(
-            "hermes",
-            format!("replaying {} topic(s)", self.subs.len()),
-        );
+        log("hermes", format!("replaying {} topic(s)", self.subs.len()));
         let topics: Vec<(String, String)> = self
             .subs
             .iter()
@@ -683,8 +673,9 @@ impl Session {
 
     /// Sends subscribe messages for both topics of a channel.
     fn subscribe_channel(&mut self, channel_id: u64) {
-        let topics: Vec<String> =
-            TOPIC_PREFIXES.map(|prefix| format!("{prefix}.{channel_id}")).into();
+        let topics: Vec<String> = TOPIC_PREFIXES
+            .map(|prefix| format!("{prefix}.{channel_id}"))
+            .into();
         let pending: Vec<(String, String)> = self
             .subs
             .iter()
@@ -715,7 +706,8 @@ impl Session {
             "unsubscribe": { "id": subscription_id },
             "timestamp": crate::logging::timestamp(),
         }));
-        self.subs.retain(|_, subscription| subscription.topic != topic);
+        self.subs
+            .retain(|_, subscription| subscription.topic != topic);
     }
 
     fn send_subscribe(&mut self, subscription_id: &str, topic: &str) {
@@ -839,8 +831,7 @@ impl Session {
         match pubsub["type"].as_str() {
             Some("stream-up") => match gql::fetch_users(&[channel_id], &[]) {
                 Ok(users) => {
-                    let Some(user) =
-                        users.into_iter().find(|user| user.channel_id == channel_id)
+                    let Some(user) = users.into_iter().find(|user| user.channel_id == channel_id)
                     else {
                         return;
                     };
@@ -854,10 +845,7 @@ impl Session {
                         &body,
                         self.settings.sound,
                     );
-                    let info = StreamInfo {
-                        live: true,
-                        user,
-                    };
+                    let info = StreamInfo { live: true, user };
                     match self
                         .infos
                         .iter()
@@ -868,9 +856,7 @@ impl Session {
                     }
                     self.emit_status(None);
                 }
-                Err(error) => {
-                    log("hermes", format!("stream-up refresh failed: {error}"))
-                }
+                Err(error) => log("hermes", format!("stream-up refresh failed: {error}")),
             },
             Some("stream-down") => {
                 if let Some(info) = self
@@ -889,21 +875,22 @@ impl Session {
         self.subs
             .values()
             .find(|subscription| subscription.topic == topic)
-            .map_or(SubStatus::Pending, |subscription| match subscription.state {
-                SubState::Pending => SubStatus::Pending,
-                SubState::Subscribed => SubStatus::Connected,
-                SubState::Failed => SubStatus::Failed,
+            .map_or(SubStatus::Pending, |subscription| {
+                match subscription.state {
+                    SubState::Pending => SubStatus::Pending,
+                    SubState::Subscribed => SubStatus::Connected,
+                    SubState::Failed => SubStatus::Failed,
+                }
             })
     }
 
     fn emit_status(&self, error: Option<&str>) {
         let mut unresolved = Vec::new();
         for entry in &self.settings.channels {
-            if !self
-                .infos
-                .iter()
-                .any(|info| info.user.channel_name.eq_ignore_ascii_case(&entry.login))
-            {
+            let tracked = entry
+                .id
+                .is_some_and(|id| self.infos.iter().any(|info| info.user.channel_id == id));
+            if !tracked {
                 unresolved.push(entry.login.clone());
             }
         }
@@ -914,8 +901,10 @@ impl Session {
                 channel_id: info.user.channel_id,
                 login: info.user.channel_name.clone(),
                 display_name: info.user.channel_display_name.clone(),
-                title_status: self
-                    .sub_status_for(&format!("broadcast-settings-update.{}", info.user.channel_id)),
+                title_status: self.sub_status_for(&format!(
+                    "broadcast-settings-update.{}",
+                    info.user.channel_id
+                )),
                 live_status: self
                     .sub_status_for(&format!("video-playback-by-id.{}", info.user.channel_id)),
             })
@@ -930,7 +919,10 @@ impl Session {
             *state.status.lock().expect("status lock poisoned") = Some(status.clone());
         }
         if let Err(send_error) = self.app.emit("hermes-status", &status) {
-            log("hermes", format!("failed to emit status event: {send_error}"));
+            log(
+                "hermes",
+                format!("failed to emit status event: {send_error}"),
+            );
         }
     }
 

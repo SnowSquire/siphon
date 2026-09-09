@@ -133,7 +133,13 @@ export default function App() {
           <span />
         </div>
         <For each={config()?.channels ?? []}>
-          {(channel) => <ChannelRow login={channel.login} onRemove={removeChannel} />}
+          {(channel) => (
+            <ChannelRow
+              id={channel.id}
+              login={channel.login}
+              onRemove={removeChannel}
+            />
+          )}
         </For>
         <Show when={(config()?.channels.length ?? 0) === 0}>
           <p class="empty">No channels configured. Add a streamer below.</p>
@@ -173,15 +179,23 @@ export default function App() {
     </main>
   );
 
-  function ChannelRow(props: { login: string; onRemove: (login: string) => void }) {
+  function ChannelRow(props: {
+    id: number | null;
+    login: string;
+    onRemove: (login: string) => void;
+  }) {
+    // rows are matched by channel id so a rename (new login / display name
+    // arriving from gql) updates the existing row instead of orphaning it
+    const resolved = createMemo(() =>
+      props.id === null
+        ? undefined
+        : status.channels.find((channel) => channel.channelId === props.id),
+    );
     // display name priority: live status event > saved config > login
     const configName = createMemo(
       () =>
         config()?.channels.find((channel) => channel.login === props.login)
           ?.displayName ?? null,
-    );
-    const resolved = createMemo(
-      () => status.channels.find((channel) => channel.login === props.login),
     );
     const notFound = createMemo(() => status.unresolved.includes(props.login));
     return (
