@@ -6,8 +6,8 @@ use crate::logging::log;
 pub fn notify<R: Runtime>(app: &AppHandle<R>, summary: &str, body: &str, sound: bool) {
     let app = app.clone();
     let (summary, body) = (summary.to_owned(), body.to_owned());
-    // showing a toast can block; keep that off the hermes thread
-    std::thread::spawn(move || {
+    // showing a toast can block; keep that off the async runtime
+    tauri::async_runtime::spawn_blocking(move || {
         log(
             "notifier",
             format!("showing notification: {summary} | {body}"),

@@ -1,13 +1,12 @@
 use std::collections::HashMap;
-use std::net::TcpStream;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::{SinkExt, StreamExt};
 use kanal::Receiver;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 
 use crate::gql::{self, User};
 use crate::logging::log;
@@ -17,6 +16,7 @@ use crate::AppState;
 const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
+const SOCKET_POLL: Duration = Duration::from_millis(500);
 const KEEPALIVE_GRACE_MULTIPLIER: u64 = 2;
 const TOPIC_PREFIXES: [&str; 2] = ["broadcast-settings-update", "video-playback-by-id"];
 const ID_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -105,13 +105,13 @@ impl StreamInfo {
     }
 }
 
-type WsStream = MaybeTlsStream<TcpStream>;
+type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 pub fn spawn<R: Runtime>(app: AppHandle<R>, settings_rx: Receiver<Settings>) {
-    std::thread::Builder::new()
-        .name("hermes".into())
-        .spawn(move || Session::new(app, settings_rx).main_loop())
-        .expect("failed to spawn hermes thread");
+    tauri::async_runtime::spawn(async move {
+        let mut session = Session::new(app, settings_rx);
+        session.main_loop().await;
+    });
 }
 
 struct Session<R: Runtime> {
@@ -120,7 +120,7 @@ struct Session<R: Runtime> {
     settings: Settings,
     infos: Vec<StreamInfo>,
     subs: HashMap<String, Subscription>,
-    socket: Option<WebSocket<WsStream>>,
+    socket: Option<WsStream>,
     current_url: String,
     recovery_url: Option<String>,
     got_welcome: bool,
@@ -167,25 +167,25 @@ impl<R: Runtime> Session<R> {
         }
     }
 
-    fn main_loop(&mut self) {
+    async fn main_loop(&mut self) {
         log("hermes", "worker started");
         loop {
-            self.poll_settings();
+            self.poll_settings().await;
             if self.settings.channels.is_empty() {
                 // nothing to watch; a session with no active subscriptions
                 // would just time out, so stay disconnected until the config
                 // gains channels
-                self.close_socket();
-                std::thread::sleep(Duration::from_millis(500));
+                self.close_socket().await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
             if self.socket.is_some() {
-                self.pump_socket();
+                self.pump_socket().await;
             } else if Instant::now() >= self.reconnect_at {
-                self.establish_connection();
+                self.establish_connection().await;
             }
             if self.socket.is_none() {
-                std::thread::sleep(Duration::from_millis(100));
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -193,7 +193,7 @@ impl<R: Runtime> Session<R> {
     /// Applies the newest settings received from the ui. Additions are
     /// subscribed on the current connection and removals unsubscribed,
     /// without ever restarting the websocket session.
-    fn poll_settings(&mut self) {
+    async fn poll_settings(&mut self) {
         let mut latest: Option<Settings> = None;
         while let Ok(Some(settings)) = self.settings_rx.try_recv() {
             latest = Some(settings);
@@ -209,17 +209,19 @@ impl<R: Runtime> Session<R> {
                     .iter()
                     .map(|entry| (
                         entry.login.as_str(),
-                        entry.id.map_or("unresolved".into(), |id| id.to_string())
+                        entry
+                            .id
+                            .map_or_else(|| "unresolved".into(), |id| id.to_string(),)
                     ))
                     .collect::<Vec<_>>(),
                 settings.notify_title_changes,
                 settings.sound,
             ),
         );
-        self.apply_settings(settings);
+        self.apply_settings(settings).await;
     }
 
-    fn apply_settings(&mut self, settings: Settings) {
+    async fn apply_settings(&mut self, settings: Settings) {
         let signature = |settings: &Settings| {
             (
                 settings
@@ -256,7 +258,7 @@ impl<R: Runtime> Session<R> {
         for id in removed_ids {
             log("hermes", format!("channel {id} removed, unsubscribing"));
             for prefix in TOPIC_PREFIXES {
-                self.unsubscribe_topic(&format!("{prefix}.{id}"));
+                self.unsubscribe_topic(&format!("{prefix}.{id}")).await;
             }
         }
         self.infos
@@ -271,42 +273,39 @@ impl<R: Runtime> Session<R> {
             .filter_map(|entry| Some((entry.login.clone(), entry.id?, entry.display_name.clone())))
             .collect();
         for (login, id, display_name) in entries {
-            match self
+            if let Some(info) = self
                 .infos
                 .iter_mut()
                 .find(|info| info.user.channel_id == id)
             {
-                Some(info) => {
-                    info.user.channel_name = login;
-                    if let Some(display_name) = display_name {
-                        info.user.channel_display_name = display_name;
-                    }
+                info.user.channel_name = login;
+                if let Some(display_name) = display_name {
+                    info.user.channel_display_name = display_name;
                 }
-                None => {
-                    log(
-                        "hermes",
-                        format!("channel {login}({id}) added, subscribing"),
-                    );
-                    self.infos.push(StreamInfo::from_entry(
-                        &ChannelEntry {
-                            login: login.clone(),
-                            id: Some(id),
-                            display_name: display_name.clone(),
-                        },
-                        id,
-                    ));
-                    self.create_subs(id);
-                    if self.got_welcome {
-                        self.subscribe_channel(id);
-                    }
+            } else {
+                log(
+                    "hermes",
+                    format!("channel {login}({id}) added, subscribing"),
+                );
+                self.infos.push(StreamInfo::from_entry(
+                    &ChannelEntry {
+                        login: login.clone(),
+                        id: Some(id),
+                        display_name: display_name.clone(),
+                    },
+                    id,
+                ));
+                self.create_subs(id);
+                if self.got_welcome {
+                    self.subscribe_channel(id).await;
                 }
             }
         }
         self.emit_status(None);
     }
 
-    fn establish_connection(&mut self) {
-        self.resolve_unknown_entries();
+    async fn establish_connection(&mut self) {
+        self.resolve_unknown_entries().await;
         self.sync_infos_and_subs();
         if self.infos.is_empty() {
             // connecting with no active subscriptions would just time out
@@ -326,10 +325,9 @@ impl<R: Runtime> Session<R> {
             return;
         }
         log("hermes", format!("connecting to {}", self.current_url));
-        match connect(self.current_url.as_str()) {
+        match connect_async(self.current_url.as_str()).await {
             Ok((socket, _)) => {
                 log("hermes", "connected, waiting for welcome");
-                set_read_timeout(&socket);
                 self.socket = Some(socket);
                 self.got_welcome = false;
                 self.last_message = Instant::now();
@@ -340,7 +338,7 @@ impl<R: Runtime> Session<R> {
                     "hermes",
                     format!("connect to {} failed: {error}", self.current_url),
                 );
-                self.on_disconnect();
+                self.on_disconnect().await;
             }
         }
     }
@@ -348,7 +346,7 @@ impl<R: Runtime> Session<R> {
     /// gql-resolves configured logins that the config file carries without an
     /// id (legacy entries or ones the ui could not resolve when saving). The
     /// resolution only lives in memory here; the next save persists it.
-    fn resolve_unknown_entries(&mut self) {
+    async fn resolve_unknown_entries(&mut self) {
         let unknown: Vec<String> = self
             .settings
             .channels
@@ -363,7 +361,7 @@ impl<R: Runtime> Session<R> {
             "hermes",
             format!("resolving unknown logins via gql: {unknown:?}"),
         );
-        match gql::fetch_users(&[], &unknown) {
+        match gql::fetch_users(&[], &unknown).await {
             Ok(users) => {
                 for entry in &mut self.settings.channels {
                     if entry.id.is_some() {
@@ -408,28 +406,25 @@ impl<R: Runtime> Session<R> {
             .filter_map(|entry| Some((entry.login.clone(), entry.id?, entry.display_name.clone())))
             .collect();
         for (login, id, display_name) in entries {
-            match self
+            if let Some(info) = self
                 .infos
                 .iter_mut()
                 .find(|info| info.user.channel_id == id)
             {
-                Some(info) => {
-                    info.user.channel_name = login;
-                    if let Some(display_name) = display_name {
-                        info.user.channel_display_name = display_name;
-                    }
+                info.user.channel_name = login;
+                if let Some(display_name) = display_name {
+                    info.user.channel_display_name = display_name;
                 }
-                None => {
-                    log("hermes", format!("tracking {login}({id})"));
-                    self.infos.push(StreamInfo::from_entry(
-                        &ChannelEntry {
-                            login: login.clone(),
-                            id: Some(id),
-                            display_name: display_name.clone(),
-                        },
-                        id,
-                    ));
-                }
+            } else {
+                log("hermes", format!("tracking {login}({id})"));
+                self.infos.push(StreamInfo::from_entry(
+                    &ChannelEntry {
+                        login: login.clone(),
+                        id: Some(id),
+                        display_name,
+                    },
+                    id,
+                ));
             }
             self.create_subs(id);
         }
@@ -438,8 +433,8 @@ impl<R: Runtime> Session<R> {
     /// Mirrors the TS client's onClose: prefer session recovery via the
     /// server-persisted subscription set, retry recovery once, otherwise
     /// reconnect fresh and replay all subscriptions locally.
-    fn on_disconnect(&mut self) {
-        self.close_socket();
+    async fn on_disconnect(&mut self) {
+        self.close_socket().await;
         self.welcome_deadline = None;
         if self.got_welcome {
             // The server keeps the session's subscription set alive, so
@@ -490,54 +485,55 @@ impl<R: Runtime> Session<R> {
         self.reconnect_at = Instant::now() + delay;
     }
 
-    fn close_socket(&mut self) {
+    async fn close_socket(&mut self) {
         if let Some(mut socket) = self.socket.take() {
-            let _ = socket.close(None);
-            let _ = socket.flush();
+            let _ = socket.close(None).await;
         }
     }
 
-    fn pump_socket(&mut self) {
+    async fn pump_socket(&mut self) {
         let now = Instant::now();
         if let Some(deadline) = self.welcome_deadline {
             if now >= deadline {
                 // the server never sent a welcome; treat the connection as dead
                 log("hermes", "no welcome within 10s, dropping connection");
-                self.on_disconnect();
+                self.on_disconnect().await;
                 return;
             }
         }
         let Some(socket) = self.socket.as_mut() else {
             return;
         };
-        match socket.read() {
-            Ok(Message::Text(text)) => self.handle_message(&text),
-            Ok(Message::Binary(data)) => {
-                if let Ok(text) = std::str::from_utf8(&data) {
-                    self.handle_message(text);
+        let message = tokio::time::timeout(SOCKET_POLL, socket.next()).await;
+        match message {
+            Ok(Some(Ok(message))) => match message {
+                Message::Text(text) => self.handle_message(&text).await,
+                Message::Binary(data) => {
+                    if let Ok(text) = std::str::from_utf8(&data) {
+                        self.handle_message(text).await;
+                    }
                 }
-            }
-            Ok(Message::Close(_)) => {
-                log("hermes", "server sent close frame");
-                self.on_disconnect();
-            }
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                // flushes pong replies queued while reading pings
-                if socket.flush().is_err() {
-                    self.on_disconnect();
-                    return;
+                Message::Close(_) => {
+                    log("hermes", "server sent close frame");
+                    self.on_disconnect().await;
                 }
+                _ => {}
+            },
+            Ok(Some(Err(error))) => {
+                log("hermes", format!("read error: {error}"));
+                self.on_disconnect().await;
+            }
+            Ok(None) => {
+                log("hermes", "connection closed");
+                self.on_disconnect().await;
+            }
+            Err(_) => {
+                // idle tick; consider the connection dead after two missed
+                // keepalives
                 if self.got_welcome
                     && now.duration_since(self.last_message)
                         > Duration::from_secs(self.keepalive_secs * KEEPALIVE_GRACE_MULTIPLIER)
                 {
-                    // consider the connection dead after two missed keepalives
                     log(
                         "hermes",
                         format!(
@@ -545,17 +541,13 @@ impl<R: Runtime> Session<R> {
                             self.keepalive_secs * KEEPALIVE_GRACE_MULTIPLIER
                         ),
                     );
-                    self.on_disconnect();
+                    self.on_disconnect().await;
                 }
-            }
-            Err(error) => {
-                log("hermes", format!("read error: {error}"));
-                self.on_disconnect();
             }
         }
     }
 
-    fn handle_message(&mut self, text: &str) {
+    async fn handle_message(&mut self, text: &str) {
         let Ok(message) = serde_json::from_str::<Value>(text) else {
             log("hermes", format!("unparseable message: {text}"));
             return;
@@ -578,11 +570,11 @@ impl<R: Runtime> Session<R> {
                 self.emit_status(None);
                 if self.resubscribe_on_welcome {
                     self.resubscribe_on_welcome = false;
-                    self.resubscribe_all();
+                    self.resubscribe_all().await;
                 } else {
                     // recovering: the server restored its own subscriptions;
                     // only topics subscribed while disconnected need sending
-                    self.send_pending();
+                    self.send_pending().await;
                 }
             }
             Some("keepalive") => {}
@@ -612,12 +604,12 @@ impl<R: Runtime> Session<R> {
                 self.emit_status(None);
             }
             Some("unsubscribeResponse") => log("hermes", format!("unsubscribe response: {text}")),
-            Some("notification") => self.handle_notification(&message),
+            Some("notification") => self.handle_notification(&message).await,
             _ => log("hermes", format!("unknown message: {text}")),
         }
     }
 
-    fn resubscribe_all(&mut self) {
+    async fn resubscribe_all(&mut self) {
         log("hermes", format!("replaying {} topic(s)", self.subs.len()));
         let topics: Vec<(String, String)> = self
             .subs
@@ -628,14 +620,14 @@ impl<R: Runtime> Session<R> {
             if let Some(subscription) = self.subs.get_mut(&id) {
                 subscription.state = SubState::Pending;
             }
-            self.send_subscribe(&id, &topic);
+            self.send_subscribe(&id, &topic).await;
         }
     }
 
     /// Sends subscribe messages for topics that are still pending, used after
     /// a session recovery where the server already restored everything it
     /// knew about.
-    fn send_pending(&mut self) {
+    async fn send_pending(&mut self) {
         let pending: Vec<(String, String)> = self
             .subs
             .iter()
@@ -649,7 +641,7 @@ impl<R: Runtime> Session<R> {
             );
         }
         for (id, topic) in pending {
-            self.send_subscribe(&id, &topic);
+            self.send_subscribe(&id, &topic).await;
         }
     }
 
@@ -672,7 +664,7 @@ impl<R: Runtime> Session<R> {
     }
 
     /// Sends subscribe messages for both topics of a channel.
-    fn subscribe_channel(&mut self, channel_id: u64) {
+    async fn subscribe_channel(&mut self, channel_id: u64) {
         let topics: Vec<String> = TOPIC_PREFIXES
             .map(|prefix| format!("{prefix}.{channel_id}"))
             .into();
@@ -685,11 +677,11 @@ impl<R: Runtime> Session<R> {
             .map(|(id, subscription)| (id.clone(), subscription.topic.clone()))
             .collect();
         for (id, topic) in pending {
-            self.send_subscribe(&id, &topic);
+            self.send_subscribe(&id, &topic).await;
         }
     }
 
-    fn unsubscribe_topic(&mut self, topic: &str) {
+    async fn unsubscribe_topic(&mut self, topic: &str) {
         let Some(subscription_id) = self
             .subs
             .iter()
@@ -705,12 +697,13 @@ impl<R: Runtime> Session<R> {
             "id": id,
             "unsubscribe": { "id": subscription_id },
             "timestamp": crate::logging::timestamp(),
-        }));
+        }))
+        .await;
         self.subs
             .retain(|_, subscription| subscription.topic != topic);
     }
 
-    fn send_subscribe(&mut self, subscription_id: &str, topic: &str) {
+    async fn send_subscribe(&mut self, subscription_id: &str, topic: &str) {
         log("hermes", format!("subscribing to {topic}"));
         let id = self.message_id();
         self.send_message(&json!({
@@ -722,20 +715,21 @@ impl<R: Runtime> Session<R> {
                 "pubsub": { "topic": topic },
             },
             "timestamp": crate::logging::timestamp(),
-        }));
+        }))
+        .await;
     }
 
-    fn send_message(&mut self, message: &Value) {
+    async fn send_message(&mut self, message: &Value) {
         let Some(socket) = self.socket.as_mut() else {
             return;
         };
-        if let Err(error) = socket.send(Message::text(message.to_string())) {
+        if let Err(error) = socket.send(Message::text(message.to_string())).await {
             log("hermes", format!("send failed: {error}"));
-            self.on_disconnect();
+            self.on_disconnect().await;
         }
     }
 
-    fn handle_notification(&mut self, message: &Value) {
+    async fn handle_notification(&mut self, message: &Value) {
         let Some(subscription_id) = message["notification"]["subscription"]["id"].as_str() else {
             return;
         };
@@ -777,7 +771,7 @@ impl<R: Runtime> Session<R> {
         if topic.0 {
             self.on_broadcast_settings_update(channel_id, &pubsub);
         } else {
-            self.on_video_playback(channel_id, &pubsub);
+            self.on_video_playback(channel_id, &pubsub).await;
         }
     }
 
@@ -827,9 +821,9 @@ impl<R: Runtime> Session<R> {
         info.user.game_id = pubsub["game_id"].as_u64();
     }
 
-    fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
+    async fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
         match pubsub["type"].as_str() {
-            Some("stream-up") => match gql::fetch_users(&[channel_id], &[]) {
+            Some("stream-up") => match gql::fetch_users(&[channel_id], &[]).await {
                 Ok(users) => {
                     let Some(user) = users.into_iter().find(|user| user.channel_id == channel_id)
                     else {
@@ -939,18 +933,5 @@ impl<R: Runtime> Session<R> {
             id.push(ID_ALPHABET[(self.rng & 63) as usize] as char);
         }
         id
-    }
-}
-
-fn set_read_timeout(socket: &WebSocket<WsStream>) {
-    let timeout = Some(Duration::from_millis(500));
-    match socket.get_ref() {
-        MaybeTlsStream::Plain(stream) => {
-            let _ = stream.set_read_timeout(timeout);
-        }
-        MaybeTlsStream::Rustls(stream) => {
-            let _ = stream.sock.set_read_timeout(timeout);
-        }
-        _ => {}
     }
 }

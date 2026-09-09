@@ -1,5 +1,13 @@
+use std::error::Error as StdError;
 use std::time::Duration;
 
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::header::CONTENT_TYPE;
+use hyper::{Method, Request};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use serde_json::{json, Value};
 
 use crate::logging::log;
@@ -10,6 +18,8 @@ const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 
 const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
 const USERS_BY_LOGINS_QUERY: &str = "query UsersByLogins($logins:[String!]){users(logins:$logins){id login displayName broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
+
+pub type Error = Box<dyn StdError + Send + Sync>;
 
 // Mirrors the original hermesnotifier.ts `StreamInfo`: every field the TS
 // client tracked is kept here even though only a subset is read.
@@ -28,7 +38,7 @@ pub struct User {
     pub live: bool,
 }
 
-pub fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, ureq::Error> {
+pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Error> {
     let mut operations = Vec::with_capacity(2);
     if !ids.is_empty() {
         operations.push(json!({
@@ -47,21 +57,32 @@ pub fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, ureq::Er
         }));
     }
 
-    log(
-        "gql",
-        format!("request: ids={ids:?} logins={logins:?} ({GQL_URL})"),
-    );
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(GQL_TIMEOUT))
+    log("gql", format!("request: ids={ids:?} logins={logins:?}"));
+    let payload = serde_json::to_vec(&Value::Array(operations))?;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(
+        HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
             .build(),
     );
-    let response: Value = agent
-        .post(GQL_URL)
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(GQL_URL)
+        .header(CONTENT_TYPE, "application/json")
         .header("Client-ID", CLIENT_ID)
-        .send_json(Value::Array(operations))?
-        .body_mut()
-        .read_json()?;
+        .body(Full::new(Bytes::from(payload)))?;
+    let response = tokio::time::timeout(GQL_TIMEOUT, client.request(request))
+        .await
+        .map_err(|_| "gql request timed out")??;
+    if !response.status().is_success() {
+        return Err(format!("gql returned status {}", response.status()).into());
+    }
+    let body = tokio::time::timeout(GQL_TIMEOUT, response.into_body().collect())
+        .await
+        .map_err(|_| "gql body read timed out")??
+        .to_bytes();
+    let response: Value = serde_json::from_slice(&body)?;
     log("gql", format!("response: {response}"));
 
     let Some(responses) = response.as_array() else {

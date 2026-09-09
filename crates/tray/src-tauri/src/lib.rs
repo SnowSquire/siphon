@@ -22,17 +22,17 @@ struct AppState {
 }
 
 #[tauri::command]
-fn get_config(state: State<'_, AppState>) -> Config {
-    Config::load(&state.config_path)
+async fn get_config(state: State<'_, AppState>) -> Result<Config, ()> {
+    Ok(Config::load(&state.config_path))
 }
 
 #[tauri::command]
-fn get_status(state: State<'_, AppState>) -> Option<hermes::StatusEvent> {
-    state.status.lock().expect("status lock poisoned").clone()
+async fn get_status(state: State<'_, AppState>) -> Result<Option<hermes::StatusEvent>, ()> {
+    Ok(state.status.lock().expect("status lock poisoned").clone())
 }
 
-#[tauri::command(async)]
-fn save_config(state: State<'_, AppState>, config: Config) -> Result<(), String> {
+#[tauri::command]
+async fn save_config(state: State<'_, AppState>, config: Config) -> Result<(), String> {
     let mut config = config;
     log(
         "config",
@@ -48,7 +48,7 @@ fn save_config(state: State<'_, AppState>, config: Config) -> Result<(), String>
             config.sound,
         ),
     );
-    resolve_config(&mut config);
+    resolve_config(&mut config).await;
     config
         .save(&state.config_path)
         .map_err(|error| error.to_string())?;
@@ -58,7 +58,7 @@ fn save_config(state: State<'_, AppState>, config: Config) -> Result<(), String>
 /// gql-resolves logins that are missing ids and refreshes stored display
 /// names, so the config file carries everything needed to render the ui
 /// without talking to twitch.
-fn resolve_config(config: &mut Config) {
+async fn resolve_config(config: &mut Config) {
     let unknown: Vec<String> = config
         .channels
         .iter()
@@ -69,7 +69,7 @@ fn resolve_config(config: &mut Config) {
     if unknown.is_empty() && known_ids.is_empty() {
         return;
     }
-    match gql::fetch_users(&known_ids, &unknown) {
+    match gql::fetch_users(&known_ids, &unknown).await {
         Ok(users) => {
             for channel in &mut config.channels {
                 match channel.id() {
@@ -167,14 +167,14 @@ pub fn run() {
             );
             // resolve legacy/unresolved entries once at startup and persist
             // the result so the config carries ids + display names
-            resolve_config(&mut config);
+            tauri::async_runtime::block_on(resolve_config(&mut config));
             config
                 .save(&config_path)
                 .map_err(|error| error.to_string())?;
 
             let (settings_tx, settings_rx) = kanal::unbounded();
             app.manage(AppState {
-                config_path: config_path.clone(),
+                config_path,
                 settings_tx: settings_tx.clone(),
                 status: Mutex::new(None),
             });

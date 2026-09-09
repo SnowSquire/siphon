@@ -20,26 +20,26 @@ pub enum Channel {
 impl Channel {
     pub fn login(&self) -> &str {
         match self {
-            Channel::Resolved { login, .. } | Channel::Unresolved(login) => login,
+            Self::Resolved { login, .. } | Self::Unresolved(login) => login,
         }
     }
 
-    pub fn id(&self) -> Option<u64> {
+    pub const fn id(&self) -> Option<u64> {
         match self {
-            Channel::Resolved { id, .. } => Some(*id),
-            Channel::Unresolved(_) => None,
+            Self::Resolved { id, .. } => Some(*id),
+            Self::Unresolved(_) => None,
         }
     }
 
     pub fn display_name(&self) -> Option<&str> {
         match self {
-            Channel::Resolved { display_name, .. } => display_name.as_deref(),
-            Channel::Unresolved(_) => None,
+            Self::Resolved { display_name, .. } => display_name.as_deref(),
+            Self::Unresolved(_) => None,
         }
     }
 
     pub fn set_resolved(&mut self, id: u64, display_name: Option<String>) {
-        *self = Channel::Resolved {
+        *self = Self::Resolved {
             login: self.login().to_owned(),
             id,
             display_name: display_name.or_else(|| self.display_name().map(String::from)),
@@ -48,15 +48,15 @@ impl Channel {
 
     pub fn set_login(&mut self, login: String) {
         match self {
-            Channel::Resolved {
+            Self::Resolved {
                 login: existing, ..
-            } => *existing = login,
-            Channel::Unresolved(existing) => *existing = login,
+            }
+            | Self::Unresolved(existing) => *existing = login,
         }
     }
 
     pub fn set_display_name(&mut self, display_name: String) {
-        if let Channel::Resolved {
+        if let Self::Resolved {
             display_name: existing,
             ..
         } = self
@@ -76,7 +76,7 @@ impl Serialize for Channel {
             display_name: Option<&'a str>,
         }
         match self {
-            Channel::Resolved {
+            Self::Resolved {
                 login,
                 id,
                 display_name,
@@ -86,7 +86,7 @@ impl Serialize for Channel {
                 display_name: display_name.as_deref(),
             }
             .serialize(serializer),
-            Channel::Unresolved(login) => Repr {
+            Self::Unresolved(login) => Repr {
                 login,
                 id: None,
                 display_name: None,
@@ -114,12 +114,12 @@ impl<'de> Deserialize<'de> for Channel {
                 login,
                 id: Some(id),
                 display_name,
-            } => Ok(Channel::Resolved {
+            } => Ok(Self::Resolved {
                 login,
                 id,
                 display_name,
             }),
-            Repr::Object { login, .. } | Repr::Login(login) => Ok(Channel::Unresolved(login)),
+            Repr::Object { login, .. } | Repr::Login(login) => Ok(Self::Unresolved(login)),
         }
     }
 }
