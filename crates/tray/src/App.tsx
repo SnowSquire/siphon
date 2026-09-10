@@ -71,12 +71,12 @@ export default function App() {
     }
   });
 
-  // the saved config in Rust is the source of truth; the resource refetches
-  // after every mutation so the ui always mirrors it
-  async function saveConfig(next: Config) {
+  // the config in Rust is the source of truth; every mutation goes through
+  // an imperative command and the resource refetches so the ui mirrors it
+  async function mutate(action: () => Promise<unknown>) {
     setError("");
     try {
-      await invoke("save_config", { config: next });
+      await action();
       await refetch();
     } catch (err) {
       setError(String(err));
@@ -85,30 +85,25 @@ export default function App() {
 
   function addChannel(event: SubmitEvent) {
     event.preventDefault();
-    const current = config();
     const login = normalizeLogin(newLogin());
     setNewLogin("");
-    if (!login || !current || current.channels.some((c) => c.login === login)) {
+    if (!login || config()?.channels.some((c) => c.login === login)) {
       return;
     }
-    saveConfig({
-      ...current,
-      channels: [...current.channels, { login, id: null, displayName: null }],
-    });
+    mutate(() => invoke("add_channel", { login }));
   }
 
   function removeChannel(login: string) {
-    const current = config();
-    if (!current) return;
-    saveConfig({
-      ...current,
-      channels: current.channels.filter((channel) => channel.login !== login),
-    });
+    mutate(() => invoke("remove_channel", { login }));
   }
 
   function toggle(key: "notifyTitleChanges" | "sound", value: boolean) {
-    const current = config();
-    if (current) saveConfig({ ...current, [key]: value });
+    mutate(() =>
+      invoke(
+        key === "notifyTitleChanges" ? "set_notify_title_changes" : "set_sound",
+        { value },
+      ),
+    );
   }
 
   return (

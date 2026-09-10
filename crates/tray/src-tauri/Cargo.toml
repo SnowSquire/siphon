@@ -20,7 +20,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-notification = "2"
+notify-rust = { version = "4", features = ["async"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,6 +54,9 @@ kanal = "0.1.1"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.55"
 
 # Keep in sync with [workspace.lints] in the root Cargo.toml.
 # Cargo requires that `lints.workspace = true` be the only table entry, so this

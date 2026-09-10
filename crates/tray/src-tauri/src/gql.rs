@@ -1,4 +1,6 @@
 use std::error::Error as StdError;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
@@ -6,18 +8,42 @@ use hyper::body::Bytes;
 use hyper::header::CONTENT_TYPE;
 use hyper::{Method, Request};
 use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde_json::{json, Value};
 
-use crate::logging::log;
+use crate::logging::{log, parse_iso_ms};
 
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 
-const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
-const USERS_BY_LOGINS_QUERY: &str = "query UsersByLogins($logins:[String!]){users(logins:$logins){id login displayName broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
+type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+// Built once and shared across all gql requests so connections are pooled.
+// hyper's legacy Client is internally immutable and its connection pool is
+// already Send + Sync, so a plain Arc (no Mutex) is enough.
+static GQL_CLIENT: OnceLock<Arc<HttpsClient>> = OnceLock::new();
+
+fn client() -> Arc<HttpsClient> {
+    GQL_CLIENT
+        .get_or_init(|| {
+            Arc::new(
+                Client::builder(TokioExecutor::new()).build(
+                    HttpsConnectorBuilder::new()
+                        .with_webpki_roots()
+                        .https_or_http()
+                        .enable_http1()
+                        .build(),
+                ),
+            )
+        })
+        .clone()
+}
+
+const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
+const USERS_BY_LOGINS_QUERY: &str = "query UsersByLogins($logins:[String!]){users(logins:$logins){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
 
 pub type Error = Box<dyn StdError + Send + Sync>;
 
@@ -25,16 +51,23 @@ pub type Error = Box<dyn StdError + Send + Sync>;
 // client tracked is kept here even though only a subset is read.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct Game {
+    pub id: u64,
+    pub name: String,
+    pub display_name: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct User {
     pub channel_id: u64,
     pub channel_name: String,
     pub channel_display_name: String,
-    pub stream_id: Option<u64>,
-    pub stream_title: String,
-    pub stream_start: Option<String>,
-    pub game_id: Option<u64>,
-    pub game_name: Option<String>,
-    pub game_display_name: Option<String>,
+    pub profile_image_url: String,
+    pub stream_id: u64,
+    pub stream_title: Option<String>,
+    pub stream_start: Option<i64>,
+    pub game: Option<Game>,
     pub live: bool,
 }
 
@@ -56,16 +89,10 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
             "operationName": "UsersByLogins",
         }));
     }
-
     log("gql", format!("request: ids={ids:?} logins={logins:?}"));
+
     let payload = serde_json::to_vec(&Value::Array(operations))?;
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(
-        HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build(),
-    );
+    let client = client();
     let request = Request::builder()
         .method(Method::POST)
         .uri(GQL_URL)
@@ -94,7 +121,7 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
         .flat_map(|response| {
             response["data"]["users"]
                 .as_array()
-                .cloned()
+                .map(Vec::as_slice)
                 .unwrap_or_default()
         })
         .filter_map(|raw| {
@@ -104,23 +131,20 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
                 channel_id,
                 channel_name: raw["login"].as_str().unwrap_or_default().into(),
                 channel_display_name: raw["displayName"].as_str().unwrap_or_default().into(),
-                stream_id: raw["stream"]["id"]
+                profile_image_url: raw["profileImageURL"].as_str().unwrap_or_default().into(),
+                stream_id: broadcast["id"].as_str()?.parse().ok()?,
+                stream_title: broadcast["title"]
                     .as_str()
-                    .and_then(|id| id.parse().ok())
-                    .or_else(|| broadcast["id"].as_str().and_then(|id| id.parse().ok())),
-                stream_title: broadcast["title"].as_str().unwrap_or_default().into(),
-                stream_start: raw["stream"]["createdAt"].as_str().map(String::from),
-                game_id: broadcast["game"]["id"]
-                    .as_str()
-                    .and_then(|id| id.parse().ok()),
-                game_name: broadcast["game"]["name"]
-                    .as_str()
-                    .filter(|game| !game.is_empty())
+                    .filter(|title| !title.is_empty())
                     .map(Into::into),
-                game_display_name: broadcast["game"]["displayName"]
-                    .as_str()
-                    .filter(|game| !game.is_empty())
-                    .map(Into::into),
+                stream_start: raw["stream"]["createdAt"].as_str().and_then(parse_iso_ms),
+                game: broadcast["game"].as_object().and_then(|game| {
+                    Some(Game {
+                        id: game["id"].as_str()?.parse().ok()?,
+                        name: game["name"].as_str()?.into(),
+                        display_name: game["displayName"].as_str()?.into(),
+                    })
+                }),
                 live: raw["stream"].is_object(),
             })
         })
@@ -143,4 +167,23 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
         ),
     );
     Ok(users)
+}
+
+/// downloads an arbitrary cdn file (e.g. a profile picture) to `path`
+pub async fn fetch_file(url: &str, path: &Path) -> Result<(), Error> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .body(Full::new(Bytes::new()))?;
+    let response = tokio::time::timeout(GQL_TIMEOUT, client().request(request))
+        .await
+        .map_err(|_| "image request timed out")??;
+    if !response.status().is_success() {
+        return Err(format!("image returned status {}", response.status()).into());
+    }
+    let bytes = tokio::time::timeout(GQL_TIMEOUT, response.into_body().collect())
+        .await
+        .map_err(|_| "image body read timed out")??
+        .to_bytes();
+    Ok(std::fs::write(path, &bytes)?)
 }

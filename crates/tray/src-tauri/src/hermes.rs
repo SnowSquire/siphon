@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 
-use crate::gql::{self, User};
+use crate::gql::{self, Game, User};
 use crate::logging::log;
 use crate::notifier;
 use crate::AppState;
@@ -29,10 +29,13 @@ pub struct ChannelEntry {
     pub display_name: Option<String>,
 }
 
-pub struct Settings {
-    pub channels: Vec<ChannelEntry>,
-    pub notify_title_changes: bool,
-    pub sound: bool,
+/// One imperative mutation, sent by the ui layer instead of diffing whole
+/// settings snapshots against the session state.
+pub enum Command {
+    AddChannel(ChannelEntry),
+    RemoveChannel(String),
+    SetNotifyTitleChanges(bool),
+    SetSound(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,48 +80,46 @@ struct Subscription {
     state: SubState,
 }
 
-struct StreamInfo {
-    user: User,
-    live: bool,
-}
-
-impl StreamInfo {
-    fn from_entry(entry: &ChannelEntry, id: u64) -> Self {
-        Self {
-            live: false,
-            user: User {
-                channel_id: id,
-                channel_name: entry.login.clone(),
-                channel_display_name: entry
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| entry.login.clone()),
-                stream_id: None,
-                stream_title: String::new(),
-                stream_start: None,
-                game_id: None,
-                game_name: None,
-                game_display_name: None,
-                live: false,
-            },
-        }
+/// Placeholder user tracked from configuration until the first gql fetch
+/// refreshes it.
+fn user_for(entry: &ChannelEntry, id: u64) -> User {
+    User {
+        channel_id: id,
+        channel_name: entry.login.clone(),
+        channel_display_name: entry
+            .display_name
+            .clone()
+            .unwrap_or_else(|| entry.login.clone()),
+        profile_image_url: String::new(),
+        stream_id: 0,
+        stream_title: None,
+        stream_start: None,
+        game: None,
+        live: false,
     }
 }
 
 type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-pub fn spawn<R: Runtime>(app: AppHandle<R>, settings_rx: Receiver<Settings>) {
+pub fn spawn<R: Runtime>(app: AppHandle<R>, command_rx: Receiver<Command>) {
     tauri::async_runtime::spawn(async move {
-        let mut session = Session::new(app, settings_rx);
+        let mut session = Session::new(app, command_rx);
         session.main_loop().await;
     });
 }
 
+/// Notification preferences the ui can change at runtime.
+struct Preferences {
+    notify_title_changes: bool,
+    sound: bool,
+}
+
 struct Session<R: Runtime> {
     app: AppHandle<R>,
-    settings_rx: Receiver<Settings>,
-    settings: Settings,
-    infos: Vec<StreamInfo>,
+    command_rx: Receiver<Command>,
+    channels: Vec<ChannelEntry>,
+    preferences: Preferences,
+    infos: Vec<User>,
     subs: HashMap<String, Subscription>,
     socket: Option<WsStream>,
     current_url: String,
@@ -135,7 +136,7 @@ struct Session<R: Runtime> {
 }
 
 impl<R: Runtime> Session<R> {
-    fn new(app: AppHandle<R>, settings_rx: Receiver<Settings>) -> Self {
+    fn new(app: AppHandle<R>, command_rx: Receiver<Command>) -> Self {
         let rng = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0x9E37_79B9_7F4A_7C15, |elapsed| {
@@ -144,9 +145,9 @@ impl<R: Runtime> Session<R> {
             | 1;
         Self {
             app,
-            settings_rx,
-            settings: Settings {
-                channels: Vec::new(),
+            command_rx,
+            channels: Vec::new(),
+            preferences: Preferences {
                 notify_title_changes: true,
                 sound: true,
             },
@@ -170,8 +171,8 @@ impl<R: Runtime> Session<R> {
     async fn main_loop(&mut self) {
         log("hermes", "worker started");
         loop {
-            self.poll_settings().await;
-            if self.settings.channels.is_empty() {
+            self.poll_commands().await;
+            if self.channels.is_empty() {
                 // nothing to watch; a session with no active subscriptions
                 // would just time out, so stay disconnected until the config
                 // gains channels
@@ -190,131 +191,94 @@ impl<R: Runtime> Session<R> {
         }
     }
 
-    /// Applies the newest settings received from the ui. Additions are
+    /// Applies the newest commands received from the ui. Additions are
     /// subscribed on the current connection and removals unsubscribed,
     /// without ever restarting the websocket session.
-    async fn poll_settings(&mut self) {
-        let mut latest: Option<Settings> = None;
-        while let Ok(Some(settings)) = self.settings_rx.try_recv() {
-            latest = Some(settings);
+    async fn poll_commands(&mut self) {
+        while let Ok(Some(command)) = self.command_rx.try_recv() {
+            match command {
+                Command::AddChannel(entry) => self.add_channel(entry).await,
+                Command::RemoveChannel(login) => self.remove_channel(&login).await,
+                Command::SetNotifyTitleChanges(value) => {
+                    log("hermes", format!("notify_title_changes={value}"));
+                    self.preferences.notify_title_changes = value;
+                }
+                Command::SetSound(value) => {
+                    log("hermes", format!("sound={value}"));
+                    self.preferences.sound = value;
+                }
+            }
         }
-        let Some(settings) = latest else { return };
-        log(
-            "hermes",
-            format!(
-                "settings received: {} channel(s) {:?}, title_changes={}, sound={}",
-                settings.channels.len(),
-                settings
-                    .channels
-                    .iter()
-                    .map(|entry| (
-                        entry.login.as_str(),
-                        entry
-                            .id
-                            .map_or_else(|| "unresolved".into(), |id| id.to_string(),)
-                    ))
-                    .collect::<Vec<_>>(),
-                settings.notify_title_changes,
-                settings.sound,
-            ),
-        );
-        self.apply_settings(settings).await;
     }
 
-    async fn apply_settings(&mut self, settings: Settings) {
-        let signature = |settings: &Settings| {
-            (
-                settings
-                    .channels
-                    .iter()
-                    .map(|entry| (entry.login.clone(), entry.id, entry.display_name.clone()))
-                    .collect::<Vec<_>>(),
-                settings.notify_title_changes,
-                settings.sound,
-            )
-        };
-        let changed = signature(&settings) != signature(&self.settings);
-        self.settings = settings;
-        if !changed {
-            return;
-        }
-        log("hermes", "settings changed, applying to the live session");
-
-        // removals: unsubscribe their topics and drop their state; matching
-        // is done by channel id so logins changing (renames) don't disturb
-        // existing subscriptions
-        let configured_ids: Vec<u64> = self
-            .settings
+    async fn add_channel(&mut self, entry: ChannelEntry) {
+        if self
             .channels
             .iter()
-            .filter_map(|entry| entry.id)
-            .collect();
-        let removed_ids: Vec<u64> = self
-            .infos
+            .any(|configured| configured.login.eq_ignore_ascii_case(&entry.login))
+        {
+            return;
+        }
+        log("hermes", format!("channel {} added", entry.login));
+        self.channels.push(ChannelEntry {
+            login: entry.login.clone(),
+            id: entry.id,
+            display_name: entry.display_name.clone(),
+        });
+        // one gql request resolves an unresolved login and fetches the new
+        // channel's info in the same response; a resolved id fetches the
+        // info directly. the two topics are subscribed right after.
+        match entry.id {
+            Some(id) => self.refresh(&[id], &[]).await,
+            None => self.refresh(&[], std::slice::from_ref(&entry.login)).await,
+        }
+        if self.got_welcome {
+            // only the new channel's topics are pending here
+            self.send_pending().await;
+        }
+        self.emit_status(None);
+    }
+
+    async fn remove_channel(&mut self, login: &str) {
+        let Some(index) = self
+            .channels
             .iter()
-            .filter(|info| !configured_ids.contains(&info.user.channel_id))
-            .map(|info| info.user.channel_id)
-            .collect();
-        for id in removed_ids {
-            log("hermes", format!("channel {id} removed, unsubscribing"));
+            .position(|configured| configured.login.eq_ignore_ascii_case(login))
+        else {
+            return;
+        };
+        let entry = self.channels.remove(index);
+        log("hermes", format!("channel {} removed", entry.login));
+        if let Some(id) = entry.id {
             for prefix in TOPIC_PREFIXES {
                 self.unsubscribe_topic(&format!("{prefix}.{id}")).await;
             }
-        }
-        self.infos
-            .retain(|info| configured_ids.contains(&info.user.channel_id));
-
-        // additions (subscribe immediately when the session is live) and
-        // login/display name refreshes for channels we already track
-        let entries: Vec<(String, u64, Option<String>)> = self
-            .settings
-            .channels
-            .iter()
-            .filter_map(|entry| Some((entry.login.clone(), entry.id?, entry.display_name.clone())))
-            .collect();
-        for (login, id, display_name) in entries {
-            if let Some(info) = self
-                .infos
-                .iter_mut()
-                .find(|info| info.user.channel_id == id)
-            {
-                info.user.channel_name = login;
-                if let Some(display_name) = display_name {
-                    info.user.channel_display_name = display_name;
-                }
-            } else {
-                log(
-                    "hermes",
-                    format!("channel {login}({id}) added, subscribing"),
-                );
-                self.infos.push(StreamInfo::from_entry(
-                    &ChannelEntry {
-                        login: login.clone(),
-                        id: Some(id),
-                        display_name: display_name.clone(),
-                    },
-                    id,
-                ));
-                self.create_subs(id);
-                if self.got_welcome {
-                    self.subscribe_channel(id).await;
-                }
-            }
+            self.infos.retain(|info| info.channel_id != id);
         }
         self.emit_status(None);
     }
 
     async fn establish_connection(&mut self) {
-        self.resolve_unknown_entries().await;
-        self.sync_infos_and_subs();
+        // one gql fetch resolves unknown logins and refreshes tracked info
+        let ids: Vec<u64> = self
+            .channels
+            .iter()
+            .filter_map(|entry| entry.id)
+            .collect();
+        let logins: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|entry| entry.id.is_none())
+            .map(|entry| entry.login.clone())
+            .collect();
+        self.refresh(&ids, &logins).await;
         if self.infos.is_empty() {
             // connecting with no active subscriptions would just time out
             log(
                 "hermes",
                 format!(
                     "no channels resolved for {:?}, retrying (typo in a login?)",
-                    self.settings
-                        .channels
+                    self.channels
                         .iter()
                         .map(|entry| entry.login.as_str())
                         .collect::<Vec<_>>()
@@ -343,27 +307,19 @@ impl<R: Runtime> Session<R> {
         }
     }
 
-    /// gql-resolves configured logins that the config file carries without an
-    /// id (legacy entries or ones the ui could not resolve when saving). The
-    /// resolution only lives in memory here; the next save persists it.
-    async fn resolve_unknown_entries(&mut self) {
-        let unknown: Vec<String> = self
-            .settings
-            .channels
-            .iter()
-            .filter(|entry| entry.id.is_none())
-            .map(|entry| entry.login.clone())
-            .collect();
-        if unknown.is_empty() {
+    /// One gql fetch serves resolution and info tracking at once: unresolved
+    /// logins gain their id, tracked infos gain fresh title/game/avatar/live
+    /// data. Ids and logins land in a single http request (two operations).
+    async fn refresh(&mut self, ids: &[u64], logins: &[String]) {
+        // local state is aligned first so a failed fetch still leaves every
+        // known id tracked (and subscribed once the session welcomes)
+        self.sync_infos_and_subs();
+        if ids.is_empty() && logins.is_empty() {
             return;
         }
-        log(
-            "hermes",
-            format!("resolving unknown logins via gql: {unknown:?}"),
-        );
-        match gql::fetch_users(&[], &unknown).await {
+        match gql::fetch_users(ids, logins).await {
             Ok(users) => {
-                for entry in &mut self.settings.channels {
+                for entry in &mut self.channels {
                     if entry.id.is_some() {
                         continue;
                     }
@@ -391,6 +347,15 @@ impl<R: Runtime> Session<R> {
                         }
                     }
                 }
+                // newly resolved entries only exist as infos after this
+                self.sync_infos_and_subs();
+                for info in &mut self.infos {
+                    if let Some(fresh) =
+                        users.iter().find(|user| user.channel_id == info.channel_id)
+                    {
+                        *info = fresh.clone();
+                    }
+                }
             }
             Err(error) => log("hermes", format!("failed to resolve channels: {error}")),
         }
@@ -400,26 +365,21 @@ impl<R: Runtime> Session<R> {
     /// every resolved config channel; reconnects replay these.
     fn sync_infos_and_subs(&mut self) {
         let entries: Vec<(String, u64, Option<String>)> = self
-            .settings
             .channels
             .iter()
             .filter_map(|entry| Some((entry.login.clone(), entry.id?, entry.display_name.clone())))
             .collect();
         for (login, id, display_name) in entries {
-            if let Some(info) = self
-                .infos
-                .iter_mut()
-                .find(|info| info.user.channel_id == id)
-            {
-                info.user.channel_name = login;
+            if let Some(info) = self.infos.iter_mut().find(|info| info.channel_id == id) {
+                info.channel_name = login;
                 if let Some(display_name) = display_name {
-                    info.user.channel_display_name = display_name;
+                    info.channel_display_name = display_name;
                 }
             } else {
                 log("hermes", format!("tracking {login}({id})"));
-                self.infos.push(StreamInfo::from_entry(
+                self.infos.push(user_for(
                     &ChannelEntry {
-                        login: login.clone(),
+                        login,
                         id: Some(id),
                         display_name,
                     },
@@ -436,26 +396,23 @@ impl<R: Runtime> Session<R> {
     async fn on_disconnect(&mut self) {
         self.close_socket().await;
         self.welcome_deadline = None;
-        if self.got_welcome {
-            // The server keeps the session's subscription set alive, so
-            // reconnecting through the recovery URL restores subscriptions
-            // without resubscribing. A fresh welcome (with a new recovery
-            // URL) arrives after recovery.
+        // The server keeps the session's subscription set alive, so
+        // reconnecting through the recovery URL restores subscriptions
+        // without resubscribing. A fresh welcome (with a new recovery URL)
+        // arrives after recovery; a recovery attempt that fails before
+        // welcome gets exactly one retry before the session is abandoned.
+        let use_recovery = if self.got_welcome {
             self.failed_recoveries = 0;
+            true
+        } else if self.current_url == HERMES_URL {
+            false
+        } else {
+            self.failed_recoveries += 1;
+            self.failed_recoveries < 2
+        };
+        if use_recovery {
             if let Some(url) = self.recovery_url.clone() {
                 self.current_url = url;
-            }
-        } else if self.current_url != HERMES_URL {
-            // recovery attempt failed before welcome; try the recovery URL
-            // once more before giving up on the session entirely
-            self.failed_recoveries += 1;
-            if self.failed_recoveries < 2 {
-                if let Some(url) = self.recovery_url.clone() {
-                    self.current_url = url;
-                }
-            } else {
-                self.current_url = HERMES_URL.into();
-                self.resubscribe_on_welcome = true;
             }
         } else {
             // no session to recover: start fresh and replay all subscriptions
@@ -507,17 +464,16 @@ impl<R: Runtime> Session<R> {
         let message = tokio::time::timeout(SOCKET_POLL, socket.next()).await;
         match message {
             Ok(Some(Ok(message))) => match message {
-                Message::Text(text) => self.handle_message(&text).await,
-                Message::Binary(data) => {
-                    if let Ok(text) = std::str::from_utf8(&data) {
-                        self.handle_message(text).await;
-                    }
-                }
                 Message::Close(_) => {
                     log("hermes", "server sent close frame");
                     self.on_disconnect().await;
                 }
-                _ => {}
+                // text and binary frames carry the same json payloads
+                message => {
+                    if let Ok(text) = message.into_text() {
+                        self.handle_message(&text).await;
+                    }
+                }
             },
             Ok(Some(Err(error))) => {
                 log("hermes", format!("read error: {error}"));
@@ -611,36 +567,37 @@ impl<R: Runtime> Session<R> {
 
     async fn resubscribe_all(&mut self) {
         log("hermes", format!("replaying {} topic(s)", self.subs.len()));
-        let topics: Vec<(String, String)> = self
-            .subs
-            .iter()
-            .map(|(id, subscription)| (id.clone(), subscription.topic.clone()))
-            .collect();
-        for (id, topic) in topics {
-            if let Some(subscription) = self.subs.get_mut(&id) {
-                subscription.state = SubState::Pending;
-            }
-            self.send_subscribe(&id, &topic).await;
+        for subscription in self.subs.values_mut() {
+            subscription.state = SubState::Pending;
         }
+        self.send_subs(|_| true).await;
     }
 
     /// Sends subscribe messages for topics that are still pending, used after
     /// a session recovery where the server already restored everything it
     /// knew about.
     async fn send_pending(&mut self) {
-        let pending: Vec<(String, String)> = self
+        let pending = self
+            .subs
+            .values()
+            .filter(|subscription| subscription.state == SubState::Pending)
+            .count();
+        if pending > 0 {
+            log("hermes", format!("subscribing {pending} pending topic(s)"));
+        }
+        self.send_subs(|subscription| subscription.state == SubState::Pending)
+            .await;
+    }
+
+    /// Sends subscribe messages for the subscriptions matching `filter`.
+    async fn send_subs(&mut self, filter: impl Fn(&Subscription) -> bool) {
+        let matching: Vec<(String, String)> = self
             .subs
             .iter()
-            .filter(|(_, subscription)| subscription.state == SubState::Pending)
+            .filter(|(_, subscription)| filter(subscription))
             .map(|(id, subscription)| (id.clone(), subscription.topic.clone()))
             .collect();
-        if !pending.is_empty() {
-            log(
-                "hermes",
-                format!("subscribing {} pending topic(s)", pending.len()),
-            );
-        }
-        for (id, topic) in pending {
+        for (id, topic) in matching {
             self.send_subscribe(&id, &topic).await;
         }
     }
@@ -660,24 +617,6 @@ impl<R: Runtime> Session<R> {
                     state: SubState::Pending,
                 },
             );
-        }
-    }
-
-    /// Sends subscribe messages for both topics of a channel.
-    async fn subscribe_channel(&mut self, channel_id: u64) {
-        let topics: Vec<String> = TOPIC_PREFIXES
-            .map(|prefix| format!("{prefix}.{channel_id}"))
-            .into();
-        let pending: Vec<(String, String)> = self
-            .subs
-            .iter()
-            .filter(|(_, subscription)| {
-                subscription.state == SubState::Pending && topics.contains(&subscription.topic)
-            })
-            .map(|(id, subscription)| (id.clone(), subscription.topic.clone()))
-            .collect();
-        for (id, topic) in pending {
-            self.send_subscribe(&id, &topic).await;
         }
     }
 
@@ -739,20 +678,10 @@ impl<R: Runtime> Session<R> {
         if subscription.state != SubState::Subscribed {
             return;
         }
-        let Some(topic) = subscription
-            .topic
-            .strip_prefix("broadcast-settings-update.")
-            .map(|id| (true, id.to_owned()))
-            .or_else(|| {
-                subscription
-                    .topic
-                    .strip_prefix("video-playback-by-id.")
-                    .map(|id| (false, id.to_owned()))
-            })
-        else {
+        let Some((topic, channel_id)) = subscription.topic.split_once('.') else {
             return;
         };
-        let Ok(channel_id) = topic.1.parse::<u64>() else {
+        let Ok(channel_id) = channel_id.parse::<u64>() else {
             return;
         };
         let Ok(pubsub) =
@@ -768,14 +697,14 @@ impl<R: Runtime> Session<R> {
                 serde_json::to_string(&pubsub).unwrap_or_default()
             ),
         );
-        if topic.0 {
-            self.on_broadcast_settings_update(channel_id, &pubsub);
-        } else {
-            self.on_video_playback(channel_id, &pubsub).await;
+        match topic {
+            "broadcast-settings-update" => self.on_broadcast_settings_update(channel_id, &pubsub).await,
+            "video-playback-by-id" => self.on_video_playback(channel_id, &pubsub).await,
+            _ => {}
         }
     }
 
-    fn on_broadcast_settings_update(&mut self, channel_id: u64, pubsub: &Value) {
+    async fn on_broadcast_settings_update(&mut self, channel_id: u64, pubsub: &Value) {
         let status = pubsub["status"].as_str().unwrap_or_default().to_owned();
         let old_status = pubsub["old_status"].as_str().unwrap_or_default();
         let game = pubsub["game"]
@@ -786,13 +715,16 @@ impl<R: Runtime> Session<R> {
         let Some(info) = self
             .infos
             .iter_mut()
-            .find(|info| info.user.channel_id == channel_id)
+            .find(|info| info.channel_id == channel_id)
         else {
             return;
         };
-        let title_changed = status != info.user.stream_title;
-        let game_changed = game != info.user.game_name;
-        if self.settings.notify_title_changes && !info.live && (title_changed || game_changed) {
+        let title_changed = info.stream_title.as_deref() != Some(status.as_str());
+        let game_changed = game.as_deref() != info.game.as_ref().map(|game| game.name.as_str());
+        // a local because nursery's suspicious_operation_groupings misfires
+        // when the two fields appear in one && chain
+        let can_notify = self.preferences.notify_title_changes && !info.live;
+        if can_notify && (title_changed || game_changed) {
             let mut lines = Vec::new();
             if title_changed {
                 lines.push(format!("{old_status} → {status}"));
@@ -809,41 +741,51 @@ impl<R: Runtime> Session<R> {
             .collect::<Vec<_>>()
             .join(" & ");
             notifier::notify(
-                &self.app,
-                &format!("[{}] {what} changed", info.user.channel_display_name),
+                &format!("[{}] {what} changed", info.channel_display_name),
                 &lines.join("\n"),
-                self.settings.sound,
-            );
+                self.preferences.sound,
+                Some(info.profile_image_url.as_str()).filter(|url| !url.is_empty()),
+            )
+            .await;
         }
         // mirrors the TS client's state updates for these events
-        info.user.stream_title = status;
-        info.user.game_name = game;
-        info.user.game_id = pubsub["game_id"].as_u64();
+        info.stream_title = Some(status).filter(|title| !title.is_empty());
+        let game_display_name = info.game.as_ref().map(|game| game.display_name.clone());
+        info.game = game.zip(pubsub["game_id"].as_u64()).map(|(name, id)| Game {
+            id,
+            name,
+            display_name: game_display_name.unwrap_or_default(),
+        });
     }
 
     async fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
         match pubsub["type"].as_str() {
             Some("stream-up") => match gql::fetch_users(&[channel_id], &[]).await {
                 Ok(users) => {
-                    let Some(user) = users.into_iter().find(|user| user.channel_id == channel_id)
+                    let Some(mut user) =
+                        users.into_iter().find(|user| user.channel_id == channel_id)
                     else {
                         return;
                     };
-                    let body = match &user.game_name {
-                        Some(game) => format!("{} — {game}", user.stream_title),
-                        None => user.stream_title.clone(),
+                    user.live = true;
+                    let body = match (&user.game, user.stream_title.as_deref()) {
+                        (Some(game), Some(title)) => format!("{title} — {}", game.name),
+                        (Some(game), None) => game.name.clone(),
+                        (None, Some(title)) => title.into(),
+                        (None, None) => String::new(),
                     };
                     notifier::notify(
-                        &self.app,
                         &format!("[{}] is LIVE", user.channel_display_name),
                         &body,
-                        self.settings.sound,
-                    );
-                    let info = StreamInfo { live: true, user };
+                        self.preferences.sound,
+                        Some(user.profile_image_url.as_str()).filter(|url| !url.is_empty()),
+                    )
+                    .await;
+                    let info = user;
                     match self
                         .infos
                         .iter()
-                        .position(|existing| existing.user.channel_id == channel_id)
+                        .position(|existing| existing.channel_id == channel_id)
                     {
                         Some(index) => self.infos[index] = info,
                         None => self.infos.push(info),
@@ -856,7 +798,7 @@ impl<R: Runtime> Session<R> {
                 if let Some(info) = self
                     .infos
                     .iter_mut()
-                    .find(|info| info.user.channel_id == channel_id)
+                    .find(|info| info.channel_id == channel_id)
                 {
                     info.live = false;
                 }
@@ -879,28 +821,27 @@ impl<R: Runtime> Session<R> {
     }
 
     fn emit_status(&self, error: Option<&str>) {
-        let mut unresolved = Vec::new();
-        for entry in &self.settings.channels {
-            let tracked = entry
-                .id
-                .is_some_and(|id| self.infos.iter().any(|info| info.user.channel_id == id));
-            if !tracked {
-                unresolved.push(entry.login.clone());
-            }
-        }
+        let unresolved: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|entry| {
+                !entry
+                    .id
+                    .is_some_and(|id| self.infos.iter().any(|info| info.channel_id == id))
+            })
+            .map(|entry| entry.login.clone())
+            .collect();
         let channels = self
             .infos
             .iter()
             .map(|info| ChannelStatus {
-                channel_id: info.user.channel_id,
-                login: info.user.channel_name.clone(),
-                display_name: info.user.channel_display_name.clone(),
-                title_status: self.sub_status_for(&format!(
-                    "broadcast-settings-update.{}",
-                    info.user.channel_id
-                )),
+                channel_id: info.channel_id,
+                login: info.channel_name.clone(),
+                display_name: info.channel_display_name.clone(),
+                title_status: self
+                    .sub_status_for(&format!("broadcast-settings-update.{}", info.channel_id)),
                 live_status: self
-                    .sub_status_for(&format!("video-playback-by-id.{}", info.user.channel_id)),
+                    .sub_status_for(&format!("video-playback-by-id.{}", info.channel_id)),
             })
             .collect();
         let status = StatusEvent {
