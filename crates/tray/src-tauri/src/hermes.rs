@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -141,7 +141,8 @@ struct Session<R: Runtime> {
     last_message: Instant,
     reconnect_at: Instant,
     reconnect_attempt: u32,
-    next_id: u64,
+    /// `SplitMix64` state for [`Session::nano_id`]
+    rng_state: u64,
 }
 
 impl<R: Runtime> Session<R> {
@@ -162,7 +163,9 @@ impl<R: Runtime> Session<R> {
             last_message: Instant::now(),
             reconnect_at: Instant::now(),
             reconnect_attempt: 0,
-            next_id: 0,
+            rng_state: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0x853c_49e6_748f_ea9b, |elapsed| elapsed.as_nanos() as u64),
         }
     }
 
@@ -341,7 +344,7 @@ impl<R: Runtime> Session<R> {
                     let topic = format!("{prefix}.{id}");
                     if let Some(sub) = self.subs.remove(&topic) {
                         log("hermes", format!("unsubscribing from {topic}"));
-                        let message_id = self.fresh_id('m');
+                        let message_id = self.nano_id();
                         self.send_message(&json!({
                             "type": "unsubscribe",
                             "id": message_id,
@@ -439,7 +442,7 @@ impl<R: Runtime> Session<R> {
             if self.subs.contains_key(&topic) {
                 continue;
             }
-            let sub_id = self.fresh_id('s');
+            let sub_id = self.nano_id();
             self.subs.insert(
                 topic,
                 Sub {
@@ -503,13 +506,25 @@ impl<R: Runtime> Session<R> {
     }
 
     async fn handle_message(&mut self, text: &str) {
+        // any frame at all is proof the connection is alive, even a blank
+        // one that carries no payload
+        self.last_message = Instant::now();
+        if text.trim().is_empty() {
+            return;
+        }
         let Ok(message) = serde_json::from_str::<Value>(text) else {
             log("hermes", format!("unparseable message: {text}"));
             return;
         };
-        self.last_message = Instant::now();
         match message["type"].as_str() {
             Some("welcome") => {
+                // a nonzero attempt count means this welcome followed at
+                // least one disconnect, so it is a reconnect
+                let summary = if self.reconnect_attempt == 0 {
+                    "Hermes connected"
+                } else {
+                    "Hermes reconnected"
+                };
                 self.welcomed = true;
                 self.reconnect_attempt = 0;
                 self.keepalive_secs = message["welcome"]["keepaliveSec"].as_u64().unwrap_or(15);
@@ -517,6 +532,14 @@ impl<R: Runtime> Session<R> {
                     "hermes",
                     format!("welcome: keepalive={}s", self.keepalive_secs),
                 );
+                notifier::notify(
+                    summary,
+                    &format!("watching {} channel(s)", self.channels.len()),
+                    self.preferences.sound,
+                    None,
+                    None,
+                )
+                .await;
                 self.emit_status(None);
                 self.resubscribe_all().await;
             }
@@ -594,7 +617,7 @@ impl<R: Runtime> Session<R> {
 
     async fn send_subscribe(&mut self, subscription_id: &str, topic: &str) {
         log("hermes", format!("subscribing to {topic}"));
-        let id = self.fresh_id('m');
+        let id = self.nano_id();
         self.send_message(&json!({
             "type": "subscribe",
             "id": id,
@@ -697,6 +720,7 @@ impl<R: Runtime> Session<R> {
                 &lines.join("\n"),
                 self.preferences.sound,
                 Some(tracked.avatar.as_str()).filter(|url| !url.is_empty()),
+                Some(&tracked.login),
             )
             .await;
         }
@@ -710,34 +734,70 @@ impl<R: Runtime> Session<R> {
         });
     }
 
+    /// Handles `video-playback-by-id` pubsub payloads. Known `type` values:
+    /// - `stream-up` / `stream-down`: live state flips; acted on below.
+    /// - `viewcount`: periodic viewer-count heartbeat while live; ignored.
+    ///   Observed shape (2026-09-12):
+    ///   `{"type":"viewcount","viewers":583,"server_time":1789245232.108976,`
+    ///   `"collaboration_status":"none","collaboration_viewers":0,`
+    ///   `"costream_status":"","costream_viewers":0}`
     async fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
         match pubsub["type"].as_str() {
-            Some("stream-up") => match gql::fetch_users(&[channel_id], &[]).await {
-                Ok(users) => {
-                    let Some(mut user) =
-                        users.into_iter().find(|user| user.channel_id == channel_id)
-                    else {
-                        return;
-                    };
-                    user.live = true;
-                    let body = match (&user.game, user.stream_title.as_deref()) {
-                        (Some(game), Some(title)) => format!("{title} — {}", game.name),
-                        (Some(game), None) => game.name.clone(),
-                        (None, Some(title)) => title.into(),
-                        (None, None) => String::new(),
-                    };
-                    notifier::notify(
-                        &format!("[{}] is LIVE", user.channel_display_name),
-                        &body,
+            Some("stream-up") => {
+                // Optimistic: flip live and notify from the cached baseline
+                // first, so neither waits for the gql round-trip below.
+                let cached = self.channels.get_mut(&channel_id).map(|tracked| {
+                    tracked.live = true;
+                    (
+                        tracked.login.clone(),
+                        tracked.display_name.clone(),
+                        tracked.game.clone(),
+                        tracked.title.clone(),
+                        tracked.avatar.clone(),
+                    )
+                });
+                self.emit_status(None);
+                let notified = if let Some((login, display_name, game, title, avatar)) = cached {
+                    Self::notify_live(
+                        &display_name,
+                        game.as_ref(),
+                        title.as_deref(),
+                        &avatar,
                         self.preferences.sound,
-                        Some(user.profile_image_url.as_str()).filter(|url| !url.is_empty()),
+                        Some(&login),
                     )
                     .await;
-                    self.upsert(user);
-                    self.emit_status(None);
+                    true
+                } else {
+                    false
+                };
+                // Refresh the details before returning; a channel unknown
+                // at event time still notifies here, as before.
+                match gql::fetch_users(&[channel_id], &[]).await {
+                    Ok(users) => {
+                        let Some(mut user) =
+                            users.into_iter().find(|user| user.channel_id == channel_id)
+                        else {
+                            return;
+                        };
+                        user.live = true;
+                        if !notified {
+                            Self::notify_live(
+                                &user.channel_display_name,
+                                user.game.as_ref(),
+                                user.stream_title.as_deref(),
+                                &user.profile_image_url,
+                                self.preferences.sound,
+                                Some(&user.channel_name),
+                            )
+                            .await;
+                        }
+                        self.upsert(user);
+                        self.emit_status(None);
+                    }
+                    Err(error) => log("hermes", format!("stream-up refresh failed: {error}")),
                 }
-                Err(error) => log("hermes", format!("stream-up refresh failed: {error}")),
-            },
+            }
             Some("stream-down") => {
                 if let Some(tracked) = self.channels.get_mut(&channel_id) {
                     tracked.live = false;
@@ -745,6 +805,32 @@ impl<R: Runtime> Session<R> {
             }
             _ => {}
         }
+    }
+
+    /// "is LIVE" notification shared by the optimistic (cached baseline)
+    /// and fallback (fresh gql user) paths.
+    async fn notify_live(
+        display_name: &str,
+        game: Option<&Game>,
+        title: Option<&str>,
+        avatar: &str,
+        sound: bool,
+        login: Option<&str>,
+    ) {
+        let body = match (game, title) {
+            (Some(game), Some(title)) => format!("{title} — {}", game.name),
+            (Some(game), None) => game.name.clone(),
+            (None, Some(title)) => title.to_owned(),
+            (None, None) => String::new(),
+        };
+        notifier::notify(
+            &format!("[{display_name}] is LIVE"),
+            &body,
+            sound,
+            Some(avatar).filter(|url| !url.is_empty()),
+            login,
+        )
+        .await;
     }
 
     fn status_for(&self, prefix: &str, id: u64) -> SubStatus {
@@ -789,10 +875,28 @@ impl<R: Runtime> Session<R> {
         }
     }
 
-    /// Monotonic message/subscription ids; the server only needs uniqueness
-    /// per connection, so a counter beats the old xorshift string generator.
-    fn fresh_id(&mut self, tag: char) -> String {
-        self.next_id += 1;
-        format!("{tag}{}", self.next_id)
+    fn nano_id(&mut self) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+        const LEN: usize = 21;
+        let mut acc: u128 = (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64());
+        let mut out = String::with_capacity(LEN);
+        for _ in 0..LEN {
+            out.push(ALPHABET[(acc & 63) as usize] as char);
+            acc >>= 6;
+        }
+        out
+    }
+
+    /// One `SplitMix64` step (Steele et al.) over the session seed. Zero is
+    /// a valid state and nearby seeds decorrelate immediately, which suits
+    /// a wall-clock-seeded `u64`.
+    #[allow(clippy::missing_const_for_fn)]
+    fn next_u64(&mut self) -> u64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 }
