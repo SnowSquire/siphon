@@ -14,7 +14,7 @@ import "./App.css";
 
 type ChannelConfig = {
   login: string;
-  id: number | null;
+  id: number;
   displayName: string | null;
 };
 
@@ -175,16 +175,14 @@ export default function App() {
   );
 
   function ChannelRow(props: {
-    id: number | null;
+    id: number;
     login: string;
     onRemove: (login: string) => void;
   }) {
     // rows are matched by channel id so a rename (new login / display name
     // arriving from gql) updates the existing row instead of orphaning it
     const resolved = createMemo(() =>
-      props.id === null
-        ? undefined
-        : status.channels.find((channel) => channel.channelId === props.id),
+      status.channels.find((channel) => channel.channelId === props.id),
     );
     // display name priority: live status event > saved config > login
     const configName = createMemo(

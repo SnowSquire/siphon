@@ -37,26 +37,76 @@ async fn get_status(state: State<'_, AppState>) -> Result<Option<hermes::StatusE
 #[tauri::command]
 async fn add_channel(state: State<'_, AppState>, login: String) -> Result<(), String> {
     let login = login.trim().to_lowercase();
-    let mut config = state.config.lock().expect("config lock poisoned").clone();
-    if config
+    if state
+        .config
+        .lock()
+        .expect("config lock poisoned")
         .channels
         .iter()
-        .any(|channel| channel.login().eq_ignore_ascii_case(&login))
+        .any(|channel| channel.login.eq_ignore_ascii_case(&login))
     {
         return Ok(());
     }
-    config.channels.push(Channel::Unresolved(login.clone()));
-    resolve_config(&mut config).await;
-    state.persist(&config)?;
-    let added = config.channels.last().expect("channel just pushed");
-    state
-        .hermes_tx
-        .send(hermes::Command::AddChannel(ChannelEntry {
-            login: added.login().to_owned(),
-            id: added.id(),
-            display_name: added.display_name().map(String::from),
-        }))
-        .map_err(|error| error.to_string())
+    // resolve before storing: only resolved channels hit the disk. A login
+    // that fails to resolve is forwarded for the session only, so the ui
+    // still shows it as not found without persisting the typo.
+    let resolved = match gql::fetch_users(&[], std::slice::from_ref(&login)).await {
+        Ok(users) => users
+            .into_iter()
+            .find(|user| user.channel_name.eq_ignore_ascii_case(&login))
+            .map(|user| {
+                log(
+                    "config",
+                    format!(
+                        "resolved {} to id {} ({})",
+                        login, user.channel_id, user.channel_display_name
+                    ),
+                );
+                Channel {
+                    login: user.channel_name,
+                    id: user.channel_id,
+                    display_name: Some(user.channel_display_name),
+                }
+            }),
+        Err(error) => {
+            log("config", format!("channel resolution failed: {error}"));
+            None
+        }
+    };
+    if let Some(channel) = resolved {
+        let entry = ChannelEntry {
+            login: channel.login.clone(),
+            id: Some(channel.id),
+            display_name: channel.display_name.clone(),
+        };
+        let mut config = state.config.lock().expect("config lock poisoned").clone();
+        if config
+            .channels
+            .iter()
+            .any(|existing| existing.id == channel.id)
+        {
+            return Ok(());
+        }
+        config.channels.push(channel);
+        state.persist(&config)?;
+        state
+            .hermes_tx
+            .send(hermes::Command::AddChannel(entry))
+            .map_err(|error| error.to_string())
+    } else {
+        log(
+            "config",
+            format!("gql returned no channel named {login}, is it a typo?"),
+        );
+        state
+            .hermes_tx
+            .send(hermes::Command::AddChannel(ChannelEntry {
+                login,
+                id: None,
+                display_name: None,
+            }))
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[tauri::command]
@@ -64,7 +114,7 @@ async fn remove_channel(state: State<'_, AppState>, login: String) -> Result<(),
     let mut config = state.config.lock().expect("config lock poisoned").clone();
     config
         .channels
-        .retain(|channel| !channel.login().eq_ignore_ascii_case(&login));
+        .retain(|channel| !channel.login.eq_ignore_ascii_case(&login));
     state.persist(&config)?;
     state
         .hermes_tx
@@ -96,61 +146,12 @@ async fn set_sound(state: State<'_, AppState>, value: bool) -> Result<(), String
 
 impl AppState {
     fn persist(&self, config: &Config) -> Result<(), String> {
-        *self.config.lock().expect("config lock poisoned") = config.clone();
-        config
+        let mut stamped = config.clone();
+        stamped.version = Config::VERSION;
+        *self.config.lock().expect("config lock poisoned") = stamped.clone();
+        stamped
             .save(&self.config_path)
             .map_err(|error| error.to_string())
-    }
-}
-
-/// gql-resolves logins that are missing ids so the config file carries
-/// everything needed to render the ui without talking to twitch.
-/// Steady-state refresh of titles/avatars/live state is hermes' job (it
-/// re-fetches on every connect); this only fills in missing ids.
-async fn resolve_config(config: &mut Config) {
-    let unknown: Vec<String> = config
-        .channels
-        .iter()
-        .filter(|channel| channel.id().is_none())
-        .map(|channel| channel.login().to_owned())
-        .collect();
-    if unknown.is_empty() {
-        return;
-    }
-    match gql::fetch_users(&[], &unknown).await {
-        Ok(users) => {
-            for channel in &mut config.channels {
-                if channel.id().is_some() {
-                    continue;
-                }
-                match users
-                    .iter()
-                    .find(|user| user.channel_name.eq_ignore_ascii_case(channel.login()))
-                {
-                    Some(user) => {
-                        log(
-                            "config",
-                            format!(
-                                "resolved {} to id {} ({})",
-                                channel.login(),
-                                user.channel_id,
-                                user.channel_display_name
-                            ),
-                        );
-                        channel
-                            .set_resolved(user.channel_id, Some(user.channel_display_name.clone()));
-                    }
-                    None => log(
-                        "config",
-                        format!(
-                            "gql returned no channel named {}, is it a typo?",
-                            channel.login()
-                        ),
-                    ),
-                }
-            }
-        }
-        Err(error) => log("config", format!("channel resolution failed: {error}")),
     }
 }
 
@@ -185,18 +186,15 @@ pub fn run() {
                     config
                         .channels
                         .iter()
-                        .map(Channel::login)
+                        .map(|channel| channel.login.as_str())
                         .collect::<Vec<_>>(),
                     config.notify_title_changes,
                     config.sound,
                 ),
             );
-            // resolve legacy/unresolved entries once at startup and persist
-            // the result so the config carries ids + display names. Hermes
-            // re-fetches everything on connect, so a fully-resolved config
-            // needs no request here at all.
-            if config.channels.iter().any(|channel| channel.id().is_none()) {
-                tauri::async_runtime::block_on(resolve_config(&mut config));
+            // stamp pre-version files so every write carries the version
+            if config.version != Config::VERSION {
+                config.version = Config::VERSION;
                 config
                     .save(&config_path)
                     .map_err(|error| error.to_string())?;
@@ -213,9 +211,9 @@ pub fn run() {
             for channel in &config.channels {
                 hermes_tx
                     .send(hermes::Command::AddChannel(ChannelEntry {
-                        login: channel.login().to_owned(),
-                        id: channel.id(),
-                        display_name: channel.display_name().map(String::from),
+                        login: channel.login.clone(),
+                        id: Some(channel.id),
+                        display_name: channel.display_name.clone(),
                     }))
                     .map_err(|error| error.to_string())?;
             }
