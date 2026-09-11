@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 
-use crate::gql::{self, User};
+use crate::gql::{self, Game, User};
 use crate::logging::log;
 use crate::notifier;
 use crate::AppState;
@@ -75,12 +75,18 @@ pub struct StatusEvent {
 
 /// Everything hermes tracks per channel: rendering data plus the notify
 /// baseline (title/game/live) refreshed by gql and patched by pubsub.
+/// Stream id/start and full game info are stored alongside for future use.
 struct Tracked {
     login: String,
     display_name: String,
     avatar: String,
+    // stored for future use (history/dedup), not read yet
+    #[allow(dead_code)]
+    stream_id: u64,
     title: Option<String>,
-    game: Option<String>,
+    #[allow(dead_code)]
+    stream_start: Option<i64>,
+    game: Option<Game>,
     live: bool,
 }
 
@@ -93,7 +99,9 @@ impl Tracked {
                 .clone()
                 .unwrap_or_else(|| entry.login.clone()),
             avatar: String::new(),
+            stream_id: 0,
             title: None,
+            stream_start: None,
             game: None,
             live: false,
         }
@@ -417,7 +425,9 @@ impl<R: Runtime> Session<R> {
                 login: user.channel_name,
                 display_name: user.channel_display_name,
                 avatar: user.profile_image_url,
+                stream_id: user.stream_id,
                 title: user.stream_title,
+                stream_start: user.stream_start,
                 game: user.game,
                 live: user.live,
             },
@@ -664,7 +674,7 @@ impl<R: Runtime> Session<R> {
             return;
         };
         let title_changed = tracked.title.as_deref() != Some(status.as_str());
-        let game_changed = game.as_deref() != tracked.game.as_deref();
+        let game_changed = game.as_deref() != tracked.game.as_ref().map(|game| game.name.as_str());
         // a local because nursery's suspicious_operation_groupings misfires
         // when the two fields appear in one && chain
         let can_notify = self.preferences.notify_title_changes && !tracked.live;
@@ -694,7 +704,12 @@ impl<R: Runtime> Session<R> {
         }
         // mirrors the TS client's state updates for these events
         tracked.title = Some(status).filter(|title| !title.is_empty());
-        tracked.game = game;
+        let game_display_name = tracked.game.as_ref().map(|game| game.display_name.clone());
+        tracked.game = game.zip(pubsub["game_id"].as_u64()).map(|(name, id)| Game {
+            id,
+            name,
+            display_name: game_display_name.unwrap_or_default(),
+        });
     }
 
     async fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
@@ -708,8 +723,8 @@ impl<R: Runtime> Session<R> {
                     };
                     user.live = true;
                     let body = match (&user.game, user.stream_title.as_deref()) {
-                        (Some(game), Some(title)) => format!("{title} — {game}"),
-                        (Some(game), None) => game.clone(),
+                        (Some(game), Some(title)) => format!("{title} — {}", game.name),
+                        (Some(game), None) => game.name.clone(),
                         (None, Some(title)) => title.into(),
                         (None, None) => String::new(),
                     };

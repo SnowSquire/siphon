@@ -13,7 +13,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde_json::{json, Value};
 
-use crate::logging::log;
+use crate::logging::{log, parse_iso_ms};
 
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
@@ -42,22 +42,34 @@ fn client() -> Arc<HttpsClient> {
         .clone()
 }
 
-// Only the fields hermes actually reads: names + avatar for rendering and
-// notifications, title/game as the notify baseline, `stream` purely as a
-// live indicator (an object when live, null when offline).
-const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{title game{name}}stream{id}}}";
-const USERS_BY_LOGINS_QUERY: &str = "query UsersByLogins($logins:[String!]){users(logins:$logins){id login displayName profileImageURL(width:70) broadcastSettings{title game{name}}stream{id}}}";
+// The full user record: ids and start times are stored for future use
+// (history/dedup) even though notifications only read a subset.
+const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
+const USERS_BY_LOGINS_QUERY: &str = "query UsersByLogins($logins:[String!]){users(logins:$logins){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
 
 pub type Error = Box<dyn StdError + Send + Sync>;
 
+// Mirrors the original hermesnotifier.ts `StreamInfo`: every field the TS
+// client tracked is kept here even though only a subset is read.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct Game {
+    pub id: u64,
+    pub name: String,
+    pub display_name: String,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct User {
     pub channel_id: u64,
     pub channel_name: String,
     pub channel_display_name: String,
     pub profile_image_url: String,
+    pub stream_id: u64,
     pub stream_title: Option<String>,
-    pub game: Option<String>,
+    pub stream_start: Option<i64>,
+    pub game: Option<Game>,
     pub live: bool,
 }
 
@@ -114,17 +126,26 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
                 .unwrap_or_default()
         })
         .filter_map(|raw| {
+            let channel_id = raw["id"].as_str()?.parse().ok()?;
             let broadcast = &raw["broadcastSettings"];
             Some(User {
-                channel_id: raw["id"].as_str()?.parse().ok()?,
+                channel_id,
                 channel_name: raw["login"].as_str().unwrap_or_default().into(),
                 channel_display_name: raw["displayName"].as_str().unwrap_or_default().into(),
                 profile_image_url: raw["profileImageURL"].as_str().unwrap_or_default().into(),
+                stream_id: broadcast["id"].as_str()?.parse().ok()?,
                 stream_title: broadcast["title"]
                     .as_str()
                     .filter(|title| !title.is_empty())
                     .map(Into::into),
-                game: broadcast["game"]["name"].as_str().map(Into::into),
+                stream_start: raw["stream"]["createdAt"].as_str().and_then(parse_iso_ms),
+                game: broadcast["game"].as_object().and_then(|game| {
+                    Some(Game {
+                        id: game["id"].as_str()?.parse().ok()?,
+                        name: game["name"].as_str()?.into(),
+                        display_name: game["displayName"].as_str()?.into(),
+                    })
+                }),
                 live: raw["stream"].is_object(),
             })
         })
