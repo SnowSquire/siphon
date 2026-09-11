@@ -1,13 +1,15 @@
 import {
+  action,
   createMemo,
-  createResource,
+  createOptimisticStore,
   createSignal,
+  createStore,
   For,
-  onCleanup,
-  onMount,
+  onSettled,
+  reconcile,
+  refresh,
   Show,
 } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
@@ -46,8 +48,13 @@ function normalizeLogin(raw: string): string {
 }
 
 export default function App() {
-  const [config, { refetch }] = createResource(async () =>
-    invoke<Config>("get_config"),
+  // derived optimistic store: get_config is the authority, the seed answers
+  // reads on first paint, and writes inside the actions below are tentative
+  // until each action settles (auto-reverted on failure)
+  const [config, setConfig] = createOptimisticStore<Config>(
+    () => invoke<Config>("get_config"),
+    { channels: [], notifyTitleChanges: true, sound: true },
+    { seedLoadingValue: true },
   );
   const [status, setStatus] = createStore<HermesStatus>({
     connected: false,
@@ -58,52 +65,79 @@ export default function App() {
   const [newLogin, setNewLogin] = createSignal("");
   const [error, setError] = createSignal("");
 
-  onMount(async () => {
-    try {
-      const unlisten = await listen<HermesStatus>("hermes-status", (event) =>
-        setStatus(reconcile(event.payload, { key: "channelId" })),
-      );
-      onCleanup(() => unlisten());
-      const snapshot = await invoke<HermesStatus | null>("get_status");
-      if (snapshot) setStatus(reconcile(snapshot, { key: "channelId" }));
-    } catch (err) {
-      setError(String(err));
-    }
+  onSettled(() => {
+    let unlisten: (() => void) | undefined;
+    listen<HermesStatus>("hermes-status", (event) =>
+      setStatus(reconcile(event.payload, "channelId")),
+    )
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch((err) => setError(String(err)));
+    invoke<HermesStatus | null>("get_status")
+      .then((snapshot) => {
+        if (snapshot) setStatus(reconcile(snapshot, "channelId"));
+      })
+      .catch((err) => setError(String(err)));
+    return () => unlisten?.();
   });
 
-  // the config in Rust is the source of truth; every mutation goes through
-  // an imperative command and the resource refetches so the ui mirrors it
-  async function mutate(action: () => Promise<unknown>) {
+  // every mutation is an action: optimistic write, backend round-trip, then
+  // refresh to land the authority truth over the overlay
+  const addChannelAction = action(function* (login: string) {
+    // temp negative id marks the row pending; refresh swaps in the real one
+    setConfig((draft) => {
+      draft.channels.push({ login, id: -Date.now(), displayName: null });
+    });
+    yield invoke("add_channel", { login });
+    yield refresh(config);
+  });
+
+  const removeChannelAction = action(function* (login: string) {
+    setConfig((draft) => {
+      draft.channels = draft.channels.filter((c) => c.login !== login);
+    });
+    yield invoke("remove_channel", { login });
+    yield refresh(config);
+  });
+
+  const toggleAction = action(function* (
+    key: "notifyTitleChanges" | "sound",
+    value: boolean,
+  ) {
+    setConfig((draft) => {
+      draft[key] = value;
+    });
+    yield invoke(
+      key === "notifyTitleChanges" ? "set_notify_title_changes" : "set_sound",
+      { value },
+    );
+    yield refresh(config);
+  });
+
+  // actions revert their overlay on failure; surfacing the rejection keeps
+  // the previous error display working without any manual refetch
+  function dispatch(promise: Promise<unknown>) {
     setError("");
-    try {
-      await action();
-      await refetch();
-    } catch (err) {
-      setError(String(err));
-    }
+    promise.catch((err) => setError(String(err)));
   }
 
   function addChannel(event: SubmitEvent) {
     event.preventDefault();
     const login = normalizeLogin(newLogin());
     setNewLogin("");
-    if (!login || config()?.channels.some((c) => c.login === login)) {
+    if (!login || config.channels.some((c) => c.login === login)) {
       return;
     }
-    mutate(() => invoke("add_channel", { login }));
+    dispatch(addChannelAction(login));
   }
 
   function removeChannel(login: string) {
-    mutate(() => invoke("remove_channel", { login }));
+    dispatch(removeChannelAction(login));
   }
 
   function toggle(key: "notifyTitleChanges" | "sound", value: boolean) {
-    mutate(() =>
-      invoke(
-        key === "notifyTitleChanges" ? "set_notify_title_changes" : "set_sound",
-        { value },
-      ),
-    );
+    dispatch(toggleAction(key, value));
   }
 
   return (
@@ -127,7 +161,7 @@ export default function App() {
           <span class="col-label">Title Status</span>
           <span />
         </div>
-        <For each={config()?.channels ?? []}>
+        <For each={config.channels}>
           {(channel) => (
             <ChannelRow
               id={channel.id}
@@ -136,7 +170,7 @@ export default function App() {
             />
           )}
         </For>
-        <Show when={(config()?.channels.length ?? 0) === 0}>
+        <Show when={config.channels.length === 0}>
           <p class="empty">No channels configured. Add a streamer below.</p>
         </Show>
       </div>
@@ -154,7 +188,7 @@ export default function App() {
       <label class="check">
         <input
           type="checkbox"
-          checked={config()?.notifyTitleChanges ?? true}
+          checked={config.notifyTitleChanges}
           onChange={(e) => toggle("notifyTitleChanges", e.currentTarget.checked)}
         />
         Notify on title changes while offline
@@ -162,7 +196,7 @@ export default function App() {
       <label class="check">
         <input
           type="checkbox"
-          checked={config()?.sound ?? true}
+          checked={config.sound}
           onChange={(e) => toggle("sound", e.currentTarget.checked)}
         />
         Notification sound
@@ -187,13 +221,13 @@ export default function App() {
     // display name priority: live status event > saved config > login
     const configName = createMemo(
       () =>
-        config()?.channels.find((channel) => channel.login === props.login)
+        config.channels.find((channel) => channel.login === props.login)
           ?.displayName ?? null,
     );
     const notFound = createMemo(() => status.unresolved.includes(props.login));
     return (
       <div class="channel-row">
-        <span class="name" classList={{ notfound: notFound() }}>
+        <span class={["name", { notfound: notFound() }]}>
           {resolved()?.displayName || configName() || props.login}
         </span>
         <Badge
