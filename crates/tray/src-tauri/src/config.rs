@@ -45,25 +45,6 @@ impl Channel {
             display_name: display_name.or_else(|| self.display_name().map(String::from)),
         };
     }
-
-    pub fn set_login(&mut self, login: String) {
-        match self {
-            Self::Resolved {
-                login: existing, ..
-            }
-            | Self::Unresolved(existing) => *existing = login,
-        }
-    }
-
-    pub fn set_display_name(&mut self, display_name: String) {
-        if let Self::Resolved {
-            display_name: existing,
-            ..
-        } = self
-        {
-            *existing = Some(display_name);
-        }
-    }
 }
 
 impl Serialize for Channel {

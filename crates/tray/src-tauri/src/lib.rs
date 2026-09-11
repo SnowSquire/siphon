@@ -20,7 +20,7 @@ struct AppState {
     // the in-memory config is the source of truth; every mutation command
     // updates it, persists it to disk and forwards a hermes command
     config: Mutex<Config>,
-    hermes_tx: kanal::Sender<hermes::Command>,
+    hermes_tx: tokio::sync::mpsc::UnboundedSender<hermes::Command>,
     status: Mutex<Option<hermes::StatusEvent>>,
 }
 
@@ -103,9 +103,10 @@ impl AppState {
     }
 }
 
-/// gql-resolves logins that are missing ids and refreshes stored display
-/// names, so the config file carries everything needed to render the ui
-/// without talking to twitch.
+/// gql-resolves logins that are missing ids so the config file carries
+/// everything needed to render the ui without talking to twitch.
+/// Steady-state refresh of titles/avatars/live state is hermes' job (it
+/// re-fetches on every connect); this only fills in missing ids.
 async fn resolve_config(config: &mut Config) {
     let unknown: Vec<String> = config
         .channels
@@ -113,20 +114,20 @@ async fn resolve_config(config: &mut Config) {
         .filter(|channel| channel.id().is_none())
         .map(|channel| channel.login().to_owned())
         .collect();
-    let known_ids: Vec<u64> = config.channels.iter().filter_map(Channel::id).collect();
-    if unknown.is_empty() && known_ids.is_empty() {
+    if unknown.is_empty() {
         return;
     }
-    match gql::fetch_users(&known_ids, &unknown).await {
+    match gql::fetch_users(&[], &unknown).await {
         Ok(users) => {
             for channel in &mut config.channels {
-                let known = channel.id();
-                let user = users.iter().find(|user| {
-                    known.is_some_and(|id| user.channel_id == id)
-                        || user.channel_name.eq_ignore_ascii_case(channel.login())
-                });
-                match (user, known) {
-                    (Some(user), None) => {
+                if channel.id().is_some() {
+                    continue;
+                }
+                match users
+                    .iter()
+                    .find(|user| user.channel_name.eq_ignore_ascii_case(channel.login()))
+                {
+                    Some(user) => {
                         log(
                             "config",
                             format!(
@@ -139,19 +140,13 @@ async fn resolve_config(config: &mut Config) {
                         channel
                             .set_resolved(user.channel_id, Some(user.channel_display_name.clone()));
                     }
-                    // refresh login/display name in case the channel was renamed
-                    (Some(user), Some(_)) => {
-                        channel.set_login(user.channel_name.clone());
-                        channel.set_display_name(user.channel_display_name.clone());
-                    }
-                    (None, None) => log(
+                    None => log(
                         "config",
                         format!(
                             "gql returned no channel named {}, is it a typo?",
                             channel.login()
                         ),
                     ),
-                    (None, Some(_)) => {}
                 }
             }
         }
@@ -197,13 +192,17 @@ pub fn run() {
                 ),
             );
             // resolve legacy/unresolved entries once at startup and persist
-            // the result so the config carries ids + display names
-            tauri::async_runtime::block_on(resolve_config(&mut config));
-            config
-                .save(&config_path)
-                .map_err(|error| error.to_string())?;
+            // the result so the config carries ids + display names. Hermes
+            // re-fetches everything on connect, so a fully-resolved config
+            // needs no request here at all.
+            if config.channels.iter().any(|channel| channel.id().is_none()) {
+                tauri::async_runtime::block_on(resolve_config(&mut config));
+                config
+                    .save(&config_path)
+                    .map_err(|error| error.to_string())?;
+            }
 
-            let (hermes_tx, command_rx) = kanal::unbounded();
+            let (hermes_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
             app.manage(AppState {
                 config_path,
                 config: Mutex::new(config.clone()),
