@@ -139,7 +139,6 @@ struct Session<R: Runtime> {
     welcomed: bool,
     keepalive_secs: u64,
     last_message: Instant,
-    welcome_deadline: Option<Instant>,
     reconnect_at: Instant,
     reconnect_attempt: u32,
     next_id: u64,
@@ -161,7 +160,6 @@ impl<R: Runtime> Session<R> {
             welcomed: false,
             keepalive_secs: 15,
             last_message: Instant::now(),
-            welcome_deadline: None,
             reconnect_at: Instant::now(),
             reconnect_attempt: 0,
             next_id: 0,
@@ -381,7 +379,6 @@ impl<R: Runtime> Session<R> {
                 self.socket = Some(socket);
                 self.welcomed = false;
                 self.last_message = Instant::now();
-                self.welcome_deadline = Some(Instant::now() + WELCOME_TIMEOUT);
             }
             Err(error) => {
                 log("hermes", format!("connect failed: {error}"));
@@ -459,7 +456,6 @@ impl<R: Runtime> Session<R> {
     async fn on_disconnect(&mut self) {
         self.close_socket().await;
         self.welcomed = false;
-        self.welcome_deadline = None;
         self.emit_status(None);
         self.schedule_reconnect();
     }
@@ -482,15 +478,18 @@ impl<R: Runtime> Session<R> {
     /// Fires once a second: enforces the welcome timeout and drops the
     /// connection after missed keepalives.
     async fn on_tick(&mut self) {
-        if let Some(deadline) = self.welcome_deadline {
-            if Instant::now() >= deadline {
-                // The server never sent a welcome; treat the connection as dead.
+        if self.socket.is_none() {
+            return;
+        }
+        if !self.welcomed {
+            // The server never sent a welcome; treat the connection as dead.
+            // Any message at all counts as signs of life and pushes this out.
+            if self.last_message.elapsed() > WELCOME_TIMEOUT {
                 log("hermes", "no welcome within 10s, dropping connection");
                 self.on_disconnect().await;
             }
-        } else if self.welcomed
-            && self.last_message.elapsed()
-                > Duration::from_secs(self.keepalive_secs * KEEPALIVE_MISSED_LIMIT)
+        } else if self.last_message.elapsed()
+            > Duration::from_secs(self.keepalive_secs * KEEPALIVE_MISSED_LIMIT)
         {
             log(
                 "hermes",
@@ -511,7 +510,6 @@ impl<R: Runtime> Session<R> {
         self.last_message = Instant::now();
         match message["type"].as_str() {
             Some("welcome") => {
-                self.welcome_deadline = None;
                 self.welcomed = true;
                 self.reconnect_attempt = 0;
                 self.keepalive_secs = message["welcome"]["keepaliveSec"].as_u64().unwrap_or(15);
