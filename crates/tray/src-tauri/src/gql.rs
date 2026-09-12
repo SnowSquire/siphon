@@ -68,6 +68,7 @@ pub struct User {
     pub profile_image_url: String,
     pub stream_id: u64,
     pub stream_title: Option<String>,
+    // millisseconds since 1970, technically should be in sync with live but we don't get them at the same time so  they are separate
     pub stream_start: Option<i64>,
     pub game: Option<Game>,
     pub live: bool,
