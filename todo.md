@@ -1,5 +1,7 @@
 clean up logging and error handling
 
+move to https://github.com/mcmah309/eros
+
 add vod support
 
 rtsp/rtp/rtcp server (seemingly best protocol for this, might make my own)

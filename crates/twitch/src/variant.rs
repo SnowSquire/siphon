@@ -56,7 +56,6 @@ pub fn fetch_variant_playist(
     auth_token: Option<&str>,
     low_latency: bool,
 ) -> Result<String, VariantPlaylistError> {
-    //  Get Access Token --------------------------------------------------
     let req = agent
         .post(TWITCH_GQL_ENDPOINT)
         .content_type("text/plain;charset=UTF-8")
@@ -225,17 +224,7 @@ fn parse_kind(variant_id: &str) -> VariantKind {
     }
 }
 
-struct TempVariant<'a> {
-    score: Option<NonZeroU16>,
-
-    variant_id: &'a str,
-    kind: VariantKind,
-    codec: Option<Codec>,
-    res: Option<(NonZeroU16, NonZeroU16)>,
-    frame_rate: Option<NonZeroU16>,
-}
-
-fn parse_stream_inf(line: &str) -> Option<TempVariant<'_>> {
+fn parse_stream_inf(line: &str, url: &str) -> Option<Variant> {
     let mut variant_id = None;
     let mut score = None;
     let mut frame_rate = None;
@@ -266,9 +255,10 @@ fn parse_stream_inf(line: &str) -> Option<TempVariant<'_>> {
     }
 
     let variant_id = variant_id?;
-    Some(TempVariant {
+    Some(Variant {
         score,
-        variant_id,
+        url: url.into(),
+        id: variant_id.into(),
         kind: parse_kind(variant_id),
         codec,
         res,
@@ -288,27 +278,21 @@ pub struct Variant {
 }
 
 fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
-    let mut stream_inf: Option<TempVariant<'_>> = None;
+    let mut stream_inf: Option<&str> = None;
 
     let mut var_vec = Vec::with_capacity(2); // always at least 2 tracks (source and audio_only)
     let mut stream_id = None;
     for line in buffer.lines() {
         if line.starts_with("#EXT-X-STREAM-INF") {
-            stream_inf = parse_stream_inf(line);
+            stream_inf = Some(line);
         } else if line.starts_with("http") {
-            let Some(variant) = stream_inf.take() else {
+            let Some(stream_inf) = stream_inf.take() else {
                 continue;
             };
 
-            var_vec.push(Variant {
-                codec: variant.codec,
-                frame_rate: variant.frame_rate,
-                kind: variant.kind,
-                res: variant.res,
-                score: variant.score,
-                url: line.into(),
-                id: variant.variant_id.into(),
-            });
+            if let Some(variant) = parse_stream_inf(stream_inf, line) {
+                var_vec.push(variant);
+            }
         } else if let Some(value) = line
             .strip_prefix("#EXT-X-SESSION-DATA:DATA-ID=\"BROADCAST-ID\",VALUE=\"")
             .and_then(|v| v.strip_suffix("\""))
