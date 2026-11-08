@@ -1,77 +1,34 @@
-//! Slot arena for segment chunk storage.
+//! Slot arena and per-spool state.
 //!
-//! Replaces the per-segment `Arc<Chunk>` chain (`Chunk::new`, `OnceLock<next>`,
-//! recursive drop) with a flat arena of fixed-size, zero-initialized slots.
+//! Two fixed slabs, both sized by construction:
 //!
-//! Every slot byte is a valid `u8` from the moment the arena exists, so the whole
-//! `MaybeUninit` / `assume_init` / "uninitialized read" class of problems is
-//! structurally impossible rather than merely carefully avoided. Slots are recycled
-//! without re-zeroing.
+//! - **Slots**: fixed 192 KiB zeroed buffers, 32 per arena, in lazily chained
+//!   arenas. A byte is initialized from the moment its arena exists, so the
+//!   uninitialized-read class of problems cannot happen; slots are recycled
+//!   without re-zeroing.
+//! - **Spools**: one small record per live spool (a segment's byte stream:
+//!   `refs`, `closed`, `published`), taken from a free list. A live spool owns at
+//!   least one slot, so `MAX_SLOTS` entries are always enough.
 //!
-//! The arena owns no threading or IO policy: it is a `Cell`/`Rc` structure intended
-//! for the single-threaded reactor, so it is `!Send` and `!Sync` by construction and
-//! needs no atomics or locks.
-//!
-//! # Reference counting
-//!
-//! `SlotMeta::refs` counts every owner of a slot:
-//!
-//! - the writer's current tail (one allocation),
-//! - every consumer pin ([`SlotRef`]),
-//! - the predecessor's `next` link (which is why a lagging reader can never follow
-//!   a recycled slot).
-//!
-//! A slot returns to its arena's free bitmap when its refcount reaches zero, and
-//! releasing the slot then releases its `next` link, so a chain is reclaimed from
-//! the head forward, iteratively (never recursively).
-//!
-//! # Aliasing
-//!
-//! Published bytes (`[0, published)`) are immutable and only handed out as `&[u8]`;
-//! the writer's [`SlotMut`] only hands out the unpublished tail
-//! (`[published, SLOT_SIZE)`). The two ranges are disjoint by construction, so the
-//! single `UnsafeCell` around the payload never produces overlapping `&`/`&mut`.
+//! Everything is `Cell`/`RefCell`: the reactor is single threaded, so this is
+//! `!Send` by construction and needs no atomics or locks.
 
 use std::alloc::Layout;
 use std::array;
 use std::cell::Cell;
+use std::cell::Ref;
 use std::cell::RefCell;
+use std::cell::RefMut;
+use std::ops::Range;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-/// Bytes per slot: `188 * 1024`.
-///
-/// 188 is the mpegts packet size, so a slot boundary never splits a packet; 1024
-/// packets also makes it 4 KiB page aligned (`47` pages), so the one-time zeroing
-/// maps to whole pages.
-pub const SLOT_SIZE: usize = 192_512;
-
-/// Slots per arena (one `u32` free bitmap).
-pub const SLOTS_PER_ARENA: usize = 32;
-
-/// Payload bytes of one arena.
-const ARENA_BYTES: usize = SLOTS_PER_ARENA * SLOT_SIZE;
-
-/// Alignment of the payload. Slots are a multiple of this, so each `SlotId` region
-/// starts on a page boundary as well.
-const ARENA_ALIGN: usize = 4096;
-
-const ARENAS_PER_STREAM: usize = 6;
-
-/// Slots a single stream may pin at once: six arenas, ~37 MB, i.e. 30 s of an
-/// ~9.8 Mbps stream (Twitch lists 30 s of segments in the live playlist, and the
-/// scheduler's replay cursors pin that whole window).
-pub const SLOTS_PER_STREAM: usize = ARENAS_PER_STREAM * SLOTS_PER_ARENA;
-
-/// Streams the daemon may serve concurrently.
-pub const MAX_STREAMS: usize = 4;
-
-/// Hard ceiling across all streams. Arenas are allocated lazily, so this is a
-/// ceiling and not a reservation.
-pub const MAX_ARENAS: usize = ARENAS_PER_STREAM * MAX_STREAMS;
-
-/// Total slots across all streams.
-pub const MAX_SLOTS: usize = MAX_ARENAS * SLOTS_PER_ARENA;
+use crate::constants::ARENA_ALIGN;
+use crate::constants::ARENA_BYTES;
+use crate::constants::MAX_ARENAS;
+use crate::constants::MAX_SLOTS;
+use crate::constants::SLOT_SIZE;
+use crate::constants::SLOTS_PER_ARENA;
 
 /// Identifies a slot inside a [`ArenaSet`].
 ///
@@ -101,12 +58,24 @@ impl SlotId {
     }
 }
 
+/// Identifies a spool record inside a [`ArenaSet`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SpoolId(u32);
+
+/// The arena has no free slot, or no free spool record, left.
+///
+/// Callers should back off and retry: a consumer is lagging behind the live
+/// window.
+#[derive(Debug, thiserror::Error)]
+#[error("slot arena is exhausted")]
+pub struct ArenaFull;
+
 struct SlotMeta {
-    /// Live owners: writer allocation, consumer pins, and the predecessor's link.
+    /// Live owners: writer tail, consumer pins, and the predecessor's link.
     refs: Cell<usize>,
     /// Published bytes, monotonic, `0..=SLOT_SIZE`.
     published: Cell<usize>,
-    /// Next slot of the same segment. The link itself holds one reference.
+    /// Next slot of the same spool. The link itself holds one reference.
     next: Cell<Option<SlotId>>,
 }
 
@@ -116,6 +85,27 @@ impl SlotMeta {
             refs: Cell::new(0),
             published: Cell::new(0),
             next: Cell::new(None),
+        }
+    }
+}
+
+struct SpoolSlot {
+    /// Writer plus every reader.
+    refs: Cell<u32>,
+    closed: Cell<bool>,
+    /// Bytes published for the whole spool.
+    published: Cell<usize>,
+    /// Only meaningful while the record is on the free list.
+    next_free: Cell<Option<SpoolId>>,
+}
+
+impl SpoolSlot {
+    const fn new() -> Self {
+        Self {
+            refs: Cell::new(0),
+            closed: Cell::new(false),
+            published: Cell::new(0),
+            next_free: Cell::new(None),
         }
     }
 }
@@ -233,22 +223,18 @@ impl Arena {
     fn bytes(&self, index: u8, published: usize) -> &[u8] {
         let start = usize::from(index) * SLOT_SIZE;
         debug_assert!(published <= SLOT_SIZE);
-        // SAFETY: `start` is in bounds for the allocation `base` is derived from,
-        // see `tail_ptr`.
+        // SAFETY: `start` is in bounds for the allocation `base` is derived from.
         let ptr = unsafe { self.base.as_ptr().add(start) };
-        // SAFETY: `base` points to `SLOTS_PER_ARENA * SLOT_SIZE` bytes owned by
-        // `_data` and initialized by the arena's construction (slots are never
-        // shrunk), and `index < SLOTS_PER_ARENA` plus `published <= SLOT_SIZE`
-        // keep `start .. start + published` in bounds. The range is at or below
-        // the published frontier, which only ever gets shared views, so it is
-        // disjoint from the writer's exclusive tail.
+        // SAFETY: `base` points to `SLOTS_PER_ARENA * SLOT_SIZE` bytes owned by the
+        // arena and initialized by its construction (slots are never shrunk), and
+        // `index < SLOTS_PER_ARENA` plus `published <= SLOT_SIZE` keep
+        // `start .. start + published` in bounds. The range is at or below the
+        // published frontier, which only ever gets shared views, so it is disjoint
+        // from the writer's exclusive tail.
         unsafe { std::slice::from_raw_parts(ptr, published) }
     }
 
     /// Pointer to the unpublished tail `[published, SLOT_SIZE)` of slot `index`.
-    ///
-    /// A raw pointer is returned because the lifetime has to be pinned to the
-    /// guard, not to the `&self` borrow of the arena.
     fn tail_ptr(&self, index: u8, published: usize) -> *mut u8 {
         let start = usize::from(index) * SLOT_SIZE + published;
         debug_assert!(published <= SLOT_SIZE);
@@ -260,25 +246,41 @@ impl Arena {
     }
 }
 
-/// Set of arenas, shared by every stream of the daemon.
+/// Slot storage and spool records, shared by everything on the reactor.
 pub struct ArenaSet {
-    arenas: RefCell<Vec<Option<Rc<Arena>>>>,
+    arenas: RefCell<[Option<Rc<Arena>>; MAX_ARENAS]>,
     live: Cell<usize>,
+    spools: RefCell<Box<[SpoolSlot]>>,
+    free_spools: Cell<Option<SpoolId>>,
 }
 
 impl ArenaSet {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        let spools: Box<[SpoolSlot]> = (0..MAX_SLOTS).map(|_| SpoolSlot::new()).collect();
+        // Chain every record onto the free list once, at startup.
+        for index in 0..MAX_SLOTS {
+            let next = if index + 1 < MAX_SLOTS {
+                Some(SpoolId(
+                    u32::try_from(index + 1).expect("spool id fits in u32"),
+                ))
+            } else {
+                None
+            };
+            spools[index].next_free.set(next);
+        }
+
         Self {
-            arenas: RefCell::new(Vec::new()),
+            arenas: RefCell::new(array::from_fn(|_| None)),
             live: Cell::new(0),
+            spools: RefCell::new(spools),
+            free_spools: Cell::new(Some(SpoolId(0))),
         }
     }
 
     /// Allocate a zeroed slot with a refcount of one.
     ///
-    /// Returns `None` at [`MAX_SLOTS`]; callers are expected to evict a lagging
-    /// consumer first.
+    /// Returns `None` at [`MAX_SLOTS`]; callers are expected to back off.
     #[must_use]
     pub fn alloc(&self) -> Option<SlotId> {
         {
@@ -295,15 +297,7 @@ impl ArenaSet {
 
         let (index, arena) = {
             let mut arenas = self.arenas.borrow_mut();
-            let index = if let Some(index) = arenas.iter().position(Option::is_none) {
-                index
-            } else {
-                if arenas.len() == MAX_ARENAS {
-                    return None;
-                }
-                arenas.push(None);
-                arenas.len() - 1
-            };
+            let index = arenas.iter().position(Option::is_none)?;
             let arena = Rc::new(Arena::new());
             arenas[index] = Some(Rc::clone(&arena));
             (index, arena)
@@ -317,9 +311,8 @@ impl ArenaSet {
 
     fn arena(&self, id: SlotId) -> Rc<Arena> {
         let arenas = self.arenas.borrow();
-        let arena = arenas
-            .get(usize::from(id.arena))
-            .and_then(Option::as_ref)
+        let arena = arenas[usize::from(id.arena)]
+            .as_ref()
             .expect("slot id refers to a freed arena");
         Rc::clone(arena)
     }
@@ -387,7 +380,7 @@ impl ArenaSet {
         self.arena(id).published(id.index)
     }
 
-    /// Number of allocated slots across all streams.
+    /// Number of allocated slots across all broadcasts.
     #[must_use]
     pub const fn live_slots(&self) -> usize {
         self.live.get()
@@ -403,6 +396,70 @@ impl ArenaSet {
     #[must_use]
     pub fn refs(&self, id: SlotId) -> usize {
         self.arena(id).slot(id.index).refs.get()
+    }
+
+    // ------------------------------------------------------------- spools --
+
+    fn spool_slot(&self, id: SpoolId) -> Ref<'_, SpoolSlot> {
+        Ref::map(self.spools.borrow(), |spools| &spools[id.0 as usize])
+    }
+
+    fn spool_slot_mut(&self, id: SpoolId) -> RefMut<'_, SpoolSlot> {
+        RefMut::map(self.spools.borrow_mut(), |spools| {
+            &mut spools[id.0 as usize]
+        })
+    }
+
+    /// Take a free spool record with one reference for the writer.
+    #[must_use]
+    pub fn alloc_spool(&self) -> Option<SpoolId> {
+        let id = self.free_spools.get()?;
+        let slot = self.spool_slot_mut(id);
+        self.free_spools.set(slot.next_free.take());
+        slot.refs.set(1);
+        slot.closed.set(false);
+        slot.published.set(0);
+        Some(id)
+    }
+
+    pub fn retain_spool(&self, id: SpoolId) {
+        let slot = self.spool_slot(id);
+        let refs = slot.refs.get();
+        debug_assert!(refs > 0, "retain of a free spool");
+        slot.refs.set(refs + 1);
+    }
+
+    pub fn release_spool(&self, id: SpoolId) {
+        let slot = self.spool_slot_mut(id);
+        let refs = slot.refs.get();
+        debug_assert!(refs > 0, "release of a free spool");
+        let refs = refs - 1;
+        slot.refs.set(refs);
+        if refs == 0 {
+            slot.next_free.set(self.free_spools.get());
+            self.free_spools.set(Some(id));
+        }
+    }
+
+    /// Bytes published for the whole spool: the change signal readers wait on.
+    #[must_use]
+    pub fn spool_published(&self, id: SpoolId) -> usize {
+        self.spool_slot(id).published.get()
+    }
+
+    pub fn publish_spool(&self, id: SpoolId, published: usize) {
+        let slot = self.spool_slot(id);
+        debug_assert!(published >= slot.published.get(), "publish is monotonic");
+        slot.published.set(published);
+    }
+
+    #[must_use]
+    pub fn spool_closed(&self, id: SpoolId) -> bool {
+        self.spool_slot(id).closed.get()
+    }
+
+    pub fn close_spool(&self, id: SpoolId) {
+        self.spool_slot(id).closed.set(true);
     }
 
     /// Debug-only consistency check: free bitmaps, per-arena `used` counters and
@@ -431,6 +488,20 @@ impl ArenaSet {
         }
 
         assert_eq!(live, self.live.get(), "global live counter out of sync");
+
+        let spools = self.spools.borrow();
+        let mut free_seen = 0usize;
+        let mut id = self.free_spools.get();
+        while let Some(spool) = id {
+            free_seen += 1;
+            assert_eq!(
+                spools[spool.0 as usize].refs.get(),
+                0,
+                "free spool with refs"
+            );
+            id = spools[spool.0 as usize].next_free.get();
+            assert!(free_seen <= MAX_SLOTS, "free list loop");
+        }
     }
 }
 
@@ -440,7 +511,7 @@ impl Default for ArenaSet {
     }
 }
 
-/// Exclusive write access to a slot, owned by the segment writer.
+/// Exclusive write access to a slot, owned by the spool writer.
 ///
 /// Obtained from [`ArenaSet::alloc`] and holds that allocation's single reference
 /// until dropped.
@@ -509,7 +580,7 @@ impl Drop for SlotMut {
     }
 }
 
-/// Read cursor over one slot, owned by a segment consumer.
+/// Read cursor over one slot, owned by a spool consumer.
 ///
 /// Holds a reference to the slot until dropped.
 pub struct SlotRef {
@@ -542,16 +613,15 @@ impl SlotRef {
         self.offset
     }
 
-    /// Next published run of the current slot, or `None` when none is available
-    /// yet. Advances the cursor to the end of the returned run.
-    pub fn chunk(&mut self) -> Option<&[u8]> {
+    /// Range of newly published bytes, advancing the cursor past them.
+    pub fn take_range(&mut self) -> Option<Range<usize>> {
         let published = self.arena.published(self.id.index);
         if published <= self.offset {
             return None;
         }
         let start = self.offset;
         self.offset = published;
-        Some(&self.arena.bytes(self.id.index, published)[start..])
+        Some(start..published)
     }
 
     /// Move the cursor to the next slot of the chain.
@@ -574,6 +644,61 @@ impl SlotRef {
 }
 
 impl Drop for SlotRef {
+    fn drop(&mut self) {
+        self.set.release(self.id);
+    }
+}
+
+/// An owned, pinned, read-only view of a published slot range.
+///
+/// `IoBuf` requires `'static`, so the view owns its reference; handing it to
+/// compio's `write_all`/`write_at` keeps the bytes alive (and pinned) until the
+/// operation completes, and cancellation drops the view, releasing the pin.
+pub struct SlotView {
+    set: Rc<ArenaSet>,
+    arena: Rc<Arena>,
+    id: SlotId,
+    range: Range<usize>,
+}
+
+impl SlotView {
+    #[must_use]
+    pub fn new(set: &Rc<ArenaSet>, id: SlotId, range: Range<usize>) -> Self {
+        set.retain(id);
+        Self {
+            arena: set.arena(id),
+            set: Rc::clone(set),
+            id,
+            range,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> SlotId {
+        self.id
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+}
+
+impl compio::buf::IoBuf for SlotView {
+    fn as_init(&self) -> &[u8] {
+        // `range` is inside the published prefix of a slot this view pins, so the
+        // bytes are initialized and stay immutable until the pin is released.
+        let bytes = self.arena.bytes(self.id.index, self.range.end);
+        &bytes[self.range.clone()]
+    }
+}
+
+impl Drop for SlotView {
     fn drop(&mut self) {
         self.set.release(self.id);
     }
@@ -603,17 +728,16 @@ mod tests {
         let mut writer = SlotMut::adopt(&set, id);
 
         let mut reader = SlotRef::new(&set, id);
-        assert_eq!(reader.chunk(), None);
+        assert!(reader.take_range().is_none());
 
         writer.tail()[..4].copy_from_slice(b"live");
         writer.publish(4);
-        assert_eq!(reader.chunk(), Some(&b"live"[..]));
-        assert_eq!(reader.chunk(), None);
+        assert_eq!(reader.take_range(), Some(0..4));
+        assert!(reader.take_range().is_none());
 
         writer.tail()[..3].copy_from_slice(b"abc");
         writer.publish(7);
-        assert_eq!(reader.chunk(), Some(&b"abc"[..]));
-        assert!(!writer.is_full());
+        assert_eq!(reader.take_range(), Some(4..7));
     }
 
     #[test]
@@ -670,10 +794,10 @@ mod tests {
         writer_b.tail()[..2].copy_from_slice(b"bb");
         writer_b.publish(2);
 
-        assert_eq!(reader.chunk(), Some(&b"aa"[..]));
-        assert_eq!(reader.chunk(), None);
+        assert_eq!(reader.take_range(), Some(0..2));
+        assert!(reader.take_range().is_none());
         assert!(reader.advance());
-        assert_eq!(reader.chunk(), Some(&b"bb"[..]));
+        assert_eq!(reader.take_range(), Some(0..2));
         assert!(!reader.advance());
 
         drop(reader);
@@ -700,6 +824,7 @@ mod tests {
         let id = set.alloc().expect("slot");
         assert_eq!(set.arena_count(), 1);
         assert_eq!(id.index(), 0);
+        set.assert_invariants();
     }
 
     #[test]
@@ -728,6 +853,24 @@ mod tests {
             set.release(id);
         }
         assert_eq!(set.arena_count(), 0);
+        set.assert_invariants();
+    }
+
+    #[test]
+    fn spools_are_recycled_through_a_fixed_table() {
+        let set = set();
+        let first = set.alloc_spool().expect("spool");
+        assert_eq!(set.spool_published(first), 0);
+        assert!(!set.spool_closed(first));
+
+        set.retain_spool(first);
+        set.release_spool(first);
+        assert_eq!(set.alloc_spool(), Some(SpoolId(first.0 + 1)));
+        // Releasing the last reference on the *second* spool puts it back; the
+        // first is still referenced.
+        set.release_spool(first);
+        assert!(set.alloc_spool().is_some());
+        set.assert_invariants();
     }
 
     #[test]

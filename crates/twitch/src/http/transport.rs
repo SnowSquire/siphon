@@ -5,16 +5,13 @@ use compio::io::AsyncWriteExt;
 use compio::net::TcpStream;
 use rustls::ClientConfig;
 
-use crate::http::CONNECT_TIMEOUT;
-use crate::http::IO_TIMEOUT;
+use crate::constants::CONNECT_TIMEOUT;
+use crate::constants::IO_TIMEOUT;
+use crate::constants::READ_BUFFER;
 use crate::http::error::Error;
 use crate::http::pool::PoolKey;
 use crate::http::timeout;
 use crate::http::tls::TlsConn;
-
-/// Socket read staging size. Sized from the transport probe: a bigger buffer than
-/// the socket queue buys no syscalls, and this lands in the 64–128 KiB sweet spot.
-pub const READ_BUFFER: usize = 64 * 1024;
 
 /// Bytes already received and not yet handed to the caller.
 #[derive(Default)]

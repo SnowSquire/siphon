@@ -16,10 +16,6 @@ mod pool;
 mod tls;
 mod transport;
 
-pub use crate::http::body::Body;
-pub use crate::http::body::Mode;
-pub use crate::http::error::Error;
-
 use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
@@ -28,7 +24,7 @@ use std::time::Duration;
 
 use http::HeaderMap;
 use http::Method;
-use http::StatusCode;
+pub use http::StatusCode;
 use http::Uri;
 use http::header::CONNECTION;
 use http::header::CONTENT_LENGTH;
@@ -37,17 +33,16 @@ use http::header::TRANSFER_ENCODING;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 
+use crate::constants::MAX_HEAD_BYTES as MAX_HEAD;
+use crate::constants::MAX_HEADERS;
+use crate::constants::MAX_REDIRECTS;
+pub use crate::http::body::Body;
 use crate::http::body::Lease;
+pub use crate::http::body::Mode;
+pub use crate::http::error::Error;
 use crate::http::pool::Pool;
 use crate::http::pool::PoolKey;
 use crate::http::transport::Conn;
-
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-pub const IO_TIMEOUT: Duration = Duration::from_secs(15);
-
-const MAX_HEAD: usize = 64 * 1024;
-const MAX_REDIRECTS: usize = 3;
-const MAX_HEADERS: usize = 64;
 
 /// Run `future` for at most `duration`.
 pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, Error> {
@@ -83,11 +78,7 @@ impl Client {
     }
 
     /// `GET url` with extra headers.
-    pub async fn get_with(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<Response, Error> {
+    pub async fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, Error> {
         let uri = parse_url(url)?;
         self.execute(Method::GET, uri, headers, None, None).await
     }
@@ -122,7 +113,8 @@ impl Client {
                 None => Conn::connect(&key, &self.tls).await?,
             };
 
-            let request = build_request(&uri, &method, headers, content_type, body.map(<[u8]>::len));
+            let request =
+                build_request(&uri, &method, headers, content_type, body.map(<[u8]>::len));
             conn.write_all(request.as_bytes()).await?;
             if let Some(body) = body
                 && !body.is_empty()
@@ -204,9 +196,7 @@ async fn read_head(conn: &mut Conn) -> Result<Head, Error> {
     }
 }
 
-fn parse_head(
-    buffer: &[u8],
-) -> Result<Option<(StatusCode, HeaderMap, usize, u8)>, Error> {
+fn parse_head(buffer: &[u8]) -> Result<Option<(StatusCode, HeaderMap, usize, u8)>, Error> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut response = httparse::Response::new(&mut headers);
 
@@ -234,7 +224,9 @@ fn parse_head(
 }
 
 fn body_mode(status: StatusCode, headers: &HeaderMap, method: &Method) -> Mode {
-    if method == Method::HEAD || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED
+    if method == Method::HEAD
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
     {
         return Mode::Length(0);
     }
@@ -277,23 +269,20 @@ fn contains_token(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn parse_url(url: &str) -> Result<Uri, Error> {
-    url.parse::<Uri>()
-        .map_err(|_| Error::Url(url.to_owned()))
+    url.parse::<Uri>().map_err(|_| Error::Url(url.to_owned()))
 }
 
 fn pool_key(uri: &Uri) -> Result<PoolKey, Error> {
-    let scheme = uri.scheme_str().ok_or_else(|| Error::Url(uri.to_string()))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| Error::Url(uri.to_string()))?;
     let tls = match scheme {
         "https" => true,
         "http" => false,
         other => return Err(Error::Scheme(other.to_owned())),
     };
-    let authority = uri
-        .authority()
-        .ok_or_else(|| Error::Url(uri.to_string()))?;
-    let port = authority
-        .port_u16()
-        .unwrap_or(if tls { 443 } else { 80 });
+    let authority = uri.authority().ok_or_else(|| Error::Url(uri.to_string()))?;
+    let port = authority.port_u16().unwrap_or(if tls { 443 } else { 80 });
     Ok(PoolKey::new(tls, authority.host().to_owned(), port))
 }
 
@@ -307,7 +296,10 @@ fn build_request(
     let mut out = String::with_capacity(256);
     out.push_str(method.as_str());
     out.push(' ');
-    out.push_str(uri.path_and_query().map_or("/", http::uri::PathAndQuery::as_str));
+    out.push_str(
+        uri.path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str),
+    );
     out.push_str(" HTTP/1.1\r\nHost: ");
     out.push_str(uri.authority().map_or("", http::uri::Authority::as_str));
     out.push_str("\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n");
@@ -471,7 +463,16 @@ mod tests {
         let client = Client::new();
         let url = format!("http://{addr}/");
 
-        let body = run(async { client.get(&url).await.expect("get").body.read_to_end(1024).await.expect("body") });
+        let body = run(async {
+            client
+                .get(&url)
+                .await
+                .expect("get")
+                .body
+                .read_to_end(1024)
+                .await
+                .expect("body")
+        });
 
         assert_eq!(body, b"abc12345");
         server.join().expect("server");
@@ -500,7 +501,16 @@ mod tests {
         let client = Client::new();
         let url = format!("http://{addr}/");
 
-        let body = run(async { client.get(&url).await.expect("get").body.read_to_end(1024).await.expect("body") });
+        let body = run(async {
+            client
+                .get(&url)
+                .await
+                .expect("get")
+                .body
+                .read_to_end(1024)
+                .await
+                .expect("body")
+        });
 
         assert_eq!(body, b"abcdefghij");
         server.join().expect("server");
@@ -515,7 +525,16 @@ mod tests {
         let client = Client::new();
         let url = format!("http://{addr}/");
 
-        let body = run(async { client.get(&url).await.expect("get").body.read_to_end(1024).await.expect("body") });
+        let body = run(async {
+            client
+                .get(&url)
+                .await
+                .expect("get")
+                .body
+                .read_to_end(1024)
+                .await
+                .expect("body")
+        });
 
         assert_eq!(body, b"body");
         server.join().expect("server");
@@ -531,8 +550,22 @@ mod tests {
         let url = format!("http://{addr}/");
 
         let (first, second) = run(async {
-            let first = client.get(&url).await.expect("first").body.read_to_end(16).await.expect("body");
-            let second = client.get(&url).await.expect("second").body.read_to_end(16).await.expect("body");
+            let first = client
+                .get(&url)
+                .await
+                .expect("first")
+                .body
+                .read_to_end(16)
+                .await
+                .expect("body");
+            let second = client
+                .get(&url)
+                .await
+                .expect("second")
+                .body
+                .read_to_end(16)
+                .await
+                .expect("body");
             (first, second)
         });
 
@@ -545,7 +578,9 @@ mod tests {
     fn follows_redirects() {
         let (addr, server) = serve(vec![
             Step {
-                pieces: vec![b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n".to_vec()],
+                pieces: vec![
+                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                ],
                 close: true,
             },
             step("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"),
@@ -553,7 +588,16 @@ mod tests {
         let client = Client::new();
         let url = format!("http://{addr}/start");
 
-        let body = run(async { client.get(&url).await.expect("get").body.read_to_end(64).await.expect("body") });
+        let body = run(async {
+            client
+                .get(&url)
+                .await
+                .expect("get")
+                .body
+                .read_to_end(64)
+                .await
+                .expect("body")
+        });
 
         assert_eq!(body, b"done");
         server.join().expect("server");

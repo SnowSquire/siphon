@@ -1,112 +1,56 @@
-use std::fs::OpenOptions;
 use std::io::Read;
-use std::io::Seek;
 use std::io::Write;
-use std::io::{self};
 use std::num::NonZeroU16;
-use std::thread::JoinHandle;
-use std::thread::{self};
+use std::rc::Rc;
 
+use compio::buf::IoBuf;
+use compio::fs::File;
+use compio::fs::OpenOptions;
+use compio::io::AsyncReadAtExt;
+use compio::io::AsyncWriteAtExt;
 use tracing::debug;
-use tracing::debug_span;
 use tracing::error;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::scheduler::SegmentMessage;
+use crate::spool::ConsumerWake;
+use crate::spool::Reader;
+use crate::spool::WakeSet;
 
 const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
 const INDEX_VERSION: u64 = 3;
 
 #[derive(Debug, thiserror::Error)]
+#[allow(variant_size_differences)] // `io::Error` next to a unit variant
 pub enum DiskOutputError {
-    #[error("failed to register disk output")]
-    RegisterReader {
-        #[source]
-        source: kanal::SendError,
-    },
-
-    #[error("failed to create manifest directory")]
-    CreateManifestDirectory {
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to create segment file at {path}")]
-    CreateSegmentFile {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to create index file at {path}")]
-    CreateIndexFile {
-        path: String,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to write index file header")]
-    WriteIndexHeader {
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to get segment file position")]
-    GetSegmentPosition {
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to segment data")]
-    WriteSegmentData {
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to flush segment file")]
-    FlushSegmentFile {
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to write index")]
-    WriteIndex {
-        #[source]
-        source: io::Error,
-    },
-    #[error("too lazy to gaf")]
-    SomeIo(#[from] io::Error),
-    #[error("Header is invalid")]
-    InvalidHeader(),
-    #[error("failed to flush index file")]
-    FlushIndexFile {
-        #[source]
-        source: io::Error,
-    },
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid index header")]
+    InvalidHeader,
+    #[error("failed to register disk output: {0}")]
+    RegisterReader(#[from] kanal::SendError),
 }
 
 pub fn spawn_disk_output(
-    add_output: &kanal::Sender<kanal::Sender<SegmentMessage>>,
     stream_id: u64,
-) -> JoinHandle<()> {
-    let (outupt_rx, ouput_tx): (
-        kanal::Sender<SegmentMessage>,
-        kanal::Receiver<SegmentMessage>,
-    ) = kanal::unbounded();
+    wakes: &Rc<WakeSet>,
+    add_output: &kanal::Sender<kanal::Sender<SegmentMessage>>,
+) {
+    let (tx, rx) = kanal::unbounded();
+    if let Err(error) = add_output.send(tx) {
+        error!(%error, "failed to register disk output");
+        return;
+    }
 
-    add_output
-        .send(outupt_rx)
-        .map_err(|source| DiskOutputError::RegisterReader { source })
-        .expect("fuuuuuuuuuu");
+    let wake = ConsumerWake::new();
+    wakes.register(&wake);
 
-    thread::Builder::new()
-        .name(format!("disk output stream id:{stream_id}"))
-        .spawn(move || {
-            if let Err(error) = run_disk_output(ouput_tx, stream_id) {
-                error!(?error, "disk output stopped");
-            }
-        })
-        .expect("failed to spawn disk output")
+    compio::runtime::spawn(async move {
+        if let Err(error) = run_disk_output(rx.to_async(), stream_id, &wake).await {
+            error!(?error, "disk output stopped");
+        }
+    })
+    .detach();
 }
 
 struct IndexHeader {
@@ -143,7 +87,7 @@ enum StreamRecord {
 }
 
 fn write_record<W: Write>(file: W, record: StreamRecord) -> Result<(), DiskOutputError> {
-    fn internal<W: Write>(mut file: W, record: StreamRecord) -> io::Result<()> {
+    fn internal<W: Write>(mut file: W, record: StreamRecord) -> std::io::Result<()> {
         let _: () = match record {
             StreamRecord::Discontinuity {
                 width,
@@ -210,10 +154,10 @@ fn write_record<W: Write>(file: W, record: StreamRecord) -> Result<(), DiskOutpu
         Ok(())
     }
 
-    internal(file, record).map_err(|err| DiskOutputError::WriteIndex { source: err })
+    internal(file, record).map_err(DiskOutputError::Io)
 }
 
-fn read_record<R: Read>(mut reader: R) -> io::Result<Option<StreamRecord>> {
+fn read_record<R: Read>(mut reader: R) -> std::io::Result<Option<StreamRecord>> {
     let mut tag = [0u8; 1];
     match reader.read(&mut tag)? {
         0 => return Ok(None),
@@ -274,59 +218,59 @@ fn read_record<R: Read>(mut reader: R) -> io::Result<Option<StreamRecord>> {
             }))
         }
 
-        tag => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        tag => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             format!("unknown stream record tag: {tag}"),
         )),
     }
 }
 
-fn read_u16<R: Read>(mut reader: R) -> io::Result<u16> {
+fn read_u16<R: Read>(mut reader: R) -> std::io::Result<u16> {
     let mut bytes = [0u8; 2];
     reader.read_exact(&mut bytes)?;
     Ok(u16::from_le_bytes(bytes))
 }
 
-fn read_u32<R: Read>(mut reader: R) -> io::Result<u32> {
+fn read_u32<R: Read>(mut reader: R) -> std::io::Result<u32> {
     let mut bytes = [0u8; 4];
     reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_u64<R: Read>(mut reader: R) -> io::Result<u64> {
+fn read_u64<R: Read>(mut reader: R) -> std::io::Result<u64> {
     let mut bytes = [0u8; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_u128<R: Read>(mut reader: R) -> io::Result<u128> {
+fn read_u128<R: Read>(mut reader: R) -> std::io::Result<u128> {
     let mut bytes = [0u8; 16];
     reader.read_exact(&mut bytes)?;
     Ok(u128::from_le_bytes(bytes))
 }
 
-fn read_bool<R: Read>(mut reader: R) -> io::Result<bool> {
+fn read_bool<R: Read>(mut reader: R) -> std::io::Result<bool> {
     let mut byte = [0u8; 1];
     reader.read_exact(&mut byte)?;
 
     match byte[0] {
         0 => Ok(false),
         1 => Ok(true),
-        value => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        value => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             format!("invalid boolean value: {value}"),
         )),
     }
 }
 
-fn write_stream_index_header<W: Write>(mut writer: W, stream_id: u64) -> io::Result<()> {
+fn write_stream_index_header<W: Write>(mut writer: W, stream_id: u64) -> std::io::Result<()> {
     writer.write_all(&INDEX_MAGIC)?;
     writer.write_all(&INDEX_VERSION.to_le_bytes())?;
     writer.write_all(&stream_id.to_le_bytes())?;
     Ok(())
 }
 
-fn read_stream_index_header<R: Read>(mut reader: R) -> io::Result<IndexHeader> {
+fn read_stream_index_header<R: Read>(mut reader: R) -> std::io::Result<IndexHeader> {
     let mut magic_buf = [0u8; 8];
 
     reader.read_exact(magic_buf.as_mut_slice())?;
@@ -340,12 +284,49 @@ fn read_stream_index_header<R: Read>(mut reader: R) -> io::Result<IndexHeader> {
     })
 }
 
-pub fn run_disk_output(
-    reader_tx: kanal::Receiver<SegmentMessage>,
-    stream_id: u64,
+async fn write_records(
+    file: &mut File,
+    position: &mut u64,
+    scratch: &mut Vec<u8>,
+    record: StreamRecord,
 ) -> Result<(), DiskOutputError> {
-    std::fs::create_dir_all("manifest")
-        .map_err(|source| DiskOutputError::CreateManifestDirectory { source })?;
+    // Records are at most 42 bytes; reusing the buffer keeps this allocation-free
+    // after the first write.
+    scratch.clear();
+    write_record(&mut *scratch, record)?;
+    let len = scratch.len() as u64;
+    let result = file.write_all_at(std::mem::take(scratch), *position).await;
+    *scratch = result.1;
+    result.0?;
+    *position += len;
+    Ok(())
+}
+
+async fn write_stream(
+    file: &mut File,
+    position: &mut u64,
+    hasher: &mut Xxh3,
+    reader: &mut Reader,
+    wake: &ConsumerWake,
+) -> Result<u64, DiskOutputError> {
+    let mut written = 0;
+    while let Some(view) = reader.next_view(wake).await {
+        let len = view.as_init().len() as u64;
+        hasher.update(view.as_init());
+        let result = file.write_all_at(view, *position).await;
+        result.0?;
+        *position += len;
+        written += len;
+    }
+    Ok(written)
+}
+
+async fn run_disk_output(
+    reader_rx: kanal::AsyncReceiver<SegmentMessage>,
+    stream_id: u64,
+    wake: &ConsumerWake,
+) -> Result<(), DiskOutputError> {
+    std::fs::create_dir_all("manifest")?;
 
     let segment_path = format!("manifest/{stream_id}.segs");
     let index_path = format!("manifest/{stream_id}.index");
@@ -353,114 +334,108 @@ pub fn run_disk_output(
     let mut is_fmp4 = false;
 
     let mut segment_file = OpenOptions::new()
+        .write(true)
         .create(true)
-        .append(true)
         .open(&segment_path)
-        .map_err(|source| DiskOutputError::CreateSegmentFile {
-            path: segment_path.clone(),
-            source,
-        })?;
+        .await?;
+    let mut segment_pos = segment_file.metadata().await?.len();
 
     let mut index_file = OpenOptions::new()
-        .create(true)
         .read(true)
-        .append(true)
+        .write(true)
+        .create(true)
         .open(&index_path)
-        .map_err(|source| DiskOutputError::CreateIndexFile {
-            path: index_path.clone(),
-            source,
-        })?;
+        .await?;
+    let index_len = index_file.metadata().await?.len();
+    let mut index_pos = index_len;
 
-    let mut index_sequence = if index_file.metadata().is_ok_and(|m| m.len() > 0) {
-        index_file.seek(io::SeekFrom::Start(0))?;
+    let mut index_sequence = if index_len > 0 {
+        let result = index_file.read_to_end_at(Vec::new(), 0).await;
+        let buffer = result.1;
+        result.0?;
 
-        let header = read_stream_index_header(&index_file)?;
-        (header.magic == INDEX_MAGIC
-            && header.version == INDEX_VERSION
-            && header.stream_id == stream_id)
-            .ok_or_else(DiskOutputError::InvalidHeader)?;
+        let mut cursor: &[u8] = &buffer;
+        let header = read_stream_index_header(&mut cursor)?;
+        if header.magic != INDEX_MAGIC
+            || header.version != INDEX_VERSION
+            || header.stream_id != stream_id
+        {
+            return Err(DiskOutputError::InvalidHeader);
+        }
+
         let mut next_init_counter = 0;
-
-        while let Some(record) = read_record(&index_file)? {
+        while let Some(record) = read_record(&mut cursor)? {
             match record {
                 StreamRecord::Init { counter, .. } => {
                     if counter != next_init_counter {
-                        return Err(
-                            DiskOutputError::InvalidHeader(/* or custom corrupt index error */),
-                        );
+                        return Err(DiskOutputError::InvalidHeader);
                     }
                     next_init_counter += 1;
-                    is_fmp4 = true; // Bonus: also fixes restoring `is_fmp4` state on restart!
-                }
-                StreamRecord::FMp4(_) => {
                     is_fmp4 = true;
                 }
-                StreamRecord::MpegTS(_) => {
-                    is_fmp4 = false;
-                }
+                StreamRecord::FMp4(_) => is_fmp4 = true,
+                StreamRecord::MpegTS(_) => is_fmp4 = false,
                 StreamRecord::Discontinuity { .. } => (),
             }
         }
-        index_file.seek(io::SeekFrom::End(0))?;
         next_init_counter
     } else {
-        write_stream_index_header(&mut index_file, stream_id)
-            .map_err(|source| DiskOutputError::WriteIndexHeader { source })?;
+        let mut header = Vec::new();
+        write_stream_index_header(&mut header, stream_id)?;
+        index_pos = header.len() as u64;
+        index_file.write_all_at(header, 0).await.0?;
         0
     };
 
     let mut hasher = Xxh3::new();
+    let mut record_buf = Vec::with_capacity(64);
 
     // TODO(rtsp): re-introduce discontinuity metadata (width/height/frame rate) from
     // the init segment / SPS parser. The index record type stays, so the on-disk
     // format (v3) is unchanged; see notes/es-rtp-rtsp.md "Dropped from the plan".
 
-    for msg in reader_tx {
-        debug!("message: {:#?}", msg);
-        match msg {
-            SegmentMessage::Segment(mut segment) => {
+    while let Ok(message) = reader_rx.recv().await {
+        match message {
+            SegmentMessage::Segment(segment) => {
+                debug!(sequence = segment.sequence_num, "writing segment");
                 hasher.reset();
+                let start = segment_pos;
+                let mut reader = segment.reader;
+                let length = write_stream(
+                    &mut segment_file,
+                    &mut segment_pos,
+                    &mut hasher,
+                    &mut reader,
+                    wake,
+                )
+                .await?;
 
-                let segment_start = segment_file
-                    .stream_position()
-                    .map_err(|source| DiskOutputError::GetSegmentPosition { source })?;
-
-                let _span = debug_span!("writing file", sequence = segment.sequence_num).entered();
-
-                while let Some(buf) = segment.reader.chunk() {
-                    segment_file
-                        .write_all(buf)
-                        .map_err(|source| DiskOutputError::WriteSegmentData { source })?;
-                    hasher.update(buf);
-                }
-
-                segment_file
-                    .flush()
-                    .map_err(|source| DiskOutputError::FlushSegmentFile { source })?;
-
-                let segment_end = segment_file
-                    .stream_position()
-                    .map_err(|source| DiskOutputError::GetSegmentPosition { source })?;
-
-                let segment_size = segment_end - segment_start;
-
-                let segment = Segment {
+                let record = Segment {
                     hash: hasher.digest128(),
                     sequence_number: segment.sequence_num,
-                    byte_offset: segment_start,
-                    byte_length: segment_size.try_into().unwrap(),
+                    byte_offset: start,
+                    byte_length: length.try_into().unwrap(),
                     timestamp_ms: segment.timestamp_ms.try_into().unwrap(),
                     muted: false,
                 };
 
                 if is_fmp4 {
-                    write_record(&mut index_file, StreamRecord::FMp4(segment))?;
+                    write_records(
+                        &mut index_file,
+                        &mut index_pos,
+                        &mut record_buf,
+                        StreamRecord::FMp4(record),
+                    )
+                    .await?;
                 } else {
-                    write_record(&mut index_file, StreamRecord::MpegTS(segment))?;
+                    write_records(
+                        &mut index_file,
+                        &mut index_pos,
+                        &mut record_buf,
+                        StreamRecord::MpegTS(record),
+                    )
+                    .await?;
                 }
-                index_file
-                    .flush()
-                    .map_err(|source| DiskOutputError::FlushIndexFile { source })?;
             }
             SegmentMessage::Prefetch { .. } | SegmentMessage::Discontinuity() => {}
             SegmentMessage::Init { mut reader } => {
@@ -468,41 +443,28 @@ pub fn run_disk_output(
                 // codec configuration for the SDP.
                 hasher.reset();
                 is_fmp4 = true;
-                let segment_start = segment_file
-                    .stream_position()
-                    .map_err(|source| DiskOutputError::GetSegmentPosition { source })?;
+                let start = segment_pos;
+                let length = write_stream(
+                    &mut segment_file,
+                    &mut segment_pos,
+                    &mut hasher,
+                    &mut reader,
+                    wake,
+                )
+                .await?;
 
-                while let Some(buf) = reader.chunk() {
-                    segment_file
-                        .write_all(buf)
-                        .map_err(|source| DiskOutputError::WriteSegmentData { source })?;
-
-                    hasher.update(buf);
-                }
-
-                segment_file
-                    .flush()
-                    .map_err(|source| DiskOutputError::FlushSegmentFile { source })?;
-
-                let segment_end = segment_file
-                    .stream_position()
-                    .map_err(|source| DiskOutputError::GetSegmentPosition { source })?;
-
-                let segment_size = segment_end - segment_start;
-
-                write_record(
+                write_records(
                     &mut index_file,
+                    &mut index_pos,
+                    &mut record_buf,
                     StreamRecord::Init {
                         counter: index_sequence,
                         hash: hasher.digest128(),
-                        byte_length: segment_size.try_into().unwrap(),
-                        byte_offset: segment_start,
+                        byte_length: length.try_into().unwrap(),
+                        byte_offset: start,
                     },
-                )?;
-
-                index_file
-                    .flush()
-                    .map_err(|source| DiskOutputError::FlushIndexFile { source })?;
+                )
+                .await?;
 
                 index_sequence += 1;
             }

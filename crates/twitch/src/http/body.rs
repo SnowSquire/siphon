@@ -1,12 +1,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::constants::MAX_CHUNK_LINE as MAX_LINE;
 use crate::http::error::Error;
 use crate::http::pool::Pool;
 use crate::http::pool::PoolKey;
 use crate::http::transport::Conn;
-
-const MAX_LINE: usize = 256;
 
 /// How the response body is delimited.
 #[derive(Clone, Copy, Debug)]
@@ -107,7 +106,9 @@ impl Body {
                         state = State::Done;
                         continue;
                     }
-                    let want = out.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                    let want = out
+                        .len()
+                        .min(usize::try_from(remaining).unwrap_or(usize::MAX));
                     let read = self.fill(&mut out[..want]).await?;
                     if read == 0 {
                         return Err(Error::Closed);
@@ -130,7 +131,9 @@ impl Body {
                             state = State::Chunked(Chunk::CrLf);
                             continue;
                         }
-                        let want = out.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                        let want = out
+                            .len()
+                            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
                         let read = self.fill(&mut out[..want]).await?;
                         if read == 0 {
                             return Err(Error::Closed);
@@ -208,7 +211,10 @@ impl Body {
 
     async fn read_line(&mut self) -> Result<Vec<u8>, Error> {
         loop {
-            if let Some(position) = self.carry[self.off..].iter().position(|&byte| byte == b'\n') {
+            if let Some(position) = self.carry[self.off..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+            {
                 let end = self.off + position;
                 let mut line = self.carry[self.off..end].to_vec();
                 if line.last() == Some(&b'\r') {

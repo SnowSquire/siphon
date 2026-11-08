@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::num::NonZeroU16;
 
 use rand::RngExt;
 use rand::distr::Alphanumeric;
@@ -7,26 +6,24 @@ use sonic_rs::JsonValueTrait;
 use sonic_rs::PointerTree;
 use sonic_rs::pointer;
 use thiserror::Error;
-use tracing::info;
-use ureq::Agent;
-use ureq::http::header::AUTHORIZATION;
 
 use crate::constants::DEFAULT_CLIENT_ID;
+use crate::constants::MAX_JSON;
+use crate::constants::MAX_MANIFEST;
 use crate::constants::PLAYER_VERSION;
 use crate::constants::TWITCH_GQL_ENDPOINT;
 use crate::constants::TWITCH_HLS_BASE;
 use crate::constants::TWITCH_OAUTH_ENDPOINT;
+use crate::http::Client;
 use crate::utils::attribute;
 use crate::utils::attributes;
 use crate::utils::float_string_to_centis;
+use crate::utils::query_string;
 
 #[derive(Debug, Error)]
 pub enum VariantPlaylistError {
-    #[error("failed to get playback access token: {0}")]
-    AccessTokenRequest(#[source] ureq::Error),
-
-    #[error("failed to parse access token response: {0}")]
-    AccessTokenParse(#[source] ureq::Error),
+    #[error("http: {0}")]
+    Request(#[from] crate::http::Error),
 
     #[error("token value is null or missing in response")]
     TokenMissing,
@@ -40,37 +37,21 @@ pub enum VariantPlaylistError {
     #[error("channel field is missing from token")]
     ChannelMissing,
 
-    #[error("failed to fetch HLS manifest: {source}, {url}")]
-    ManifestRequest {
-        #[source]
-        source: ureq::Error,
-        url: String,
-    },
+    #[error("manifest is not valid utf-8")]
+    Utf8,
 
-    #[error("failed to read manifest body: {0}")]
-    ManifestRead(#[source] ureq::Error),
+    #[error("manifest request returned {0}")]
+    Status(crate::http::StatusCode),
 }
 
-pub fn fetch_variant_playist(
-    agent: &Agent,
+pub async fn fetch_variant_playlist(
+    client: &Client,
     channel: &str,
     client_id: &str,
     auth_token: Option<&str>,
     low_latency: bool,
 ) -> Result<String, VariantPlaylistError> {
-    let req = agent
-        .post(TWITCH_GQL_ENDPOINT)
-        .content_type("text/plain;charset=UTF-8")
-        .header("Device-ID", random_id())
-        .header("Client-ID", client_id);
-
-    let req = if let Some(auth_token) = auth_token {
-        req.header("Authorization", format!("OAuth {auth_token}"))
-    } else {
-        req
-    };
-
-    let res = req.send(sonic_rs::to_vec(&sonic_rs::json!({
+    let body = sonic_rs::to_vec(&sonic_rs::json!({
         "extensions": {
             "persistedQuery": {
                 "sha256Hash": "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9",
@@ -86,12 +67,24 @@ pub fn fetch_variant_playist(
             "platform": "site",
             "vodID": ""
         }
-    }))?).map_err(VariantPlaylistError::AccessTokenRequest)?;
-    info!("sent pat req");
-    let res = res
-        .into_body()
-        .read_to_vec()
-        .map_err(VariantPlaylistError::AccessTokenParse)?;
+    }))?;
+
+    let device_id = random_id();
+    let authorization = auth_token.map(|token| format!("OAuth {token}"));
+    let mut headers: Vec<(&str, &str)> = vec![("Device-ID", &device_id), ("Client-ID", client_id)];
+    if let Some(authorization) = &authorization {
+        headers.push(("Authorization", authorization));
+    }
+
+    let mut response = client
+        .post(
+            TWITCH_GQL_ENDPOINT,
+            "text/plain;charset=UTF-8",
+            &body,
+            &headers,
+        )
+        .await?;
+    let payload = response.body.read_to_end(MAX_JSON).await?;
 
     // setup master playlist -------------------------------------------
 
@@ -99,8 +92,7 @@ pub fn fetch_variant_playist(
     tree.add_path(pointer!["data", "streamPlaybackAccessToken", "value"]);
     tree.add_path(pointer!["data", "streamPlaybackAccessToken", "signature"]);
 
-    info!("added paths");
-    let parsed_json = sonic_rs::get_many(res.as_slice(), &tree)?;
+    let parsed_json = sonic_rs::get_many(payload.as_slice(), &tree)?;
 
     let token_value = parsed_json[0]
         .as_str()
@@ -116,56 +108,47 @@ pub fn fetch_variant_playist(
         .as_str()
         .ok_or(VariantPlaylistError::ChannelMissing)?;
 
-    // let acmb = sonic_rs::json!({
-    //     "AppVersion": "8faed90d-c8f5-46a7-9d7c-4934daaba82",
-    //     "ClientApp": "twilight",
-    //     "URL": format!("https://www.twitch.tv/{token_channel}"),
-    // });
+    let p_value = rand::random_range(0..9_999_999).to_string();
+    let session_id = random_id();
+    let params = [
+        ("allow_source", "true"),     // enables source variant
+        ("allow_audio_only", "true"), // enables audio only variant
+        ("allow_spectre", "true"), // idk what this adds but twtich-dlp has it, to inspect, maybe the fabled ertmpaudio1?
+        ("browser_family", "chrome"),
+        ("browser_version", "151.0"),
+        ("cdm", "wv"),
+        ("enable_score", "true"), // enables SCORE attribute in EXT-X-STREAM-INF
+        ("fast_bread", if low_latency { "true" } else { "false" }),
+        ("include_unavailable", "true"),
+        ("lang", "en"),
+        ("os_name", "Windows"),
+        ("os_version", "NT 10.0"),
+        ("p", p_value.as_str()),
+        ("platform", "web"),
+        ("play_session_id", session_id.as_str()),
+        ("player_backend", "mediaplayer"),
+        ("player_version", PLAYER_VERSION),
+        ("playlist_include_framerate", "true"),
+        ("reassignments_supported", "true"),
+        ("sig", signature),
+        ("supported_codecs", "av1,h265,h264"),
+        ("token", token_value),
+        ("transcode_mode", "cbr_v1"),
+        ("multigroup_video", "true"), // enables vertical variants
+    ];
 
-    // let acmb_str = sonic_rs::to_string(&acmb).map_err(|_| ManifestError::ChannelMissing)?;
-    // let acmb_b64 = base64::Engine::encode(&STANDARD, acmb_str.as_bytes());
+    let url = format!(
+        "{TWITCH_HLS_BASE}/{token_channel}.m3u8?{}",
+        query_string(&params)
+    );
 
-    let p_value = rand::random_range(0..9_999_999);
-    // info!(%acmb_str, %token_value_str, %signature);
-    let manifest = agent
-        .get(format!("{TWITCH_HLS_BASE}/{token_channel}.m3u8"))
-        .query_pairs([
-            // ("acmb", acmb_b64.as_str()),
-            ("allow_source", "true"),     // enables source variant
-            ("allow_audio_only", "true"), // enables audio only variant
-            ("allow_spectre", "true"), // idk what this adds but twtich-dlp has it, to inspect, maybe the fabled ertmpaudio1?
-            ("browser_family", "chrome"),
-            ("browser_version", "151.0"),
-            ("cdm", "wv"),
-            ("enable_score", "true"), // enables SCORE attribute in EXT-X-STREAM-INF
-            ("fast_bread", if low_latency { "true" } else { "false" }),
-            ("include_unavailable", "true"),
-            ("lang", "en"),
-            ("os_name", "Windows"),
-            ("os_version", "NT 10.0"),
-            ("p", &p_value.to_string()),
-            ("platform", "web"),
-            ("play_session_id", &random_id()),
-            ("player_backend", "mediaplayer"),
-            ("player_version", PLAYER_VERSION),
-            ("playlist_include_framerate", "true"),
-            ("reassignments_supported", "true"),
-            ("sig", signature),
-            ("supported_codecs", "av1,h265,h264"),
-            ("token", token_value),
-            ("transcode_mode", "cbr_v1"),
-            ("multigroup_video", "true"), // enables vertical  variants
-        ]);
+    let mut response = client.get(&url).await?;
+    if !response.status.is_success() {
+        return Err(VariantPlaylistError::Status(response.status));
+    }
+    let body = response.body.read_to_end(MAX_MANIFEST).await?;
 
-    manifest
-        .call()
-        .map_err(|e| VariantPlaylistError::ManifestRequest {
-            source: e,
-            url: String::new(),
-        })?
-        .into_body()
-        .read_to_string()
-        .map_err(VariantPlaylistError::ManifestRead)
+    String::from_utf8(body).map_err(|_| VariantPlaylistError::Utf8)
 }
 
 fn random_id() -> String {
@@ -245,16 +228,16 @@ fn parse_stream_inf(line: &str, url: &str) -> Option<Variant> {
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct Variant {
-    pub score: Option<NonZeroU16>,
+    pub score: Option<std::num::NonZeroU16>,
     pub url: Box<str>,
     pub id: Box<str>,
     pub kind: VariantKind,
     pub codec: Option<Codec>,
-    pub res: Option<(NonZeroU16, NonZeroU16)>,
-    pub frame_rate: Option<NonZeroU16>,
+    pub res: Option<(std::num::NonZeroU16, std::num::NonZeroU16)>,
+    pub frame_rate: Option<std::num::NonZeroU16>,
 }
 
-fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
+fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, Option<u64>) {
     let mut stream_inf: Option<&str> = None;
 
     let mut var_vec = Vec::with_capacity(2); // always at least 2 tracks (source and audio_only)
@@ -280,17 +263,17 @@ fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
 
     var_vec.sort_by(|a, b| {
         b.score
-            .map_or(0, NonZeroU16::get)
-            .cmp(&a.score.map_or(0, NonZeroU16::get))
+            .map_or(0, std::num::NonZeroU16::get)
+            .cmp(&a.score.map_or(0, std::num::NonZeroU16::get))
     });
 
     var_vec.shrink_to_fit();
 
-    (var_vec, stream_id.unwrap())
+    (var_vec, stream_id)
 }
 
-fn choose_client_id<'a>(
-    agent: &Agent,
+async fn choose_client_id<'a>(
+    client: &Client,
     client_id: Option<&'a str>,
     auth_token: Option<&str>,
 ) -> Result<Cow<'a, str>, Box<dyn std::error::Error>> {
@@ -298,32 +281,56 @@ fn choose_client_id<'a>(
         (None, None) => Ok(DEFAULT_CLIENT_ID.into()),
         (Some(client_id), _) => Ok(client_id.into()),
         (None, Some(auth_token)) => {
-            let response = agent
-                .get(TWITCH_OAUTH_ENDPOINT)
-                .header(AUTHORIZATION, format!("OAuth {auth_token}"))
-                .call()?
-                .into_body()
-                .read_to_vec()?;
-            Ok(sonic_rs::get(response.as_slice(), pointer!["client_id"])?
+            let authorization = format!("OAuth {auth_token}");
+            let mut response = client
+                .get_with(TWITCH_OAUTH_ENDPOINT, &[("Authorization", &authorization)])
+                .await?;
+            let body = response.body.read_to_end(MAX_JSON).await?;
+            Ok(sonic_rs::get(body.as_slice(), pointer!["client_id"])?
                 .to_string()
                 .into())
         }
     }
 }
 
-pub fn get_variants(
-    agent: &Agent,
+pub async fn get_variants(
+    client: &Client,
     client_id: Option<&str>,
     auth_token: Option<&str>,
     channel: &str,
     low_latency: bool,
 ) -> (Vec<Variant>, u64) {
-    let client_id = choose_client_id(agent, client_id, auth_token).unwrap();
+    let client_id = match choose_client_id(client, client_id, auth_token).await {
+        Ok(client_id) => client_id,
+        Err(error) => {
+            eprintln!("failed to resolve a client id: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let master_manifest =
-        fetch_variant_playist(agent, channel, &client_id, auth_token, low_latency).unwrap();
+        match fetch_variant_playlist(client, channel, &client_id, auth_token, low_latency).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                eprintln!("failed to resolve variants for {channel}: {error}");
+                std::process::exit(1);
+            }
+        };
 
-    parse_variant_playlist(&master_manifest)
+    let (variants, stream_id) = parse_variant_playlist(&master_manifest);
+    if variants.is_empty() {
+        eprintln!("no variants for {channel}: is the channel live?");
+        std::process::exit(1);
+    }
+
+    let Some(stream_id) = stream_id else {
+        // The broadcast id keys the on-disk files; a one-off session can live
+        // without it, it just cannot resume.
+        tracing::warn!("master playlist has no BROADCAST-ID, using a random stream id");
+        return (variants, rand::random::<u64>());
+    };
+
+    (variants, stream_id)
 }
 
 #[cfg(test)]
@@ -345,8 +352,11 @@ mod tests {
                 .map(|(width, height)| (width.get(), height.get())),
             Some((1920, 1080))
         );
-        assert_eq!(variant.frame_rate.map(NonZeroU16::get), Some(6000));
-        assert_eq!(variant.score.map(NonZeroU16::get), Some(950));
+        assert_eq!(
+            variant.frame_rate.map(std::num::NonZeroU16::get),
+            Some(6000)
+        );
+        assert_eq!(variant.score.map(std::num::NonZeroU16::get), Some(950));
         assert!(matches!(variant.codec, Some(Codec::H264)));
     }
 
@@ -361,6 +371,6 @@ https://example/720p60.m3u8
         let (variants, stream_id) = parse_variant_playlist(playlist);
 
         assert_eq!(variants.len(), 1);
-        assert_eq!(stream_id, 123_456_789);
+        assert_eq!(stream_id, Some(123_456_789));
     }
 }

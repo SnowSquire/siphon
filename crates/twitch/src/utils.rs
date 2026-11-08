@@ -1,5 +1,4 @@
 use std::num::NonZeroU16;
-use std::ptr;
 
 pub trait RetainUnordered<T> {
     /// Keeps elements for which `f` returns `true`; order of survivors is not preserved.
@@ -27,45 +26,41 @@ impl<T> RetainUnordered<T> for Vec<T> {
     }
 }
 
-pub fn httpify_url(url: &str) -> Box<str> {
-    url.strip_prefix("https://").map_or_else(
-        || Box::from(url),
-        |rest| {
-            const HTTP_PREFIX: &[u8; 7] = b"http://";
-            // `url` starts with the 8-byte `"https://"`, so with `rest = &url[8..]`:
-            // `url.len() == 8 + rest.len()` and the buffer holds exactly
-            // `7 + rest.len()` bytes (`"http://" ++ rest`).
-            let mut buffer = Box::<[u8]>::new_uninit_slice(url.len() - 1);
+/// Percent-encodes `value` as a URL query component.
+///
+/// RFC 3986 unreserved bytes pass through; everything else, including the `+`,
+/// `/` and `=` of a base64 signature or token, is escaped.
+pub fn encode_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-            let dest = buffer.as_mut_ptr().cast::<u8>();
-            // SAFETY: `dest` points to a fresh `Box<[MaybeUninit<u8>]>` allocation of
-            // `7 + rest.len()` bytes, so bytes `0..7` are valid for writing.
-            // `HTTP_PREFIX` is a valid 7-byte static, and source/dest live in
-            // distinct allocations, so they cannot overlap.
-            unsafe {
-                ptr::copy_nonoverlapping(HTTP_PREFIX.as_ptr(), dest, HTTP_PREFIX.len());
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
             }
-            // SAFETY: `dest` starts a `7 + rest.len()`-byte allocation, so offsetting
-            // by 7 stays in bounds (at most one-past-the-end when `rest` is empty)
-            // within the same allocation.
-            let rest_dest = unsafe { dest.add(HTTP_PREFIX.len()) };
-            // SAFETY: `rest_dest` has `rest.len()` writable bytes (see buffer sizing
-            // above). `rest.as_ptr()` is valid for `rest.len()` reads, and source
-            // (`url`'s call-site allocation) and dest (fresh `Box` allocation)
-            // cannot overlap.
-            unsafe {
-                ptr::copy_nonoverlapping(rest.as_ptr(), rest_dest, rest.len());
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[usize::from(byte >> 4)]));
+                out.push(char::from(HEX[usize::from(byte & 0x0f)]));
             }
-            // SAFETY: every byte was just initialized above (`7 + rest.len()` bytes
-            // covering the whole buffer).
-            let buffer = unsafe { buffer.assume_init() };
-            // SAFETY: the contents are valid UTF-8: `"http://"` is ASCII and `rest`
-            // is the `&str` remainder of `url` after stripping the ASCII `"https://"`
-            // prefix, so the split/join is on a char boundary. `Box<[u8]>` and
-            // `Box<str>` share layout, so the transmute only adds the UTF-8 invariant.
-            unsafe { std::mem::transmute::<Box<[u8]>, Box<str>>(buffer) }
-        },
-    )
+        }
+    }
+    out
+}
+
+/// Builds `key=value&...` with both sides percent-encoded.
+pub fn query_string(params: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (index, (key, value)) in params.iter().enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        out.push_str(&encode_component(key));
+        out.push('=');
+        out.push_str(&encode_component(value));
+    }
+    out
 }
 
 /// Splits an unsigned decimal string into its integer part and its first
@@ -160,6 +155,13 @@ pub fn attribute<'a>(value: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_query_components() {
+        assert_eq!(encode_component("abc-._~"), "abc-._~");
+        assert_eq!(encode_component("a b+c/d=e"), "a%20b%2Bc%2Fd%3De");
+        assert_eq!(query_string(&[("a", "1"), ("b", "2")]), "a=1&b=2");
+    }
 
     #[test]
     fn parses_quoted_attributes_with_commas() {

@@ -10,17 +10,13 @@ use rustls::unbuffered::ConnectionState;
 use rustls::unbuffered::EncodeError;
 use rustls::unbuffered::EncryptError;
 
-use crate::http::IO_TIMEOUT;
+use crate::constants::IO_TIMEOUT;
+use crate::constants::READ_BUFFER;
+use crate::constants::TLS_OUT_BUFFER as OUT_BUFFER;
+use crate::constants::TLS_WRITE_CHUNK as WRITE_CHUNK;
 use crate::http::error::Error;
 use crate::http::timeout;
 use crate::http::transport::Carry;
-use crate::http::transport::READ_BUFFER;
-
-/// Plaintext bytes encrypted per `WriteTraffic::encrypt` call: one TLS record.
-const WRITE_CHUNK: usize = 16 * 1024;
-
-/// Scratch for one encoded/encrypted record: plaintext plus record overhead.
-const OUT_BUFFER: usize = WRITE_CHUNK + 2 * 1024;
 
 /// TLS over completion IO, driven through `rustls::unbuffered`.
 ///

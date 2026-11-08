@@ -1,118 +1,135 @@
-use std::array;
-use std::io::Read;
-use std::io::{self};
-use std::thread::JoinHandle;
-use std::thread::sleep;
+use std::rc::Rc;
 use std::time::Duration;
 
-use kanal::Receiver;
+use kanal::AsyncReceiver;
 use thiserror::Error;
+use tracing::Instrument;
 use tracing::Span;
+use tracing::debug;
 use tracing::warn;
-use ureq::Agent;
 
-use crate::downloader::ToDownloader::FetchURL;
-use crate::segment::Writer;
-
-const MAX_RETRIES: u32 = 4;
+use crate::constants::ARENA_BACKOFF;
+use crate::constants::ARENA_RETRIES;
+use crate::constants::DOWNLOAD_RETRIES;
+use crate::http::Client;
+use crate::spool::ArenaFull;
+use crate::spool::Writer;
 
 pub enum ToDownloader {
     FetchURL {
-        url: Box<str>,
+        url: Rc<str>,
         writer: Writer,
         span: Span,
     },
 }
 
-pub fn spawn_downloaders<const N: usize>(
-    agent: &Agent,
-    rx: &Receiver<ToDownloader>,
-) -> [JoinHandle<()>; N] {
-    array::from_fn(|index| {
-        let rx = rx.clone();
-        let agent = agent.clone();
-        std::thread::Builder::new()
-            .name(format!("downloader {index}"))
-            .spawn(move || download_worker(rx, &agent))
-            .expect("failed to spawn downloader thread")
-    })
+pub fn spawn_downloaders<const N: usize>(client: &Rc<Client>, rx: &kanal::Receiver<ToDownloader>) {
+    for _ in 0..N {
+        let rx = rx.clone().to_async();
+        let client = Rc::clone(client);
+        compio::runtime::spawn(async move {
+            worker(rx, &client).await;
+        })
+        .detach();
+    }
 }
 
-pub fn download_worker(rx: Receiver<ToDownloader>, agent: &Agent) {
-    for msg in rx {
-        match msg {
-            FetchURL {
-                url,
-                mut writer,
-                span,
-            } => {
-                let _guard = span.enter();
-                let mut attempt = 0;
+async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
+    while let Ok(message) = rx.recv().await {
+        let ToDownloader::FetchURL {
+            url,
+            mut writer,
+            span,
+        } = message;
 
-                loop {
-                    let result = launch_download_ureq(agent, url.as_ref(), &mut writer);
-
-                    match result {
-                        Ok(()) => break,
-                        Err(e) => {
-                            attempt += 1;
-                            if attempt > MAX_RETRIES {
-                                warn!(
-                                    "download of {} failed after {} attempts: {}. giving up",
-                                    url, attempt, e
-                                );
-                                break;
-                            }
-                            let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
-                            warn!(
-                                "download of {} failed (attempt {}/{}): {}. retrying in {:?}",
-                                url, attempt, MAX_RETRIES, e, backoff
-                            );
-                            sleep(backoff);
-                        }
+        let mut attempt = 0;
+        loop {
+            match fetch(client, &url, &mut writer, &span).await {
+                Ok(()) => break,
+                Err(error) => {
+                    // Retrying would append to a partially written segment.
+                    if !writer.is_empty() {
+                        warn!(%url, %error, "download failed after writing bytes, giving up");
+                        break;
                     }
+                    attempt += 1;
+                    if attempt > DOWNLOAD_RETRIES {
+                        warn!(%url, %error, attempt, "download failed, giving up");
+                        break;
+                    }
+                    let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                    warn!(%url, %error, attempt, ?backoff, "download failed, retrying");
+                    compio::time::sleep(backoff).await;
                 }
             }
         }
     }
 }
 
-#[derive(Error, Debug)]
-enum DownloadError {
-    #[error("io error: {0}")]
-    Io(#[from] io::Error),
-    #[error("ureq error: {0}")]
-    Ureq(#[from] ureq::Error),
+#[derive(Debug, Error)]
+enum FetchError {
+    #[error(transparent)]
+    Http(#[from] crate::http::Error),
+    #[error(transparent)]
+    Arena(#[from] ArenaFull),
 }
 
-fn launch_download_ureq(
-    agent: &Agent,
+async fn fetch(
+    client: &Rc<Client>,
     url: &str,
     writer: &mut Writer,
-) -> Result<(), DownloadError> {
-    let mut reader = agent
-        .get(url)
-        .header("Accept-Encoding", "")
-        .call()?
-        .into_body()
-        .into_reader();
+    span: &Span,
+) -> Result<(), FetchError> {
+    let started = std::time::Instant::now();
+    let mut response = client.get(url).instrument(span.clone()).await?;
+    let head_ms = started.elapsed().as_millis();
+    let mut reads = 0usize;
+    let mut first_read_ms = 0u128;
+    let mut last_read = started;
+    let mut max_gap_ms = 0u128;
+    let mut max_read = 0usize;
+    let mut slow_gaps = 0usize;
+    let mut arena_waits = 0;
 
     loop {
-        // SAFETY: `writable_slice` lends the exclusively-owned uninitialized
-        // tail. Handing it to `read` as `&mut [u8]` relies on `read` only ever
-        // writing (never reading) the buffer; `commit` below marks exactly the
-        // `written` bytes initialized.
-        let dst = unsafe { writer.writable_slice().assume_init_mut() };
-        let written = reader.read(dst)?;
-        if written == 0 {
-            break;
+        let dst = match writer.tail() {
+            Ok(dst) => dst,
+            Err(error) => {
+                arena_waits += 1;
+                if arena_waits > ARENA_RETRIES {
+                    return Err(error.into());
+                }
+                compio::time::sleep(ARENA_BACKOFF).await;
+                continue;
+            }
+        };
+
+        let read = response.body.read(dst).instrument(span.clone()).await?;
+        if read == 0 {
+            debug!(
+                url = %url.rsplit('/').next().unwrap_or_default().get(..8).unwrap_or(""),
+                head_ms,
+                reads,
+                first_read_ms,
+                max_gap_ms,
+                max_read,
+                slow_gaps,
+                total_ms = started.elapsed().as_millis(),
+                "body end"
+            );
+            return Ok(());
         }
-        // SAFETY: `written` bytes were just written by `read` and lie within
-        // the slice above; single writer, no aliasing.
-        unsafe { writer.commit(written) };
-
-        writer.publish();
+        reads += 1;
+        if reads == 1 {
+            first_read_ms = started.elapsed().as_millis();
+        }
+        let gap = last_read.elapsed().as_millis();
+        max_gap_ms = max_gap_ms.max(gap);
+        if gap > 100 {
+            slow_gaps += 1;
+        }
+        last_read = std::time::Instant::now();
+        max_read = max_read.max(read);
+        writer.commit(read);
     }
-
-    Ok(())
 }

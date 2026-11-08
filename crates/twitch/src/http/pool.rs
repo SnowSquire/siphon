@@ -41,9 +41,9 @@ impl Pool {
     pub const fn new() -> Self {
         Self {
             idle: VecDeque::new(),
-            max_idle: 8,
-            max_idle_per_host: 4,
-            max_idle_age: Duration::from_secs(30),
+            max_idle: crate::constants::POOL_MAX_IDLE,
+            max_idle_per_host: crate::constants::POOL_MAX_IDLE_PER_HOST,
+            max_idle_age: crate::constants::POOL_IDLE_AGE,
         }
     }
 
