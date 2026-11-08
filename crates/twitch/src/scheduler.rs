@@ -388,7 +388,14 @@ impl StreamScheduler {
         // this means that we can trust the tls after xms, as long as we invalidate it after the TES.
         // we can also trust tls after ads since ads don't have disconnect protection
         // if there are other possible discontinuties then these assumptions don't hold. ¯\_(ツ)_/¯
+        //
+        // Twitch's post-ad TLS can lag the running counter: it is the sequence
+        // of the last ad segment (or even excludes short ad tails), not the
+        // first live segment that follows it. The ad EXTINFs have already
+        // advanced the counter, so add one after ads and never let a stale TLS
+        // rewind it.
         let mut trust_next_tls_val = false;
+        let mut tls_follows_ad = false;
 
         while let Some(line) = lines.next() {
             let Some((tag, value)) = line.split_once(':') else {
@@ -400,9 +407,11 @@ impl StreamScheduler {
                     segment_time_ms = float_string_to_millis(value)
                         .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
                     trust_next_tls_val = false;
+                    tls_follows_ad = false;
                 }
                 "#EXT-X-MEDIA-SEQUENCE" => {
                     trust_next_tls_val = true;
+                    tls_follows_ad = false;
                     let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
 
                     sequence_number = front;
@@ -413,8 +422,14 @@ impl StreamScheduler {
                 "#EXT-X-TWITCH-LIVE-SEQUENCE" => {
                     if trust_next_tls_val {
                         let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
-                        sequence_number = front;
+                        // After an ad, TLS points at the last ad segment. The
+                        // next live segment is one past it. A stale header TLS
+                        // (observed after ad windows) can also be below XMS, so
+                        // only ever move the counter forward.
+                        let tls_front = if tls_follows_ad { front + 1 } else { front };
+                        sequence_number = sequence_number.max(tls_front);
                         trust_next_tls_val = false;
+                        tls_follows_ad = false;
                     }
                 }
                 "#EXT-X-DISCONTINUITY" => {
@@ -455,7 +470,8 @@ impl StreamScheduler {
                 }
                 "#EXTINF" => {
                     trust_next_tls_val = false;
-                    if value.contains('|') {
+                    tls_follows_ad = value.contains('|');
+                    if tls_follows_ad {
                         trust_next_tls_val = true;
                     } else if sequence_number >= self.segment_tail
                         && let Some(url) = lines.next()

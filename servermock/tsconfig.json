@@ -1,5 +1,6 @@
 {
   "include": ["main.ts", "hermesnotifier.ts"],
+  "exclude": ["segments"],
   "compilerOptions": {
     "target": "esnext",
     "module": "ESNext",
