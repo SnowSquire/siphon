@@ -16,6 +16,8 @@ use crate::constants::PLAYER_VERSION;
 use crate::constants::TWITCH_GQL_ENDPOINT;
 use crate::constants::TWITCH_HLS_BASE;
 use crate::constants::TWITCH_OAUTH_ENDPOINT;
+use crate::utils::attribute;
+use crate::utils::attributes;
 use crate::utils::float_string_to_centis;
 
 #[derive(Debug, Error)]
@@ -174,32 +176,6 @@ fn random_id() -> String {
         .collect()
 }
 
-fn attributes(tag: &str) -> impl Iterator<Item = (&str, &str)> {
-    let mut rest = tag.split_once(':').map_or("", |(_, attrs)| attrs);
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-
-        let eq: usize = rest.find('=')?;
-        let key = rest[..eq].trim();
-        let after_eq = &rest[eq + 1..];
-
-        let (value, tail) = if let Some(quoted) = after_eq.strip_prefix('"') {
-            let close = quoted.find('"')?;
-            let value = &quoted[..close];
-            let tail = quoted[close + 1..].strip_prefix(',').unwrap_or("");
-            (value, tail)
-        } else {
-            after_eq
-                .split_once(',')
-                .map_or_else(|| (after_eq.trim(), ""), |(v, t)| (v.trim(), t))
-        };
-
-        rest = tail;
-        Some((key, value))
-    })
-}
 #[derive(Clone)]
 pub enum VariantKind {
     Landscape,
@@ -231,7 +207,8 @@ fn parse_stream_inf(line: &str, url: &str) -> Option<Variant> {
     let mut codec = None;
     let mut res = None;
 
-    for (key, value) in attributes(line) {
+    let attrs = line.split_once(':').map_or("", |(_, attrs)| attrs);
+    for (key, value) in attributes(attrs) {
         match key {
             "STABLE-VARIANT-ID" => variant_id = Some(value),
             "SCORE" => score = float_string_to_centis(value),
@@ -293,9 +270,9 @@ fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, u64) {
             if let Some(variant) = parse_stream_inf(stream_inf, line) {
                 var_vec.push(variant);
             }
-        } else if let Some(value) = line
-            .strip_prefix("#EXT-X-SESSION-DATA:DATA-ID=\"BROADCAST-ID\",VALUE=\"")
-            .and_then(|v| v.strip_suffix("\""))
+        } else if let Some(attrs) = line.strip_prefix("#EXT-X-SESSION-DATA:")
+            && attribute(attrs, "DATA-ID") == Some("BROADCAST-ID")
+            && let Some(value) = attribute(attrs, "VALUE")
         {
             stream_id = value.parse::<u64>().ok();
         }
@@ -347,4 +324,43 @@ pub fn get_variants(
         fetch_variant_playist(agent, channel, &client_id, auth_token, low_latency).unwrap();
 
     parse_variant_playlist(&master_manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_stream_inf_with_quoted_codecs() {
+        let line = "#EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS=\"avc1.4d401f,mp4a.40.2\",\
+                    RESOLUTION=1920x1080,FRAME-RATE=60.000,SCORE=9.5,\
+                    STABLE-VARIANT-ID=\"720p60\"";
+
+        let variant = parse_stream_inf(line, "https://example/720p60.m3u8").unwrap();
+
+        assert_eq!(variant.id.as_ref(), "720p60");
+        assert_eq!(
+            variant
+                .res
+                .map(|(width, height)| (width.get(), height.get())),
+            Some((1920, 1080))
+        );
+        assert_eq!(variant.frame_rate.map(NonZeroU16::get), Some(6000));
+        assert_eq!(variant.score.map(NonZeroU16::get), Some(950));
+        assert!(matches!(variant.codec, Some(Codec::H264)));
+    }
+
+    #[test]
+    fn reads_broadcast_id_from_session_data() {
+        let playlist = "\
+#EXTM3U
+#EXT-X-SESSION-DATA:DATA-ID=\"BROADCAST-ID\",VALUE=\"123456789\"
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,STABLE-VARIANT-ID=\"720p60\"
+https://example/720p60.m3u8
+";
+        let (variants, stream_id) = parse_variant_playlist(playlist);
+
+        assert_eq!(variants.len(), 1);
+        assert_eq!(stream_id, 123_456_789);
+    }
 }

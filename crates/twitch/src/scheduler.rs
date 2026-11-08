@@ -1,5 +1,3 @@
-use std::num::ParseFloatError;
-use std::num::ParseIntError;
 use std::thread::JoinHandle;
 use std::thread::{self};
 use std::time::Duration;
@@ -16,13 +14,16 @@ use tracing::debug_span;
 use tracing::error;
 use tracing::info;
 use tracing::span;
+use tracing::warn;
 use ureq::Agent;
 
 use crate::downloader::ToDownloader;
+use crate::playlist::Event;
+use crate::playlist::ManifestParseError;
+use crate::playlist::Playlist;
 use crate::segment::Reader;
 use crate::segment::Stream;
 use crate::utils::RetainUnordered;
-use crate::utils::float_string_to_millis;
 use crate::utils::httpify_url;
 
 struct PrefetchSegment {
@@ -54,16 +55,6 @@ impl From<Segment> for SegmentMessage {
     fn from(value: Segment) -> Self {
         Self::Segment(value)
     }
-}
-
-#[derive(Error, Debug)]
-enum ManifestParseError {
-    #[error("invalid integer: {0}")]
-    Int(#[from] ParseIntError),
-    #[error("invalid float: {0}")]
-    Float(#[from] ParseFloatError),
-    #[error("unable to split as expected")]
-    Split(),
 }
 
 #[derive(Error, Debug)]
@@ -237,58 +228,49 @@ impl StreamScheduler {
         &mut self,
         url: &str,
         expected_sequence: u64,
-        infoline: &str,
         timestamp_ms: u64,
-    ) -> Result<Duration, Box<dyn std::error::Error>> {
+        duration_ms: u64,
+    ) {
         let prefetch = self
             .prefetches
             .iter()
             .position(|s| s.expected_id == expected_sequence && s.url.as_ref() == url)
             .map(|idx| self.prefetches.swap_remove(idx));
-        // more specifically if the title in the extinf is not 'live' but not 100% sure on that
-        let is_ad: bool = infoline.contains('|');
 
-        let duration =
-            Duration::try_from_secs_f64(infoline.split_once(',').map(|d| d.0).unwrap().parse()?)?;
+        let duration = Duration::from_millis(duration_ms);
         let span = debug_span!(
             "main segment",
             sequence_id = expected_sequence,
             was_prefetched = prefetch.is_some(),
-            %is_ad,
             duration = duration.as_secs_f64(),
         );
 
         let _guard = span.enter();
         debug!("new main segment");
-        if is_ad {
-            return Ok(duration);
-        }
 
-        if let Some(prefetch) = prefetch {
-            let segment = Segment {
-                sequence_num: expected_sequence,
-                reader: prefetch.reader,
-                timestamp_ms,
-            };
-            self.segments.push(segment.clone());
-
-            self.readers.retain_unordered(|reader| {
-                if reader.try_send(segment.clone().into()).is_ok_and(|v| v) {
-                    true // success, keep
-                } else {
-                    let _ = reader.close(); // close it
-                    false
-                }
-            });
+        let (segment, writer) = if let Some(prefetch) = prefetch {
+            (
+                Segment {
+                    sequence_num: expected_sequence,
+                    reader: prefetch.reader,
+                    timestamp_ms,
+                },
+                None,
+            )
         } else {
-            let (writer, segmentreader) = Stream::new_stream();
-            let segment = Segment {
-                sequence_num: expected_sequence,
-                reader: segmentreader,
-                timestamp_ms,
-            };
-            self.segments.push(segment.clone());
+            let (writer, reader) = Stream::new_stream();
+            (
+                Segment {
+                    sequence_num: expected_sequence,
+                    reader,
+                    timestamp_ms,
+                },
+                Some(writer),
+            )
+        };
+        self.segments.push(segment.clone());
 
+        if let Some(writer) = writer {
             self.downloaders
                 .send(ToDownloader::FetchURL {
                     url: httpify_url(url),
@@ -297,18 +279,18 @@ impl StreamScheduler {
                     span: span.clone(),
                 })
                 .unwrap(); // if this send fails i genuinely have no idea how to handle it just leave it
-            self.readers.retain_unordered(|reader| {
-                if reader.try_send(segment.clone().into()).is_ok_and(|v| v) {
-                    true // success, keep
-                } else {
-                    let _ = reader.close(); // close it
-                    false
-                }
-            });
         }
 
+        self.readers.retain_unordered(|reader| {
+            if reader.try_send(segment.clone().into()).is_ok_and(|v| v) {
+                true // success, keep
+            } else {
+                let _ = reader.close(); // close it
+                false
+            }
+        });
+
         self.last_segment_dur = duration;
-        Ok(duration)
     }
 
     fn dispatch_prefetch(&mut self, url: &str, expected_sequence: u64) -> Result<(), ()> {
@@ -356,9 +338,44 @@ impl StreamScheduler {
         Ok(())
     }
 
+    fn broadcast_discontinuity(&mut self) {
+        self.readers.retain_unordered(|reader| {
+            if reader
+                .try_send(SegmentMessage::Discontinuity())
+                .is_ok_and(|v| v)
+            {
+                true // success, keep
+            } else {
+                let _ = reader.close(); // close it
+                false
+            }
+        });
+    }
+
+    fn apply_init(&mut self, uri: &str) -> Result<(), SchedulerError> {
+        if let Some((old, _)) = &self.init {
+            if old.as_str() != uri {
+                debug!(old, uri, "init segment changed mid-stream");
+            }
+            return Ok(());
+        }
+
+        let span = debug_span!("init segment");
+        let (writer, reader) = Stream::new_stream();
+        self.downloaders.send(ToDownloader::FetchURL {
+            url: uri.into(),
+            writer,
+            span,
+        })?;
+        self.init = Some((uri.into(), reader));
+
+        Ok(())
+    }
+
     fn reload(&mut self) -> Result<u64, SchedulerError> {
         let span = span!(Level::INFO, "manifest");
         let _guard = span.enter();
+
         let manifest = self
             .agent
             .get(self.stream_url.as_ref())
@@ -366,147 +383,61 @@ impl StreamScheduler {
             .into_body()
             .read_to_string()?;
 
-        if manifest
-            .lines()
-            .next()
-            .is_some_and(|l| l.trim() == "#EXT-X-ENDLIST")
-        {
-            info!("stream offline");
-            return Err(SchedulerError::Offline {});
-        }
-
         let original_prefetch_tail = self.prefetch_tail;
-        let mut sequence_number = 0;
+        // Dropout protection repeats the final sequence at every checkpoint, so
+        // only the last annotation is a meaningful canary.
+        let mut last_checkpoint = None;
 
-        let mut lines = manifest.lines();
-
-        let mut segment_time_ms = 0;
-        // this is so dumb but twitch has a bug where multiple disconnect protections in one playlist all have the same value (being of the final sequence)
-        // since we don't care about downloading & persisting ads, we don't have to worry about their sequence number conflict with the real segments
-
-        // the order of tags in the playlist is typically XMS\nTLS\nT-ELAPSED-SECS, unless first segments is an ad. in which case there's no TLS (until the first real segment)
-        // this means that we can trust the tls after xms, as long as we invalidate it after the TES.
-        // we can also trust tls after ads since ads don't have disconnect protection
-        // if there are other possible discontinuties then these assumptions don't hold. ¯\_(ツ)_/¯
-        //
-        // Twitch's post-ad TLS can lag the running counter: it is the sequence
-        // of the last ad segment (or even excludes short ad tails), not the
-        // first live segment that follows it. The ad EXTINFs have already
-        // advanced the counter, so add one after ads and never let a stale TLS
-        // rewind it.
-        let mut trust_next_tls_val = false;
-        let mut tls_follows_ad = false;
-
-        while let Some(line) = lines.next() {
-            let Some((tag, value)) = line.split_once(':') else {
-                continue;
-            };
-
-            match tag {
-                "#EXT-X-TWITCH-ELAPSED-SECS" => {
-                    segment_time_ms = float_string_to_millis(value)
-                        .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
-                    trust_next_tls_val = false;
-                    tls_follows_ad = false;
-                }
-                "#EXT-X-MEDIA-SEQUENCE" => {
-                    trust_next_tls_val = true;
-                    tls_follows_ad = false;
-                    let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
-
-                    sequence_number = front;
-                    debug!("new front {}", sequence_number);
-
+        for event in Playlist::new(&manifest) {
+            match event? {
+                Event::MediaSequence(front) => {
+                    debug!("new front {front}");
                     self.segments.retain(|s| s.sequence_num >= front);
                 }
-                "#EXT-X-TWITCH-LIVE-SEQUENCE" => {
-                    if trust_next_tls_val {
-                        let front: u64 = value.parse().map_err(ManifestParseError::Int)?;
-                        // After an ad, TLS points at the last ad segment. The
-                        // next live segment is one past it. A stale header TLS
-                        // (observed after ad windows) can also be below XMS, so
-                        // only ever move the counter forward.
-                        let tls_front = if tls_follows_ad { front + 1 } else { front };
-                        sequence_number = sequence_number.max(tls_front);
-                        trust_next_tls_val = false;
-                        tls_follows_ad = false;
-                    }
+                Event::Init(uri) => self.apply_init(uri)?,
+                Event::Discontinuity => self.broadcast_discontinuity(),
+                Event::Checkpoint { annotated, next } => last_checkpoint = Some((annotated, next)),
+                Event::Ended => {
+                    info!("stream offline");
+                    return Err(SchedulerError::Offline {});
                 }
-                "#EXT-X-DISCONTINUITY" => {
-                    self.readers.retain_unordered(|reader| {
-                        if reader
-                            .try_send(SegmentMessage::Discontinuity())
-                            .is_ok_and(|v| v)
-                        {
-                            true // success, keep
-                        } else {
-                            let _ = reader.close(); // close it
-                            false
-                        }
-                    });
-                }
-                "#EXT-X-MAP" => {
-                    //#EXT-X-MAP:URI="main.mp4",BYTERANGE="560@0", this code doesn't handle having multiple values after the URI, should probably write a better m3u8 parser
-                    let new_init = value
-                        .split_once('=')
-                        .ok_or_else(ManifestParseError::Split)?
-                        .1
-                        .trim_matches('"');
-
-                    if let Some(old_init) = &self.init {
-                        if new_init != old_init.0 {
-                            // TODO: log
-                        }
-                    } else {
-                        let span = debug_span!("init segment");
-                        let (writer, reader) = Stream::new_stream();
-                        self.downloaders.send(ToDownloader::FetchURL {
-                            url: new_init.into(),
-                            writer,
-                            span: span.clone(),
-                        })?;
-                        self.init = Some((new_init.into(), reader));
-                    }
-                }
-                "#EXTINF" => {
-                    trust_next_tls_val = false;
-                    tls_follows_ad = value.contains('|');
-                    if tls_follows_ad {
-                        trust_next_tls_val = true;
-                    } else if sequence_number >= self.segment_tail
-                        && let Some(url) = lines.next()
-                    {
-                        self.segment_tail = sequence_number + 1;
-                        self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
-
-                        self.dispatch_main(url, sequence_number, value, segment_time_ms)
-                            .map_err(|_| SchedulerError::Dispatch)?;
+                Event::Media(media) => {
+                    // Ads consume sequence numbers but are never downloaded.
+                    if media.is_ad || media.sequence < self.segment_tail {
+                        continue;
                     }
 
-                    sequence_number += 1;
-                    let segment_len = float_string_to_millis(
-                        value
-                            .split_once(',')
-                            .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?
-                            .0,
-                    )
-                    .ok_or(SchedulerError::Parse(ManifestParseError::Split()))?;
-                    segment_time_ms += segment_len;
+                    self.segment_tail = media.sequence + 1;
+                    self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
+                    self.dispatch_main(
+                        media.uri,
+                        media.sequence,
+                        media.timestamp_ms,
+                        media.duration_ms,
+                    );
                 }
-                "#EXT-X-TWITCH-PREFETCH" | "#EXT-X-PREFETCH" => {
-                    if sequence_number >= self.prefetch_tail {
-                        self.prefetch_tail = sequence_number + 1;
-
-                        self.dispatch_prefetch(value, sequence_number)
-                            .map_err(|()| SchedulerError::Dispatch)?;
+                Event::Prefetch { uri, sequence } => {
+                    if sequence < self.prefetch_tail {
+                        continue;
                     }
-                    sequence_number += 1;
+
+                    self.prefetch_tail = sequence + 1;
+                    self.dispatch_prefetch(uri, sequence)
+                        .map_err(|()| SchedulerError::Dispatch)?;
                 }
-                _ => (),
             }
         }
 
-        // info!(new_segments = self.prefetch_tail - original_prefetch_tail, %mains, %prefetches);
+        if let Some((annotated, next)) = last_checkpoint
+            && annotated > next
+        {
+            warn!(
+                tls = annotated,
+                sequence = next,
+                "live sequence annotation ahead of positional sequence"
+            );
+        }
+
         Ok(self.prefetch_tail - original_prefetch_tail)
     }
 }

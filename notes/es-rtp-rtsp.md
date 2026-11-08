@@ -125,6 +125,76 @@ breaks). Options:
 - AV1-in-TS.
 - TS-over-RTP.
 
+## Client memory / IO (uninitialized reads)
+
+The chunks live in a zero-initialized slot arena (next section), so every byte
+of the payload buffer is always a valid `u8`. That removes the old
+`writable_slice().assume_init_mut()` -> `Read::read(&mut [u8])` UB without any
+nightly features: `writable_slice()` is `&mut [u8]`, and `Read`/`AsyncRead` can
+write into it directly.
+
+If the one-time arena zeroing ever becomes measurable, the uninit path is:
+
+- `#![feature(read_buf, core_io_borrowed_buf)]` on nightly (both are needed;
+  `core_io_borrowed_buf` alone does not give you `Read::read_buf`).
+- `Read::read_buf(&mut BorrowedCursor)` with
+  `BorrowedBuf::from(&mut [MaybeUninit<u8>])`. The default `read_buf` impl
+  zero-initializes via `ensure_init`; an impl that overrides it writes into the
+  cursor without initializing.
+- rustls: enable `rustls = { features = ["read_buf"] }`. Its build script sets
+  `cfg(read_buf)` only on nightly, and `Reader::read_buf` appends plaintext
+  directly into the cursor (`cursor.append(...)`), no memset.
+- compio plaintext: `AsyncRead::read<B: IoBufMut>` already takes uninit buffers;
+  the driver writes through raw pointers. `IoBuf` is `'static`, and `IoBufMut`
+  is implemented for `Uninit<T>`/`Slice<T>` but not `Arc`, so wrap a slot in a
+  `ChunkBuf { id: SlotId, offset: usize }` owner that implements `IoBufMut`.
+- TLS boundary: `compio-tls` only exposes futures
+  `AsyncRead::poll_read(&mut [u8])` and does not expose the underlying
+  `rustls::ClientConnection`, so `read_buf` requires driving rustls directly
+  (`read_tls`, `process_new_packets`, `reader().read_buf(cursor)`).
+- `BorrowedBuf`/`read_buf` is still unstable (rust issue #117693) as of 1.99.
+
+With the zeroed arena none of this is required; it is recorded as the fallback,
+not the plan.
+
+## Slot chunk allocator
+
+Replaces `Arc<Chunk>` (`Chunk::new`, `OnceLock<next>`, drop-chain) with a global
+arena of fixed slots. The compio reactor is single-threaded, so this needs no
+atomics and no locks: `Cell`/`NonNull` are enough.
+
+- 32 slots per arena, 32-bit free bitmap.
+- Chunk size `192_512` = `188 * 1024` = 47 pages. The old 16 KiB factor was a
+  ureq buffering artefact; 188 is the only real constraint (TS alignment), and
+  `192_512` is the smallest size that is also 4 KiB page-aligned.
+- Arena data = `32 * 192_512 = 6_160_384 B` (~5.9 MiB), allocated with
+  `alloc_zeroed` so every slot byte is initialized from the start.
+- `SlotMeta { refs: Cell<u32>, next: Cell<Option<SlotId>> }` in a separate array
+  from `data`, so the bitmap/metadata scan does not touch the payload.
+- Intrusive refcount per slot. A slice is live while held by the writer (tail),
+  any reader, or the predecessor's `next` link. The `next` link must hold a
+  reference, otherwise a lagging reader can follow a recycled slot.
+- Free path: refcount `1 -> 0`; take `next` and release it iteratively (never
+  recursively, a long chain would overflow the stack); set the bitmap bit
+  (`debug_assert` it was clear, so double-free is impossible); if the arena
+  bitmap is full, unlink and deallocate the arena.
+- Allocation: `trailing_zeros` on the free bitmap; if empty, push a new arena
+  onto the chain.
+- Guarantees: `SlotRef` (readers) and `SlotMut` (writer) pin a slot and deref to
+  `&[u8]`/`&mut [u8]`. No mutex is needed; the stream frontier provides the
+  visibility edge.
+- Global allocator shared by all channels in the daemon. Arenas are reclaimed
+  when fully free; the free sets advance in stream order so the head is usually
+  the one that empties. A doubly-linked list makes unlink O(1).
+- Buffer depth: 32 slots is ~6 MiB, roughly 8 s at the measured ~0.75 MB/s while
+  the live prefetch is in flight. Arena growth covers catch-up and slow readers.
+- No blocking consumers: FFmpeg is dropped from this plan, and RTSP/RTP
+  packetization plus compio-fs run on the reactor. If a blocking consumer is
+  ever added, the only sound pattern is: pin on the reactor, pass a `Send`
+  `SlotView`, and release only on an explicit completion message. compio's
+  `spawn_blocking` does **not** cancel the task when the future is dropped, so a
+  guard held by the cancellable future would be a use-after-free.
+
 ## Open risks
 
 - AV1 RTP is AOM `av1-rtp-spec` v1.0, not an RFC; player support is assumed acceptable.

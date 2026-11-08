@@ -1,6 +1,7 @@
 mod constants;
 mod disk;
 mod downloader;
+mod playlist;
 mod scheduler;
 mod segment;
 mod tcp;
