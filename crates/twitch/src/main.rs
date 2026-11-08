@@ -1,4 +1,7 @@
 mod constants;
+// compio tasks are deliberately !Send (one thread-per-core reactor).
+#[allow(dead_code, clippy::future_not_send)] // TODO(compio): drop dead_code once used
+mod http;
 mod disk;
 mod downloader;
 mod playlist;
@@ -9,6 +12,7 @@ mod utils;
 mod variant;
 
 use clap::Parser;
+#[cfg(not(miri))]
 use mimalloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
 
@@ -19,6 +23,8 @@ use crate::tcp::spawn_tcp_listener;
 use crate::variant::Variant;
 use crate::variant::get_variants;
 
+// Miri cannot execute a foreign allocator, so it runs on the system allocator.
+#[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -47,6 +53,10 @@ struct Config {
     quality: Option<String>,
     #[arg(short, long)]
     debug: bool,
+
+    /// Throwaway: fetch a URL through the new client and print the response.
+    #[arg(long)]
+    probe: Option<String>,
 }
 
 fn main() {
@@ -61,6 +71,11 @@ fn main() {
         .new_agent();
 
     let cfg = Config::parse();
+
+    if let Some(url) = &cfg.probe {
+        run_probe(url);
+        return;
+    }
 
     let (variants, stream_id) = if cfg.debug {
         (
@@ -106,4 +121,29 @@ fn main() {
     for thread in download_threads {
         let _ = thread.join();
     }
+}
+
+fn run_probe(url: &str) {
+    let client = http::Client::new();
+    let runtime = compio::runtime::Runtime::new().expect("compio runtime");
+    runtime.block_on(async {
+        let mut response = match client.get(url).await {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("request failed: {error}");
+                return;
+            }
+        };
+        println!("{}", response.status);
+        for (name, value) in &response.headers {
+            println!("{name}: {}", value.to_str().unwrap_or("<binary>"));
+        }
+        match response.body.read_to_end(128 * 1024 * 1024).await {
+            Ok(body) => {
+                println!("--- {} bytes", body.len());
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), &body);
+            }
+            Err(error) => eprintln!("body failed: {error}"),
+        }
+    });
 }

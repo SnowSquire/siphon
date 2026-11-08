@@ -10,17 +10,32 @@ authors = ["Ozeniken"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
-ffmpeg-next = "9.0.0"
+compio = { version = "0.19", features = [
+    "macros",
+    "net",
+    "fs",
+    "time",
+    "signal",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = "1"
+httparse = "1"
 kanal = "0.1.1"
 mimalloc = "0.1.52"
 rand = "0.10.2"
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
 sonic-rs = "0.5.8"
 thiserror = "2.0.20"
 tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = { version = "3.3.0", features = ["rustls"] }
-ureq-proto = { version = "0.6.1", features = ["client"] }
 wait_on_address = { git = "https://github.com/DouglasDwyer/wait_on_address.git", rev = "71ea457950bed173ee4039c8fd5bc45ad1e3aa17" }
+webpki-roots = "1"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 

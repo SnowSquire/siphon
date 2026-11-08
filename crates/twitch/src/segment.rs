@@ -5,6 +5,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+// TODO(compio): remove the `dead_code` allow once `writer`/`reader` are rebuilt on
+// top of the arena (phase 3 of the port).
+#[allow(dead_code)]
+mod arena;
 mod reader;
 mod writer;
 
@@ -12,7 +16,6 @@ use wait_on_address::AtomicWait;
 
 use crate::constants::CHUNK_SIZE;
 pub use crate::segment::reader::Reader;
-pub use crate::segment::reader::SeekableReader;
 pub use crate::segment::writer::Writer;
 
 #[derive(Debug)]

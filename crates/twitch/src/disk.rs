@@ -7,15 +7,12 @@ use std::num::NonZeroU16;
 use std::thread::JoinHandle;
 use std::thread::{self};
 
-use ffmpeg_next::format::context::StreamIo;
-use ffmpeg_next::{self as ffmpeg};
 use tracing::debug;
 use tracing::debug_span;
 use tracing::error;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::scheduler::SegmentMessage;
-use crate::segment::SeekableReader;
 
 const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
 const INDEX_VERSION: u64 = 3;
@@ -347,8 +344,6 @@ pub fn run_disk_output(
     reader_tx: kanal::Receiver<SegmentMessage>,
     stream_id: u64,
 ) -> Result<(), DiskOutputError> {
-    ffmpeg::init().unwrap();
-
     std::fs::create_dir_all("manifest")
         .map_err(|source| DiskOutputError::CreateManifestDirectory { source })?;
 
@@ -414,10 +409,11 @@ pub fn run_disk_output(
         0
     };
 
-    let mut probed_stream = false;
     let mut hasher = Xxh3::new();
 
-    // this needs to be initialized from the stream header but i dont wanna do that right now
+    // TODO(rtsp): re-introduce discontinuity metadata (width/height/frame rate) from
+    // the init segment / SPS parser. The index record type stays, so the on-disk
+    // format (v3) is unchanged; see notes/es-rtp-rtsp.md "Dropped from the plan".
 
     for msg in reader_tx {
         debug!("message: {:#?}", msg);
@@ -430,11 +426,6 @@ pub fn run_disk_output(
                     .map_err(|source| DiskOutputError::GetSegmentPosition { source })?;
 
                 let _span = debug_span!("writing file", sequence = segment.sequence_num).entered();
-                let ffmpeg_reader = if probed_stream {
-                    None
-                } else {
-                    Some(segment.reader.clone())
-                };
 
                 while let Some(buf) = segment.reader.chunk() {
                     segment_file
@@ -453,47 +444,6 @@ pub fn run_disk_output(
 
                 let segment_size = segment_end - segment_start;
 
-                if let Some(reader) = ffmpeg_reader {
-                    // TODO:  create a better seekable struct for the reader (put all the Arc<Chunk> in an Vec & wrap it with read + seek)
-                    let input_ctx = ffmpeg::format::input_from_stream(
-                        StreamIo::from_read_seek(SeekableReader::new(reader)).unwrap(),
-                        None,
-                        None,
-                    )
-                    .unwrap();
-
-                    let video_stream = input_ctx
-                        .streams()
-                        .best(ffmpeg::media::Type::Video)
-                        .unwrap();
-
-                    let decoder =
-                        ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())
-                            .unwrap();
-                    let video_decoder = decoder.decoder().video().unwrap();
-
-                    let width = video_decoder.width();
-                    let height = video_decoder.height();
-                    let framerate = video_decoder
-                        .frame_rate()
-                        .into_iter()
-                        .chain([video_stream.avg_frame_rate(), video_stream.rate()])
-                        .find(|r| r.numerator() > 0 && r.denominator() > 0);
-
-                    write_record(
-                        &mut index_file,
-                        StreamRecord::Discontinuity {
-                            width: width.try_into().unwrap(),
-                            height: height.try_into().unwrap(),
-                            rate_num: framerate
-                                .and_then(|f| NonZeroU16::new(f.numerator().try_into().unwrap())),
-                            rate_denom: framerate
-                                .and_then(|f| NonZeroU16::new(f.denominator().try_into().unwrap())),
-                        },
-                    )?;
-
-                    probed_stream = true;
-                }
                 let segment = Segment {
                     hash: hasher.digest128(),
                     sequence_number: segment.sequence_num,
@@ -512,10 +462,10 @@ pub fn run_disk_output(
                     .flush()
                     .map_err(|source| DiskOutputError::FlushIndexFile { source })?;
             }
-            SegmentMessage::Prefetch { .. } => {}
-            SegmentMessage::Discontinuity() => probed_stream = false,
+            SegmentMessage::Prefetch { .. } | SegmentMessage::Discontinuity() => {}
             SegmentMessage::Init { mut reader } => {
-                // we should do the ffmpeg probing on these
+                // TODO(rtsp): this is where the init segment parser will pick up
+                // codec configuration for the SDP.
                 hasher.reset();
                 is_fmp4 = true;
                 let segment_start = segment_file
@@ -555,7 +505,6 @@ pub fn run_disk_output(
                     .map_err(|source| DiskOutputError::FlushIndexFile { source })?;
 
                 index_sequence += 1;
-                probed_stream = true;
             }
         }
     }
