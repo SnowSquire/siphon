@@ -7,6 +7,8 @@ use std::time::UNIX_EPOCH;
 use kanal::AsyncSender;
 use kanal::Receiver;
 use kanal::Sender;
+use eros::IntoUnion;
+use eros::ReshapeUnion;
 use thiserror::Error;
 use tracing::Level;
 use tracing::debug;
@@ -61,22 +63,28 @@ impl From<Segment> for SegmentMessage {
 }
 
 #[derive(Error, Debug)]
-enum SchedulerError {
-    #[error("manifest ended")]
-    Offline,
-    #[error("http error: {0}")]
-    Http(#[from] crate::http::Error),
-    #[error("manifest is not valid utf-8")]
+#[error("manifest ended")]
+struct Offline;
+
+#[derive(Error, Debug)]
+#[error("manifest is not valid utf-8")]
+struct Utf8;
+
+#[derive(Error, Debug)]
+#[error("duplicate dispatch")]
+struct Dispatch;
+
+/// The open sum of everything the scheduler loop can fail with. Each function
+/// below lists only the subset it can actually produce.
+type SchedulerErrors = (
+    crate::http::Error,
+    ManifestParseError,
+    ArenaFull,
+    kanal::SendError,
     Utf8,
-    #[error("failed to parse manifest: {0}")]
-    Parse(#[from] ManifestParseError),
-    #[error("slot arena exhausted")]
-    Arena(#[from] ArenaFull),
-    #[error("dispatch error")]
+    Offline,
     Dispatch,
-    #[error("send error: {0}")]
-    Send(#[from] kanal::SendError),
-}
+);
 
 /// copied and modified from twitch-hls-client directly
 pub struct StreamScheduler {
@@ -138,7 +146,7 @@ impl StreamScheduler {
         loop {
             match self.mainloop().await {
                 Ok(()) => {}
-                Err(SchedulerError::Offline) => {
+                Err(error) if error.is_inner::<Offline>() => {
                     info!("stream ended");
                     return;
                 }
@@ -190,7 +198,7 @@ impl StreamScheduler {
         }
     }
 
-    async fn mainloop(&mut self) -> Result<(), SchedulerError> {
+    async fn mainloop(&mut self) -> eros::Result<(), SchedulerErrors> {
         const MIN_EDGE_POLL: Duration = Duration::from_millis(200);
         const MAX_EDGE_POLL: Duration = Duration::from_secs(5);
         const CATCHUP_POLL: Duration = Duration::from_millis(100);
@@ -228,7 +236,7 @@ impl StreamScheduler {
         expected_sequence: u64,
         timestamp_ms: u64,
         duration_ms: u64,
-    ) -> Result<(), SchedulerError> {
+    ) -> eros::Result<(), (ArenaFull, kanal::SendError)> {
         let prefetch = self
             .prefetches
             .iter()
@@ -259,7 +267,7 @@ impl StreamScheduler {
                 None,
             )
         } else {
-            let (writer, reader) = Spool::open(&self.arena, &self.wakes)?;
+            let (writer, reader) = Spool::open(&self.arena, &self.wakes).union()?;
             (
                 Segment {
                     sequence_num: expected_sequence,
@@ -278,7 +286,8 @@ impl StreamScheduler {
                     writer,
                     span: span.clone(),
                 })
-                .await?;
+                .await
+                .union()?;
         }
 
         self.readers.retain_unordered(|reader| {
@@ -302,18 +311,18 @@ impl StreamScheduler {
         &mut self,
         url: &str,
         expected_sequence: u64,
-    ) -> Result<(), SchedulerError> {
+    ) -> eros::Result<(), (ArenaFull, kanal::SendError, Dispatch)> {
         let prefetch = self
             .prefetches
             .iter()
             .find(|s| s.expected_id == expected_sequence);
 
         if prefetch.is_some() {
-            return Err(SchedulerError::Dispatch);
+            return Err(Dispatch).union();
         }
         debug!(sequence = expected_sequence, "prefetch dispatched");
 
-        let (writer, reader) = Spool::open(&self.arena, &self.wakes)?;
+        let (writer, reader) = Spool::open(&self.arena, &self.wakes).union()?;
         let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
         let url = Rc::<str>::from(url);
 
@@ -323,7 +332,8 @@ impl StreamScheduler {
                 writer,
                 span,
             })
-            .await?;
+            .await
+            .union()?;
 
         self.readers.retain_unordered(|consumer| {
             push(
@@ -350,7 +360,7 @@ impl StreamScheduler {
         });
     }
 
-    async fn apply_init(&mut self, uri: &str) -> Result<(), SchedulerError> {
+    async fn apply_init(&mut self, uri: &str) -> eros::Result<(), (ArenaFull, kanal::SendError)> {
         if let Some((old, _)) = &self.init {
             if old.as_str() != uri {
                 debug!(old, uri, "init segment changed mid-stream");
@@ -359,23 +369,24 @@ impl StreamScheduler {
         }
 
         let span = debug_span!("init segment");
-        let (writer, reader) = Spool::open(&self.arena, &self.wakes)?;
+        let (writer, reader) = Spool::open(&self.arena, &self.wakes).union()?;
         self.downloaders
             .send(ToDownloader::FetchURL {
                 url: uri.into(),
                 writer,
                 span,
             })
-            .await?;
+            .await
+            .union()?;
         self.init = Some((uri.into(), reader));
 
         Ok(())
     }
 
-    async fn reload(&mut self) -> Result<u64, SchedulerError> {
-        let mut response = self.client.get(&self.stream_url).await?;
-        let body = response.body.read_to_end(MAX_MANIFEST).await?;
-        let manifest = std::str::from_utf8(&body).map_err(|_| SchedulerError::Utf8)?;
+    async fn reload(&mut self) -> eros::Result<u64, SchedulerErrors> {
+        let mut response = self.client.get(&self.stream_url).await.union()?;
+        let body = response.body.read_to_end(MAX_MANIFEST).await.union()?;
+        let manifest = std::str::from_utf8(&body).map_err(|_| Utf8).union()?;
 
         let original_prefetch_tail = self.prefetch_tail;
         // Dropout protection repeats the final sequence at every checkpoint, so
@@ -383,17 +394,17 @@ impl StreamScheduler {
         let mut last_checkpoint = None;
 
         for event in Playlist::new(manifest) {
-            match event? {
+            match event.union()? {
                 Event::MediaSequence(front) => {
                     debug!("new front {front}");
                     self.segments.retain(|s| s.sequence_num >= front);
                 }
-                Event::Init(uri) => self.apply_init(uri).await?,
+                Event::Init(uri) => self.apply_init(uri).await.widen()?,
                 Event::Discontinuity => self.broadcast_discontinuity(),
                 Event::Checkpoint { annotated, next } => last_checkpoint = Some((annotated, next)),
                 Event::Ended => {
                     info!("stream offline");
-                    return Err(SchedulerError::Offline {});
+                    return Err(Offline).union();
                 }
                 Event::Media(media) => {
                     // Ads consume sequence numbers but are never downloaded.
@@ -409,7 +420,8 @@ impl StreamScheduler {
                         media.timestamp_ms,
                         media.duration_ms,
                     )
-                    .await?;
+                    .await
+                    .widen()?;
                 }
                 Event::Prefetch { uri, sequence } => {
                     if sequence < self.prefetch_tail {
@@ -417,7 +429,7 @@ impl StreamScheduler {
                     }
 
                     self.prefetch_tail = sequence + 1;
-                    self.dispatch_prefetch(uri, sequence).await?;
+                    self.dispatch_prefetch(uri, sequence).await.widen()?;
                 }
             }
         }

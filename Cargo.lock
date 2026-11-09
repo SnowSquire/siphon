@@ -1324,6 +1324,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "eros"
+version = "0.9.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9e965d9d7b09f2b5762deb31c9dd0e03853572cb903f4c6fa3f5f95b512ad5f"
+dependencies = [
+ "eros-macros",
+]
+
+[[package]]
+name = "eros-macros"
+version = "0.9.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc66b3c6ca0453ae4bf14922789b53b947b0c98cdf423436aa6078866653db9"
+dependencies = [
+ "proc-macro-crate 3.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5058,6 +5079,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "compio",
+ "eros",
  "futures-util",
  "http",
  "httparse",
