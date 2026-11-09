@@ -1,14 +1,19 @@
+use std::future::poll_fn;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use eros::IntoUnion;
+use eros::ReshapeUnion;
+use futures_util::future::Either;
+use futures_util::future::select;
+use futures_util::pin_mut;
 use kanal::AsyncSender;
 use kanal::Receiver;
 use kanal::Sender;
-use eros::IntoUnion;
-use eros::ReshapeUnion;
 use thiserror::Error;
 use tracing::Level;
 use tracing::debug;
@@ -25,6 +30,7 @@ use crate::playlist::Event;
 use crate::playlist::ManifestParseError;
 use crate::playlist::Playlist;
 use crate::spool::ArenaFull;
+use crate::spool::ConsumerWake;
 use crate::spool::Reader;
 use crate::spool::Spool;
 use crate::spool::WakeSet;
@@ -86,6 +92,28 @@ type SchedulerErrors = (
     Dispatch,
 );
 
+/// Resolves when a consumer registers, re-checking the channel after parking so
+/// a registration that races with the park is not missed.
+async fn next_reader(
+    receive: Receiver<Sender<SegmentMessage>>,
+    wake: Rc<ConsumerWake>,
+) -> Sender<SegmentMessage> {
+    poll_fn(move |context| {
+        if let Ok(Some(reader)) = receive.try_recv() {
+            return Poll::Ready(reader);
+        }
+        wake.park(context);
+        // The channel is the latch: a registration that landed between the
+        // check above and the park is still in the queue, so checking it again
+        // is what closes the race. The waker only saves the poll interval.
+        if let Ok(Some(reader)) = receive.try_recv() {
+            return Poll::Ready(reader);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 /// copied and modified from twitch-hls-client directly
 pub struct StreamScheduler {
     client: Rc<Client>,
@@ -94,6 +122,7 @@ pub struct StreamScheduler {
     stream_url: Box<str>,
     downloaders: AsyncSender<ToDownloader>,
     receive: Receiver<Sender<SegmentMessage>>,
+    reader_wake: Rc<ConsumerWake>,
 
     /// hls fmp4 init header, doesn't reqire a discontinuity
     init: Option<(String, Reader)>,
@@ -116,6 +145,7 @@ impl StreamScheduler {
         stream_url: Box<str>,
         downloaders: AsyncSender<ToDownloader>,
         receive: Receiver<Sender<SegmentMessage>>,
+        reader_wake: Rc<ConsumerWake>,
     ) -> Self {
         Self {
             client,
@@ -124,6 +154,7 @@ impl StreamScheduler {
             stream_url,
             downloaders,
             receive,
+            reader_wake,
 
             init: None,
 
@@ -139,26 +170,47 @@ impl StreamScheduler {
     }
 
     pub async fn main(mut self) {
+        const MIN_BACKOFF: Duration = Duration::from_millis(200);
+        const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
         let span = span!(Level::INFO, "scheduler");
         let _ = &span;
         info!("{}", self.stream_url);
 
+        let mut backoff = MIN_BACKOFF;
         loop {
             match self.mainloop().await {
-                Ok(()) => {}
-                Err(error) if error.is_inner::<Offline>() => {
-                    info!("stream ended");
-                    return;
-                }
+                Ok(()) => backoff = MIN_BACKOFF,
                 Err(error) => {
-                    warn!(%error, "scheduler reset");
-                    self.reset();
+                    if error.is_inner::<Offline>() {
+                        info!("stream ended");
+                        return;
+                    }
+
+                    // `reload` applies events as it parses, so a failure after
+                    // the first event leaves the window half-updated and it must
+                    // be reset. Transport failures happen before any event is
+                    // applied: the window is intact, and resetting would discard
+                    // segments that are still live.
+                    if error.is_inner::<crate::http::Error>() {
+                        warn!(%error, ?backoff, "manifest fetch failed, retrying");
+                    } else {
+                        warn!(%error, ?backoff, "scheduler reset");
+                        self.reset();
+                    }
+
+                    compio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
         }
     }
 
     fn reset(&mut self) {
+        // Sequences rewind, but consumers filter on a monotonically increasing
+        // sequence, so they have to drop that filter first. Without this a
+        // connected client silently drops every segment emitted after a reset.
+        self.broadcast_discontinuity();
         self.segment_tail = 0;
         self.prefetch_tail = 0;
         self.last_segment_dur = Duration::from_secs(5);
@@ -168,34 +220,40 @@ impl StreamScheduler {
     }
 
     fn handle_new_readers(&mut self) {
+        while let Ok(Some(tx)) = self.receive.try_recv() {
+            self.adopt(tx);
+        }
+    }
+
+    /// Register one new consumer: hand it the init segment and the tail of the
+    /// window, or drop it when its bounded queue cannot take them.
+    fn adopt(&mut self, tx: Sender<SegmentMessage>) {
         const BACKLOG: usize = crate::constants::MAX_CONSUMER_LAG - 2;
 
-        'readers: while let Ok(Some(tx)) = self.receive.try_recv() {
-            debug!("new sender");
-            if let Some(init) = &self.init
-                && !push(
-                    &tx,
-                    SegmentMessage::Init {
-                        reader: init.1.clone(),
-                    },
-                    "new reader init",
-                )
-            {
-                continue 'readers;
-            }
-
-            // A late joiner gets the newest part of the window, not all of it:
-            // the whole backlog has to fit in the bounded queue alongside live
-            // segments, or every new client would be dropped immediately.
-            let skip = self.segments.len().saturating_sub(BACKLOG);
-            for segment in self.segments.iter().skip(skip) {
-                if !push(&tx, segment.clone().into(), "new reader backlog") {
-                    continue 'readers;
-                }
-            }
-
-            self.readers.push(tx);
+        debug!("new sender");
+        if let Some(init) = &self.init
+            && !push(
+                &tx,
+                SegmentMessage::Init {
+                    reader: init.1.clone(),
+                },
+                "new reader init",
+            )
+        {
+            return;
         }
+
+        // A late joiner gets the newest part of the window, not all of it:
+        // the whole backlog has to fit in the bounded queue alongside live
+        // segments, or every new client would be dropped immediately.
+        let skip = self.segments.len().saturating_sub(BACKLOG);
+        for segment in self.segments.iter().skip(skip) {
+            if !push(&tx, segment.clone().into(), "new reader backlog") {
+                return;
+            }
+        }
+
+        self.readers.push(tx);
     }
 
     async fn mainloop(&mut self) -> eros::Result<(), SchedulerErrors> {
@@ -224,10 +282,35 @@ impl StreamScheduler {
         self.handle_new_readers();
 
         if let Some(sleep_time) = sleep_dur.checked_sub(start.elapsed()) {
-            compio::time::sleep(sleep_time).await;
+            self.idle(sleep_time).await;
         }
 
         Ok(())
+    }
+
+    /// Sleep out the poll interval, waking early whenever a consumer connects.
+    async fn idle(&mut self, sleep_time: Duration) {
+        let deadline = Instant::now() + sleep_time;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+
+            let sleep = compio::time::sleep(remaining);
+            let wait = next_reader(self.receive.clone(), Rc::clone(&self.reader_wake));
+            pin_mut!(sleep, wait);
+
+            match select(sleep, wait).await {
+                Either::Left(((), _)) => return,
+                // Adopt the new consumer immediately, then keep sleeping out
+                // whatever is left of the interval.
+                Either::Right((reader, _)) => {
+                    self.adopt(reader);
+                    self.handle_new_readers();
+                }
+            }
+        }
     }
 
     async fn dispatch_main(
@@ -487,5 +570,44 @@ mod tests {
         // channel immediately.
         assert!(tx.try_send(SegmentMessage::Discontinuity()).is_err());
         assert!(rx.try_recv().is_err());
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        compio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_reader_already_queued_is_taken_without_waiting() {
+        let (queue, receive) = kanal::unbounded();
+        let (consumer, _keep) = kanal::bounded::<SegmentMessage>(1);
+        queue.send(consumer).expect("queue");
+
+        // Would hang if the first check did not see the queued sender.
+        let taken = run(next_reader(receive, ConsumerWake::new()));
+        assert!(taken.try_send(SegmentMessage::Discontinuity()).is_ok());
+    }
+
+    #[test]
+    fn a_reader_registered_during_the_wait_wakes_it() {
+        let (queue, receive) = kanal::unbounded();
+        let wake = ConsumerWake::new();
+        let signalled = run(async {
+            let signal = Rc::clone(&wake);
+            compio::runtime::spawn(async move {
+                compio::time::sleep(Duration::from_millis(10)).await;
+                let (consumer, _keep) = kanal::bounded::<SegmentMessage>(1);
+                queue.send(consumer).expect("queue");
+                signal.wake();
+            })
+            .detach();
+
+            let wait = next_reader(receive, Rc::clone(&wake));
+            let guard = compio::time::sleep(Duration::from_secs(5));
+            pin_mut!(wait, guard);
+            matches!(select(wait, guard).await, Either::Left(_))
+        });
+        assert!(signalled);
     }
 }

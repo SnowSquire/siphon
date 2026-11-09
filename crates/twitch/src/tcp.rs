@@ -21,6 +21,7 @@ use crate::spool::WakeSet;
 pub fn spawn_tcp_listener(
     wakes: Rc<WakeSet>,
     add_readers: kanal::Sender<kanal::Sender<SegmentMessage>>,
+    reader_wake: Rc<ConsumerWake>,
 ) {
     compio::runtime::spawn(async move {
         const ADDRS: [SocketAddr; 4] = [
@@ -41,6 +42,7 @@ pub fn spawn_tcp_listener(
                 listener,
                 Rc::clone(&wakes),
                 add_readers.clone(),
+                Rc::clone(&reader_wake),
             ))
             .detach();
         }
@@ -52,6 +54,7 @@ async fn accept_loop(
     listener: TcpListener,
     wakes: Rc<WakeSet>,
     add_readers: kanal::Sender<kanal::Sender<SegmentMessage>>,
+    reader_wake: Rc<ConsumerWake>,
 ) {
     loop {
         match listener.accept().await {
@@ -66,6 +69,10 @@ async fn accept_loop(
                 if add_readers.send(tx).is_err() {
                     return;
                 }
+                // Wake the scheduler out of its poll interval so the client gets
+                // the init segment and backlog immediately instead of waiting
+                // for the next manifest poll.
+                reader_wake.wake();
                 let wake = ConsumerWake::new();
                 wakes.register(&wake);
                 compio::runtime::spawn(client(stream, rx.to_async(), peer, wake)).detach();

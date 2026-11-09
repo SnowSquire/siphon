@@ -45,17 +45,16 @@ impl ConsumerWake {
         })
     }
 
-    fn park(&self, context: &Context<'_>) {
+    pub(crate) fn park(&self, context: &Context<'_>) {
         self.waker.set(Some(context.waker().clone()));
     }
 
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
     }
 }
-
 /// The consumers a publish must wake.
 ///
 /// One list per scheduler, allocated once; entries are weak so a consumer that

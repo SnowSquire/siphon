@@ -12,6 +12,7 @@ use crate::constants::ARENA_BACKOFF;
 use crate::constants::ARENA_RETRIES;
 use crate::constants::DOWNLOAD_RETRIES;
 use crate::http::Client;
+use crate::http::StatusCode;
 use crate::spool::ArenaFull;
 use crate::spool::Writer;
 
@@ -52,6 +53,12 @@ async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
                         warn!(%url, %error, "download failed after writing bytes, giving up");
                         break;
                     }
+                    // A terminal failure (bad URL, 404, certificate) fails the
+                    // same way every time; retrying only delays the next segment.
+                    if !error.retryable() {
+                        warn!(%url, %error, "download failed, giving up");
+                        break;
+                    }
                     attempt += 1;
                     if attempt > DOWNLOAD_RETRIES {
                         warn!(%url, %error, attempt, "download failed, giving up");
@@ -72,6 +79,25 @@ enum FetchError {
     Http(#[from] crate::http::Error),
     #[error(transparent)]
     Arena(#[from] ArenaFull),
+    #[error("http status {0}")]
+    Status(StatusCode),
+}
+
+impl FetchError {
+    /// Whether another attempt could plausibly succeed.
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Http(error) => error.retryable(),
+            // `fetch` already waited `ARENA_RETRIES * ARENA_BACKOFF` for a free
+            // slot, so another round would repeat the wait and starve again.
+            Self::Arena(_) => false,
+            Self::Status(status) => {
+                status.is_server_error()
+                    || *status == StatusCode::REQUEST_TIMEOUT
+                    || *status == StatusCode::TOO_MANY_REQUESTS
+            }
+        }
+    }
 }
 
 async fn fetch(
@@ -82,6 +108,10 @@ async fn fetch(
 ) -> Result<(), FetchError> {
     let started = std::time::Instant::now();
     let mut response = client.get(url).instrument(span.clone()).await?;
+    // Without this, a 404/503 error page would be published as segment bytes.
+    if !response.status.is_success() {
+        return Err(FetchError::Status(response.status));
+    }
     let head_ms = started.elapsed().as_millis();
     let mut reads = 0usize;
     let mut first_read_ms = 0u128;
@@ -131,5 +161,22 @@ async fn fetch(
         last_read = std::time::Instant::now();
         max_read = max_read.max(read);
         writer.commit(read);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_transient_failures_only() {
+        assert!(FetchError::Status(StatusCode::INTERNAL_SERVER_ERROR).retryable());
+        assert!(FetchError::Status(StatusCode::SERVICE_UNAVAILABLE).retryable());
+        assert!(FetchError::Status(StatusCode::TOO_MANY_REQUESTS).retryable());
+        assert!(FetchError::Status(StatusCode::REQUEST_TIMEOUT).retryable());
+
+        assert!(!FetchError::Status(StatusCode::NOT_FOUND).retryable());
+        assert!(!FetchError::Status(StatusCode::FORBIDDEN).retryable());
+        assert!(!FetchError::Arena(ArenaFull).retryable());
     }
 }

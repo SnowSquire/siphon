@@ -33,6 +33,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::arena::ArenaSet;
 use crate::http::Client;
+use crate::spool::ConsumerWake;
 use crate::spool::WakeSet;
 use crate::variant::Variant;
 use crate::variant::get_variants;
@@ -112,7 +113,12 @@ async fn main() {
 
     downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(&client, &downloaders_rx);
     disk::spawn_disk_output(stream_id, &wakes, &outputs_tx);
-    tcp::spawn_tcp_listener(Rc::clone(&wakes), outputs_tx.clone());
+    let reader_wake = ConsumerWake::new();
+    tcp::spawn_tcp_listener(
+        Rc::clone(&wakes),
+        outputs_tx.clone(),
+        Rc::clone(&reader_wake),
+    );
 
     let scheduler = scheduler::StreamScheduler::new(
         client,
@@ -121,6 +127,7 @@ async fn main() {
         variants.first().unwrap().url.clone(),
         downloaders_tx.to_async(),
         outputs_rx,
+        reader_wake,
     );
 
     scheduler.main().await;

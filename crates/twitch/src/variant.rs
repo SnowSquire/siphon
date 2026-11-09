@@ -276,7 +276,7 @@ async fn choose_client_id<'a>(
     client: &Client,
     client_id: Option<&'a str>,
     auth_token: Option<&str>,
-) -> Result<Cow<'a, str>, Box<dyn std::error::Error>> {
+) -> Result<Cow<'a, str>, VariantPlaylistError> {
     match (client_id, auth_token) {
         (None, None) => Ok(DEFAULT_CLIENT_ID.into()),
         (Some(client_id), _) => Ok(client_id.into()),
