@@ -14,11 +14,12 @@ design-only.
   demuxer concatenates PES payloads and splits at AUD NALs; the PTS/DTS of the
   PES containing the AUD is assigned to that AU. Assuming one AU per PES drops
   frames and corrupts every later reference.
-- The media consumer paces at 1x from a shared 90 kHz epoch; RTCP SR maps that
-  to wall-clock NTP. RTSP consumers register as live-only (`ConsumerRegistration
-  { backlog: false }`) so a late client starts at the edge instead of replaying
-  the window behind the pacer. Prefetch messages are skipped because they carry
-  no playlist timestamp; the main segment follows with it.
+- The media consumer paces at 1x from a shared 90 kHz epoch; RTCP sender
+  reports map that media clock (not the wall clock at send time) to NTP. RTSP
+  consumers register as live-only (`ConsumerRegistration { backlog: false }`)
+  so a late client starts at the edge instead of replaying the window behind the
+  pacer. Prefetch messages are played immediately; their playlist timestamp is
+  extrapolated from the last complete segment.
 - Absolute position / live signalling: the playhead is tracked from the
   playlist's elapsed time (`Segment::timestamp_ms`, from
   `#EXT-X-TWITCH-ELAPSED-SECS`). DESCRIBE puts it in the SDP session-level
@@ -32,24 +33,79 @@ design-only.
   therefore mpv) does not parse `Scale`, so asking a late starter to play 1.3x
   cannot work.
 - UDP and interleaved-TCP transports are both supported; RTCP SRs are sent once
-  per second (SR + SDES CNAME).
+  per second (SR + SDES CNAME), including throughout VOD. The SR's NTP is
+  `origin + media presentation time`, so the mapping is the same regardless of
+  how far ahead the VOD pacer has sent; a wall-clock NTP would make ffmpeg pull
+  the timeline backwards on every report.
 
 ## VOD / DVR seeking (implemented)
 
-- The live playlist only has the recent window. `rtsp/vod.rs` derives
-  `index-dvr.m3u8` from the live variant (`index*.m3u8` in the same directory)
-  and parses the whole broadcast timeline. The mock serves the same path.
-- A normal join stays on the live scheduler spools (live edge). A real seek
+- The live playlist only has the recent window. `rtsp/vod.rs` ports twitch-dlp's
+  `getM3u8.ts` to find the whole-broadcast playlist: a public archive through
+  `FFZ_RecentBroadcasts` + `PlaybackAccessToken` + usher, otherwise the private
+  `{domain}/{sha1("{channel}_{stream_id}_{start}")[..20]}_…/chunked/index-dvr.m3u8`
+  probed across Twitch's VOD domains for start offsets `0, -1, +1`. The archive
+  master comes from usher's `/vod/v2/` endpoint, which publishes the same
+  `STABLE-VARIANT-ID` as the live master. It is fetched in parallel with live
+  variant resolution, but only for its media playlist URLs (the signature stays
+  on the master); the archive variant is chosen later by matching that stable
+  variant id. Debug mode points at the mock's `/index-dvr.m3u8`. A background
+  task refreshes and re-parses the playlist every 10 s (Twitch publishes a new
+  group roughly that often), in parallel with the live scheduler, so a seek
+  never has to fetch a playlist first.
+- A normal join stays on the live scheduler spools (live edge). Prefetch
+  segments are played as soon as the scheduler downloads them; their playlist
+  timestamp is extrapolated from the last complete segment. A real seek
   (`PAUSE` then `PLAY` with `Range: npt=X-`) makes the media engine fetch the
   DVR segment containing X, start at the last keyframe at or before X, and play
-  the DVR timeline forward at 1x. Live messages are drained and the newest one
-  is kept; when the DVR playlist ends, the engine hands over to the live spool
-  (pacer re-anchored at the first live sample).
+  the DVR timeline forward.
+- The DVR playlist ends about one group (~10 s) behind the live edge. The
+  scheduler publishes a snapshot of its live playback window (`Vec<Segment>`,
+  Readers into the same spools) to the RTSP engine. At the DVR end the engine
+  replays that window from `position_ms` (the DVR playhead) up to the live edge
+  at 4x, then continues with the live consumer queue. It re-reads the window as
+  the scheduler refreshes it, so segments that arrive during the replay (or
+  messages dropped by the lossy consumer queue during a download stall) do not
+  leave holes. The gap cannot come from the queue: a live-only consumer never
+  receives segments published before it joined. `push_handover` inserts by
+  sequence and deduplicates, because prefetch and main-playlist messages can
+  arrive out of order.
+- The RTSP consumer is `ConsumerRegistration { lossy: true }`: when its bounded
+  queue is full it loses one message instead of being disconnected. Normal live
+  playback only needs the newest segment and the DVR handover heals holes from
+  the live window, whereas closing the consumer permanently killed the output.
+- A seek bumps a per-session epoch; the writer drops older-epoch packets still
+  queued from the live burst. A `Session::seeking` flag additionally suppresses
+  the fan-out between the PLAY response and `set_media_base`, so no packet with
+  the old sequence/timestamps leaks into the new timeline. Keep the RTP
+  **sequence** running across the seek: ffmpeg resets `s->seq` but not its RTP
+  statistics, so restarting at 1 is a 64k jump that is rejected as
+  `bad cseq 0001 expected=0001`; continuing at `max_seq + 1` is accepted.
+- VOD is paced at **16x**, not 1x. The pacer fills the bounded per-session
+  outbound queue (4096 RTP packets); when it is full the media engine waits for
+  capacity instead of dropping the client, so the queue acts as the player's
+  buffer and the send rate settles at the client's drain rate. A 2x player
+  therefore stays ahead instead of starving, and mpv's duration (which it grows
+  from the highest demuxed PTS) grows with the live edge. The queue also hides
+  the next segment's on-demand fetch; fetching it *before* the first emit made
+  every seek wait for two full segments.
+- A seek `PLAY` deliberately omits `RTP-Info`. The header seeds ffmpeg's
+  `base_timestamp`, but the media engine has not reset the RTP epoch yet, so the
+  value would be the old live timestamp; ffmpeg then rejects every post-seek
+  packet until the next `PLAY` (the "click pause/play to make it go" symptom).
+  Without it, the first packet establishes the base.
+- While serving VOD, RTCP sender reports are sent with the media-clock NTP
+  described above, so the mapping stays consistent even though the pacer sends
+  ahead of wall time. For live, the same formula reads as real time and removes
+  B-frame timestamp jitter: the SR's RTP value is the last packet actually
+  sent, never a separately computed DTS playhead.
+- VOD playback aborts and returns to live once no RTSP client is connected, so
+  a closed player cannot keep downloading the archive.
 - Seek packets start a new RTP/RTCP epoch: the shared `base_pts` and both
-  `Track::last_rtp/last_ntp` mappings are reset, and `Range: npt=X-` becomes
-  ffmpeg's `range_start_offset`. Small negative audio-vs-video PTS offsets are
-  clamped in `media_delta`, otherwise `rem_euclid(2^33)` produces a wrapped
-  timestamp and bogus player duration.
+  `Track` mappings are reset, and `Range: npt=X-` becomes ffmpeg's
+  `range_start_offset`. `media_delta` is signed: only a delta near ±2^33 is a
+  wrap, because the small negative audio-vs-video offset at a keyframe is real.
+  Both tracks anchor on the same minimum PES PTS of the first segment played.
 - The SDP advertises a finite `a=range:npt=0-<live playhead>` so players enable
   seeking; the initial PLAY is still treated as live (only PAUSE+PLAY is a
   seek). mpv's watch-later resume is a real PAUSE+PLAY and is honored; disable

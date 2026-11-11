@@ -1,7 +1,5 @@
 use std::borrow::Cow;
 
-use rand::RngExt;
-use rand::distr::Alphanumeric;
 use sonic_rs::JsonValueTrait;
 use sonic_rs::PointerTree;
 use sonic_rs::pointer;
@@ -19,6 +17,7 @@ use crate::utils::attribute;
 use crate::utils::attributes;
 use crate::utils::float_string_to_centis;
 use crate::utils::query_string;
+use crate::utils::random_id;
 
 #[derive(Debug, Error)]
 pub enum VariantPlaylistError {
@@ -42,6 +41,9 @@ pub enum VariantPlaylistError {
 
     #[error("manifest request returned {0}")]
     Status(crate::http::StatusCode),
+
+    #[error("no variants for {0}: is the channel live?")]
+    NoVariants(String),
 }
 
 pub async fn fetch_variant_playlist(
@@ -149,14 +151,6 @@ pub async fn fetch_variant_playlist(
     let body = response.body.read_to_end(MAX_MANIFEST).await?;
 
     String::from_utf8(body).map_err(|_| VariantPlaylistError::Utf8)
-}
-
-fn random_id() -> String {
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect()
 }
 
 #[derive(Clone)]
@@ -299,38 +293,25 @@ pub async fn get_variants(
     auth_token: Option<&str>,
     channel: &str,
     low_latency: bool,
-) -> (Vec<Variant>, u64) {
-    let client_id = match choose_client_id(client, client_id, auth_token).await {
-        Ok(client_id) => client_id,
-        Err(error) => {
-            eprintln!("failed to resolve a client id: {error}");
-            std::process::exit(1);
-        }
-    };
+) -> Result<(Vec<Variant>, u64), VariantPlaylistError> {
+    let client_id = choose_client_id(client, client_id, auth_token).await?;
 
     let variant_playlist =
-        match fetch_variant_playlist(client, channel, &client_id, auth_token, low_latency).await {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                eprintln!("failed to resolve variants for {channel}: {error}");
-                std::process::exit(1);
-            }
-        };
+        fetch_variant_playlist(client, channel, &client_id, auth_token, low_latency).await?;
 
     let (variants, stream_id) = parse_variant_playlist(&variant_playlist);
     if variants.is_empty() {
-        eprintln!("no variants for {channel}: is the channel live?");
-        std::process::exit(1);
+        return Err(VariantPlaylistError::NoVariants(channel.to_owned()));
     }
 
     let Some(stream_id) = stream_id else {
         // The broadcast id keys the on-disk files; a one-off session can live
         // without it, it just cannot resume.
         tracing::warn!("master playlist has no BROADCAST-ID, using a random stream id");
-        return (variants, rand::random::<u64>());
+        return Ok((variants, rand::random::<u64>()));
     };
 
-    (variants, stream_id)
+    Ok((variants, stream_id))
 }
 
 #[cfg(test)]

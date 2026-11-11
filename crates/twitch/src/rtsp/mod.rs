@@ -9,16 +9,21 @@ mod aac;
 mod h264;
 mod sdp;
 mod ts;
-mod vod;
+pub mod vod;
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::future::poll_fn;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -33,18 +38,18 @@ use compio::net::UdpSocket;
 use kanal::AsyncReceiver;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 use tracing::warn;
 
 use crate::constants::DEFAULT_RTSP_PORT;
 use crate::constants::MAX_CONSUMER_LAG;
-use crate::constants::MAX_MANIFEST;
 use crate::constants::RTP_MAX_PAYLOAD;
 use crate::http::Client;
 use crate::rtsp::aac::AudioConfig;
 use crate::rtsp::h264::H264Config;
 use crate::rtsp::ts::Sample;
 use crate::rtsp::ts::TsDemuxer;
-use crate::rtsp::vod::VodTimeline;
+use crate::rtsp::vod::Dvr;
 use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::Segment;
 use crate::scheduler::SegmentMessage;
@@ -55,6 +60,18 @@ const TRACK_VIDEO: u8 = 0;
 const TRACK_AUDIO: u8 = 1;
 const TRACK_COUNT: usize = 2;
 
+/// Outbound-queue slots kept free for the RTCP sender reports that are queued
+/// between samples. They are not part of `wait_out_capacity`'s packet count, so
+/// without the headroom a full queue silently drops the report.
+const RTCP_HEADROOM: usize = 64;
+
+/// One RTP/RTCP packet, shared by every session's queue.
+///
+/// The packetizer builds it once per access unit; each session then holds a
+/// refcount instead of a copy. Cloning a `Vec` per session per packet was the
+/// hottest allocation in the RTSP output (~20k/s at 16x with two viewers).
+type RtpPacket = Rc<Vec<u8>>;
+
 /// RTP timestamps wrap at 2^32, and PTS wraps at 2^33; deltas are taken modulo
 /// the PTS wrap so both wrap cleanly.
 const PTS_WRAP: i64 = 1 << 33;
@@ -62,18 +79,19 @@ const PTS_WRAP: i64 = 1 << 33;
 const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 const SDES_CNAME: &[u8] = b"twitch-hls-client2";
 
-/// PTS delta from a shared epoch, handling the 33-bit wrap.
+/// Signed PTS delta from a track epoch, handling the 33-bit wrap.
 ///
-/// Audio PES packets at a seek keyframe can be a few frames ahead of the video
-/// base, which would otherwise become a near-2^33 delta and a wrapped RTP
-/// timestamp. Treat small negative offsets as zero; only large negative values
-/// are a real wrap.
-fn media_delta(pts: i64, base: i64) -> i64 {
+/// A small negative delta is a real reordering/offset, not a wrap; clamping it
+/// to zero makes several frames share a timestamp. Only a delta near ±2^33 is
+/// treated as the wrap.
+const fn media_delta(pts: i64, base: i64) -> i64 {
     let delta = pts - base;
-    if (-10 * 90_000..0).contains(&delta) {
-        0
+    if delta < -(PTS_WRAP / 2) {
+        delta + PTS_WRAP
+    } else if delta >= PTS_WRAP / 2 {
+        delta - PTS_WRAP
     } else {
-        delta.rem_euclid(PTS_WRAP)
+        delta
     }
 }
 
@@ -91,11 +109,13 @@ struct Track {
     clock_rate: u32,
     ssrc: u32,
     next_seq: u16,
-    last_rtp: u32,
-    last_ntp: u64,
-    /// Wall-clock instant [`Self::last_ntp`] was sampled at. The sender report
-    /// extrapolates both clocks from here, like gortsplib's `rtpsender`.
-    last_system: Instant,
+    /// RTP timestamp of the last packet actually sent. Sender reports must be
+    /// anchored on this exact value, never on a separately computed playhead:
+    /// the two clocks only line up when the SR describes a packet that was
+    /// really sent.
+    last_packet_rtp: u32,
+    /// Presentation time of the last packet on the shared 90 kHz PES epoch.
+    last_media_90k: i64,
     packet_count: u32,
     octet_count: u32,
 }
@@ -107,16 +127,25 @@ impl Track {
             clock_rate,
             ssrc,
             next_seq: u16::try_from(ssrc & 0x7FFF).expect("16-bit mask"),
-            last_rtp: 0,
-            last_ntp: 0,
-            last_system: Instant::now(),
+            last_packet_rtp: 0,
+            last_media_90k: 0,
             packet_count: 0,
             octet_count: 0,
         }
     }
 
     /// Build one RTP packet around `payload`, consuming a sequence number.
-    fn packet(&mut self, timestamp: u32, marker: bool, payload: &[u8], ntp: u64) -> Vec<u8> {
+    ///
+    /// Returned shared: the fan-out hands the same buffer to every session's
+    /// queue, so the packet is allocated once per access unit and not once per
+    /// session.
+    fn packet(
+        &mut self,
+        timestamp: u32,
+        media_90k: i64,
+        marker: bool,
+        payload: &[u8],
+    ) -> RtpPacket {
         let mut packet = Vec::with_capacity(12 + payload.len());
         packet.push(0x80);
         packet.push(if marker {
@@ -130,41 +159,52 @@ impl Track {
         packet.extend_from_slice(payload);
 
         self.next_seq = self.next_seq.wrapping_add(1);
-        self.last_rtp = timestamp;
-        self.last_ntp = ntp;
-        self.last_system = Instant::now();
+        self.last_packet_rtp = timestamp;
+        self.last_media_90k = media_90k;
         self.packet_count = self.packet_count.wrapping_add(1);
 
         self.octet_count = self
             .octet_count
             .wrapping_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
-        packet
+        Rc::new(packet)
     }
 
-    /// Forget the packet timestamp used by RTCP sender reports while keeping
-    /// the cumulative packet/octet counters.
-    fn reset_mapping(&mut self) {
-        self.last_rtp = 0;
-        self.last_ntp = ntp_now();
-        self.last_system = Instant::now();
+    /// Forget the per-epoch state. Sequence numbers restart at 1 because the
+    /// receiver resets its own tracking on a seek and expects the next packet
+    /// after the gap to resynchronise.
+    /// Forget the per-epoch timestamp state. The RTP **sequence continues**:
+    /// ffmpeg resets its `s->seq` counter on a seek but keeps the RTP
+    /// statistics (`max_seq`) from before it. Resetting the sequence to 1
+    /// therefore looks like a 64k jump, is rejected, and produces the
+    /// `bad cseq 0001 expected=0001` line before resynchronising on the second
+    /// packet. Continuing gives `max_seq + 1`, which is accepted immediately.
+    const fn reset_mapping(&mut self) {
+        self.last_packet_rtp = 0;
+        self.last_media_90k = 0;
     }
 
     /// RTCP sender report plus an SDES CNAME item.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn sender_report(&self) -> Option<Vec<u8>> {
+    ///
+    /// The NTP value is derived from the *media* clock (`origin` plus the
+    /// packet's presentation time), not from the wall clock at send time. VOD is
+    /// sent ahead of real time, and ffmpeg maps packet timestamps through the
+    /// last SR: a wall-clock anchor would make every report pull the timeline
+    /// backwards when the sender is buffering ahead of the player. A media-clock
+    /// anchor makes the mapping identical between reports, so it introduces no
+    /// jumps at all, and indexing it from the shared PES base keeps the two
+    /// tracks on one timeline.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn sender_report(&self, origin: u64) -> Option<Vec<u8>> {
         if self.packet_count == 0 {
             return None;
         }
 
-        // Extrapolate both clocks from the last sent packet so the mapping stays
-        // current between media packets (gortsplib's rtpsender does the same).
-        let elapsed = self.last_system.elapsed();
-        let ticks = (elapsed.as_secs_f64() * f64::from(self.clock_rate)) as u32;
-        let rtp = self.last_rtp.wrapping_add(ticks);
-        let ntp_fraction = (elapsed.as_nanos() << 32) / 1_000_000_000;
-        let ntp = self
-            .last_ntp
-            .wrapping_add(u64::try_from(ntp_fraction).unwrap_or(u64::MAX));
+        let rtp = self.last_packet_rtp;
+        let ntp = origin.wrapping_add(media_to_ntp(self.last_media_90k));
 
         let mut packet = Vec::with_capacity(44);
         // Sender report: V=2, RC=0, PT=200, length 6 (28 bytes).
@@ -198,7 +238,24 @@ impl Track {
 }
 
 struct Session {
-    out: kanal::Sender<Outbound>,
+    /// The player's outbound queue: RTP, RTCP and transport setup.
+    ///
+    /// Deliberately an [`kanal::AsyncSender`]: it exposes `try_send`, `len`,
+    /// `capacity` and `is_closed`, but *not* the blocking `send`, which parks
+    /// the thread when the queue is full. Everything here shares one reactor
+    /// thread, so that call can only deadlock against the writer task that
+    /// would free a slot.
+    out: kanal::AsyncSender<Outbound>,
+    /// RTSP control bytes waiting for the writer.
+    ///
+    /// Responses must never be queued behind the RTP backlog: the outbound
+    /// channel is deliberately filled to capacity while VOD is paced ahead of
+    /// the player, and `kanal::Sender::send` *blocks the thread* when full. On
+    /// this single-threaded reactor that deadlocks against the very writer
+    /// task that would free a slot, freezing every RTP stream and every log
+    /// line until the process is restarted. Control bytes therefore live in
+    /// their own unbounded queue that the writer drains before each message.
+    control: RefCell<VecDeque<Vec<u8>>>,
     /// Bit set of tracks this session has set up.
     subscribed: Cell<u8>,
     playing: Cell<bool>,
@@ -209,13 +266,79 @@ struct Session {
     /// NPT offset last advertised in a PLAY response. Kept unchanged for
     /// pause/resume so ffmpeg's `range_start_offset` does not jump.
     range_start: Cell<f64>,
+    /// Bumped on a seek. The writer drops queued packets from older epochs, so
+    /// a burst buffered before the seek cannot leak into the new timeline.
+    epoch: Cell<u32>,
+    /// A seek is in flight: the media engine has not reset its RTP epoch yet.
+    /// Suppress the fan-out until it does, or packets with the old sequence
+    /// numbers and timestamps leak past the PLAY response.
+    seeking: Cell<bool>,
+    /// When the current seek was requested. A PLAY whose response or media
+    /// engine never completes must not gate the stream forever, so the
+    /// watchdog releases the session after [`SEEK_TIMEOUT`].
+    seek_started: Cell<Option<Instant>>,
+    /// The session has received a video keyframe in the current RTP epoch.
+    /// A live RTSP session joins mid-GOP, where the decoder lacks references
+    /// and reports "reference picture missing"; hold video until the next IDR.
+    video_synced: Cell<bool>,
+    /// Woken whenever this session's outbound queue gains room.
+    drain: Rc<DrainSignal>,
+}
+
+/// Whether the outbound queue has room for the media engine, without polling.
+///
+/// The engine must wait for every playing session to accept the next access
+/// unit's packets, and polling that cost 500 wake-ups a second per blocked
+/// track. Instead the engine parks on one waker: the writer bumps the
+/// generation after every dequeue, and every state change that can unblock the
+/// engine (pause, seek, disconnect) bumps it too. The waiter re-checks after
+/// parking, so a wake can never be lost.
+struct DrainSignal {
+    generation: Cell<u64>,
+    waker: Cell<Option<Waker>>,
+}
+
+impl DrainSignal {
+    fn new() -> Rc<Self> {
+        Rc::new(Self {
+            generation: Cell::new(0),
+            waker: Cell::new(None),
+        })
+    }
+
+    fn notify(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    const fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    fn park(&self, context: &Context<'_>) {
+        self.waker.set(Some(context.waker().clone()));
+    }
 }
 
 enum Outbound {
-    Rtsp(Vec<u8>),
-    Setup { track: u8, transport: Transport },
-    Rtp { track: u8, data: Vec<u8> },
-    Rtcp { track: u8, data: Vec<u8> },
+    /// Wake the writer so it re-checks the session's control queue.
+    Flush,
+    Setup {
+        track: u8,
+        transport: Transport,
+    },
+    Rtp {
+        epoch: u32,
+        track: u8,
+        data: RtpPacket,
+    },
+    Rtcp {
+        epoch: u32,
+        track: u8,
+        data: RtpPacket,
+    },
 }
 
 enum Transport {
@@ -239,14 +362,23 @@ pub struct Hub {
     video_config: RefCell<Option<H264Config>>,
     audio_config: RefCell<Option<AudioConfig>>,
     ready: Cell<bool>,
-    base_pts: Cell<Option<i64>>,
+    video_base: Cell<Option<i64>>,
+    audio_base: Cell<Option<i64>>,
+    /// NTP time corresponding to media time zero of the current RTP epoch.
+    /// Sender reports map their media timestamp through this value.
+    rtp_origin_ntp: Cell<u64>,
     /// Current playhead in milliseconds since the start of the broadcast.
     position_ms: Cell<u64>,
+    /// Set for the duration of one video access unit, so `send` can decide
+    /// whether a session still waiting for an IDR may start.
+    video_keyframe: Cell<bool>,
     /// Seek requests from RTSP control to the media engine (consumer channel).
     seek_tx: RefCell<Option<kanal::AsyncSender<SegmentMessage>>>,
     video: RefCell<Track>,
     audio: RefCell<Track>,
     next_session: Cell<u32>,
+    /// Wakes the media engine when the outbound queues gain room.
+    drain: Rc<DrainSignal>,
 }
 
 impl Hub {
@@ -258,8 +390,11 @@ impl Hub {
             video_config: RefCell::new(None),
             audio_config: RefCell::new(None),
             ready: Cell::new(false),
-            base_pts: Cell::new(None),
+            video_base: Cell::new(None),
+            audio_base: Cell::new(None),
+            rtp_origin_ntp: Cell::new(0),
             position_ms: Cell::new(0),
+            video_keyframe: Cell::new(false),
             seek_tx: RefCell::new(None),
             video: RefCell::new(Track::new(
                 sdp::VIDEO_PAYLOAD_TYPE,
@@ -268,6 +403,7 @@ impl Hub {
             )),
             audio: RefCell::new(Track::new(sdp::AUDIO_PAYLOAD_TYPE, 48_000, 0x5A5A_0002)),
             next_session: Cell::new(0),
+            drain: DrainSignal::new(),
         }
     }
 
@@ -300,6 +436,8 @@ impl Hub {
         self.sessions
             .borrow_mut()
             .retain(|candidate| !Rc::ptr_eq(candidate, session));
+        // A session that was blocking the engine is gone.
+        self.notify_drain();
     }
 
     fn has_track(&self, track: u8) -> bool {
@@ -311,76 +449,209 @@ impl Hub {
     }
 
     /// Fan one RTP packet out to every playing session subscribed to `track`.
-    fn send(&self, track: u8, packet: &[u8]) {
+    ///
+    /// The packet is shared, not copied: every queue holds the same `Rc`, so
+    /// the fan-out costs a refcount per session.
+    fn send(&self, track: u8, packet: &RtpPacket) {
         let bit = 1u8 << track;
+        let keyframe = self.video_keyframe.get();
         self.sessions.borrow_mut().retain(|session| {
-            if !session.playing.get() || session.subscribed.get() & bit == 0 {
+            if !session.playing.get()
+                || session.seeking.get()
+                || session.subscribed.get() & bit == 0
+            {
                 return true;
             }
-            session
-                .out
-                .try_send(Outbound::Rtp {
+            // A live join starts mid-GOP. Feeding that to the decoder produces
+            // "reference picture missing" until the next IDR, so hold the
+            // video fan-out for this session until a keyframe access unit.
+            if track == TRACK_VIDEO && !session.video_synced.get() {
+                if !keyframe {
+                    return true;
+                }
+                session.video_synced.set(true);
+            }
+            Self::push_out(
+                session,
+                Outbound::Rtp {
+                    epoch: session.epoch.get(),
                     track,
-                    data: packet.to_vec(),
-                })
-                .is_ok_and(|sent| sent)
+                    data: Rc::clone(packet),
+                },
+            )
         });
     }
 
-    fn send_rtcp(&self) {
-        if let Some(report) = self.video.borrow().sender_report() {
-            self.send_rtcp_packet(TRACK_VIDEO, &report);
-        }
-        if let Some(report) = self.audio.borrow().sender_report() {
-            self.send_rtcp_packet(TRACK_AUDIO, &report);
-        }
+    /// Whether any RTSP client is still connected (playing or paused).
+    fn has_sessions(&self) -> bool {
+        !self.sessions.borrow().is_empty()
     }
 
-    fn send_rtcp_packet(&self, track: u8, packet: &[u8]) {
-        let bit = 1u8 << track;
-        self.sessions.borrow_mut().retain(|session| {
-            if !session.playing.get() || session.subscribed.get() & bit == 0 {
-                return true;
+    /// Queue one outbound message, dropping it when the player's buffer is
+    /// full. Returns `false` only when the writer is gone.
+    ///
+    /// A full queue must never unregister the session: `try_send` reports
+    /// "full" separately from "closed", and treating the two the same silently
+    /// removed a live client from the fan-out for good, so playback froze while
+    /// the control plane kept answering until the player was reloaded.
+    fn push_out(session: &Session, message: Outbound) -> bool {
+        session.out.try_send(message).is_ok()
+    }
+
+    /// Wait until every playing session subscribed to `track` can accept
+    /// `packets` more RTP packets.
+    ///
+    /// The bounded outbound queue is the receiver's buffer. Short VOD
+    /// segments are sent as fast as that buffer drains, which is what lets a
+    /// player consume faster than real time; a full queue means "slow down",
+    /// not "drop the client". [`RTCP_HEADROOM`] slots stay free for the sender
+    /// reports that are queued between samples: RTCP is not part of the packet
+    /// count, and a rejected report is a lost NTP/RTP mapping.
+    ///
+    /// Event-driven: the writer bumps [`DrainSignal`] on every dequeue, and
+    /// pausing/seeking/disconnecting bumps it too, so this parks instead of
+    /// polling the queues.
+    async fn wait_out_capacity(&self, track: u8, packets: usize) {
+        if !self.out_queue_blocked(track, packets) {
+            return;
+        }
+        let started = Instant::now();
+        loop {
+            self.wait_drained().await;
+            if !self.out_queue_blocked(track, packets) {
+                break;
             }
-            session
-                .out
-                .try_send(Outbound::Rtcp {
-                    track,
-                    data: packet.to_vec(),
-                })
-                .is_ok_and(|sent| sent)
-        });
+        }
+        let waited = started.elapsed();
+        if waited >= Duration::from_secs(2) {
+            debug!(
+                track,
+                waited_ms = waited.as_millis(),
+                queued = self.sessions.borrow().iter().map(|s| s.out.len()).max(),
+                "rtsp: outbound queue blocked on the client"
+            );
+        }
     }
 
-    /// Shared 90 kHz epoch for both tracks, so the A/V offset is preserved.
-    fn media_base(&self, pts: i64) -> i64 {
-        self.base_pts.get().unwrap_or_else(|| {
-            self.base_pts.set(Some(pts));
-            pts
+    /// Whether any playing session on `track` is too close to full.
+    fn out_queue_blocked(&self, track: u8, packets: usize) -> bool {
+        let bit = 1u8 << track;
+        self.sessions.borrow().iter().any(|session| {
+            !session.out.is_closed()
+                && session.playing.get()
+                && !session.seeking.get()
+                && session.subscribed.get() & bit != 0
+                && session.out.len().saturating_add(packets)
+                    > session.out.capacity().saturating_sub(RTCP_HEADROOM)
         })
     }
 
+    /// Park until something may have freed outbound capacity.
+    async fn wait_drained(&self) {
+        let seen = self.drain.generation();
+        poll_fn(|context| {
+            if self.drain.generation() != seen {
+                return Poll::Ready(());
+            }
+            self.drain.park(context);
+            // Re-check after parking: a notify between the check above and the
+            // park must not be lost.
+            if self.drain.generation() == seen {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+    }
+
+    /// Something that can unblock the media engine changed state.
+    fn notify_drain(&self) {
+        self.drain.notify();
+    }
+
+    fn send_rtcp(&self) {
+        let origin = self.rtp_origin_ntp.get();
+        if let Some(report) = self.video.borrow().sender_report(origin) {
+            self.send_rtcp_packet(TRACK_VIDEO, &Rc::new(report));
+        }
+        if let Some(report) = self.audio.borrow().sender_report(origin) {
+            self.send_rtcp_packet(TRACK_AUDIO, &Rc::new(report));
+        }
+    }
+
+    fn send_rtcp_packet(&self, track: u8, packet: &RtpPacket) {
+        let bit = 1u8 << track;
+        self.sessions.borrow_mut().retain(|session| {
+            if !session.playing.get()
+                || session.seeking.get()
+                || session.subscribed.get() & bit == 0
+            {
+                return true;
+            }
+            Self::push_out(
+                session,
+                Outbound::Rtcp {
+                    epoch: session.epoch.get(),
+                    track,
+                    data: Rc::clone(packet),
+                },
+            )
+        });
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn rtp_timestamp(&self, pts: i64, clock_rate: u32) -> u32 {
-        let base = self.media_base(pts);
-        let delta = media_delta(pts, base) as u128;
-        let scaled = delta * u128::from(clock_rate) / 90_000;
-        (scaled as u32).wrapping_add(0)
+    fn rtp_timestamp(pts: i64, clock_rate: u32, base: &Cell<Option<i64>>) -> u32 {
+        let base = base.get().unwrap_or_else(|| {
+            base.set(Some(pts));
+            pts
+        });
+        let delta = media_delta(pts, base);
+        let scaled = delta * i64::from(clock_rate) / 90_000;
+        scaled as u32
     }
 
     fn set_position_ms(&self, position_ms: u64) {
         self.position_ms.set(position_ms);
     }
 
-    /// Discard the shared RTP timestamp epoch; the next sample starts a new one.
-    /// The RTCP sender reports must forget the old mapping too, or a report sent
-    /// before the first post-seek packet pairs an old RTP timestamp with a new
-    /// NTP time and players remap the whole stream incorrectly.
+    /// Discard the per-track RTP timestamp epochs; the next samples start new
+    /// ones. The RTCP sender reports must forget the old mapping too, or a report
+    /// sent before the first post-seek packet pairs an old RTP timestamp with a
+    /// new NTP time and players remap the whole stream incorrectly.
     fn reset_media_base(&self) {
         debug!("rtsp: reset RTP/RTCP timestamp mapping");
-        self.base_pts.set(None);
+        self.video_base.set(None);
+        self.audio_base.set(None);
         self.video.borrow_mut().reset_mapping();
         self.audio.borrow_mut().reset_mapping();
+        for session in self.sessions.borrow().iter() {
+            session.video_synced.set(false);
+        }
+    }
+
+    /// Start the next samples from an explicit PES PTS epoch. Both tracks use
+    /// the same value at a seek, so the A/V offset is preserved.
+    fn set_media_base(&self, pts: i64) {
+        self.video_base.set(Some(pts));
+        self.audio_base.set(Some(pts));
+        // The SRs of this epoch describe presentation time relative to `pts`;
+        // anchor that media clock on the wall clock now. Live reports then read
+        // as real time, and VOD reports stay internally consistent.
+        self.rtp_origin_ntp.set(ntp_now());
+        self.end_seek();
+    }
+
+    /// Release sessions held back while the media engine was resetting its RTP
+    /// epoch. Anything queued in that window belongs to the old timeline.
+    fn end_seek(&self) {
+        for session in self.sessions.borrow().iter() {
+            session.seeking.set(false);
+            session.seek_started.set(None);
+        }
+        // Released sessions can back-pressure the engine again, and a waiter
+        // that saw `seeking` must re-evaluate.
+        self.notify_drain();
     }
 
     fn set_seek_sender(&self, sender: kanal::AsyncSender<SegmentMessage>) {
@@ -452,15 +723,21 @@ async fn control_session(stream: TcpStream, peer: SocketAddr, hub: Rc<Hub>) {
     let local = stream.local_addr().unwrap_or(peer);
     let (mut read, write) = stream.into_split();
     let (out_tx, out_rx) = kanal::bounded(4096);
-    compio::runtime::spawn(writer(write, out_rx.to_async())).detach();
 
     let session = Rc::new(Session {
-        out: out_tx,
+        out: out_tx.to_async(),
+        control: RefCell::new(VecDeque::new()),
         subscribed: Cell::new(0),
         playing: Cell::new(false),
         paused: Cell::new(false),
         range_start: Cell::new(0.0),
+        epoch: Cell::new(0),
+        seeking: Cell::new(false),
+        seek_started: Cell::new(None),
+        video_synced: Cell::new(false),
+        drain: Rc::clone(&hub.drain),
     });
+    compio::runtime::spawn(writer(write, out_rx.to_async(), Rc::clone(&session))).detach();
     hub.add_session(Rc::clone(&session));
     let id = hub.next_session_id();
     debug!(%peer, %id, "rtsp client connected");
@@ -476,65 +753,107 @@ async fn control_session(stream: TcpStream, peer: SocketAddr, hub: Rc<Hub>) {
     debug!(%peer, %id, "rtsp client disconnected");
 }
 
-async fn writer(mut stream: TcpStream, rx: AsyncReceiver<Outbound>) {
+async fn writer(mut stream: TcpStream, rx: AsyncReceiver<Outbound>, session: Rc<Session>) {
     let mut transports: [Option<Transport>; TRACK_COUNT] = [None, None];
+    // Interleaved framing buffer, allocated once and handed back by every
+    // write. `write_all` returns the buffer it was given, so the payload is
+    // copied in place instead of into a fresh `Vec` per packet.
+    let mut frame = Vec::with_capacity(64 + RTP_MAX_PAYLOAD);
 
-    while let Ok(message) = rx.recv().await {
-        match message {
-            Outbound::Rtsp(bytes) => {
-                if stream.write_all(bytes).await.0.is_err() {
-                    break;
-                }
+    'writer: loop {
+        // Control bytes go first, always. A response parked behind the RTP
+        // backlog would stall the player's seek for as long as its buffer
+        // takes to drain.
+        loop {
+            let next = session.control.borrow_mut().pop_front();
+            let Some(bytes) = next else { break };
+            if stream.write_all(bytes).await.0.is_err() {
+                break 'writer;
             }
+        }
+
+        let Ok(message) = rx.recv().await else {
+            break 'writer;
+        };
+        // A slot just came free. Wake the media engine if it is waiting here
+        // rather than on the driver.
+        session.drain.notify();
+        match message {
+            Outbound::Flush => {}
             Outbound::Setup { track, transport } => {
                 transports[usize::from(track)] = Some(transport);
             }
-            Outbound::Rtp { track, data } => match &transports[usize::from(track)] {
-                Some(Transport::Tcp { rtp_channel, .. }) => {
-                    if write_interleaved(&mut stream, *rtp_channel, data)
-                        .await
-                        .is_err()
-                    {
-                        break;
+            Outbound::Rtp { epoch, track, data } => {
+                if epoch != session.epoch.get() {
+                    continue;
+                }
+                match &transports[usize::from(track)] {
+                    Some(Transport::Tcp { rtp_channel, .. }) => {
+                        match write_interleaved(&mut stream, &mut frame, *rtp_channel, &data).await
+                        {
+                            Ok(returned) => frame = returned,
+                            Err(()) => break,
+                        }
                     }
-                }
-                Some(Transport::Udp { rtp, rtp_peer, .. }) => {
-                    let _ = rtp.send_to(data, *rtp_peer).await;
-                }
-                None => {}
-            },
-            Outbound::Rtcp { track, data } => match &transports[usize::from(track)] {
-                Some(Transport::Tcp { rtcp_channel, .. }) => {
-                    if write_interleaved(&mut stream, *rtcp_channel, data)
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Some(Transport::Udp { rtp, rtp_peer, .. }) => {
+                        let _ = rtp.send_to(data, *rtp_peer).await;
                     }
+                    None => {}
                 }
-                Some(Transport::Udp {
-                    rtcp, rtcp_peer, ..
-                }) => {
-                    let _ = rtcp.send_to(data, *rtcp_peer).await;
+            }
+            Outbound::Rtcp { epoch, track, data } => {
+                if epoch != session.epoch.get() {
+                    continue;
                 }
-                None => {}
-            },
+                match &transports[usize::from(track)] {
+                    Some(Transport::Tcp { rtcp_channel, .. }) => {
+                        match write_interleaved(&mut stream, &mut frame, *rtcp_channel, &data).await
+                        {
+                            Ok(returned) => frame = returned,
+                            Err(()) => break,
+                        }
+                    }
+                    Some(Transport::Udp {
+                        rtcp, rtcp_peer, ..
+                    }) => {
+                        let _ = rtcp.send_to(data, *rtcp_peer).await;
+                    }
+                    None => {}
+                }
+            }
         }
     }
+
+    // The writer is gone, so this session can never accept another packet.
+    // Dropping the receiver closes the channel, and `out_queue_blocked` then
+    // ignores the session -- but a media engine already parked here has to be
+    // told to re-check, or it would wait for a client that no longer exists.
+    drop(rx);
+    session.drain.notify();
 }
 
+/// Write one interleaved frame (`$`, channel, length, payload).
+///
+/// Takes and returns the session's framing buffer: `write_all` hands the buffer
+/// back, so the allocation survives across packets. The payload still has to be
+/// copied once to put the four-byte header in front of it, but nothing is
+/// allocated.
 async fn write_interleaved(
     stream: &mut TcpStream,
+    frame: &mut Vec<u8>,
     channel: u8,
-    data: Vec<u8>,
-) -> std::io::Result<()> {
+    data: &[u8],
+) -> Result<Vec<u8>, ()> {
     let len = u16::try_from(data.len()).unwrap_or(0);
-    let mut frame = Vec::with_capacity(data.len() + 4);
-    frame.push(b'$');
-    frame.push(channel);
+    frame.clear();
+    frame.extend_from_slice(&[b'$', channel]);
     frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&data);
-    stream.write_all(frame).await.0
+    frame.extend_from_slice(data);
+
+    let taken = std::mem::take(frame);
+    let written = stream.write_all(taken).await;
+    written.0.map_err(|_| ())?;
+    Ok(written.1)
 }
 
 struct Request {
@@ -688,34 +1007,74 @@ async fn handle_request(
         "PLAY" => {
             session.playing.set(true);
 
-            // ffmpeg's RTSP seek sends PAUSE, then PLAY with the target range.
-            // A first PLAY is not a seek: it starts at the live edge. A resume
-            // seek (including mpv's watch-later position) is a real PAUSE+PLAY
-            // and is honored.
-            let seek_requested = session.paused.replace(false);
-            if seek_requested
-                && let Some(target) = request.range.as_deref().and_then(parse_npt_start)
-            {
+            // A PAUSE+PLAY is always a seek. So is a PLAY carrying a new range
+            // while already playing: mpv sometimes seeks without pausing, and
+            // requiring PAUSE made the first seek silently resume instead.
+            let requested = request.range.as_deref().and_then(parse_npt_start);
+            let was_paused = session.paused.replace(false);
+            let seek_requested = requested.is_some_and(|target| {
+                was_paused
+                    || seconds_to_ms(target).abs_diff(seconds_to_ms(session.range_start.get()))
+                        > 1_500
+            });
+            debug!(
+                range = request.range.as_deref().unwrap_or("-"),
+                was_paused,
+                seek_requested,
+                position_ms = hub.position_ms.get(),
+                "rtsp: PLAY"
+            );
+            let mut waiting = false;
+            if seek_requested && let Some(target) = requested {
                 let target_ms = seconds_to_ms(target);
-                if target_ms.abs_diff(hub.position_ms.get()) > 1_500
-                    && hub.request_seek(target_ms).await
-                {
-                    session.range_start.set(target);
+                if target_ms.abs_diff(hub.position_ms.get()) > 1_500 {
+                    session.seeking.set(true);
+                    session.seek_started.set(Some(Instant::now()));
+                    if hub.request_seek(target_ms).await {
+                        session.epoch.set(session.epoch.get().wrapping_add(1));
+                        session.range_start.set(target);
+                        waiting = true;
+                    }
                 }
             }
+            // A PLAY that did not ask the media engine for a new timeline (first
+            // play, plain resume, or a no-op seek) must not leave the session
+            // gated behind `seeking`.
+            if !waiting {
+                session.seeking.set(false);
+                session.seek_started.set(None);
+            }
+            // `playing`/`seeking` just changed, so the engine may no longer be
+            // blocked on this session's queue.
+            hub.notify_drain();
 
             let info = rtp_info(hub, &request.uri, session.subscribed.get());
             // Keep the offset stable across pause/resume; only a seek changes it.
             let range = format!("npt={:.3}-", session.range_start.get());
-            let headers = [("Range", range.as_str()), ("RTP-Info", info.as_str())];
+            let mut headers = vec![("Range", range.as_str())];
+            // RTP-Info seeds ffmpeg's `base_timestamp`. On a seek, the media
+            // engine has not reset the RTP epoch yet, so the value here is the
+            // old live timestamp; advertising it makes ffmpeg reject every
+            // post-seek packet until the next PLAY. Omit it and let the first
+            // packet establish the base.
+            if !seek_requested {
+                headers.push(("RTP-Info", info.as_str()));
+            }
             send_response(session, response(&request.cseq, Some(id), &headers, ""));
             true
         }
         "PAUSE" => {
             // ffmpeg's RTSP seek sends PAUSE followed by PLAY with the target
-            // range; keep the session alive and stop the RTP fan-out.
+            // range; keep the session alive and stop the RTP fan-out. Bump the
+            // epoch so packets queued before the seek are dropped by the writer.
             session.playing.set(false);
             session.paused.set(true);
+            session.seeking.set(true);
+            session.seek_started.set(Some(Instant::now()));
+            session.epoch.set(session.epoch.get().wrapping_add(1));
+            // A paused session no longer back-pressures the media engine.
+            hub.notify_drain();
+            debug!(position_ms = hub.position_ms.get(), "rtsp: PAUSE");
             send_response(session, response(&request.cseq, Some(id), &[], ""));
             true
         }
@@ -822,9 +1181,12 @@ async fn setup(
     };
     let _ = server_ssrc;
 
+    // Setup arrives before any media for this track; the queue is empty, so
+    // there is room. Never use the blocking `send` here: on a full queue it
+    // parks the reactor thread and deadlocks the writer task.
     if session
         .out
-        .send(Outbound::Setup { track, transport })
+        .try_send(Outbound::Setup { track, transport })
         .is_err()
     {
         return false;
@@ -846,7 +1208,11 @@ fn track_ssrc(hub: &Hub, track: u8) -> u32 {
 }
 
 fn send_response(session: &Session, bytes: Vec<u8>) {
-    let _ = session.out.send(Outbound::Rtsp(bytes));
+    session.control.borrow_mut().push_back(bytes);
+    // Wake the writer. The RTP queue may be full, in which case the failed
+    // poke is harmless: the writer re-checks the control queue after every
+    // message it does dequeue.
+    let _ = session.out.try_send(Outbound::Flush);
 }
 
 fn response(cseq: &str, session: Option<&str>, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
@@ -894,14 +1260,14 @@ fn rtp_info(hub: &Hub, uri: &str, subscribed: u8) -> String {
         let video = hub.video.borrow();
         entries.push(format!(
             "{base}/trackID=0;seq={};rtptime={}",
-            video.next_seq, video.last_rtp
+            video.next_seq, video.last_packet_rtp
         ));
     }
     if subscribed & (1 << TRACK_AUDIO) != 0 {
         let audio = hub.audio.borrow();
         entries.push(format!(
             "{base}/trackID=1;seq={};rtptime={}",
-            audio.next_seq, audio.last_rtp
+            audio.next_seq, audio.last_packet_rtp
         ));
     }
 
@@ -970,6 +1336,14 @@ fn ntp_now() -> u64 {
     (seconds << 32) | fraction
 }
 
+/// Convert a 90 kHz presentation offset to NTP fixed-point units.
+fn media_to_ntp(media_90k: i64) -> u64 {
+    let ticks = u128::try_from(media_90k.max(0)).unwrap_or(0);
+    let seconds = u64::try_from(ticks / 90_000).unwrap_or(u64::MAX);
+    let fraction = u64::try_from(((ticks % 90_000) << 32) / 90_000).unwrap_or(0);
+    (seconds << 32).wrapping_add(fraction)
+}
+
 /// Sleep until `pts` is due, anchored to the wall clock at the first sample.
 ///
 /// A stream that arrives faster than real time is clamped to at most [`MAX_LEAD`]
@@ -999,13 +1373,21 @@ impl Timeline {
 struct Pacer {
     base_pts: Option<i64>,
     base_wall: Instant,
+    /// Media seconds sent per wall-clock second. Live is 1x; VOD sends ahead of
+    /// real time so a player can buffer and consume faster than 1x.
+    speed: f64,
 }
 
 impl Pacer {
     fn new() -> Self {
+        Self::with_speed(1.0)
+    }
+
+    fn with_speed(speed: f64) -> Self {
         Self {
             base_pts: None,
             base_wall: Instant::now(),
+            speed,
         }
     }
 
@@ -1022,7 +1404,7 @@ impl Pacer {
             return;
         };
 
-        let delta = media_delta(pts, base) as u128;
+        let delta = media_delta(pts, base).max(0) as u128;
         if delta > 10 * 90_000 {
             // A jump of more than ten seconds is a discontinuity, not jitter.
             self.base_pts = Some(pts);
@@ -1030,7 +1412,8 @@ impl Pacer {
             return;
         }
 
-        let offset = Duration::from_micros(u64::try_from(delta * 1_000_000 / 90_000).unwrap_or(0));
+        let offset = Duration::from_micros(u64::try_from(delta * 1_000_000 / 90_000).unwrap_or(0))
+            .div_f64(self.speed);
         let target = self.base_wall + offset;
         if target > now + MAX_LEAD {
             self.base_wall -= target.duration_since(now).saturating_sub(MAX_LEAD);
@@ -1048,16 +1431,32 @@ impl Pacer {
 
 /// Largest DVR segment body accepted from the VOD playlist.
 const MAX_VOD_SEGMENT: usize = 64 * 1024 * 1024;
-/// How often the DVR playlist is re-fetched while seeking/playing VOD.
-const VOD_REFRESH: Duration = Duration::from_secs(3);
+/// VOD is sent ahead of real time so players can buffer and consume faster than
+/// 1x. The bounded outbound queue ultimately throttles this to the client's
+/// drain rate; the high cap just fills the player's cache quickly after a seek.
+const VOD_SPEED: f64 = 16.0;
+/// Catch-up pace while replaying the live window after a DVR seek.
+const HANDOVER_SPEED: f64 = 4.0;
+/// Nominal live segment duration, used to decide whether a live-window segment
+/// still overlaps the DVR playhead.
+const LIVE_SEGMENT_MS: u64 = 2_000;
+/// How far a live segment may start before the DVR playhead and still be the
+/// one to resume from. The last DVR sample ends a frame or two before the group
+/// boundary, so require the *start* to be within this window.
+const LIVE_START_TOLERANCE_MS: u64 = 200;
+/// How long a seek waits for the background task to publish the first DVR
+/// timeline. Discovery normally finishes in well under a second; a join-time
+/// watch-later seek must not be turned into "play live" because of a slow start.
+const DVR_WAIT: Duration = Duration::from_secs(5);
 
 /// Register the demuxing consumer with the scheduler's fan-out.
 pub fn spawn_media(
     hub: Rc<Hub>,
     client: Rc<Client>,
-    live_url: &str,
+    dvr: Rc<Dvr>,
     wakes: &Rc<WakeSet>,
     add_output: &kanal::Sender<ConsumerRegistration>,
+    live_window: Rc<RefCell<Vec<Segment>>>,
 ) {
     let (tx, rx) = kanal::bounded(MAX_CONSUMER_LAG);
     // The RTSP control plane sends seeks through the same ordered consumer
@@ -1065,21 +1464,67 @@ pub fn spawn_media(
     hub.set_seek_sender(tx.clone().to_async());
     // A live RTSP session starts at the live edge: replaying the window would
     // put it seconds behind the pacer and the bounded queue would drop it.
-    if let Err(error) = add_output.send(ConsumerRegistration { tx, backlog: false }) {
+    if let Err(error) = add_output.send(ConsumerRegistration {
+        tx,
+        backlog: false,
+        lossy: true,
+    }) {
         error!(%error, "failed to register rtsp consumer");
         return;
     }
 
     let wake = ConsumerWake::new();
     wakes.register(&wake);
-    let dvr_url = vod::dvr_url(live_url);
 
+    compio::runtime::spawn(watchdog(Rc::clone(&hub))).detach();
     compio::runtime::spawn(async move {
-        Media::new(hub, client, dvr_url, rx.to_async(), wake)
+        Media::new(hub, client, dvr, rx.to_async(), wake, live_window)
             .run()
             .await;
     })
     .detach();
+}
+
+/// How long a session may stay gated on a seek before the stream is released.
+/// A response or media engine that never completes the seek must degrade to a
+/// glitch, not to a dead stream that only a reload recovers from.
+const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Release sessions whose seek never completed, and say why.
+///
+/// This also doubles as a liveness check: the whole reactor runs on one
+/// thread, so a log line that never appears means some task is spinning or
+/// blocking the thread rather than waiting on the driver.
+async fn watchdog(hub: Rc<Hub>) {
+    loop {
+        compio::time::sleep(Duration::from_secs(1)).await;
+        let mut stalled = Vec::new();
+        for session in hub.sessions.borrow().iter() {
+            let Some(started) = session.seek_started.get() else {
+                continue;
+            };
+            if started.elapsed() >= SEEK_TIMEOUT {
+                stalled.push((
+                    session.seeking.get(),
+                    session.playing.get(),
+                    session.out.len(),
+                    session.out.capacity(),
+                    session.range_start.get(),
+                    session.epoch.get(),
+                ));
+            }
+        }
+        if stalled.is_empty() {
+            continue;
+        }
+        warn!(
+            sessions = ?stalled,
+            position_ms = hub.position_ms.get(),
+            ready = hub.ready.get(),
+            "rtsp: seek did not complete, releasing gated sessions"
+        );
+        hub.end_seek();
+    }
 }
 
 enum VodOutcome {
@@ -1087,22 +1532,43 @@ enum VodOutcome {
     Live,
 }
 
+/// Where the media engine is in the DVR -> live transition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Handover {
+    /// Normal live playback.
+    None,
+    /// The DVR ended; replay the live playlist window from the playhead.
+    Replaying,
+    /// The window has been replayed; drain the segments queued during VOD.
+    Queue,
+}
+
 struct Media {
     hub: Rc<Hub>,
     client: Rc<Client>,
-    dvr_url: Option<String>,
+    dvr: Rc<Dvr>,
     rx: AsyncReceiver<SegmentMessage>,
     wake: Rc<ConsumerWake>,
     demuxer: TsDemuxer,
     pacer: Pacer,
     timeline: Timeline,
     samples: Vec<Sample>,
-    vod: Option<VodTimeline>,
-    vod_fetched: Instant,
     last_sequence: u64,
     last_rtcp: Instant,
-    /// Newest live segment seen while the engine was playing VOD.
+    /// Newest live segment seen during normal live playback.
     pending_live: Option<Segment>,
+    /// Live segments received while playing VOD, in broadcast order. At the
+    /// handover they are replayed from the first one after the DVR playhead, so
+    /// the transition starts at the beginning of the next live/DVR group
+    /// instead of jumping to the newest segment.
+    handover: VecDeque<Segment>,
+    handover_state: Handover,
+    /// A VOD seek actually played DVR segments (as opposed to a target in the
+    /// live window). Used to report the VOD -> live boundary once.
+    vod_played: bool,
+    /// Scheduler snapshot of the live playlist window, used to bridge the DVR
+    /// lag at the handover.
+    live_window: Rc<RefCell<Vec<Segment>>>,
     /// A discontinuity happened in the live stream while playing VOD.
     live_discontinuity: bool,
 }
@@ -1111,31 +1577,72 @@ impl Media {
     fn new(
         hub: Rc<Hub>,
         client: Rc<Client>,
-        dvr_url: Option<String>,
+        dvr: Rc<Dvr>,
         rx: AsyncReceiver<SegmentMessage>,
         wake: Rc<ConsumerWake>,
+        live_window: Rc<RefCell<Vec<Segment>>>,
     ) -> Self {
         Self {
             hub,
             client,
-            dvr_url,
+            dvr,
             rx,
             wake,
             demuxer: TsDemuxer::new(),
             pacer: Pacer::new(),
             timeline: Timeline::default(),
             samples: Vec::new(),
-            vod: None,
-            vod_fetched: Instant::now(),
             last_sequence: 0,
             last_rtcp: Instant::now(),
             pending_live: None,
+            handover: VecDeque::new(),
+            handover_state: Handover::None,
+            vod_played: false,
+            live_window,
             live_discontinuity: false,
         }
     }
 
     async fn run(mut self) {
         loop {
+            if self.handover_state != Handover::None {
+                // The DVR playlist lags the live edge by roughly one group.
+                // Replay the live window from the DVR playhead so playback
+                // continues with the first live segment after the last DVR
+                // group instead of jumping to the newest one.
+                if self.handover_state == Handover::Replaying {
+                    self.handover_state = Handover::Queue;
+                    if let Some(seek) = self.replay_live_window().await {
+                        self.seek(seek).await;
+                        continue;
+                    }
+                }
+                // Drop live segments that end before the DVR playhead. The
+                // first kept one starts the next live segment after the last
+                // DVR group, so the switch does not skip a group's worth of
+                // content (or jump the timestamps).
+                while self.handover.front().is_some_and(|segment| {
+                    segment.timestamp_ms.saturating_add(LIVE_SEGMENT_MS)
+                        < self.hub.position_ms.get()
+                }) {
+                    self.handover.pop_front();
+                }
+                if let Some(segment) = self.handover.pop_front() {
+                    debug!(
+                        sequence = segment.sequence_num,
+                        timestamp_ms = segment.timestamp_ms,
+                        playhead = self.hub.position_ms.get(),
+                        "rtsp: handover play"
+                    );
+                    if let Some(seek) = self.play_live(SegmentMessage::Segment(segment)).await {
+                        self.seek(seek).await;
+                    }
+                    continue;
+                }
+                self.handover_state = Handover::None;
+                self.pacer = Pacer::new();
+            }
+
             if let Some(segment) = self.pending_live.take() {
                 if let Some(seek) = self.play_live(SegmentMessage::Segment(segment)).await {
                     self.seek(seek).await;
@@ -1157,15 +1664,140 @@ impl Media {
         }
     }
 
-    async fn seek(&mut self, target_ms: u64) {
-        let mut target = target_ms;
+    async fn seek(&mut self, mut target: u64) {
+        // Live segments received during the seek/VOD are kept in order. At the
+        // handover they are replayed from the first one after the DVR playhead,
+        // which is the start of the next live segment below the DVR grouping.
+        self.handover.clear();
+        self.handover_state = Handover::Replaying;
+        self.vod_played = false;
+        self.pending_live = None;
+        // The DVR task discovers and refreshes the playlist in parallel. On a
+        // fresh start a seek (typically mpv's watch-later resume) can arrive
+        // before the first fetch completes; wait for it rather than snapping
+        // back to live. Newer seeks and live traffic are handled meanwhile.
+        let deadline = Instant::now() + DVR_WAIT;
+        while self.dvr.is_empty() {
+            if Instant::now() >= deadline {
+                debug!("rtsp: no DVR timeline, playing live");
+                break;
+            }
+            if let Some(seek) = drain_messages(
+                &self.rx,
+                &mut self.pending_live,
+                &mut self.handover,
+                self.handover_state != Handover::None,
+                &mut self.last_sequence,
+                &mut self.live_discontinuity,
+            ) {
+                target = seek;
+            }
+            compio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Send the first RTCP report of the new epoch right after the first
+        // sample, so the receiver switches to the fresh media-clock mapping
+        // before it has buffered any meaningful amount of audio or video.
+        self.last_rtcp = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
         while let VodOutcome::Seek(next) = self.play_vod(target).await {
             target = next;
         }
-        // The DVR and live copies have independent timestamp continuity at the
-        // handover; anchor the live pacer at its first sample instead of
-        // inheriting the VOD playhead (which would burst if it is behind).
-        self.pacer.reset();
+        // No DVR timeline (or nothing to play): release the sessions that the
+        // seek gated; they continue live from the current epoch.
+        self.hub.end_seek();
+
+        if self.vod_played && self.hub.has_sessions() {
+            // The DVR ended and the media engine is switching this client to
+            // the live edge. Report the boundary and how far the DVR trailed
+            // live (the first live-window segment after the DVR playhead).
+            let playhead = self.hub.position_ms.get();
+            let (live_start, live_edge, sequence) = {
+                let window = self.live_window.borrow();
+                let start = window.iter().find(|segment| {
+                    segment.timestamp_ms.saturating_add(LIVE_START_TOLERANCE_MS) >= playhead
+                });
+                start.map_or((playhead, playhead, 0), |segment| {
+                    (
+                        segment.timestamp_ms,
+                        window.last().map_or(segment.timestamp_ms, |last| {
+                            last.timestamp_ms.saturating_add(LIVE_SEGMENT_MS)
+                        }),
+                        segment.sequence_num,
+                    )
+                })
+            };
+            info!(
+                target_ms = target,
+                playhead_ms = playhead,
+                live_start_ms = live_start,
+                live_edge_ms = live_edge,
+                dvr_lag_ms = live_edge.saturating_sub(playhead),
+                sequence,
+                "rtsp: client crossed VOD -> live boundary"
+            );
+        }
+
+        // The DVR and live PES timestamps are continuous (the DVR files are
+        // concatenated live segments), so the handover queue is replayed in
+        // order. Give it a catch-up pace, then settle back to 1x live.
+        debug!(
+            target_ms = target,
+            vod_played = self.vod_played,
+            handover = ?self.handover_state,
+            handover_segments = self.handover.len(),
+            pending_live = self.pending_live.is_some(),
+            playhead_ms = self.hub.position_ms.get(),
+            "rtsp: seek finished"
+        );
+        if self.handover_state == Handover::None {
+            self.pacer = Pacer::new();
+        } else {
+            self.pacer = Pacer::with_speed(HANDOVER_SPEED);
+        }
+    }
+
+    /// Replay the live playlist window from the current broadcast playhead.
+    ///
+    /// The DVR playlist ends about one group (~10 s) behind the live edge, so
+    /// jumping straight to the newest live spool skips that group. The live
+    /// playlist still lists it; those spools are alive in the scheduler's
+    /// window, so replay them in order before the queued live segments.
+    async fn replay_live_window(&mut self) -> Option<u64> {
+        let playhead = self.hub.position_ms.get();
+        let window = self.live_window.borrow().clone();
+        let start = window.iter().position(|segment| {
+            segment.timestamp_ms.saturating_add(LIVE_START_TOLERANCE_MS) >= playhead
+        })?;
+        self.last_sequence = window[start].sequence_num.saturating_sub(1);
+        debug!(
+            playhead,
+            window = window.len(),
+            start_ms = window[start].timestamp_ms,
+            newest_ms = window.last().map(|segment| segment.timestamp_ms),
+            sequence = window[start].sequence_num,
+            "rtsp: replaying live window at DVR handover"
+        );
+
+        // Follow the window as the scheduler refreshes it. A one-shot snapshot
+        // ends before the segments that arrive while the replay is running, and
+        // a message the bounded queue could not take during a download stall
+        // would then leave a hole. Re-reading the window heals both.
+        loop {
+            let window = self.live_window.borrow().clone();
+            let segment = window
+                .into_iter()
+                .find(|segment| segment.sequence_num > self.last_sequence)?;
+            debug!(
+                sequence = segment.sequence_num,
+                timestamp_ms = segment.timestamp_ms,
+                "rtsp: live window segment"
+            );
+            if let Some(seek) = self.play_live(SegmentMessage::Segment(segment)).await {
+                return Some(seek);
+            }
+        }
     }
 
     /// Handle one scheduler message. Returns a seek target if the control plane
@@ -1180,9 +1812,28 @@ impl Media {
                 self.pacer.reset();
                 None
             }
-            // Prefetches carry no playlist timestamp; the main Segment follows.
+            // The scheduler starts downloading prefetch segments before they
+            // are listed as complete; playing them immediately removes the
+            // prefetch lead from the live latency. The matching `Segment`
+            // message is skipped by the sequence filter.
+            SegmentMessage::Prefetch {
+                expected_sequence,
+                timestamp_ms,
+                reader,
+            } => {
+                debug!(
+                    sequence = expected_sequence,
+                    timestamp_ms, "rtsp: prefetch segment"
+                );
+                self.play_live_segment(Segment {
+                    timestamp_ms,
+                    sequence_num: expected_sequence,
+                    reader,
+                })
+                .await
+            }
             // TS has no init segment; fMP4 is not supported by this output yet.
-            SegmentMessage::Prefetch { .. } | SegmentMessage::Init { .. } => None,
+            SegmentMessage::Init { .. } => None,
             SegmentMessage::Seek(target) => Some(target),
         }
     }
@@ -1204,6 +1855,8 @@ impl Media {
             if let Some(seek) = drain_messages(
                 &self.rx,
                 &mut self.pending_live,
+                &mut self.handover,
+                self.handover_state != Handover::None,
                 &mut self.last_sequence,
                 &mut self.live_discontinuity,
             ) {
@@ -1211,10 +1864,25 @@ impl Media {
             }
             self.demuxer.feed(view.as_init(), &mut self.samples);
             sync_config(&self.hub, &self.demuxer);
+            if self.hub.video_base.get().is_none() {
+                let base = self
+                    .samples
+                    .iter()
+                    .map(|sample| match sample {
+                        Sample::Video(video) => video.pts,
+                        Sample::Audio(audio) => audio.pts,
+                    })
+                    .min();
+                if let Some(base) = base {
+                    self.hub.set_media_base(base);
+                }
+            }
             for sample in self.samples.drain(..) {
                 if let Some(seek) = drain_messages(
                     &self.rx,
                     &mut self.pending_live,
+                    &mut self.handover,
+                    self.handover_state != Handover::None,
                     &mut self.last_sequence,
                     &mut self.live_discontinuity,
                 ) {
@@ -1231,6 +1899,8 @@ impl Media {
             if let Some(seek) = drain_messages(
                 &self.rx,
                 &mut self.pending_live,
+                &mut self.handover,
+                self.handover_state != Handover::None,
                 &mut self.last_sequence,
                 &mut self.live_discontinuity,
             ) {
@@ -1245,61 +1915,61 @@ impl Media {
 
     /// Play the DVR timeline from `target_ms` until the live edge or a seek.
     async fn play_vod(&mut self, target_ms: u64) -> VodOutcome {
-        if !self.load_vod(true).await {
-            return VodOutcome::Live;
-        }
-        let Some(mut index) = self
-            .vod
-            .as_ref()
-            .and_then(|timeline| timeline.find(target_ms))
-        else {
-            // The target is outside the DVR timeline (usually the live window).
-            return VodOutcome::Live;
-        };
-        debug!(
-            target_ms,
-            dvr_end_ms = self.vod.as_ref().map_or(0, |timeline| timeline.end_ms),
-            "rtsp: VOD seek"
-        );
-
+        // A seek can land outside the DVR range (typically at the live edge).
+        // Start it on a fresh RTP epoch either way: otherwise the first
+        // live-window frame is timestamped from the old VOD base and the
+        // player waits on a position far in the future.
         self.demuxer = TsDemuxer::new();
-        self.pacer = Pacer::new();
+        self.pacer = Pacer::with_speed(VOD_SPEED);
         self.timeline = Timeline::default();
         self.samples.clear();
         self.hub.reset_media_base();
         self.hub.set_position_ms(target_ms);
+
+        let Some((mut url, mut start_ms, mut duration_ms)) = self.dvr.segment_at(target_ms) else {
+            // The target is outside the DVR timeline (usually the live window).
+            debug!(
+                target_ms,
+                dvr_end_ms = self.dvr.end_ms(),
+                "rtsp: VOD target outside timeline, handing over to live"
+            );
+            return VodOutcome::Live;
+        };
+        debug!(target_ms, dvr_end_ms = self.dvr.end_ms(), "rtsp: VOD seek");
+
         let mut first = true;
+        let mut prefetched: Option<(Vec<u8>, u64)> = None;
 
         loop {
             if let Some(seek) = drain_messages(
                 &self.rx,
                 &mut self.pending_live,
+                &mut self.handover,
+                self.handover_state != Handover::None,
                 &mut self.last_sequence,
                 &mut self.live_discontinuity,
             ) {
                 return VodOutcome::Seek(seek);
             }
 
-            let Some((url, start_ms)) = self.current_vod_segment(index) else {
-                // End of the DVR copy: refresh and continue if it grew,
-                // otherwise the live spools take over.
-                if self.load_vod(true).await
-                    && self.vod.as_ref().is_some_and(|v| v.segments.len() > index)
-                {
-                    continue;
-                }
+            // Nobody is watching any more: stop pulling the archive.
+            if !self.hub.has_sessions() {
+                debug!("rtsp: VOD stopped: no sessions");
                 return VodOutcome::Live;
-            };
+            }
 
-            let Some(bytes) = self.fetch_segment(&url).await else {
-                warn!(url = %url, "rtsp: VOD segment fetch failed");
-                if self.load_vod(true).await
-                    && self.vod.as_ref().is_some_and(|v| v.segments.len() > index)
-                {
-                    continue;
-                }
-                return VodOutcome::Live;
+            let bytes = if let Some((bytes, start)) = prefetched.take() {
+                debug_assert_eq!(start, start_ms);
+                bytes
+            } else {
+                debug!(url = %url, start_ms, "rtsp: VOD fetching segment");
+                let Some(bytes) = self.fetch_segment(&url).await else {
+                    warn!(url = %url, "rtsp: VOD segment fetch failed");
+                    return VodOutcome::Live;
+                };
+                bytes
             };
+            self.vod_played = true;
 
             self.samples.clear();
             self.demuxer.feed(&bytes, &mut self.samples);
@@ -1311,6 +1981,38 @@ impl Media {
             } else {
                 0
             };
+            if first {
+                // Anchor the RTP epochs on the earliest PES time we will
+                // actually send. Otherwise a later sample can precede the base
+                // and the player sees duplicate or wrapped timestamps.
+                let base = self
+                    .samples
+                    .iter()
+                    .skip(start_index)
+                    .map(|sample| match sample {
+                        Sample::Video(video) => video.pts,
+                        Sample::Audio(audio) => audio.pts,
+                    })
+                    .min();
+                if let Some(base) = base {
+                    self.hub.set_media_base(base);
+                }
+            } else if self.hub.video_base.get().is_none() {
+                // The first segment had nothing to send (an ad, or a truncated
+                // fetch). The session is still gated on the seek; anchor on the
+                // first segment that does carry samples or it stays silent.
+                let base = self
+                    .samples
+                    .iter()
+                    .map(|sample| match sample {
+                        Sample::Video(video) => video.pts,
+                        Sample::Audio(audio) => audio.pts,
+                    })
+                    .min();
+                if let Some(base) = base {
+                    self.hub.set_media_base(base);
+                }
+            }
             let skipped_ms = samples_skipped_ms(&self.samples, start_index);
             let first_video_pts = self.samples.iter().find_map(|sample| match sample {
                 Sample::Video(video) => Some(video.pts),
@@ -1323,23 +2025,29 @@ impl Media {
                     Sample::Video(video) => Some(video.pts),
                     Sample::Audio(_) => None,
                 });
+            let last_video_pts = self.samples.iter().rev().find_map(|sample| match sample {
+                Sample::Video(video) => Some(video.pts),
+                Sample::Audio(_) => None,
+            });
             debug!(
                 start_ms,
                 target_ms,
                 first_video_pts,
                 chosen_pts,
+                last_video_pts,
                 skipped_ms,
                 samples = self.samples.len(),
                 "rtsp: VOD segment loaded"
             );
             self.timeline.start(start_ms.saturating_add(skipped_ms));
             first = false;
-            index += 1;
 
             for sample in self.samples.drain(start_index..) {
                 if let Some(seek) = drain_messages(
                     &self.rx,
                     &mut self.pending_live,
+                    &mut self.handover,
+                    self.handover_state != Handover::None,
                     &mut self.last_sequence,
                     &mut self.live_discontinuity,
                 ) {
@@ -1349,41 +2057,29 @@ impl Media {
                 maybe_rtcp(&self.hub, &mut self.last_rtcp);
             }
             self.hub.mark_ready();
-        }
-    }
 
-    fn current_vod_segment(&self, index: usize) -> Option<(String, u64)> {
-        let segment = self.vod.as_ref()?.segments.get(index)?;
-        Some((segment.url.clone(), segment.start_ms))
-    }
-
-    async fn load_vod(&mut self, force: bool) -> bool {
-        if !force && self.vod.is_some() && self.vod_fetched.elapsed() < VOD_REFRESH {
-            return true;
+            // The refresh task replaces the whole playlist, so the next
+            // segment is looked up by broadcast time, never by list index.
+            let next_position = start_ms.saturating_add(duration_ms);
+            let Some((next_url, next_start, next_duration)) = self.dvr.segment_at(next_position)
+            else {
+                // Reached the published DVR end: hand over to live.
+                debug!(
+                    next_position,
+                    dvr_end_ms = self.dvr.end_ms(),
+                    "rtsp: VOD reached published end"
+                );
+                return VodOutcome::Live;
+            };
+            if next_start <= start_ms {
+                // The refreshed playlist has not moved past this segment yet.
+                debug!(start_ms, next_start, "rtsp: VOD playlist has not advanced");
+                return VodOutcome::Live;
+            }
+            url = next_url;
+            start_ms = next_start;
+            duration_ms = next_duration;
         }
-        let Some(url) = self.dvr_url.clone() else {
-            return false;
-        };
-        let Some(text) = self.fetch_text(&url).await else {
-            return false;
-        };
-        let timeline = VodTimeline::parse(&url, &text);
-        if timeline.segments.is_empty() {
-            return false;
-        }
-        self.vod = Some(timeline);
-        self.vod_fetched = Instant::now();
-        true
-    }
-
-    async fn fetch_text(&self, url: &str) -> Option<String> {
-        let mut response = self.client.get(url).await.ok()?;
-        if !response.status.is_success() {
-            warn!(url = %url, status = %response.status, "rtsp: VOD playlist request failed");
-            return None;
-        }
-        let body = response.body.read_to_end(MAX_MANIFEST).await.ok()?;
-        std::str::from_utf8(&body).ok().map(str::to_owned)
     }
 
     async fn fetch_segment(&self, url: &str) -> Option<Vec<u8>> {
@@ -1395,11 +2091,14 @@ impl Media {
     }
 }
 
-/// Drain queued live messages. Keeps the newest live segment for the handover
-/// and returns the latest seek request.
+/// Drain queued live messages. During VOD the segments are kept in order for
+/// the handover; during live only the newest one matters. Returns the latest
+/// seek request.
 fn drain_messages(
     rx: &AsyncReceiver<SegmentMessage>,
     pending_live: &mut Option<Segment>,
+    handover: &mut VecDeque<Segment>,
+    queue: bool,
     last_sequence: &mut u64,
     live_discontinuity: &mut bool,
 ) -> Option<u64> {
@@ -1407,7 +2106,9 @@ fn drain_messages(
     while let Ok(Some(message)) = rx.try_recv() {
         match message {
             SegmentMessage::Segment(segment) => {
-                if pending_live
+                if queue {
+                    push_handover(handover, segment);
+                } else if pending_live
                     .as_ref()
                     .is_none_or(|pending| segment.sequence_num > pending.sequence_num)
                 {
@@ -1419,10 +2120,51 @@ fn drain_messages(
                 *live_discontinuity = true;
             }
             SegmentMessage::Seek(target) => seek = Some(target),
-            SegmentMessage::Prefetch { .. } | SegmentMessage::Init { .. } => {}
+            SegmentMessage::Prefetch {
+                expected_sequence,
+                timestamp_ms,
+                reader,
+            } => {
+                let candidate = Segment {
+                    timestamp_ms,
+                    sequence_num: expected_sequence,
+                    reader,
+                };
+                if queue {
+                    push_handover(handover, candidate);
+                } else if pending_live
+                    .as_ref()
+                    .is_none_or(|pending| candidate.sequence_num > pending.sequence_num)
+                {
+                    *pending_live = Some(candidate);
+                }
+            }
+            SegmentMessage::Init { .. } => {}
         }
     }
     seek
+}
+
+/// Keep roughly the DVR lag's worth of live segments for the handover.
+///
+/// Prefetch and playlist messages can arrive out of order for the same window
+/// (a prefetch tag for the next segment may precede the main dispatch of the
+/// current one), so insert by sequence. Appending would let the queue play
+/// 14201 before a late 14200, and the sequence filter would then drop 14200.
+fn push_handover(handover: &mut VecDeque<Segment>, segment: Segment) {
+    const MAX_HANDOVER: usize = 12;
+    match handover
+        .iter()
+        .position(|queued| queued.sequence_num >= segment.sequence_num)
+    {
+        // The same segment was already queued from the other message kind.
+        Some(index) if handover[index].sequence_num == segment.sequence_num => return,
+        Some(index) => handover.insert(index, segment),
+        None => handover.push_back(segment),
+    }
+    if handover.len() > MAX_HANDOVER {
+        handover.pop_front();
+    }
 }
 
 fn maybe_rtcp(hub: &Hub, last_rtcp: &mut Instant) {
@@ -1505,13 +2247,21 @@ async fn emit_sample(hub: &Hub, pacer: &mut Pacer, timeline: &mut Timeline, samp
                 debug!(pts = video.pts, dts = video.dts, "rtsp: video keyframe");
             }
             // Pace on DTS: that is the order the packets leave the decoder.
+            // VOD playback skips the clock and fills the receiver's queue
+            // instead, so it can run ahead of real time.
             pacer.wait(video.dts).await;
             hub.set_position_ms(timeline.position_ms(video.dts));
 
-            let timestamp = hub.rtp_timestamp(video.pts, sdp::VIDEO_CLOCK_RATE);
-            let ntp = ntp_now();
-            let mut scratch = Vec::new();
+            let timestamp = Hub::rtp_timestamp(video.pts, sdp::VIDEO_CLOCK_RATE, &hub.video_base);
+            let media = media_delta(
+                video.pts,
+                hub.video_base.get().expect("timestamp set the base"),
+            );
+            hub.wait_out_capacity(TRACK_VIDEO, video_packet_count(&video.nals))
+                .await;
 
+            hub.video_keyframe.set(video.keyframe);
+            let mut scratch = Vec::new();
             h264::packetize(
                 &video.nals,
                 RTP_MAX_PAYLOAD,
@@ -1520,26 +2270,42 @@ async fn emit_sample(hub: &Hub, pacer: &mut Pacer, timeline: &mut Timeline, samp
                     let packet = hub
                         .video
                         .borrow_mut()
-                        .packet(timestamp, marker, payload, ntp);
+                        .packet(timestamp, media, marker, payload);
                     hub.send(TRACK_VIDEO, &packet);
                 },
             );
+            hub.video_keyframe.set(false);
         }
         Sample::Audio(audio) => {
+            let clock_rate = hub.audio.borrow().clock_rate;
             pacer.wait(audio.pts).await;
             hub.set_position_ms(timeline.position_ms(audio.pts));
 
-            let clock_rate = hub.audio.borrow().clock_rate;
-            let timestamp = hub.rtp_timestamp(audio.pts, clock_rate);
+            let timestamp = Hub::rtp_timestamp(audio.pts, clock_rate, &hub.audio_base);
+            let media = media_delta(
+                audio.pts,
+                hub.audio_base.get().expect("timestamp set the base"),
+            );
+            hub.wait_out_capacity(TRACK_AUDIO, 1).await;
+
             let payload = aac::packetize(&audio.frame);
-            let ntp = ntp_now();
             let packet = hub
                 .audio
                 .borrow_mut()
-                .packet(timestamp, true, &payload, ntp);
+                .packet(timestamp, media, true, &payload);
             hub.send(TRACK_AUDIO, &packet);
         }
     }
+}
+
+/// Upper bound on the RTP packets one access unit will produce, used to reserve
+/// room in the receiver queues before packetizing.
+fn video_packet_count(nals: &[Vec<u8>]) -> usize {
+    let fragment = RTP_MAX_PAYLOAD.saturating_sub(2).max(1);
+    nals.iter()
+        .map(|nal| nal.len().div_ceil(fragment).max(1))
+        .sum::<usize>()
+        .max(1)
 }
 
 #[cfg(test)]
@@ -1573,9 +2339,9 @@ mod tests {
     #[test]
     fn sender_report_is_a_valid_compound_packet() {
         let mut track = Track::new(sdp::VIDEO_PAYLOAD_TYPE, 90_000, 0x1234_5678);
-        track.packet(0, true, &[1, 2, 3], ntp_now());
+        track.packet(0, 0, true, &[1, 2, 3]);
 
-        let report = track.sender_report().expect("report");
+        let report = track.sender_report(0).expect("report");
         // Sender report: 28 bytes, length field 6.
         assert_eq!(report[1], 200);
         assert_eq!(u16::from_be_bytes([report[2], report[3]]), 6);
@@ -1583,6 +2349,18 @@ mod tests {
         assert_eq!(report[29], 202);
         let sdes_len = u16::from_be_bytes([report[30], report[31]]);
         assert_eq!(usize::from(sdes_len) * 4 + 4, report.len() - 28);
+    }
+
+    #[test]
+    fn reset_mapping_keeps_the_rtp_sequence_running() {
+        let mut track = Track::new(sdp::VIDEO_PAYLOAD_TYPE, 90_000, 0x1234_5678);
+        track.packet(0, 0, true, &[1]);
+        let expected = track.next_seq;
+        track.reset_mapping();
+        assert_eq!(track.next_seq, expected, "a seek must not restart at 1");
+
+        let packet = track.packet(0, 0, true, &[1]);
+        assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), expected);
     }
 
     #[test]

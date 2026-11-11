@@ -38,7 +38,11 @@ pub fn spawn_disk_output(
     add_output: &kanal::Sender<ConsumerRegistration>,
 ) {
     let (tx, rx) = kanal::unbounded();
-    if let Err(error) = add_output.send(ConsumerRegistration { tx, backlog: true }) {
+    if let Err(error) = add_output.send(ConsumerRegistration {
+        tx,
+        backlog: true,
+        lossy: false,
+    }) {
         error!(%error, "failed to register disk output");
         return;
     }

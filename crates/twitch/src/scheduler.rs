@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::future::poll_fn;
 use std::rc::Rc;
 use std::task::Poll;
@@ -50,6 +51,44 @@ pub struct ConsumerRegistration {
     /// output want this; a live RTSP session does not (it would start ~30 s
     /// behind and never catch up at the 1x pacer).
     pub backlog: bool,
+    /// Drop individual messages when the bounded queue is full instead of
+    /// disconnecting. RTSP keeps only the newest live segment during normal
+    /// playback and replays the live window at a DVR handover, so losing a
+    /// message during a download stall must not kill the output.
+    pub lossy: bool,
+}
+
+/// One registered consumer of the live fan-out.
+#[derive(Debug)]
+struct Consumer {
+    tx: Sender<SegmentMessage>,
+    lossy: bool,
+}
+
+impl Consumer {
+    fn send(&self, message: SegmentMessage, reason: &'static str) -> bool {
+        match self.tx.try_send(message) {
+            Ok(true) => true,
+            Ok(false) if self.lossy => {
+                debug!(reason, "dropping message: consumer lagging");
+                true
+            }
+            Ok(false) => {
+                warn!(
+                    reason,
+                    queued = crate::constants::MAX_CONSUMER_LAG,
+                    "dropping consumer: lagging behind"
+                );
+                let _ = self.tx.close();
+                false
+            }
+            Err(error) => {
+                debug!(%error, reason, "dropping consumer: channel closed");
+                let _ = self.tx.close();
+                false
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +105,9 @@ pub enum SegmentMessage {
     Segment(Segment),
     Prefetch {
         expected_sequence: u64,
+        /// Playlist time of this segment, extrapolated from the last complete
+        /// segment; prefetch tags do not carry an elapsed time.
+        timestamp_ms: u64,
         reader: Reader,
     },
     Discontinuity(),
@@ -145,7 +187,13 @@ pub struct StreamScheduler {
     segments: Vec<Segment>,
     prefetches: Vec<PrefetchSegment>,
 
-    readers: Vec<Sender<SegmentMessage>>,
+    /// Snapshot of `segments` for the RTSP engine. When VOD playback reaches
+    /// the end of the DVR playlist, the segments between there and the live
+    /// edge are still in the live window; replaying them bridges the DVR lag
+    /// instead of jumping to the newest live segment.
+    live_window: Rc<RefCell<Vec<Segment>>>,
+
+    readers: Vec<Consumer>,
 
     segment_tail: u64,
     prefetch_tail: u64,
@@ -153,7 +201,7 @@ pub struct StreamScheduler {
 }
 
 impl StreamScheduler {
-    pub const fn new(
+    pub fn new(
         client: Rc<Client>,
         arena: Rc<ArenaSet>,
         wakes: Rc<WakeSet>,
@@ -176,12 +224,22 @@ impl StreamScheduler {
             segments: Vec::new(),
             prefetches: Vec::new(),
 
+            live_window: Rc::new(RefCell::new(Vec::new())),
+
             readers: Vec::new(),
 
             segment_tail: 0,
             prefetch_tail: 0,
             last_segment_dur: Duration::from_secs(5),
         }
+    }
+
+    /// Share the scheduler's live playlist window with another consumer (the
+    /// RTSP engine, which bridges the DVR lag at a seek handover).
+    #[must_use]
+    pub fn with_live_window(mut self, live_window: Rc<RefCell<Vec<Segment>>>) -> Self {
+        self.live_window = live_window;
+        self
     }
 
     pub async fn main(mut self) {
@@ -232,6 +290,7 @@ impl StreamScheduler {
         self.init = None;
         self.segments.clear();
         self.prefetches.clear();
+        self.live_window.borrow_mut().clear();
     }
 
     fn handle_new_readers(&mut self) {
@@ -245,11 +304,11 @@ impl StreamScheduler {
     fn adopt(&mut self, registration: ConsumerRegistration) {
         const BACKLOG: usize = crate::constants::MAX_CONSUMER_LAG - 2;
 
-        let ConsumerRegistration { tx, backlog } = registration;
-        debug!(backlog, "new sender");
+        let ConsumerRegistration { tx, backlog, lossy } = registration;
+        debug!(backlog, lossy, "new sender");
+        let consumer = Consumer { tx, lossy };
         if let Some(init) = &self.init
-            && !push(
-                &tx,
+            && !consumer.send(
                 SegmentMessage::Init {
                     reader: init.1.clone(),
                 },
@@ -265,13 +324,13 @@ impl StreamScheduler {
             // segments, or every new client would be dropped immediately.
             let skip = self.segments.len().saturating_sub(BACKLOG);
             for segment in self.segments.iter().skip(skip) {
-                if !push(&tx, segment.clone().into(), "new reader backlog") {
+                if !consumer.send(segment.clone().into(), "new reader backlog") {
                     return;
                 }
             }
         }
 
-        self.readers.push(tx);
+        self.readers.push(consumer);
     }
 
     async fn mainloop(&mut self) -> eros::Result<(), SchedulerErrors> {
@@ -391,17 +450,8 @@ impl StreamScheduler {
                 .union()?;
         }
 
-        self.readers.retain_unordered(|reader| {
-            if reader
-                .try_send(segment.clone().into())
-                .is_ok_and(|sent| sent)
-            {
-                true // success, keep
-            } else {
-                let _ = reader.close(); // close it
-                false
-            }
-        });
+        self.readers
+            .retain_unordered(|reader| reader.send(segment.clone().into(), "segment"));
 
         self.last_segment_dur = duration;
 
@@ -426,6 +476,13 @@ impl StreamScheduler {
         let (writer, reader) = Spool::open(&self.arena, &self.wakes).union()?;
         let span = debug_span!("prefetch segment", sequence_id = expected_sequence);
         let url = Rc::<str>::from(url);
+        let duration_ms = u64::try_from(self.last_segment_dur.as_millis()).unwrap_or(0);
+        let timestamp_ms = self.segments.last().map_or(0, |segment| {
+            let offset = expected_sequence.saturating_sub(segment.sequence_num + 1);
+            segment
+                .timestamp_ms
+                .saturating_add(duration_ms.saturating_mul(offset + 1))
+        });
 
         self.downloaders
             .send(ToDownloader::FetchURL {
@@ -437,10 +494,10 @@ impl StreamScheduler {
             .union()?;
 
         self.readers.retain_unordered(|consumer| {
-            push(
-                consumer,
+            consumer.send(
                 SegmentMessage::Prefetch {
                     expected_sequence,
+                    timestamp_ms,
                     reader: reader.clone(),
                 },
                 "prefetch",
@@ -457,7 +514,7 @@ impl StreamScheduler {
 
     fn broadcast_discontinuity(&mut self) {
         self.readers.retain_unordered(|reader| {
-            push(reader, SegmentMessage::Discontinuity(), "discontinuity")
+            reader.send(SegmentMessage::Discontinuity(), "discontinuity")
         });
     }
 
@@ -545,30 +602,8 @@ impl StreamScheduler {
             );
         }
 
+        (*self.live_window.borrow_mut()).clone_from(&self.segments);
         Ok(self.prefetch_tail - original_prefetch_tail)
-    }
-}
-
-/// Hand one message to a consumer, dropping it when it has gone away or fallen
-/// too far behind. Bounded consumer queues are the lag policy: a full queue is a
-/// client that cannot keep up with the live window (see `MAX_CONSUMER_LAG`).
-fn push(reader: &Sender<SegmentMessage>, message: SegmentMessage, reason: &'static str) -> bool {
-    match reader.try_send(message) {
-        Ok(true) => true,
-        Ok(false) => {
-            warn!(
-                reason,
-                queued = crate::constants::MAX_CONSUMER_LAG,
-                "dropping consumer: lagging behind"
-            );
-            let _ = reader.close();
-            false
-        }
-        Err(error) => {
-            debug!(%error, reason, "dropping consumer: channel closed");
-            let _ = reader.close();
-            false
-        }
     }
 }
 
@@ -579,15 +614,32 @@ mod tests {
     #[test]
     fn a_full_consumer_queue_is_dropped() {
         let (tx, rx) = kanal::bounded(1);
+        let consumer = Consumer { tx, lossy: false };
 
-        assert!(push(&tx, SegmentMessage::Discontinuity(), "first"));
+        assert!(consumer.send(SegmentMessage::Discontinuity(), "first"));
         // No receiver poll happened, so the queue is full: the consumer is dropped.
-        assert!(!push(&tx, SegmentMessage::Discontinuity(), "second"));
+        assert!(!consumer.send(SegmentMessage::Discontinuity(), "second"));
 
         // Closing discards whatever was queued, so the consumer sees a closed
         // channel immediately.
-        assert!(tx.try_send(SegmentMessage::Discontinuity()).is_err());
+        assert!(
+            consumer
+                .tx
+                .try_send(SegmentMessage::Discontinuity())
+                .is_err()
+        );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_lossy_consumer_keeps_going_when_full() {
+        let (tx, rx) = kanal::bounded(1);
+        let consumer = Consumer { tx, lossy: true };
+
+        assert!(consumer.send(SegmentMessage::Discontinuity(), "first"));
+        assert!(consumer.send(SegmentMessage::Discontinuity(), "second"));
+        assert!(consumer.send(SegmentMessage::Discontinuity(), "third"));
+        assert!(rx.try_recv().is_ok());
     }
 
     fn run<F: Future>(future: F) -> F::Output {
@@ -604,6 +656,7 @@ mod tests {
             .send(ConsumerRegistration {
                 tx: consumer,
                 backlog: true,
+                lossy: false,
             })
             .expect("queue");
 
@@ -625,6 +678,7 @@ mod tests {
                     .send(ConsumerRegistration {
                         tx: consumer,
                         backlog: true,
+                        lossy: false,
                     })
                     .expect("queue");
                 signal.wake();

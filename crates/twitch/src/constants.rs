@@ -117,5 +117,9 @@ pub const POOL_IDLE_AGE: Duration = Duration::from_secs(30);
 /// Cap on a media playlist body.
 pub const MAX_MANIFEST: usize = 1024 * 1024;
 
+/// Cap on a VOD/DVR playlist body. These cover the whole broadcast, so a long
+/// stream can be several megabytes.
+pub const MAX_VOD_MANIFEST: usize = 8 * 1024 * 1024;
+
 /// Cap on a GQL / OAuth JSON body.
 pub const MAX_JSON: usize = 256 * 1024;

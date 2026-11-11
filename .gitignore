@@ -5,3 +5,7 @@ servermock/output
 servermock/node_modules
 servermock/unused/
 servermock/config.json
+
+# Player-side repro artefacts
+freeze-probe.log
+mpv-*.log

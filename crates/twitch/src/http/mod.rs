@@ -83,6 +83,18 @@ impl Client {
         self.execute(Method::GET, uri, headers, None, None).await
     }
 
+    /// `HEAD url` with no extra headers.
+    pub async fn head(&self, url: &str) -> Result<Response, Error> {
+        self.head_with(url, &[]).await
+    }
+
+    /// `HEAD url` with extra headers. The body is always empty; the response
+    /// head is enough for existence probes.
+    pub async fn head_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, Error> {
+        let uri = parse_url(url)?;
+        self.execute(Method::HEAD, uri, headers, None, None).await
+    }
+
     /// `POST url` with a body.
     pub async fn post(
         &self,
@@ -125,7 +137,7 @@ impl Client {
             let head = read_head(&mut conn).await?;
 
             if head.status.is_redirection()
-                && method == Method::GET
+                && matches!(method, Method::GET | Method::HEAD)
                 && let Some(location) = head.headers.get(LOCATION)
             {
                 uri = resolve(&uri, location)?;

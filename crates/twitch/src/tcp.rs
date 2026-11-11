@@ -68,7 +68,11 @@ async fn accept_loop(
                 // which is the lagging-consumer policy.
                 let (tx, rx) = kanal::bounded(MAX_CONSUMER_LAG);
                 if add_readers
-                    .send(ConsumerRegistration { tx, backlog: true })
+                    .send(ConsumerRegistration {
+                        tx,
+                        backlog: true,
+                        lossy: false,
+                    })
                     .is_err()
                 {
                     return;
@@ -114,6 +118,7 @@ async fn client(
             SegmentMessage::Prefetch {
                 expected_sequence,
                 mut reader,
+                ..
             } => {
                 if last_sequence >= expected_sequence {
                     continue;
