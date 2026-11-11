@@ -1,6 +1,62 @@
 # ES-RTP / RTSP output design
 
-Status: decided direction, not implemented.
+Status: implemented for the TS source (H.264 + AAC) in `crates/twitch/src/rtsp/`.
+Disk output is disabled while this is the only sink. fMP4 / HEVC / AV1 are still
+design-only.
+
+## Implementation notes (TS)
+
+- Packetizers are ports of gortsplib `rtph264` / `rtpmpeg4audio` (MIT): single
+  NAL, STAP-A and FU-A for H.264; AAC-hbr AU headers for audio; 1450-byte
+  payload budget.
+- **PES boundaries are not access-unit boundaries.** Twitch's muxer can start a
+  PES with the tail of the previous AU, followed by the next AU's AUD. The
+  demuxer concatenates PES payloads and splits at AUD NALs; the PTS/DTS of the
+  PES containing the AUD is assigned to that AU. Assuming one AU per PES drops
+  frames and corrupts every later reference.
+- The media consumer paces at 1x from a shared 90 kHz epoch; RTCP SR maps that
+  to wall-clock NTP. RTSP consumers register as live-only (`ConsumerRegistration
+  { backlog: false }`) so a late client starts at the edge instead of replaying
+  the window behind the pacer. Prefetch messages are skipped because they carry
+  no playlist timestamp; the main segment follows with it.
+- Absolute position / live signalling: the playhead is tracked from the
+  playlist's elapsed time (`Segment::timestamp_ms`, from
+  `#EXT-X-TWITCH-ELAPSED-SECS`). DESCRIBE puts it in the SDP session-level
+  `a=range:npt=<seconds>-` (open-ended, so players treat the stream as live and
+  leave ffmpeg's duration unset), and PLAY repeats it in `Range: npt=<seconds>-`,
+  which ffmpeg adds to every RTP timestamp (`range_start_offset`). Clients that
+  do not rebase start times then display the absolute NPT. mpv rebases by
+  default; `--rebase-start-time=no` shows the absolute position, and
+  `demuxer-start-time` exposes it either way.
+- RTSP `Scale` catch-up was considered and dropped: ffmpeg's RTSP demuxer (and
+  therefore mpv) does not parse `Scale`, so asking a late starter to play 1.3x
+  cannot work.
+- UDP and interleaved-TCP transports are both supported; RTCP SRs are sent once
+  per second (SR + SDES CNAME).
+
+## VOD / DVR seeking (implemented)
+
+- The live playlist only has the recent window. `rtsp/vod.rs` derives
+  `index-dvr.m3u8` from the live variant (`index*.m3u8` in the same directory)
+  and parses the whole broadcast timeline. The mock serves the same path.
+- A normal join stays on the live scheduler spools (live edge). A real seek
+  (`PAUSE` then `PLAY` with `Range: npt=X-`) makes the media engine fetch the
+  DVR segment containing X, start at the last keyframe at or before X, and play
+  the DVR timeline forward at 1x. Live messages are drained and the newest one
+  is kept; when the DVR playlist ends, the engine hands over to the live spool
+  (pacer re-anchored at the first live sample).
+- Seek packets start a new RTP/RTCP epoch: the shared `base_pts` and both
+  `Track::last_rtp/last_ntp` mappings are reset, and `Range: npt=X-` becomes
+  ffmpeg's `range_start_offset`. Small negative audio-vs-video PTS offsets are
+  clamped in `media_delta`, otherwise `rem_euclid(2^33)` produces a wrapped
+  timestamp and bogus player duration.
+- The SDP advertises a finite `a=range:npt=0-<live playhead>` so players enable
+  seeking; the initial PLAY is still treated as live (only PAUSE+PLAY is a
+  seek). mpv's watch-later resume is a real PAUSE+PLAY and is honored; disable
+  it client-side if a fixed RTSP URL should always start live.
+- `SegmentMessage::Seek` is the control message from the RTSP plane to the media
+  engine. It travels through the existing ordered consumer channel because
+  kanal async receivers are not safe in `select`.
 
 ## Decisions
 

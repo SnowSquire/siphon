@@ -16,6 +16,33 @@ use crate::http::StatusCode;
 use crate::spool::ArenaFull;
 use crate::spool::Writer;
 
+#[derive(Debug, Error)]
+enum FetchError {
+    #[error(transparent)]
+    Http(#[from] crate::http::Error),
+    #[error(transparent)]
+    Arena(#[from] ArenaFull),
+    #[error("http status {0}")]
+    Status(StatusCode),
+}
+
+impl FetchError {
+    /// Whether another attempt could plausibly succeed.
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Http(error) => error.retryable(),
+            // `fetch` already waited `ARENA_RETRIES * ARENA_BACKOFF` for a free
+            // slot, so another round would repeat the wait and starve again.
+            Self::Arena(_) => false,
+            Self::Status(status) => {
+                status.is_server_error()
+                    || *status == StatusCode::REQUEST_TIMEOUT
+                    || *status == StatusCode::TOO_MANY_REQUESTS
+            }
+        }
+    }
+}
+
 pub enum ToDownloader {
     FetchURL {
         url: Rc<str>,
@@ -68,33 +95,6 @@ async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
                     warn!(%url, %error, attempt, ?backoff, "download failed, retrying");
                     compio::time::sleep(backoff).await;
                 }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-enum FetchError {
-    #[error(transparent)]
-    Http(#[from] crate::http::Error),
-    #[error(transparent)]
-    Arena(#[from] ArenaFull),
-    #[error("http status {0}")]
-    Status(StatusCode),
-}
-
-impl FetchError {
-    /// Whether another attempt could plausibly succeed.
-    fn retryable(&self) -> bool {
-        match self {
-            Self::Http(error) => error.retryable(),
-            // `fetch` already waited `ARENA_RETRIES * ARENA_BACKOFF` for a free
-            // slot, so another round would repeat the wait and starve again.
-            Self::Arena(_) => false,
-            Self::Status(status) => {
-                status.is_server_error()
-                    || *status == StatusCode::REQUEST_TIMEOUT
-                    || *status == StatusCode::TOO_MANY_REQUESTS
             }
         }
     }

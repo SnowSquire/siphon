@@ -12,6 +12,7 @@ use tracing::debug;
 use tracing::error;
 use xxhash_rust::xxh3::Xxh3;
 
+use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::SegmentMessage;
 use crate::spool::ConsumerWake;
 use crate::spool::Reader;
@@ -34,10 +35,10 @@ pub enum DiskOutputError {
 pub fn spawn_disk_output(
     stream_id: u64,
     wakes: &Rc<WakeSet>,
-    add_output: &kanal::Sender<kanal::Sender<SegmentMessage>>,
+    add_output: &kanal::Sender<ConsumerRegistration>,
 ) {
     let (tx, rx) = kanal::unbounded();
-    if let Err(error) = add_output.send(tx) {
+    if let Err(error) = add_output.send(ConsumerRegistration { tx, backlog: true }) {
         error!(%error, "failed to register disk output");
         return;
     }
@@ -437,7 +438,9 @@ async fn run_disk_output(
                     .await?;
                 }
             }
-            SegmentMessage::Prefetch { .. } | SegmentMessage::Discontinuity() => {}
+            SegmentMessage::Prefetch { .. }
+            | SegmentMessage::Discontinuity()
+            | SegmentMessage::Seek(_) => {}
             SegmentMessage::Init { mut reader } => {
                 // TODO(rtsp): this is where the init segment parser will pick up
                 // codec configuration for the SDP.

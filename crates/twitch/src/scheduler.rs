@@ -42,8 +42,20 @@ struct PrefetchSegment {
     reader: Reader,
 }
 
+/// A consumer registering for the live fan-out.
+#[derive(Debug)]
+pub struct ConsumerRegistration {
+    pub tx: Sender<SegmentMessage>,
+    /// Replay the current window before live segments. Disk and the raw-TS
+    /// output want this; a live RTSP session does not (it would start ~30 s
+    /// behind and never catch up at the 1x pacer).
+    pub backlog: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Segment {
+    /// Presentation time since the start of the broadcast. The RTSP output maps
+    /// this to NPT so clients can show the absolute position in the stream.
     pub timestamp_ms: u64,
     pub sequence_num: u64,
     pub reader: Reader,
@@ -60,6 +72,9 @@ pub enum SegmentMessage {
     Init {
         reader: Reader,
     },
+    /// Seek request from the RTSP control plane (broadcast milliseconds). Only
+    /// the RTSP consumer sends this; the scheduler never does.
+    Seek(u64),
 }
 
 impl From<Segment> for SegmentMessage {
@@ -95,9 +110,9 @@ type SchedulerErrors = (
 /// Resolves when a consumer registers, re-checking the channel after parking so
 /// a registration that races with the park is not missed.
 async fn next_reader(
-    receive: Receiver<Sender<SegmentMessage>>,
+    receive: Receiver<ConsumerRegistration>,
     wake: Rc<ConsumerWake>,
-) -> Sender<SegmentMessage> {
+) -> ConsumerRegistration {
     poll_fn(move |context| {
         if let Ok(Some(reader)) = receive.try_recv() {
             return Poll::Ready(reader);
@@ -121,7 +136,7 @@ pub struct StreamScheduler {
     wakes: Rc<WakeSet>,
     stream_url: Box<str>,
     downloaders: AsyncSender<ToDownloader>,
-    receive: Receiver<Sender<SegmentMessage>>,
+    receive: Receiver<ConsumerRegistration>,
     reader_wake: Rc<ConsumerWake>,
 
     /// hls fmp4 init header, doesn't reqire a discontinuity
@@ -144,7 +159,7 @@ impl StreamScheduler {
         wakes: Rc<WakeSet>,
         stream_url: Box<str>,
         downloaders: AsyncSender<ToDownloader>,
-        receive: Receiver<Sender<SegmentMessage>>,
+        receive: Receiver<ConsumerRegistration>,
         reader_wake: Rc<ConsumerWake>,
     ) -> Self {
         Self {
@@ -220,17 +235,18 @@ impl StreamScheduler {
     }
 
     fn handle_new_readers(&mut self) {
-        while let Ok(Some(tx)) = self.receive.try_recv() {
-            self.adopt(tx);
+        while let Ok(Some(registration)) = self.receive.try_recv() {
+            self.adopt(registration);
         }
     }
 
-    /// Register one new consumer: hand it the init segment and the tail of the
-    /// window, or drop it when its bounded queue cannot take them.
-    fn adopt(&mut self, tx: Sender<SegmentMessage>) {
+    /// Register one new consumer: hand it the init segment and (optionally) the
+    /// tail of the window, or drop it when its bounded queue cannot take them.
+    fn adopt(&mut self, registration: ConsumerRegistration) {
         const BACKLOG: usize = crate::constants::MAX_CONSUMER_LAG - 2;
 
-        debug!("new sender");
+        let ConsumerRegistration { tx, backlog } = registration;
+        debug!(backlog, "new sender");
         if let Some(init) = &self.init
             && !push(
                 &tx,
@@ -243,13 +259,15 @@ impl StreamScheduler {
             return;
         }
 
-        // A late joiner gets the newest part of the window, not all of it:
-        // the whole backlog has to fit in the bounded queue alongside live
-        // segments, or every new client would be dropped immediately.
-        let skip = self.segments.len().saturating_sub(BACKLOG);
-        for segment in self.segments.iter().skip(skip) {
-            if !push(&tx, segment.clone().into(), "new reader backlog") {
-                return;
+        if backlog {
+            // A late joiner gets the newest part of the window, not all of it:
+            // the whole backlog has to fit in the bounded queue alongside live
+            // segments, or every new client would be dropped immediately.
+            let skip = self.segments.len().saturating_sub(BACKLOG);
+            for segment in self.segments.iter().skip(skip) {
+                if !push(&tx, segment.clone().into(), "new reader backlog") {
+                    return;
+                }
             }
         }
 
@@ -582,11 +600,16 @@ mod tests {
     fn a_reader_already_queued_is_taken_without_waiting() {
         let (queue, receive) = kanal::unbounded();
         let (consumer, _keep) = kanal::bounded::<SegmentMessage>(1);
-        queue.send(consumer).expect("queue");
+        queue
+            .send(ConsumerRegistration {
+                tx: consumer,
+                backlog: true,
+            })
+            .expect("queue");
 
         // Would hang if the first check did not see the queued sender.
         let taken = run(next_reader(receive, ConsumerWake::new()));
-        assert!(taken.try_send(SegmentMessage::Discontinuity()).is_ok());
+        assert!(taken.tx.try_send(SegmentMessage::Discontinuity()).is_ok());
     }
 
     #[test]
@@ -598,7 +621,12 @@ mod tests {
             compio::runtime::spawn(async move {
                 compio::time::sleep(Duration::from_millis(10)).await;
                 let (consumer, _keep) = kanal::bounded::<SegmentMessage>(1);
-                queue.send(consumer).expect("queue");
+                queue
+                    .send(ConsumerRegistration {
+                        tx: consumer,
+                        backlog: true,
+                    })
+                    .expect("queue");
                 signal.wake();
             })
             .detach();

@@ -3,8 +3,10 @@
 mod arena;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
 mod constants;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
-mod disk;
+// Disk output is disabled for now: RTSP/RTP is the only sink. The module is kept
+// (and mirrors index.hexpat) for when the DVR output comes back.
+// #[allow(clippy::future_not_send)]
+// mod disk;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
 mod downloader;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
@@ -15,6 +17,8 @@ mod spool;
 mod http;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
 mod playlist;
+#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+mod rtsp;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
 mod scheduler;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
@@ -79,11 +83,18 @@ async fn main() {
 
     let cfg = Config::parse();
 
+    // Debug mode replays the mock's captured segments, which are from sunnys.
+    let title = if cfg.debug {
+        "sunnys".to_owned()
+    } else {
+        cfg.channel.clone()
+    };
+
     let client = Rc::new(Client::new());
     let arena = Rc::new(ArenaSet::new());
     let wakes = WakeSet::new();
 
-    let (variants, stream_id) = if cfg.debug {
+    let (variants, _stream_id) = if cfg.debug {
         (
             vec![Variant {
                 codec: None,
@@ -110,9 +121,22 @@ async fn main() {
 
     let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
     let (outputs_tx, outputs_rx) = kanal::unbounded();
+    let stream_url = variants.first().unwrap().url.clone();
 
     downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(&client, &downloaders_rx);
-    disk::spawn_disk_output(stream_id, &wakes, &outputs_tx);
+    // Disk output is disabled for now; RTSP is the primary sink.
+    // disk::spawn_disk_output(stream_id, &wakes, &outputs_tx);
+
+    let hub = Rc::new(rtsp::Hub::new(title));
+    rtsp::spawn_server(Rc::clone(&hub));
+    rtsp::spawn_media(
+        Rc::clone(&hub),
+        Rc::clone(&client),
+        &stream_url,
+        &wakes,
+        &outputs_tx,
+    );
+
     let reader_wake = ConsumerWake::new();
     tcp::spawn_tcp_listener(
         Rc::clone(&wakes),
@@ -124,7 +148,7 @@ async fn main() {
         client,
         arena,
         wakes,
-        variants.first().unwrap().url.clone(),
+        stream_url,
         downloaders_tx.to_async(),
         outputs_rx,
         reader_wake,

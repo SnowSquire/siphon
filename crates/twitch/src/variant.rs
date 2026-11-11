@@ -308,7 +308,7 @@ pub async fn get_variants(
         }
     };
 
-    let master_manifest =
+    let variant_playlist =
         match fetch_variant_playlist(client, channel, &client_id, auth_token, low_latency).await {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -317,7 +317,7 @@ pub async fn get_variants(
             }
         };
 
-    let (variants, stream_id) = parse_variant_playlist(&master_manifest);
+    let (variants, stream_id) = parse_variant_playlist(&variant_playlist);
     if variants.is_empty() {
         eprintln!("no variants for {channel}: is the channel live?");
         std::process::exit(1);

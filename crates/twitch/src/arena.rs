@@ -30,6 +30,14 @@ use crate::constants::MAX_SLOTS;
 use crate::constants::SLOT_SIZE;
 use crate::constants::SLOTS_PER_ARENA;
 
+/// The arena has no free slot, or no free spool record, left.
+///
+/// Callers should back off and retry: a consumer is lagging behind the live
+/// window.
+#[derive(Debug, thiserror::Error)]
+#[error("slot arena is exhausted")]
+pub struct ArenaFull;
+
 /// Identifies a slot inside a [`ArenaSet`].
 ///
 /// Ids are stable while the slot is referenced; because an arena is only released
@@ -61,14 +69,6 @@ impl SlotId {
 /// Identifies a spool record inside a [`ArenaSet`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SpoolId(u32);
-
-/// The arena has no free slot, or no free spool record, left.
-///
-/// Callers should back off and retry: a consumer is lagging behind the live
-/// window.
-#[derive(Debug, thiserror::Error)]
-#[error("slot arena is exhausted")]
-pub struct ArenaFull;
 
 struct SlotMeta {
     /// Live owners: writer tail, consumer pins, and the predecessor's link.

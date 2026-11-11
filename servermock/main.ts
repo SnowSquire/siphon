@@ -27,7 +27,9 @@ const segment_by_filename = new Map(segment_list.map((s) => [s.filename, s]));
 
 const LIVE_WINDOW_MS = 30_000;
 const DVR_TARGET_MS = 10_000;
-const SPEED = 8;
+// Wall-clock multiplier for the simulated broadcast. Set SPEED=1 to replay at
+// real time (the RTSP pacer honors it); the default races ahead.
+const SPEED = Number(process.env.SPEED ?? 8);
 
 const session_id = String(Math.floor(Date.now() * 1000 + Math.random() * 1000));
 const dvr_groups = buildDvrGroups(segment_list);

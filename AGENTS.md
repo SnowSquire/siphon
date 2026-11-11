@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Twitch HLS live-stream client (Rust) + `servermock/` (Node mock Twitch edge server) used to test it offline. No README; `todo.md` and `notes.txt` are the maintainer's live scratch notes — read them before touching scheduler/disk logic. `notes/` has the longer design documents (transport probe, slot arena / RTSP direction, TLS client API).
+Twitch HLS live-stream client (Rust) + `servermock/` (Node mock Twitch edge server) used to test it offline. No README; `todo.md` and `notes.txt` are the maintainer's live scratch notes — read them before touching scheduler/disk logic. `notes/` has the longer design documents (transport probe, slot arena / RTSP output, TLS client API).
 
 ## Commands
 
@@ -17,17 +17,17 @@ Twitch HLS live-stream client (Rust) + `servermock/` (Node mock Twitch edge serv
 - **slot** — fixed 192 512 B zeroed buffer in the arena. Never "chunk": *chunk* means an HTTP transfer-encoding chunk.
 - **segment** — one HLS media playlist entry (~2 s), one HTTP fetch.
 - **spool** — the byte stream of one segment: one `Writer`, any number of `Reader`s, backed by a chain of slots.
-- **consumer** — the task/sink reading a spool (disk, each TCP client). A consumer owns one `ConsumerWake`.
+- **consumer** — the task/sink reading a spool (RTSP, disk, each raw-TCP client). A consumer owns one `ConsumerWake`.
 - **reader** — a consumer's cursor into a spool.
 
 ## Local dev loop (servermock)
 
 `--debug` mode bypasses Twitch and fetches `http://127.0.0.2:8000/index.m3u8`.
 
-1. In `servermock/`: `pnpm install` first (installs `@node-rs/xxhash`); `pnpm dev` runs `node --watch main.ts`. It needs real segment files in `servermock/segments/` (gitignored). The mock replays at `SPEED = 8` and ends with `#EXT-X-ENDLIST`; `touch servermock/main.ts` restarts it from the top.
-2. `cargo run -p twitch-hls-client2 -- -c anything -d` — `-c` is still required by clap even in debug mode. Debug mode uses a fixed broadcast id (`0`) so restarts resume the same files.
-3. Client serves the raw TS stream over TCP on `localhost:7417` (v4 and v6; ephemeral ports as fallback) and persists to `manifest/{broadcast_id}.segs` + `.index`.
-4. `ffprobe -i tcp://127.0.0.1:7417` is the quick end-to-end check.
+1. In `servermock/`: `pnpm install` first (installs `@node-rs/xxhash`); `pnpm dev` runs `node --watch main.ts`. It needs real segment files in `servermock/segments/` (gitignored). The mock replays at `SPEED = 8` by default (override with `SPEED=1 pnpm dev` for a real-time RTSP test) and ends with `#EXT-X-ENDLIST`; `touch servermock/main.ts` restarts it from the top.
+2. `cargo run -p twitch-hls-client2 -- -c anything -d` — `-c` is still required by clap even in debug mode. Debug mode uses broadcast id `0`.
+3. Client serves RTSP on `rtsp://127.0.0.1:8554/` (v4 and v6; ephemeral ports as fallback) and the raw TS stream on `localhost:7417`. Disk output is currently disabled.
+4. `ffplay -nodisp rtsp://127.0.0.1:8554/` is the end-to-end video check; `ffprobe -i tcp://127.0.0.1:7417` still checks the raw TS fan-out.
 
 ## Architecture
 
@@ -41,10 +41,11 @@ Single-threaded `compio` reactor (`#[compio::main]`). Everything below runs as t
 - `http/` — hand-rolled HTTP/1.1 client. Pool keyed by `(tls, host, port)` with 4 idle/host, 8 total, 30 s; chunked-first framing decoder that reads payload straight into the caller's buffer; `rustls::unbuffered` driven over compio completion reads (no `compio-tls`, no futures-io bridge). rustls types are confined to `http/tls.rs`.
 - `scheduler.rs` — polls the manifest through the client, parses Twitch tags, dispatches segment/prefetch/init fetches, fans spools out to registered consumers. `variant.rs` resolves master playlists via Twitch GQL + usher (`utils::query_string` percent-encodes the signed usher URL). Segment URLs are shared as `Rc<str>` between the fetch message and the prefetch entry.
 - `downloader.rs` — `constants::DOWNLOAD_TASKS` worker tasks pulling from a bounded queue; bodies stream into the spool; retries with backoff only while the spool is still empty (a retry after bytes would corrupt the segment).
-- `disk.rs` — `compio-fs` appends to `manifest/{broadcast_id}.segs` and record-encodes `manifest/{broadcast_id}.index` (magic `"OZENIKEN"`, version 3, little-endian). No file cursor: explicit offsets tracked in memory; the record buffer is reused. Restarts resume by reading the index once and replaying it.
+- `rtsp/` — minimal RTSP server + ES-over-RTP output. `ts.rs` demuxes the TS source (PAT/PMT, PES, Annex B H.264, ADTS AAC), `h264.rs`/`aac.rs` are ports of gortsplib's RFC 6184/3640 packetizers, `sdp.rs` builds the description from discovered parameter sets. `vod.rs` derives/parses `index-dvr.m3u8` for the full broadcast timeline. `mod.rs` owns one media consumer, a global 1x pacer, UDP or interleaved-TCP transports, RTCP SR, the RTSP control plane, and VOD seeking: a PAUSE+PLAY with a Range fetches DVR segments from the target keyframe and hands over to the live spool at the edge. RTSP consumers join at the live edge (no backlog replay) so they cannot lag the pacer.
+- `disk.rs` — **disabled for now** (module not compiled). Would use `compio-fs` to append `manifest/{broadcast_id}.segs` and record-encode `manifest/{broadcast_id}.index` (magic `"OZENIKEN"`, version 3, little-endian). No file cursor: explicit offsets tracked in memory; the record buffer is reused. Restarts resume by reading the index once and replaying it.
 - `tcp.rs` — one listener + accept loop per loopback family, one task per client; `Discontinuity` resets the client's sequence filter.
 
-No native FFmpeg dependency. The discontinuity probe is gone; `StreamRecord::Discontinuity` keeps its encoder/decoder so v3 index files stay compatible, and the init/SPS parser will produce it later (TODO in `disk.rs`).
+No native FFmpeg dependency. The discontinuity probe is gone; `StreamRecord::Discontinuity` keeps its encoder/decoder so v3 index files stay compatible, and the init/SPS parser will produce it later (TODO in `disk.rs`). fMP4/HEVC/AV1 RTP output is not implemented yet.
 
 ## Gotchas (hard-won, do not "simplify")
 
@@ -56,6 +57,10 @@ No native FFmpeg dependency. The discontinuity probe is gone; `StreamRecord::Dis
 - A completion read learns its size from the buffer's capacity; a fresh `Vec` needs `reserve` before `read`.
 - Spans must be attached with `.instrument(span)`, never `span.enter()` held across an `.await` — everything shares one thread.
 - `crates/twitch/src/index.hexpat` (ImHex pattern) mirrors `disk.rs`; keep both in sync when changing the on-disk format.
+- Twitch's TS muxer does **not** align PES boundaries with access units: a PES can begin with the tail of the previous AU before the next AU's AUD. Treat the video PES payloads as one continuous Annex B stream and split at AUD NALs (`rtsp/ts.rs`); assuming one AU per PES drops ~20% of frames and corrupts every later reference.
+- The RTSP playhead/NPT comes from the playlist's elapsed time (`Segment::timestamp_ms`), not from raw PES PTS (which is an arbitrary 90 kHz clock). DESCRIBE and PLAY both send an open-ended `npt=<playhead>-` range: the SDP range marks the stream live, and the PLAY range becomes ffmpeg's `range_start_offset` so clients can show absolute position. Skipping `Prefetch` messages in the RTSP consumer is deliberate — they have no playlist timestamp.
+- RTCP fields are big-endian 32-bit words. `ntp >> 32` is still a `u64` in Rust, and the compound-packet length is words-minus-one; both mistakes silently shift the RTP/NTP mapping and make players report a DTS discontinuity.
+- On an RTSP seek the RTP/RTCP epoch must be reset together (`reset_media_base` + `Track::reset_mapping`), or the first post-seek sender report pairs an old RTP timestamp with a new NTP time. Also clamp small negative audio-vs-video PTS offsets in `media_delta`; `rem_euclid(2^33)` on a −60 ms offset produced a near-2^32 audio timestamp and a bogus 5976 s player duration.
 
 ## Repo conventions
 

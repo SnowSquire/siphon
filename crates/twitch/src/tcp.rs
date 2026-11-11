@@ -13,6 +13,7 @@ use tracing::error;
 
 use crate::constants::DEFAULT_PORT;
 use crate::constants::MAX_CONSUMER_LAG;
+use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::SegmentMessage;
 use crate::spool::ConsumerWake;
 use crate::spool::Reader;
@@ -20,7 +21,7 @@ use crate::spool::WakeSet;
 
 pub fn spawn_tcp_listener(
     wakes: Rc<WakeSet>,
-    add_readers: kanal::Sender<kanal::Sender<SegmentMessage>>,
+    add_readers: kanal::Sender<ConsumerRegistration>,
     reader_wake: Rc<ConsumerWake>,
 ) {
     compio::runtime::spawn(async move {
@@ -53,7 +54,7 @@ pub fn spawn_tcp_listener(
 async fn accept_loop(
     listener: TcpListener,
     wakes: Rc<WakeSet>,
-    add_readers: kanal::Sender<kanal::Sender<SegmentMessage>>,
+    add_readers: kanal::Sender<ConsumerRegistration>,
     reader_wake: Rc<ConsumerWake>,
 ) {
     loop {
@@ -66,7 +67,10 @@ async fn accept_loop(
                 // Bounded: the scheduler drops a client whose queue fills up,
                 // which is the lagging-consumer policy.
                 let (tx, rx) = kanal::bounded(MAX_CONSUMER_LAG);
-                if add_readers.send(tx).is_err() {
+                if add_readers
+                    .send(ConsumerRegistration { tx, backlog: true })
+                    .is_err()
+                {
                     return;
                 }
                 // Wake the scheduler out of its poll interval so the client gets
@@ -121,6 +125,8 @@ async fn client(
                 last_sequence = 0;
                 Ok(())
             }
+            // RTSP-only control message.
+            SegmentMessage::Seek(_) => Ok(()),
         };
 
         if written.is_err() {
