@@ -111,7 +111,13 @@ pub enum SegmentMessage {
         reader: Reader,
     },
     Discontinuity(),
+    /// The stream's `#EXT-X-MAP` segment, which every consumer must see before
+    /// media.
+    ///
+    /// TS streams carry none and the RTSP sink is TS-only, so nothing reads the
+    /// bytes yet; the fMP4 sink will.
     Init {
+        #[allow(dead_code)]
         reader: Reader,
     },
     /// Seek request from the RTSP control plane (broadcast milliseconds). Only

@@ -17,11 +17,8 @@ pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
 // ----------------------------------------------------------- local server --
 
-/// Preferred port for the raw TS output; ephemeral if taken.
-pub const DEFAULT_PORT: u16 = 7417;
-
 /// RTSP control port; RTP/RTCP use ephemeral ports or interleaved TCP.
-pub const DEFAULT_RTSP_PORT: u16 = 8554;
+pub const DEFAULT_RTSP_PORT: u16 = 7417;
 
 /// RTP payload budget, matching gortsplib's default:
 /// 1500 (UDP MTU) - 20 (IP) - 8 (UDP) - 12 (RTP) - 10 (SRTP headroom).
@@ -31,8 +28,8 @@ pub const RTP_MAX_PAYLOAD: usize = 1450;
 pub const DOWNLOAD_TASKS: usize = 8;
 
 /// A consumer whose queue holds this many segments is more than ~40 s behind the
-/// live edge and gets dropped. Late or rate-limited viewers are meant to be served
-/// by the RTSP/RTP output instead (see notes/es-rtp-rtsp.md).
+/// live edge and gets dropped. The RTSP consumer registers as lossy and drops the
+/// individual message instead, so this only bites a strict consumer.
 pub const MAX_CONSUMER_LAG: usize = 20;
 
 // ----------------------------------------------------------------- arena --

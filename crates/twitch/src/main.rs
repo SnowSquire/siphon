@@ -24,8 +24,6 @@ mod scheduler;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
 mod sha1;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
-mod tcp;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
 mod utils;
 #[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
 mod variant;
@@ -186,11 +184,6 @@ async fn main() -> Result<(), variant::VariantPlaylistError> {
     );
 
     let reader_wake = ConsumerWake::new();
-    tcp::spawn_tcp_listener(
-        Rc::clone(&wakes),
-        outputs_tx.clone(),
-        Rc::clone(&reader_wake),
-    );
 
     let scheduler = scheduler::StreamScheduler::new(
         client,
