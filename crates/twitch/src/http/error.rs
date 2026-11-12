@@ -29,6 +29,18 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether this failure can be blamed on a pooled connection that the server
+    /// closed while it was idle.
+    ///
+    /// A keep-alive connection is validated only by using it, so a write or the
+    /// first read may discover a socket the peer already ended. That is not a
+    /// property of the request; a fresh connection can succeed. `Protocol` is
+    /// excluded on purpose: a malformed response will parse the same way twice.
+    #[must_use]
+    pub const fn stale_connection(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Timeout(_) | Self::Closed | Self::Tls(_))
+    }
+
     /// Whether the same request could succeed on a fresh connection.
     ///
     /// Only failures that are deterministic for a given URL are terminal: a
@@ -49,6 +61,17 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_transport_failures_look_stale() {
+        assert!(Error::Closed.stale_connection());
+        assert!(Error::Timeout("io").stale_connection());
+        assert!(Error::Io(io::Error::from(io::ErrorKind::ConnectionReset)).stale_connection());
+
+        assert!(!Error::Protocol("invalid response head").stale_connection());
+        assert!(!Error::Url("no scheme".into()).stale_connection());
+        assert!(!Error::Scheme("ftp".into()).stale_connection());
+    }
 
     #[test]
     fn only_deterministic_failures_are_terminal() {

@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::future::poll_fn;
+use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
@@ -37,6 +38,10 @@ use compio::net::TcpStream;
 use compio::net::UdpSocket;
 use futures_util::future::LocalBoxFuture;
 use kanal::AsyncReceiver;
+use socket2::Domain;
+use socket2::Protocol;
+use socket2::Socket;
+use socket2::Type;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -786,24 +791,21 @@ impl Stream {
     }
 }
 
-/// Serve one pre-built stream on every loopback family (play mode).
+/// Serve one pre-built stream on both loopback families (play mode).
+///
+/// Two listeners, one per family, on the same port. Both are loopback-only,
+/// so the stream is never served to the network.
 pub fn spawn_single(stream: Rc<Stream>) {
-    const ADDRS: [SocketAddr; 4] = [
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), DEFAULT_RTSP_PORT),
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_RTSP_PORT),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    ];
-
     compio::runtime::spawn(async move {
+        let listeners = match loopback_listeners() {
+            Ok(listeners) => listeners,
+            Err(error) => {
+                error!(%error, "failed to bind the RTSP listener");
+                return;
+            }
+        };
         let resolver: Rc<dyn StreamResolver> = Rc::new(SingleStream { stream });
-
-        // compio's `bind` takes the first address that works, so each loopback
-        // family gets its own listener (and its own accept loop).
-        for addr in ADDRS {
-            let Ok(listener) = TcpListener::bind(addr).await else {
-                continue;
-            };
+        for listener in listeners {
             let local = listener.local_addr().expect("local addr");
             println!("rtsp://{local}/");
             compio::runtime::spawn(accept_loop(listener, Rc::clone(&resolver))).detach();
@@ -812,10 +814,76 @@ pub fn spawn_single(stream: Rc<Stream>) {
     .detach();
 }
 
+/// Both loopback families, on the default port if it is free, else on an
+/// ephemeral one.
+fn loopback_listeners() -> std::io::Result<Vec<TcpListener>> {
+    match bind_loopbacks(DEFAULT_RTSP_PORT) {
+        Ok(listeners) => Ok(listeners),
+        Err(error) => {
+            warn!(
+                %error,
+                port = DEFAULT_RTSP_PORT,
+                "rtsp: default port unavailable, binding an ephemeral pair"
+            );
+            bind_loopbacks(0)
+        }
+    }
+}
+
+/// Bind `127.0.0.1` and `::1` on one port.
+///
+/// v4 goes first because it picks the port when `0` asks for an ephemeral one;
+/// v6 then takes the same number. A family that cannot bind at all (an IPv6
+/// stack that is switched off) is skipped, but `AddrInUse` moves the whole pair
+/// to another port: half a pair on the default port is worse than a full pair
+/// on an ephemeral one.
+fn bind_loopbacks(port: u16) -> std::io::Result<Vec<TcpListener>> {
+    let v4 = bind_loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+    let port = v4
+        .as_ref()
+        .ok()
+        .and_then(|listener| listener.local_addr().ok())
+        .map_or(port, |local| local.port());
+    let v6 = bind_loopback(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port));
+    match (v4, v6) {
+        (Ok(v4), Ok(v6)) => Ok(vec![v4, v6]),
+        (Ok(_v4), Err(error)) if error.kind() == ErrorKind::AddrInUse => Err(error),
+        (Err(error), Ok(_)) if error.kind() == ErrorKind::AddrInUse => Err(error),
+        (Ok(v4), Err(error)) => {
+            warn!(%error, port, "rtsp: no IPv6 loopback listener");
+            Ok(vec![v4])
+        }
+        (Err(error), Ok(v6)) => {
+            warn!(%error, port, "rtsp: no IPv4 loopback listener");
+            Ok(vec![v6])
+        }
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+/// Bind one loopback address.
+///
+/// compio's binder would do, except it sets `SO_REUSEADDR` unconditionally: on
+/// Windows that lets a second process share the port instead of failing, so the
+/// ephemeral fallback above would never trigger. Unix still sets it, to rebind
+/// over `TIME_WAIT`.
+fn bind_loopback(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    TcpListener::from_std(socket.into())
+}
+
 /// Bind `addr` and serve whatever the resolver hands out (daemon mode).
 ///
-/// One listener: `--bind` names the exact address, so the loopback-family
-/// fallback of `spawn_single` does not apply.
+/// One listener: `--bind` names the exact address, so the loopback pair of
+/// `spawn_single` does not apply.
 pub async fn serve(resolver: Rc<dyn StreamResolver>, addr: SocketAddr) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -2534,6 +2602,27 @@ fn video_packet_count(nals: &[Vec<u8>]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_play_listeners_share_a_port() {
+        compio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                // Port 0: the test must not fight a running `play`.
+                let listeners = bind_loopbacks(0).expect("bind");
+                assert!(!listeners.is_empty());
+                let port = listeners[0].local_addr().expect("local addr").port();
+                for listener in &listeners {
+                    assert_eq!(listener.local_addr().expect("local addr").port(), port);
+                    let local = listener.local_addr().expect("local addr");
+                    let (connected, accepted) =
+                        futures_util::future::join(TcpStream::connect(local), listener.accept())
+                            .await;
+                    connected.expect("connect");
+                    accepted.expect("accept");
+                }
+            });
+    }
 
     #[test]
     fn parses_udp_and_tcp_transports() {

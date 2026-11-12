@@ -1,0 +1,17 @@
+# Paths a new worktree must receive even though Git ignores them.
+#
+# Worktree creation starts from the tracked tree and skips everything
+# .gitignore excludes, so only ignored paths the worktree actually needs
+# belong here. Build output is never carried over; large captured media is
+# hardlinked by scripts/worktree-setup.sh instead of listed here.
+#
+# servermock/config.json: machine-local mock/notifier prefs (channels,
+# notification toggles). Tiny, and servermock/hermesnotifier.ts reads it
+# unconditionally.
+servermock/config.json
+
+# Captured media (servermock/segments and captures/) is NOT copied. The project's
+# worktree startup script hardlinks it from $OPENCODE_WORKTREE_BASE instead; the
+# script is tracked at scripts/worktree-setup.sh.
+
+

@@ -5087,6 +5087,7 @@ dependencies = [
  "mimalloc",
  "rand",
  "rustls",
+ "socket2",
  "sonic-rs",
  "thiserror 2.0.20",
  "tracing",

@@ -32,6 +32,7 @@ use http::header::LOCATION;
 use http::header::TRANSFER_ENCODING;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
+use tracing::debug;
 
 use crate::constants::MAX_HEAD_BYTES as MAX_HEAD;
 use crate::constants::MAX_HEADERS;
@@ -118,23 +119,31 @@ impl Client {
     ) -> Result<Response, Error> {
         for _ in 0..=MAX_REDIRECTS {
             let key = pool_key(&uri)?;
-
-            let pooled = self.pool.borrow_mut().take(&key);
-            let mut conn = match pooled {
-                Some(conn) => conn,
-                None => Conn::connect(&key, &self.tls).await?,
-            };
-
             let request =
                 build_request(&uri, &method, headers, content_type, body.map(<[u8]>::len));
-            conn.write_all(request.as_bytes()).await?;
-            if let Some(body) = body
-                && !body.is_empty()
-            {
-                conn.write_all(body).await?;
-            }
 
-            let head = read_head(&mut conn).await?;
+            // A pooled connection can have been closed by the server while it sat
+            // idle; HTTP/1.1 only discovers that when the next request is written
+            // or read. That is not a failure of the request, so drop the socket
+            // and retry once on a fresh connection. A second failure is returned:
+            // the request itself is then suspect. Replaying is safe because the
+            // only non-GET this client sends is a read-only GQL query.
+            let (conn, head) = loop {
+                let pooled = self.pool.borrow_mut().take(&key);
+                let reused = pooled.is_some();
+                let mut conn = match pooled {
+                    Some(conn) => conn,
+                    None => Conn::connect(&key, &self.tls).await?,
+                };
+
+                match send_request(&mut conn, &request, body).await {
+                    Ok(head) => break (conn, head),
+                    Err(error) if reused && error.stale_connection() => {
+                        debug!(%error, host = key.host.as_str(), "stale pooled connection");
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
 
             if head.status.is_redirection()
                 && matches!(method, Method::GET | Method::HEAD)
@@ -180,6 +189,17 @@ struct Head {
     headers: HeaderMap,
     leftover: Vec<u8>,
     version: u8,
+}
+
+/// Write the request line, headers and optional body, then read the response head.
+async fn send_request(conn: &mut Conn, request: &str, body: Option<&[u8]>) -> Result<Head, Error> {
+    conn.write_all(request.as_bytes()).await?;
+    if let Some(body) = body
+        && !body.is_empty()
+    {
+        conn.write_all(body).await?;
+    }
+    read_head(conn).await
 }
 
 async fn read_head(conn: &mut Conn) -> Result<Head, Error> {
@@ -556,6 +576,46 @@ mod tests {
     fn reuses_keep_alive_connections() {
         let (addr, server) = serve(vec![
             step("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na"),
+            step("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb"),
+        ]);
+        let client = Client::new();
+        let url = format!("http://{addr}/");
+
+        let (first, second) = run(async {
+            let first = client
+                .get(&url)
+                .await
+                .expect("first")
+                .body
+                .read_to_end(16)
+                .await
+                .expect("body");
+            let second = client
+                .get(&url)
+                .await
+                .expect("second")
+                .body
+                .read_to_end(16)
+                .await
+                .expect("body");
+            (first, second)
+        });
+
+        assert_eq!(first, b"a");
+        assert_eq!(second, b"b");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn retries_when_a_pooled_connection_was_closed() {
+        let (addr, server) = serve(vec![
+            // The first response is well-formed and keep-alive by its headers,
+            // but the server drops the socket right after it: the client has no
+            // way to know until it reuses the connection.
+            Step {
+                pieces: vec![b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na".to_vec()],
+                close: true,
+            },
             step("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb"),
         ]);
         let client = Client::new();

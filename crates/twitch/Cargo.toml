@@ -30,6 +30,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
     "tls12",
 ] }
+socket2 = "0.6"
 sonic-rs = "0.5.8"
 thiserror = "2.0.20"
 tracing = { version = "0.1.44" }
