@@ -4,14 +4,22 @@
 //! [`Reader`] cursor and get owned, pinned [`SlotView`]s of the published bytes, so
 //! TCP and disk writes hand arena memory straight to the kernel.
 //!
+//! ## State
+//!
+//! A spool owns one [`Spool`] block — the shared message box between its writer
+//! and its readers — plus a one-way chain of arena slots. The block holds only the
+//! published total and the closed flag; everything else a reader needs is on the
+//! slot it is currently pinning. `SlotRef: Clone` duplicates the cursor, so a
+//! consumer can be handed the same spool at the same position; there is no rewind.
+//!
 //! ## Wakeups
 //!
 //! There is no wait list on the spool. Every consumer task owns one
 //! [`ConsumerWake`] slot (one `Waker`, allocated once when the task starts) and
 //! registers it in the scheduler's [`WakeSet`]. A publish wakes every registered
 //! consumer; a consumer parked on a different spool re-checks its own frontier and
-//! parks again, which costs one poll and keeps the per-spool state down to two
-//! counters.
+//! parks again, which costs one poll and keeps the per-spool state down to the
+//! block itself.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -25,12 +33,10 @@ use std::task::Waker;
 
 pub use crate::arena::ArenaFull;
 pub use crate::arena::ArenaSet;
-pub use crate::arena::SlotId;
 use crate::arena::SlotMut;
 pub use crate::arena::SlotRef;
 pub use crate::arena::SlotView;
-pub use crate::arena::SpoolId;
-use crate::constants::SLOT_BUDGET;
+use crate::constants::SEGMENT_SLOTS_MAX;
 
 /// One waker slot per consumer task.
 pub struct ConsumerWake {
@@ -87,43 +93,48 @@ impl WakeSet {
 }
 
 /// A spool: one writer, any number of readers, one segment's worth of bytes.
-pub struct Spool;
+///
+/// The writer block and the refcount: the writer plus every reader hold one
+/// `Rc`, and the last of them frees it.
+pub struct Spool {
+    arena: Rc<ArenaSet>,
+    /// Total bytes published, the change signal readers park on.
+    published: Cell<usize>,
+    /// The writer is gone, so the end of the chain is the end of the stream.
+    closed: Cell<bool>,
+}
 
 impl Spool {
     /// Open a spool in `arena`, with its wakeups delivered through `wakes`.
     pub fn open(arena: &Rc<ArenaSet>, wakes: &Rc<WakeSet>) -> Result<(Writer, Reader), ArenaFull> {
-        let id = arena.alloc_spool().ok_or(ArenaFull)?;
-        let Some(head) = arena.alloc() else {
-            arena.release_spool(id);
-            return Err(ArenaFull);
+        let head = arena.alloc().ok_or(ArenaFull)?;
+        let spool = Rc::new(Self {
+            arena: Rc::clone(arena),
+            published: Cell::new(0),
+            closed: Cell::new(false),
+        });
+
+        let reader = Reader {
+            spool: Rc::clone(&spool),
+            cursor: SlotRef::new(arena, head),
+        };
+        let writer = Writer {
+            spool,
+            wakes: Rc::clone(wakes),
+            tail: SlotMut::adopt(arena, head),
+            slots: 1,
         };
 
-        let tail = SlotMut::adopt(arena, head);
-        let reader = Reader::new(arena, id, head);
-
-        Ok((
-            Writer {
-                arena: Rc::clone(arena),
-                wakes: Rc::clone(wakes),
-                id,
-                tail,
-                written: 0,
-                slots: 1,
-            },
-            reader,
-        ))
+        Ok((writer, reader))
     }
 }
 
 /// The single writer of one spool.
 pub struct Writer {
-    arena: Rc<ArenaSet>,
+    spool: Rc<Spool>,
     wakes: Rc<WakeSet>,
-    id: SpoolId,
     tail: SlotMut,
-    written: usize,
-    /// Slots this spool owns, capped at the per-spool budget so one lagging spool
-    /// cannot eat the global arena.
+    /// Slots this spool owns, capped so one lagging segment cannot pin the pool.
     slots: usize,
 }
 
@@ -131,12 +142,12 @@ impl Writer {
     /// Writable remainder of the tail slot, linking a new slot when it is full.
     pub fn tail(&mut self) -> Result<&mut [u8], ArenaFull> {
         if self.tail.is_full() {
-            if self.slots >= SLOT_BUDGET {
+            if self.slots >= SEGMENT_SLOTS_MAX {
                 return Err(ArenaFull);
             }
-            let id = self.arena.alloc().ok_or(ArenaFull)?;
-            let next = SlotMut::adopt(&self.arena, id);
-            self.arena.link(self.tail.id(), id);
+            let id = self.spool.arena.alloc().ok_or(ArenaFull)?;
+            let next = SlotMut::adopt(&self.spool.arena, id);
+            self.tail.id().link(id);
             self.tail = next;
             self.slots += 1;
         }
@@ -144,53 +155,35 @@ impl Writer {
     }
 
     /// Publish `len` more bytes and wake the consumers.
-    pub fn commit(&mut self, len: usize) {
+    pub fn commit(&self, len: usize) {
         let published = self.tail.published() + len;
         self.tail.publish(published);
-        self.written += len;
-        self.arena.publish_spool(self.id, self.written);
+        let total = self.spool.published.get() + len;
+        self.spool.published.set(total);
         self.wakes.wake_all();
     }
 
     /// Nothing has been written yet, so a retry cannot corrupt the spool.
-    pub const fn is_empty(&self) -> bool {
-        self.written == 0
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.spool.published.get() == 0
     }
 }
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        self.arena.close_spool(self.id);
+        self.spool.closed.set(true);
         self.wakes.wake_all();
-        self.arena.release_spool(self.id);
     }
 }
 
 /// A consumer's cursor over one spool.
 pub struct Reader {
-    arena: Rc<ArenaSet>,
-    id: SpoolId,
-    head: SlotId,
+    spool: Rc<Spool>,
     cursor: SlotRef,
 }
 
 impl Reader {
-    fn new(arena: &Rc<ArenaSet>, id: SpoolId, head: SlotId) -> Self {
-        arena.retain_spool(id);
-        Self {
-            arena: Rc::clone(arena),
-            id,
-            head,
-            cursor: SlotRef::new(arena, head),
-        }
-    }
-
-    /// A fresh cursor at the first byte of the spool, for late joiners and for
-    /// handing the same spool to another consumer.
-    pub fn rewind(&self) -> Self {
-        Self::new(&self.arena, self.id, self.head)
-    }
-
     /// Next published run as an owned, pinned view. `None` once the writer is gone
     /// and everything has been consumed.
     ///
@@ -198,24 +191,23 @@ impl Reader {
     /// read.
     pub async fn next_view(&mut self, wake: &ConsumerWake) -> Option<SlotView> {
         loop {
-            let seen = self.arena.spool_published(self.id);
+            let seen = self.spool.published.get();
 
             if let Some(range) = self.cursor.take_range() {
-                return Some(SlotView::new(&self.arena, self.cursor.id(), range));
+                return Some(SlotView::new(&self.spool.arena, self.cursor.id(), range));
             }
 
-            if self.arena.next(self.cursor.id()).is_some() {
+            if self.cursor.id().next().is_some() {
                 self.cursor.advance();
                 continue;
             }
 
-            if self.arena.spool_closed(self.id) {
+            if self.spool.closed.get() {
                 return None;
             }
 
             Wait {
-                arena: &self.arena,
-                id: self.id,
+                spool: &self.spool,
                 wake,
                 seen,
             }
@@ -224,33 +216,31 @@ impl Reader {
     }
 }
 
-impl Drop for Reader {
-    fn drop(&mut self) {
-        self.arena.release_spool(self.id);
-    }
-}
-
 impl Clone for Reader {
+    /// A cursor at the same position, for handing the same spool to another
+    /// consumer. It continues where the source is; it never rewinds.
     fn clone(&self) -> Self {
-        self.rewind()
+        Self {
+            spool: Rc::clone(&self.spool),
+            cursor: self.cursor.clone(),
+        }
     }
 }
 
-#[allow(clippy::missing_fields_in_debug)] // the arena is a shared handle, not state
+#[allow(clippy::missing_fields_in_debug)] // the spool is shared state, not a cursor
 impl std::fmt::Debug for Reader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reader")
-            .field("head", &self.head)
             .field("cursor", &self.cursor.id())
+            .field("offset", &self.cursor.offset())
             .finish()
     }
 }
 
 struct Wait<'a> {
-    arena: &'a ArenaSet,
-    id: SpoolId,
+    spool: &'a Spool,
     wake: &'a ConsumerWake,
-    /// Published length observed before checking the cursor.
+    /// Published total observed before checking the cursor.
     seen: usize,
 }
 
@@ -258,8 +248,7 @@ impl Future for Wait<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        let changed =
-            || self.arena.spool_closed(self.id) || self.arena.spool_published(self.id) != self.seen;
+        let changed = || self.spool.closed.get() || self.spool.published.get() != self.seen;
         if changed() {
             return Poll::Ready(());
         }
@@ -366,20 +355,32 @@ mod tests {
     }
 
     #[test]
-    fn a_clone_rewinds_to_the_start() {
+    fn a_clone_starts_at_the_cursor() {
         let arena = arena();
         let wakes = WakeSet::new();
         let wake = ConsumerWake::new();
         let (mut writer, reader) = Spool::open(&arena, &wakes).expect("spool");
 
         let (first_out, second_out) = run(async {
-            writer.tail().expect("tail")[..3].copy_from_slice(b"abc");
-            writer.commit(3);
+            writer.tail().expect("tail")[..1].copy_from_slice(b"a");
+            writer.commit(1);
+
+            let mut first = reader;
+            let mut first_out = first
+                .next_view(&wake)
+                .await
+                .expect("first publish")
+                .as_init()
+                .to_vec();
+
+            // Cloned after the first byte was consumed: the clone continues from
+            // there instead of replaying the segment.
+            let mut second = first.clone();
+
+            writer.tail().expect("tail")[..2].copy_from_slice(b"bc");
+            writer.commit(2);
             drop(writer);
 
-            let mut first = reader.clone();
-            let mut second = reader;
-            let mut first_out = Vec::new();
             while let Some(view) = first.next_view(&wake).await {
                 first_out.extend_from_slice(view.as_init());
             }
@@ -391,7 +392,7 @@ mod tests {
         });
 
         assert_eq!(first_out, b"abc");
-        assert_eq!(second_out, b"abc");
+        assert_eq!(second_out, b"bc");
     }
 
     #[test]
@@ -434,6 +435,29 @@ mod tests {
         });
 
         assert_eq!(count, SLOT_SIZE + 10);
+    }
+
+    #[test]
+    fn a_segment_is_capped_at_a_fixed_number_of_slots() {
+        use crate::constants::SLOT_SIZE;
+
+        let arena = arena();
+        let wakes = WakeSet::new();
+        let (mut writer, _reader) = Spool::open(&arena, &wakes).expect("spool");
+
+        let mut written = 0;
+        while let Ok(tail) = writer.tail() {
+            let len = tail.len();
+            writer.commit(len);
+            written += len;
+            assert!(
+                written <= SEGMENT_SLOTS_MAX * SLOT_SIZE,
+                "spool grew past its cap"
+            );
+        }
+
+        assert_eq!(written, SEGMENT_SLOTS_MAX * SLOT_SIZE);
+        assert_eq!(arena.live_slots(), SEGMENT_SLOTS_MAX);
     }
 
     #[test]

@@ -53,23 +53,13 @@ pub const ARENA_ALIGN: usize = 4096;
 /// Payload bytes of one arena.
 pub const ARENA_BYTES: usize = SLOTS_PER_ARENA * SLOT_SIZE;
 
-const ARENAS_PER_BROADCAST: usize = 6;
-
-/// Slots one spool may hold at once: six arenas, ~37 MB, i.e. 30 s of an
-/// ~9.8 Mbps stream. Twitch lists 30 s of segments in the live playlist, and the
-/// scheduler's replay cursors pin that whole window.
-pub const SLOT_BUDGET: usize = ARENAS_PER_BROADCAST * SLOTS_PER_ARENA;
-
-/// Broadcasts the daemon may serve concurrently.
-pub const MAX_BROADCASTS: usize = 4;
-
-/// Hard ceiling across all broadcasts. Arenas are allocated lazily, so this is a
-/// ceiling and not a reservation.
-pub const MAX_ARENAS: usize = ARENAS_PER_BROADCAST * MAX_BROADCASTS;
-
-/// Total slots across all broadcasts, and therefore the number of spool records
-/// that can ever be live.
-pub const MAX_SLOTS: usize = MAX_ARENAS * SLOTS_PER_ARENA;
+/// Slots one spool — one segment — may hold.
+///
+/// Twitch caps a source at 8 Mbps, so a 10 s DVR segment is ~10.6 MB and these 64
+/// slots are 12.3 MB: room for a spike, but small enough that one lagging consumer
+/// cannot pin the pool. Arenas themselves are allocated on demand with no cap, so
+/// this is the only way a spool write fails.
+pub const SEGMENT_SLOTS_MAX: usize = 64;
 
 // ------------------------------------------------------------ downloader --
 
