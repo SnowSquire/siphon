@@ -20,6 +20,20 @@ pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 /// RTSP control port; RTP/RTCP use ephemeral ports or interleaved TCP.
 pub const DEFAULT_RTSP_PORT: u16 = 7417;
 
+/// Streams a daemon may serve at once (`--max-streams`). Each stream is a whole
+/// per-variant pipeline (scheduler, DVR refresh, media engine) sharing the
+/// global downloader queue and slot pool, so this bounds those tasks rather
+/// than memory directly.
+pub const MAX_STREAMS: usize = 8;
+
+/// Debug mode replays the mock server's playlists instead of Twitch's.
+pub const DEBUG_MANIFEST_URL: &str = "http://127.0.0.2:8000/index.m3u8";
+pub const DEBUG_DVR_URL: &str = "http://127.0.0.2:8000/index-dvr.m3u8";
+/// The mock's segments were captured from this channel.
+pub const DEBUG_CHANNEL_TITLE: &str = "sunnys";
+/// The single variant the debug master playlist pretends to offer.
+pub const DEBUG_VARIANT_ID: &str = "1080p";
+
 /// RTP payload budget, matching gortsplib's default:
 /// 1500 (UDP MTU) - 20 (IP) - 8 (UDP) - 12 (RTP) - 10 (SRTP headroom).
 pub const RTP_MAX_PAYLOAD: usize = 1450;

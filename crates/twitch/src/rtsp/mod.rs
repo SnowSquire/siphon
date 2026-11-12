@@ -35,6 +35,7 @@ use compio::io::AsyncWriteExt;
 use compio::net::TcpListener;
 use compio::net::TcpStream;
 use compio::net::UdpSocket;
+use futures_util::future::LocalBoxFuture;
 use kanal::AsyncReceiver;
 use tracing::debug;
 use tracing::error;
@@ -78,6 +79,78 @@ const PTS_WRAP: i64 = 1 << 33;
 
 const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 const SDES_CNAME: &[u8] = b"twitch-hls-client2";
+
+/// Identity of one RTSP presentation: a channel login and an optional
+/// `STABLE-VARIANT-ID`. `None` means the first variant, like `play`'s default.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StreamKey {
+    /// Twitch login, lowercased.
+    pub login: String,
+    /// `STABLE-VARIANT-ID` (`chunked`, `720p60`, `audio_only`, ...).
+    pub quality: Option<String>,
+}
+
+/// Why a DESCRIBE could not be served. `status` is the RTSP status line.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolveError {
+    pub status: &'static str,
+}
+
+impl ResolveError {
+    pub const BAD_REQUEST: Self = Self {
+        status: "400 Bad Request",
+    };
+    pub const NOT_FOUND: Self = Self {
+        status: "404 Not Found",
+    };
+    pub const UNAVAILABLE: Self = Self {
+        status: "503 Service Unavailable",
+    };
+}
+
+/// Turns a request URI into the stream its control connection talks to.
+///
+/// `play` serves one pre-built stream and ignores the path; `daemon` resolves
+/// `/<channel>/<quality>/` through its registry.
+pub trait StreamResolver {
+    fn resolve<'a>(&'a self, uri: &'a str) -> LocalBoxFuture<'a, Result<Rc<Stream>, ResolveError>>;
+
+    /// The last control connection for `stream` disconnected.
+    fn release(&self, stream: &Rc<Stream>);
+}
+
+/// Split `/channel/quality/trackID=0` out of an RTSP request URI.
+///
+/// Path segments, never query parameters: ffmpeg appends a relative
+/// `a=control:trackID=0` by string concatenation, so a query would swallow the
+/// track fragment.
+#[must_use]
+pub fn parse_stream_key(uri: &str) -> Option<StreamKey> {
+    // Both `rtsp://host/path` and an absolute path (`/path`) are accepted.
+    let path = uri.split_once("://").map_or(uri, |(_, rest)| {
+        rest.find('/').map_or("", |slash| &rest[slash..])
+    });
+    let mut segments = path.trim_start_matches('/').split('/');
+
+    let login = segments.next()?;
+    if login.is_empty()
+        || login.len() > 64
+        || !login.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let quality = match segments.next() {
+        Some(segment) if !segment.is_empty() && !segment.starts_with("trackID=") => {
+            Some(segment.to_owned())
+        }
+        _ => None,
+    };
+
+    Some(StreamKey {
+        login: login.to_ascii_lowercase(),
+        quality,
+    })
+}
 
 /// Signed PTS delta from a track epoch, handling the 33-bit wrap.
 ///
@@ -238,6 +311,10 @@ impl Track {
 }
 
 struct Session {
+    /// The stream this control connection described, if any. A connection may
+    /// send OPTIONS first; DESCRIBE attaches it, and re-describing another URI
+    /// moves it.
+    stream: RefCell<Option<Rc<Stream>>>,
     /// The player's outbound queue: RTP, RTCP and transport setup.
     ///
     /// Deliberately an [`kanal::AsyncSender`]: it exposes `try_send`, `len`,
@@ -281,8 +358,10 @@ struct Session {
     /// A live RTSP session joins mid-GOP, where the decoder lacks references
     /// and reports "reference picture missing"; hold video until the next IDR.
     video_synced: Cell<bool>,
-    /// Woken whenever this session's outbound queue gains room.
-    drain: Rc<DrainSignal>,
+    /// Woken whenever this session's outbound queue gains room. Replaced when
+    /// the control connection attaches to a stream (DESCRIBE): before that
+    /// there is nothing to wake.
+    drain: RefCell<Rc<DrainSignal>>,
 }
 
 /// Whether the outbound queue has room for the media engine, without polling.
@@ -355,9 +434,14 @@ enum Transport {
 }
 
 /// Shared state between the RTSP control tasks and the media consumer.
-pub struct Hub {
+pub struct Stream {
+    /// Which `(channel, quality)` this presentation serves.
+    key: StreamKey,
     /// Streamer/channel name; the SDP session name and player title.
     title: String,
+    /// Set when the daemon drops the stream because its last viewer left. The
+    /// scheduler, the DVR refresh and the media engine check it and stop.
+    stop: Cell<bool>,
     sessions: RefCell<Vec<Rc<Session>>>,
     video_config: RefCell<Option<H264Config>>,
     audio_config: RefCell<Option<AudioConfig>>,
@@ -376,16 +460,17 @@ pub struct Hub {
     seek_tx: RefCell<Option<kanal::AsyncSender<SegmentMessage>>>,
     video: RefCell<Track>,
     audio: RefCell<Track>,
-    next_session: Cell<u32>,
     /// Wakes the media engine when the outbound queues gain room.
     drain: Rc<DrainSignal>,
 }
 
-impl Hub {
+impl Stream {
     #[must_use]
-    pub fn new(title: impl Into<String>) -> Self {
+    pub fn new(key: StreamKey, title: impl Into<String>) -> Self {
         Self {
+            key,
             title: title.into(),
+            stop: Cell::new(false),
             sessions: RefCell::new(Vec::new()),
             video_config: RefCell::new(None),
             audio_config: RefCell::new(None),
@@ -402,9 +487,36 @@ impl Hub {
                 0x5A5A_0001,
             )),
             audio: RefCell::new(Track::new(sdp::AUDIO_PAYLOAD_TYPE, 48_000, 0x5A5A_0002)),
-            next_session: Cell::new(0),
             drain: DrainSignal::new(),
         }
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> &StreamKey {
+        &self.key
+    }
+
+    /// Stop every task that belongs to this stream.
+    ///
+    /// Closing the seek channel wakes the media engine once the scheduler has
+    /// dropped its consumer sender; `stop` is checked directly while a VOD fetch
+    /// or a segment read is in flight, because closing a channel cannot
+    /// interrupt an in-progress await.
+    pub fn stop(&self) {
+        if self.stop.replace(true) {
+            return;
+        }
+        // Dropping the last seek sender closes the consumer channel, which
+        // ends `Media::run`'s `recv` even when no segment is arriving.
+        self.seek_tx.borrow_mut().take();
+        // A media engine parked on outbound capacity must re-check: every
+        // session is gone, so it is no longer blocked.
+        self.notify_drain();
+    }
+
+    #[must_use]
+    pub const fn stopped(&self) -> bool {
+        self.stop.get()
     }
 
     /// The first segment has been demuxed: DESCRIBE can build an SDP.
@@ -414,18 +526,12 @@ impl Hub {
 
     async fn wait_ready(&self) -> bool {
         for _ in 0..100 {
-            if self.ready.get() {
-                return true;
+            if self.ready.get() || self.stop.get() {
+                return self.ready.get();
             }
             compio::time::sleep(Duration::from_millis(100)).await;
         }
         self.ready.get()
-    }
-
-    fn next_session_id(&self) -> String {
-        let value = self.next_session.get().wrapping_add(1);
-        self.next_session.set(value);
-        format!("{:08x}", value ^ 0x5A5A_0000)
     }
 
     fn add_session(&self, session: Rc<Session>) {
@@ -483,7 +589,7 @@ impl Hub {
     }
 
     /// Whether any RTSP client is still connected (playing or paused).
-    fn has_sessions(&self) -> bool {
+    pub fn has_sessions(&self) -> bool {
         !self.sessions.borrow().is_empty()
     }
 
@@ -680,15 +786,17 @@ impl Hub {
     }
 }
 
-/// Bind the RTSP listener on both loopback families.
-pub fn spawn_server(hub: Rc<Hub>) {
+/// Serve one pre-built stream on every loopback family (play mode).
+pub fn spawn_single(stream: Rc<Stream>) {
+    const ADDRS: [SocketAddr; 4] = [
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), DEFAULT_RTSP_PORT),
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_RTSP_PORT),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    ];
+
     compio::runtime::spawn(async move {
-        const ADDRS: [SocketAddr; 4] = [
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), DEFAULT_RTSP_PORT),
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_RTSP_PORT),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        ];
+        let resolver: Rc<dyn StreamResolver> = Rc::new(SingleStream { stream });
 
         // compio's `bind` takes the first address that works, so each loopback
         // family gets its own listener (and its own accept loop).
@@ -698,13 +806,47 @@ pub fn spawn_server(hub: Rc<Hub>) {
             };
             let local = listener.local_addr().expect("local addr");
             println!("rtsp://{local}/");
-            compio::runtime::spawn(accept_loop(listener, Rc::clone(&hub))).detach();
+            compio::runtime::spawn(accept_loop(listener, Rc::clone(&resolver))).detach();
         }
     })
     .detach();
 }
 
-async fn accept_loop(listener: TcpListener, hub: Rc<Hub>) {
+/// Bind `addr` and serve whatever the resolver hands out (daemon mode).
+///
+/// One listener: `--bind` names the exact address, so the loopback-family
+/// fallback of `spawn_single` does not apply.
+pub async fn serve(resolver: Rc<dyn StreamResolver>, addr: SocketAddr) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    println!("rtsp://{local}/");
+    accept_loop(listener, resolver).await;
+    Ok(())
+}
+
+/// The `play` resolver: one stream, any URI.
+struct SingleStream {
+    stream: Rc<Stream>,
+}
+
+impl StreamResolver for SingleStream {
+    fn resolve<'a>(
+        &'a self,
+        _uri: &'a str,
+    ) -> LocalBoxFuture<'a, Result<Rc<Stream>, ResolveError>> {
+        Box::pin(async { Ok(Rc::clone(&self.stream)) })
+    }
+
+    fn release(&self, _stream: &Rc<Stream>) {}
+}
+
+fn next_session_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let value = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:08x}", value ^ 0x5A5A_0000)
+}
+
+async fn accept_loop(listener: TcpListener, resolver: Rc<dyn StreamResolver>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
@@ -712,19 +854,21 @@ async fn accept_loop(listener: TcpListener, hub: Rc<Hub>) {
                     error!(%peer, "failed to set TCP no delay");
                     continue;
                 }
-                compio::runtime::spawn(control_session(stream, peer, Rc::clone(&hub))).detach();
+                compio::runtime::spawn(control_session(stream, peer, Rc::clone(&resolver)))
+                    .detach();
             }
             Err(error) => warn!(%error, "rtsp accept failed"),
         }
     }
 }
 
-async fn control_session(stream: TcpStream, peer: SocketAddr, hub: Rc<Hub>) {
+async fn control_session(stream: TcpStream, peer: SocketAddr, resolver: Rc<dyn StreamResolver>) {
     let local = stream.local_addr().unwrap_or(peer);
     let (mut read, write) = stream.into_split();
     let (out_tx, out_rx) = kanal::bounded(4096);
 
     let session = Rc::new(Session {
+        stream: RefCell::new(None),
         out: out_tx.to_async(),
         control: RefCell::new(VecDeque::new()),
         subscribed: Cell::new(0),
@@ -735,21 +879,27 @@ async fn control_session(stream: TcpStream, peer: SocketAddr, hub: Rc<Hub>) {
         seeking: Cell::new(false),
         seek_started: Cell::new(None),
         video_synced: Cell::new(false),
-        drain: Rc::clone(&hub.drain),
+        drain: RefCell::new(DrainSignal::new()),
     });
     compio::runtime::spawn(writer(write, out_rx.to_async(), Rc::clone(&session))).detach();
-    hub.add_session(Rc::clone(&session));
-    let id = hub.next_session_id();
+    let id = next_session_id();
     debug!(%peer, %id, "rtsp client connected");
 
     let mut buffer = Vec::new();
     while let Some(request) = read_request(&mut read, &mut buffer).await {
-        if !handle_request(&hub, &session, &id, local, peer, &request).await {
+        if !handle_request(&resolver, &session, &id, local, peer, &request).await {
             break;
         }
     }
 
-    hub.remove_session(&session);
+    // Detach from whatever stream this control connection described. The
+    // daemon drops a stream as soon as its last viewer is gone.
+    if let Some(stream) = session.stream.borrow_mut().take() {
+        stream.remove_session(&session);
+        if !stream.has_sessions() {
+            resolver.release(&stream);
+        }
+    }
     debug!(%peer, %id, "rtsp client disconnected");
 }
 
@@ -777,7 +927,7 @@ async fn writer(mut stream: TcpStream, rx: AsyncReceiver<Outbound>, session: Rc<
         };
         // A slot just came free. Wake the media engine if it is waiting here
         // rather than on the driver.
-        session.drain.notify();
+        session.drain.borrow().notify();
         match message {
             Outbound::Flush => {}
             Outbound::Setup { track, transport } => {
@@ -829,7 +979,7 @@ async fn writer(mut stream: TcpStream, rx: AsyncReceiver<Outbound>, session: Rc<
     // ignores the session -- but a media engine already parked here has to be
     // told to re-check, or it would wait for a client that no longer exists.
     drop(rx);
-    session.drain.notify();
+    session.drain.borrow().notify();
 }
 
 /// Write one interleaved frame (`$`, channel, length, payload).
@@ -956,54 +1106,36 @@ fn content_length(head: &[u8]) -> usize {
 }
 
 async fn handle_request(
-    hub: &Hub,
+    resolver: &Rc<dyn StreamResolver>,
     session: &Rc<Session>,
     id: &str,
     local: SocketAddr,
     peer: SocketAddr,
     request: &Request,
 ) -> bool {
+    if request.method == "OPTIONS" {
+        let headers = [(
+            "Public",
+            "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER",
+        )];
+        send_response(session, response(&request.cseq, None, &headers, ""));
+        return true;
+    }
+    if request.method == "DESCRIBE" {
+        return describe(resolver, session, local, request).await;
+    }
+
+    // Everything else acts on the stream this connection described.
+    let Some(hub) = session.stream.borrow().clone() else {
+        send_response(
+            session,
+            error_response(&request.cseq, "455 Method Not Valid in This State"),
+        );
+        return true;
+    };
+
     match request.method.as_str() {
-        "OPTIONS" => {
-            let headers = [(
-                "Public",
-                "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER, SET_PARAMETER",
-            )];
-            send_response(session, response(&request.cseq, None, &headers, ""));
-            true
-        }
-        "DESCRIBE" => {
-            if !hub.wait_ready().await {
-                send_response(
-                    session,
-                    error_response(&request.cseq, "503 Service Unavailable"),
-                );
-                return true;
-            }
-
-            let video = hub.video_config.borrow();
-            let audio = hub.audio_config.borrow();
-            // A finite end makes the stream seekable in the player; the live
-            // playhead is the current end of the broadcast.
-            let end = hub.position_seconds();
-            let end = (end >= 0.5).then_some(end);
-            let sdp = sdp::build(local.ip(), &hub.title, end, video.as_ref(), audio.as_ref());
-            drop(video);
-            drop(audio);
-
-            let base = if request.uri.ends_with('/') {
-                request.uri.clone()
-            } else {
-                format!("{}/", request.uri)
-            };
-            let headers = [
-                ("Content-Type", "application/sdp"),
-                ("Content-Base", base.as_str()),
-            ];
-            send_response(session, response(&request.cseq, None, &headers, &sdp));
-            true
-        }
-        "SETUP" => setup(hub, session, id, peer, request).await,
+        "SETUP" => setup(&hub, session, id, peer, request).await,
         "PLAY" => {
             session.playing.set(true);
 
@@ -1048,7 +1180,7 @@ async fn handle_request(
             // blocked on this session's queue.
             hub.notify_drain();
 
-            let info = rtp_info(hub, &request.uri, session.subscribed.get());
+            let info = rtp_info(&hub, &request.uri, session.subscribed.get());
             // Keep the offset stable across pause/resume; only a seek changes it.
             let range = format!("npt={:.3}-", session.range_start.get());
             let mut headers = vec![("Range", range.as_str())];
@@ -1096,9 +1228,82 @@ async fn handle_request(
     }
 }
 
+/// Resolve the requested `(channel, quality)`, attach the connection to it and
+/// answer with the SDP.
+async fn describe(
+    resolver: &Rc<dyn StreamResolver>,
+    session: &Rc<Session>,
+    local: SocketAddr,
+    request: &Request,
+) -> bool {
+    let stream = match resolver.resolve(&request.uri).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            debug!(uri = %request.uri, status = error.status, "rtsp: DESCRIBE failed");
+            send_response(session, error_response(&request.cseq, error.status));
+            return true;
+        }
+    };
+    attach(session, resolver, &stream);
+
+    if !stream.wait_ready().await {
+        send_response(
+            session,
+            error_response(&request.cseq, "503 Service Unavailable"),
+        );
+        return true;
+    }
+
+    let video = stream.video_config.borrow();
+    let audio = stream.audio_config.borrow();
+    // A finite end makes the stream seekable in the player; the live
+    // playhead is the current end of the broadcast.
+    let end = stream.position_seconds();
+    let end = (end >= 0.5).then_some(end);
+    let sdp = sdp::build(
+        local.ip(),
+        &stream.title,
+        end,
+        video.as_ref(),
+        audio.as_ref(),
+    );
+    drop(video);
+    drop(audio);
+
+    let base = if request.uri.ends_with('/') {
+        request.uri.clone()
+    } else {
+        format!("{}/", request.uri)
+    };
+    let headers = [
+        ("Content-Type", "application/sdp"),
+        ("Content-Base", base.as_str()),
+    ];
+    send_response(session, response(&request.cseq, None, &headers, &sdp));
+    true
+}
+
+/// Move the control connection onto `stream`, detaching it from the previous
+/// one. A second DESCRIBE for another URI is legal and moves the session.
+fn attach(session: &Rc<Session>, resolver: &Rc<dyn StreamResolver>, stream: &Rc<Stream>) {
+    let previous = session.stream.replace(Some(Rc::clone(stream)));
+    if previous.as_ref().is_some_and(|old| Rc::ptr_eq(old, stream)) {
+        return;
+    }
+    session.drain.borrow_mut().clone_from(&stream.drain);
+    stream.add_session(Rc::clone(session));
+
+    if let Some(old) = previous {
+        old.remove_session(session);
+        if !old.has_sessions() {
+            resolver.release(&old);
+        }
+    }
+}
+
 #[allow(clippy::similar_names)] // rtp/rtcp are the protocol's names
 async fn setup(
-    hub: &Hub,
+    hub: &Stream,
     session: &Rc<Session>,
     id: &str,
     peer: SocketAddr,
@@ -1200,7 +1405,7 @@ async fn setup(
     true
 }
 
-fn track_ssrc(hub: &Hub, track: u8) -> u32 {
+fn track_ssrc(hub: &Stream, track: u8) -> u32 {
     match track {
         TRACK_VIDEO => hub.video.borrow().ssrc,
         _ => hub.audio.borrow().ssrc,
@@ -1252,7 +1457,7 @@ fn seconds_to_ms(seconds: f64) -> u64 {
     (seconds.max(0.0) * 1000.0) as u64
 }
 
-fn rtp_info(hub: &Hub, uri: &str, subscribed: u8) -> String {
+fn rtp_info(hub: &Stream, uri: &str, subscribed: u8) -> String {
     let base = uri.trim_end_matches('/');
     let mut entries = Vec::new();
 
@@ -1451,12 +1656,13 @@ const DVR_WAIT: Duration = Duration::from_secs(5);
 
 /// Register the demuxing consumer with the scheduler's fan-out.
 pub fn spawn_media(
-    hub: Rc<Hub>,
+    hub: Rc<Stream>,
     client: Rc<Client>,
     dvr: Rc<Dvr>,
     wakes: &Rc<WakeSet>,
     add_output: &kanal::Sender<ConsumerRegistration>,
     live_window: Rc<RefCell<Vec<Segment>>>,
+    reader_wake: &Rc<ConsumerWake>,
 ) {
     let (tx, rx) = kanal::bounded(MAX_CONSUMER_LAG);
     // The RTSP control plane sends seeks through the same ordered consumer
@@ -1472,6 +1678,9 @@ pub fn spawn_media(
         error!(%error, "failed to register rtsp consumer");
         return;
     }
+    // The scheduler's registration latch parks instead of polling; without
+    // this poke a new stream waits out a whole manifest poll interval.
+    reader_wake.wake();
 
     let wake = ConsumerWake::new();
     wakes.register(&wake);
@@ -1495,9 +1704,12 @@ const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
 /// This also doubles as a liveness check: the whole reactor runs on one
 /// thread, so a log line that never appears means some task is spinning or
 /// blocking the thread rather than waiting on the driver.
-async fn watchdog(hub: Rc<Hub>) {
+async fn watchdog(hub: Rc<Stream>) {
     loop {
         compio::time::sleep(Duration::from_secs(1)).await;
+        if hub.stopped() {
+            return;
+        }
         let mut stalled = Vec::new();
         for session in hub.sessions.borrow().iter() {
             let Some(started) = session.seek_started.get() else {
@@ -1544,7 +1756,7 @@ enum Handover {
 }
 
 struct Media {
-    hub: Rc<Hub>,
+    hub: Rc<Stream>,
     client: Rc<Client>,
     dvr: Rc<Dvr>,
     rx: AsyncReceiver<SegmentMessage>,
@@ -1575,7 +1787,7 @@ struct Media {
 
 impl Media {
     fn new(
-        hub: Rc<Hub>,
+        hub: Rc<Stream>,
         client: Rc<Client>,
         dvr: Rc<Dvr>,
         rx: AsyncReceiver<SegmentMessage>,
@@ -1605,6 +1817,13 @@ impl Media {
 
     async fn run(mut self) {
         loop {
+            // The daemon drops a stream when its last viewer leaves; nothing
+            // waits for the channel to close first because a VOD fetch or a
+            // stalled segment can hold it open for seconds.
+            if self.hub.stopped() {
+                debug!("rtsp: media engine stopped");
+                return;
+            }
             if self.handover_state != Handover::None {
                 // The DVR playlist lags the live edge by roughly one group.
                 // Replay the live window from the DVR playhead so playback
@@ -1941,6 +2160,9 @@ impl Media {
         let mut prefetched: Option<(Vec<u8>, u64)> = None;
 
         loop {
+            if self.hub.stopped() {
+                return VodOutcome::Live;
+            }
             if let Some(seek) = drain_messages(
                 &self.rx,
                 &mut self.pending_live,
@@ -2167,7 +2389,7 @@ fn push_handover(handover: &mut VecDeque<Segment>, segment: Segment) {
     }
 }
 
-fn maybe_rtcp(hub: &Hub, last_rtcp: &mut Instant) {
+fn maybe_rtcp(hub: &Stream, last_rtcp: &mut Instant) {
     if last_rtcp.elapsed() >= Duration::from_secs(1) {
         hub.send_rtcp();
         *last_rtcp = Instant::now();
@@ -2224,7 +2446,7 @@ fn samples_skipped_ms(samples: &[Sample], index: usize) -> u64 {
     }
 }
 
-fn sync_config(hub: &Hub, demuxer: &TsDemuxer) {
+fn sync_config(hub: &Stream, demuxer: &TsDemuxer) {
     if demuxer.video_config().is_ready() {
         let mut slot = hub.video_config.borrow_mut();
         if slot.as_ref() != Some(demuxer.video_config()) {
@@ -2240,7 +2462,7 @@ fn sync_config(hub: &Hub, demuxer: &TsDemuxer) {
     }
 }
 
-async fn emit_sample(hub: &Hub, pacer: &mut Pacer, timeline: &mut Timeline, sample: Sample) {
+async fn emit_sample(hub: &Stream, pacer: &mut Pacer, timeline: &mut Timeline, sample: Sample) {
     match sample {
         Sample::Video(video) => {
             if video.keyframe {
@@ -2252,7 +2474,8 @@ async fn emit_sample(hub: &Hub, pacer: &mut Pacer, timeline: &mut Timeline, samp
             pacer.wait(video.dts).await;
             hub.set_position_ms(timeline.position_ms(video.dts));
 
-            let timestamp = Hub::rtp_timestamp(video.pts, sdp::VIDEO_CLOCK_RATE, &hub.video_base);
+            let timestamp =
+                Stream::rtp_timestamp(video.pts, sdp::VIDEO_CLOCK_RATE, &hub.video_base);
             let media = media_delta(
                 video.pts,
                 hub.video_base.get().expect("timestamp set the base"),
@@ -2281,7 +2504,7 @@ async fn emit_sample(hub: &Hub, pacer: &mut Pacer, timeline: &mut Timeline, samp
             pacer.wait(audio.pts).await;
             hub.set_position_ms(timeline.position_ms(audio.pts));
 
-            let timestamp = Hub::rtp_timestamp(audio.pts, clock_rate, &hub.audio_base);
+            let timestamp = Stream::rtp_timestamp(audio.pts, clock_rate, &hub.audio_base);
             let media = media_delta(
                 audio.pts,
                 hub.audio_base.get().expect("timestamp set the base"),
@@ -2334,6 +2557,33 @@ mod tests {
             Some(TRACK_AUDIO)
         );
         assert_eq!(track_from_uri("rtsp://127.0.0.1:8554/twitch"), None);
+    }
+
+    #[test]
+    fn parses_the_stream_key_from_the_request_uri() {
+        let key = parse_stream_key("rtsp://127.0.0.1:7417/Sunnys/720p60/").expect("key");
+        assert_eq!(key.login, "sunnys");
+        assert_eq!(key.quality.as_deref(), Some("720p60"));
+
+        // A missing quality means the first variant.
+        let key = parse_stream_key("rtsp://127.0.0.1:7417/sunnys/").expect("key");
+        assert_eq!(key.quality, None);
+
+        // The track control URI of a stream without a quality is not a quality.
+        let key = parse_stream_key("rtsp://127.0.0.1:7417/sunnys/trackID=0").expect("key");
+        assert_eq!(key.quality, None);
+
+        // Absolute paths are accepted too.
+        assert_eq!(
+            parse_stream_key("/sunnys/audio_only").expect("key"),
+            StreamKey {
+                login: "sunnys".to_owned(),
+                quality: Some("audio_only".to_owned()),
+            }
+        );
+
+        assert!(parse_stream_key("rtsp://127.0.0.1:7417/").is_none());
+        assert!(parse_stream_key("").is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # RTSP daemon mode
 
-Status: plan only, nothing implemented. Prerequisite: the slot-arena rework
-(dynamic arenas) lands first, as its own commit.
+Status: implemented (`daemon.rs`, `rtsp::StreamResolver`). The arena rework it
+depended on landed first.
 
 ## Goal
 
@@ -12,9 +12,11 @@ workers, the listeners.
 
 ## CLI
 
-`twitch-hls-client2 daemon [--bind <addr>] [--max-streams N]`, with the current
-behaviour moved under an explicit `play` subcommand. `-c/--channel` and
-`-q/--quality` belong to `play` and are not valid for `daemon`.
+`twitch-hls-client2 daemon [--bind <addr>] [--max-streams N]`. The old
+behaviour moved under an explicit `play` subcommand (`-c/--channel` and
+`-q/--quality` live there). `--bind` defaults to `127.0.0.1:7417`; `daemon`
+binds exactly that address, so the dual-loopback-family fallback is only in
+`play`. `--max-streams` defaults to `constants::MAX_STREAMS` (8).
 
 ## URI
 
@@ -25,7 +27,7 @@ behaviour moved under an explicit `play` subcommand. `-c/--channel` and
   would swallow the track fragment (`...?quality=x/trackID=0`).
 - `<channel>` is the Twitch login, lowercased.
 - `<quality>` is a `STABLE-VARIANT-ID` (`chunked`, `720p60`, `audio_only`, ...).
-  Missing means the first variant, i.e. today's `-q` behaviour.
+  Missing means the first variant. An unknown id is a 404.
 - `a=control:trackID=0` stays relative; `Content-Base` is the request URI plus a
   trailing slash.
 
@@ -33,58 +35,58 @@ behaviour moved under an explicit `play` subcommand. `-c/--channel` and
 
 `Registry` keyed by `(channel, quality)`.
 
-1. DESCRIBE resolves the key. The channel entry does one GQL variant fetch per
+1. DESCRIBE resolves the key through a small keyed async gate (one mutex per
+   stream key / channel). The channel entry does one GQL variant fetch per
    login and caches the title plus the variant list.
-2. The stream entry picks the variant by id and builds the per-variant
-   pipeline: `Hub`, `WakeSet`, consumer-registration channel, `Dvr::spawn`,
+2. The stream entry picks the variant by id and builds the per-variant pipeline:
+   `Stream`, `WakeSet`, consumer-registration channel, `Dvr::spawn`,
    `spawn_media`, scheduler task.
-3. `Session` holds `Option<Rc<Stream>>`; the accept loop hands the registry down
-   instead of a single `Rc<Hub>`.
-4. **Last viewer disconnects: drop the stream immediately** (decided). That
-   needs a `stop: Cell<bool>` checked by the scheduler loop and by `play_vod`,
-   plus dropping the registration sender so the scheduler's consumer loop ends
-   and the spools release.
-5. Whether the channel entry (title + cached variants) is dropped too, or kept
-   until the daemon exits, is still open.
+3. `Session` holds `RefCell<Option<Rc<Stream>>>`; the accept loop hands the
+   resolver down instead of a single `Rc<Stream>`. A session attaches on
+   DESCRIBE, not on connect.
+4. **Last viewer disconnects: drop the stream immediately.** `Stream::stop`
+   sets the stop flag and clears the seek sender; `StreamRuntime::stop` also
+   stops the `Dvr`, pokes the scheduler latch and drops the registration
+   sender. `next_reader`/`handle_new_readers` treat "closed and empty" as
+   `Stopped`, so the scheduler returns, and the media engine's `recv` ends when
+   the scheduler drops its consumer. The media loop, `play_vod` and the
+   watchdog additionally check `stopped()`.
+5. The channel entry is dropped with the channel's last stream (decided). A
+   reconnect re-resolves the variant list instead of playing a stale one; there
+   is no separate expiry timer.
 
 ## Sharing
 
-- Global: `Client`, one `ArenaSet` (shared by every stream, already sized as a
-  pool), the downloader queue, the RTSP listeners.
+- Global: `Client`, one `ArenaSet` (already sized as a pool), the downloader
+  queue, the RTSP listener.
 - Per channel: login, title, variant list.
-- Per stream (one variant): scheduler, `Dvr`, `Hub`, `WakeSet`, media engine,
-  consumer-registration channel, stop flag.
+- Per stream (one variant): scheduler, `Dvr`, `Stream`, `WakeSet`, media engine,
+  consumer-registration channel, stop flags.
 
 `Dvr` is per variant, not per channel: it stores the chosen `live_variant` and
 resolves that variant's archive media playlist.
 
 ## Capacity
 
-- `--max-streams`, defaulting to the renamed `MAX_STREAMS`. When full and no
-  stream is eligible for an immediate drop, answer DESCRIBE with 503; do not
-  evict a stream that someone is watching.
-- The slot budget is global. A stalled segment on one stream can consume slots
-  another stream needs (`SLOT_BUDGET` is per spool, not per stream), so a
-  per-stream reservation is an open question.
+- `--max-streams` (defaults to `MAX_STREAMS`). Streams with no attached
+  sessions are dropped before the count is checked; a stream someone is
+  watching is never evicted. When full, DESCRIBE gets a 503.
+- The capacity check and the registry insert are in the same synchronous block
+  (`spawn_stream` has no await), so the count is exact even when resolutions
+  interleave.
+- The slot budget is still global (`SEGMENT_SLOTS_MAX` is per spool, not per
+  stream), so a per-stream reservation remains open.
 
 ## Naming
 
-`Hub` becomes `Stream` (one variant's RTSP presentation); `MAX_BROADCASTS`
-becomes `MAX_STREAMS`. "Broadcast" keeps its meaning from `AGENTS.md`: one
-channel's live stream.
+`Hub` became `Stream` (one variant's RTSP presentation). "Broadcast" keeps its
+meaning from `AGENTS.md`: one channel's live stream. There was no
+`MAX_BROADCASTS` left to rename; the new cap is `MAX_STREAMS`.
 
 ## Open questions
 
-- Raw TS output: settled — `tcp.rs` was removed and RTSP is the only sink, so
-  the daemon has nothing to decide here. The RTSP listener binds 7417.
 - Per-stream slot reservation.
-- Does the channel entry expire (stale title / variant list)?
-- Per-stream spans for tracing.
-
-## Prerequisite: arena rework
-
-The arena currently cannot express "grow when needed": `MAX_ARENAS` is
-compile-time, `alloc()` scans `[Option<Rc<Arena>>; MAX_ARENAS]`, and an emptied
-arena is dropped at once, so a pool at the boundary re-allocates a zeroed 6 MB
-arena per slot. The rework (linked list of arenas, monotonic ids, one spare empty
-arena) is being designed separately.
+- Per-stream spans for tracing (the scheduler/media spans are currently
+  stream-agnostic).
+- Debug mode resolves every login to the mock playlist, so an unknown channel
+  cannot be exercised offline.

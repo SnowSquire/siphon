@@ -17,6 +17,7 @@
 //! Discovery and refresh run in a background task, in parallel with the live
 //! scheduler, so a seek never has to fetch a playlist first.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -143,6 +144,9 @@ struct DvrState {
 /// The discovered DVR playlist shared by the refresh task and the RTSP output.
 pub struct Dvr {
     state: RefCell<DvrState>,
+    /// Set when the daemon drops the stream: the refresh task exits instead of
+    /// polling a playlist nobody consumes.
+    stop: Cell<bool>,
 }
 
 impl Dvr {
@@ -156,7 +160,18 @@ impl Dvr {
                 timeline: None,
                 live_variant: None,
             }),
+            stop: Cell::new(false),
         })
+    }
+
+    /// Ask the discovery/refresh task to exit. It checks the flag between
+    /// polls, so it may live for up to [`REFRESH`] longer.
+    pub fn stop(&self) {
+        self.stop.set(true);
+    }
+
+    const fn stopped(&self) -> bool {
+        self.stop.get()
     }
 
     /// Record the live variant selected by the scheduler (its
@@ -241,6 +256,10 @@ pub fn spawn(client: Rc<Client>, channel: Option<String>, dvr: Rc<Dvr>) {
     compio::runtime::spawn(async move {
         let mut url = dvr.url();
         loop {
+            if dvr.stopped() {
+                debug!("dvr: stopped");
+                return;
+            }
             if url.is_none() {
                 let Some(channel) = channel.as_deref() else {
                     return;

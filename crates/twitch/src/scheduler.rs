@@ -143,6 +143,12 @@ struct Utf8;
 #[error("duplicate dispatch")]
 struct Dispatch;
 
+/// The daemon dropped the stream: the registration channel has no senders left,
+/// so there can never be another consumer.
+#[derive(Error, Debug)]
+#[error("stream stopped")]
+struct Stopped;
+
 /// The open sum of everything the scheduler loop can fail with. Each function
 /// below lists only the subset it can actually produce.
 type SchedulerErrors = (
@@ -153,26 +159,34 @@ type SchedulerErrors = (
     Utf8,
     Offline,
     Dispatch,
+    Stopped,
 );
 
 /// Resolves when a consumer registers, re-checking the channel after parking so
 /// a registration that races with the park is not missed.
+///
+/// `None` means the registration channel is closed and empty: the daemon dropped
+/// the stream because its last viewer left. That has to be observable: a task
+/// waiting for a consumer that can never arrive would hold its spools forever.
 async fn next_reader(
     receive: Receiver<ConsumerRegistration>,
     wake: Rc<ConsumerWake>,
-) -> ConsumerRegistration {
+) -> Option<ConsumerRegistration> {
     poll_fn(move |context| {
-        if let Ok(Some(reader)) = receive.try_recv() {
-            return Poll::Ready(reader);
+        match receive.try_recv() {
+            Ok(Some(reader)) => return Poll::Ready(Some(reader)),
+            Ok(None) => {}
+            Err(_) => return Poll::Ready(None),
         }
         wake.park(context);
         // The channel is the latch: a registration that landed between the
         // check above and the park is still in the queue, so checking it again
         // is what closes the race. The waker only saves the poll interval.
-        if let Ok(Some(reader)) = receive.try_recv() {
-            return Poll::Ready(reader);
+        match receive.try_recv() {
+            Ok(Some(reader)) => Poll::Ready(Some(reader)),
+            Ok(None) => Poll::Pending,
+            Err(_) => Poll::Ready(None),
         }
-        Poll::Pending
     })
     .await
 }
@@ -265,6 +279,10 @@ impl StreamScheduler {
                         info!("stream ended");
                         return;
                     }
+                    if error.is_inner::<Stopped>() {
+                        info!("stream stopped: no consumers left");
+                        return;
+                    }
 
                     // `reload` applies events as it parses, so a failure after
                     // the first event leaves the window half-updated and it must
@@ -299,9 +317,15 @@ impl StreamScheduler {
         self.live_window.borrow_mut().clear();
     }
 
-    fn handle_new_readers(&mut self) {
-        while let Ok(Some(registration)) = self.receive.try_recv() {
-            self.adopt(registration);
+    /// Adopt every queued registration. `false` means the channel is closed and
+    /// empty: the stream was dropped.
+    fn handle_new_readers(&mut self) -> bool {
+        loop {
+            match self.receive.try_recv() {
+                Ok(Some(registration)) => self.adopt(registration),
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
         }
     }
 
@@ -362,22 +386,27 @@ impl StreamScheduler {
         } else {
             CATCHUP_POLL
         };
-        self.handle_new_readers();
+        if !self.handle_new_readers() {
+            return Err(Stopped).union();
+        }
 
-        if let Some(sleep_time) = sleep_dur.checked_sub(start.elapsed()) {
-            self.idle(sleep_time).await;
+        if let Some(sleep_time) = sleep_dur.checked_sub(start.elapsed())
+            && !self.idle(sleep_time).await
+        {
+            return Err(Stopped).union();
         }
 
         Ok(())
     }
 
     /// Sleep out the poll interval, waking early whenever a consumer connects.
-    async fn idle(&mut self, sleep_time: Duration) {
+    /// Returns `false` when the registration channel closed (stream dropped).
+    async fn idle(&mut self, sleep_time: Duration) -> bool {
         let deadline = Instant::now() + sleep_time;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return;
+                return true;
             }
 
             let sleep = compio::time::sleep(remaining);
@@ -385,12 +414,15 @@ impl StreamScheduler {
             pin_mut!(sleep, wait);
 
             match select(sleep, wait).await {
-                Either::Left(((), _)) => return,
+                Either::Left(((), _)) => return true,
+                Either::Right((None, _)) => return false,
                 // Adopt the new consumer immediately, then keep sleeping out
                 // whatever is left of the interval.
-                Either::Right((reader, _)) => {
+                Either::Right((Some(reader), _)) => {
                     self.adopt(reader);
-                    self.handle_new_readers();
+                    if !self.handle_new_readers() {
+                        return false;
+                    }
                 }
             }
         }
@@ -667,7 +699,7 @@ mod tests {
             .expect("queue");
 
         // Would hang if the first check did not see the queued sender.
-        let taken = run(next_reader(receive, ConsumerWake::new()));
+        let taken = run(next_reader(receive, ConsumerWake::new())).expect("registration");
         assert!(taken.tx.try_send(SegmentMessage::Discontinuity()).is_ok());
     }
 
@@ -697,5 +729,13 @@ mod tests {
             matches!(select(wait, guard).await, Either::Left(_))
         });
         assert!(signalled);
+    }
+
+    #[test]
+    fn a_dropped_stream_closes_the_registration_latch() {
+        let (queue, receive) = kanal::unbounded::<ConsumerRegistration>();
+        // No senders left and nothing queued: the daemon dropped the stream.
+        drop(queue);
+        assert!(run(next_reader(receive, ConsumerWake::new())).is_none());
     }
 }

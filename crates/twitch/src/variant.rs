@@ -44,6 +44,9 @@ pub enum VariantPlaylistError {
 
     #[error("no variants for {0}: is the channel live?")]
     NoVariants(String),
+
+    #[error("no variant {quality} for {channel}")]
+    UnknownQuality { channel: String, quality: String },
 }
 
 pub async fn fetch_variant_playlist(
@@ -229,6 +232,33 @@ pub struct Variant {
     pub codec: Option<Codec>,
     pub res: Option<(std::num::NonZeroU16, std::num::NonZeroU16)>,
     pub frame_rate: Option<std::num::NonZeroU16>,
+}
+
+/// The variant an explicit quality id names, or the first one when `None`.
+#[must_use]
+pub fn choose_variant<'a>(variants: &'a [Variant], quality: Option<&str>) -> Option<&'a Variant> {
+    quality.map_or_else(
+        || variants.first(),
+        |quality| {
+            variants
+                .iter()
+                .find(|variant| variant.id.as_ref() == quality)
+        },
+    )
+}
+
+/// The single variant debug mode pretends the mock server offers.
+#[must_use]
+pub fn debug_variant() -> Variant {
+    Variant {
+        score: None,
+        url: crate::constants::DEBUG_MANIFEST_URL.into(),
+        id: crate::constants::DEBUG_VARIANT_ID.into(),
+        kind: VariantKind::Landscape,
+        codec: None,
+        res: None,
+        frame_rate: None,
+    }
 }
 
 fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, Option<u64>) {

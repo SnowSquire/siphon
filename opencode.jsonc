@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "references": {
+    "gortsplib": {
+      "repository": "bluenviron/gortsplib",
+      "branch": "main",
+      "description": "Go RTSP/RTP implementation - reference for RFC 6184/3640 packetizers, SDP, RTCP and RTSP server/client behavior",
+    },
+    "mediacommon": {
+      "repository": "bluenviron/mediacommon",
+      "branch": "main",
+      "description": "Go MPEG-TS/fMP4 demuxing and codec helpers (H.264, AAC/ADTS) - reference for TS demuxing and codec configuration",
+    },
+    "ffmpeg": {
+      "repository": "FFmpeg/FFmpeg",
+      "branch": "master",
+      "description": "FFmpeg sources - reference for RTSP/RTP client behavior (libavformat rtsp.c, rtspdec.c, rtpdec.c), SDP range handling and stream metadata",
+    },
+    "mpv": {
+      "repository": "mpv-player/mpv",
+      "branch": "master",
+      "description": "mpv player sources - reference for how RTSP start_time, duration and live streams are displayed",
+    },
+  },
+}
