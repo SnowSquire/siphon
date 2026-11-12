@@ -6,6 +6,8 @@
 //! track, and RTCP sender reports for the NTP/RTP mapping.
 
 mod aac;
+#[cfg(test)]
+mod bench;
 mod h264;
 mod sdp;
 mod ts;
@@ -566,6 +568,7 @@ impl Stream {
     fn send(&self, track: u8, packet: &RtpPacket) {
         let bit = 1u8 << track;
         let keyframe = self.video_keyframe.get();
+        let video = 1u8 << TRACK_VIDEO;
         self.sessions.borrow_mut().retain(|session| {
             if !session.playing.get()
                 || session.seeking.get()
@@ -573,23 +576,35 @@ impl Stream {
             {
                 return true;
             }
-            // A live join starts mid-GOP. Feeding that to the decoder produces
-            // "reference picture missing" until the next IDR, so hold the
-            // video fan-out for this session until a keyframe access unit.
-            if track == TRACK_VIDEO && !session.video_synced.get() {
+            // A live join starts mid-GOP, so *every* track waits for the first
+            // video keyframe. Feeding a mid-GOP access unit to the decoder
+            // produces "reference picture missing" until the next IDR, and
+            // audio that starts seconds before video breaks ffmpeg's
+            // cross-stream RTCP mapping: on the first sender report it copies
+            // that stream's `rtcp_ts_offset` and `first_rtcp_ntp_time` into
+            // every stream that has not seen a report yet (rtsp.c), which is
+            // only valid if both tracks' first received packets are the same
+            // instant. Starting audio alone made the audio timeline jump back
+            // by the IDR wait, which players report as a non-monotonic DTS at
+            // the join.
+            if !session.video_synced.get() && session.subscribed.get() & video != 0 {
                 if !keyframe {
                     return true;
                 }
                 session.video_synced.set(true);
             }
-            Self::push_out(
+            let keep = Self::push_out(
                 session,
                 Outbound::Rtp {
                     epoch: session.epoch.get(),
                     track,
                     data: Rc::clone(packet),
                 },
-            )
+            );
+            if !keep {
+                debug!("rtsp: unregistering session, its writer is gone");
+            }
+            keep
         });
     }
 
@@ -606,7 +621,13 @@ impl Stream {
     /// removed a live client from the fan-out for good, so playback froze while
     /// the control plane kept answering until the player was reloaded.
     fn push_out(session: &Session, message: Outbound) -> bool {
-        session.out.try_send(message).is_ok()
+        if session.out.is_closed() {
+            return false;
+        }
+        // Full: the player's buffer is the back-pressure signal, not a reason
+        // to stop sending it media. The packet (or report) is dropped.
+        let _ = session.out.try_send(message);
+        true
     }
 
     /// Wait until every playing session subscribed to `track` can accept
@@ -700,14 +721,18 @@ impl Stream {
             {
                 return true;
             }
-            Self::push_out(
+            let keep = Self::push_out(
                 session,
                 Outbound::Rtcp {
                     epoch: session.epoch.get(),
                     track,
                     data: Rc::clone(packet),
                 },
-            )
+            );
+            if !keep {
+                debug!("rtsp: unregistering session, its writer is gone");
+            }
+            keep
         });
     }
 
@@ -2554,6 +2579,7 @@ async fn emit_sample(hub: &Stream, pacer: &mut Pacer, timeline: &mut Timeline, s
             hub.video_keyframe.set(video.keyframe);
             let mut scratch = Vec::new();
             h264::packetize(
+                &video.data,
                 &video.nals,
                 RTP_MAX_PAYLOAD,
                 &mut scratch,
@@ -2591,10 +2617,10 @@ async fn emit_sample(hub: &Stream, pacer: &mut Pacer, timeline: &mut Timeline, s
 
 /// Upper bound on the RTP packets one access unit will produce, used to reserve
 /// room in the receiver queues before packetizing.
-fn video_packet_count(nals: &[Vec<u8>]) -> usize {
+fn video_packet_count(nals: &[(usize, usize)]) -> usize {
     let fragment = RTP_MAX_PAYLOAD.saturating_sub(2).max(1);
     nals.iter()
-        .map(|nal| nal.len().div_ceil(fragment).max(1))
+        .map(|&(start, end)| (end - start).div_ceil(fragment).max(1))
         .sum::<usize>()
         .max(1)
 }

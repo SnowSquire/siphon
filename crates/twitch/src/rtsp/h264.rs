@@ -54,14 +54,18 @@ fn insert_unique(sets: &mut Vec<Vec<u8>>, nal: &[u8]) {
     }
 }
 
-/// Split an Annex B byte stream into NAL units.
+/// Split an Annex B byte stream into NAL unit ranges.
 ///
 /// Mirrors mediaconvert's `AnnexB.Unmarshal`: an initial start code is required,
 /// a single zero byte preceding a `00 00 01` delimiter is treated as part of a
 /// four-byte start code, and everything else (including trailing
 /// `cabac_zero_word` padding) stays in the NAL.
+///
+/// The ranges index the caller's buffer instead of copying each NAL out of it:
+/// one access unit is ~13 NAL units, and copying them cost one more pass over
+/// the whole elementary stream (plus an allocation per NAL).
 #[must_use]
-pub fn split_annex_b(buf: &[u8]) -> Option<Vec<&[u8]>> {
+pub fn split_annex_b(buf: &[u8]) -> Option<Vec<(usize, usize)>> {
     let mut pos = if buf.len() >= 4 && buf[0..4] == [0, 0, 0, 1] {
         4
     } else if buf.len() >= 3 && buf[0..3] == [0, 0, 1] {
@@ -76,21 +80,21 @@ pub fn split_annex_b(buf: &[u8]) -> Option<Vec<&[u8]>> {
 
     let mut positions = Vec::new();
     while pos < buf.len() {
-        match find_start_code(&buf[pos..]) {
+        match find_start_code(buf, pos) {
             None => {
                 positions.push((pos, buf.len()));
                 break;
             }
             Some(index) => {
-                let end = if index > 0 && buf[pos + index - 1] == 0 {
-                    pos + index - 1
+                let end = if index > pos && buf[index - 1] == 0 {
+                    index - 1
                 } else {
-                    pos + index
+                    index
                 };
                 if end > pos {
                     positions.push((pos, end));
                 }
-                pos += index + 3;
+                pos = index + 3;
             }
         }
     }
@@ -99,36 +103,35 @@ pub fn split_annex_b(buf: &[u8]) -> Option<Vec<&[u8]>> {
         return None;
     }
 
-    Some(
-        positions
-            .into_iter()
-            .map(|(start, end)| &buf[start..end])
-            .collect(),
-    )
+    Some(positions)
 }
 
-fn find_start_code(data: &[u8]) -> Option<usize> {
-    data.windows(3).position(|window| window == [0, 0, 1])
+/// Offset of the next `00 00 01` start code at or after `from`.
+///
+/// Every NAL boundary of the elementary stream is found by this scan, and H.264
+/// slice data is dense with `00 00 03` emulation-prevention pairs, so a
+/// byte-at-a-time search is the hottest loop in the demuxer. `memmem` searches
+/// the three-byte delimiter with SIMD instead.
+pub fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
+    let tail = data.get(from..)?;
+    memchr::memmem::find(tail, &[0, 0, 1]).map(|offset| from + offset)
 }
 
 /// mediaconvert removes the access unit delimiter before packetization.
-#[must_use]
-pub fn strip_aud(nals: Vec<&[u8]>) -> Vec<&[u8]> {
-    if nals
+pub fn strip_aud(au: &[u8], nals: &mut Vec<(usize, usize)>) {
+    let is_aud = nals
         .first()
-        .is_some_and(|nal| nal.first().is_some_and(|header| header & 0x1F == NAL_AUD))
-    {
-        nals.into_iter().skip(1).collect()
-    } else {
-        nals
+        .is_some_and(|&(start, _)| au.get(start).is_some_and(|header| header & 0x1F == NAL_AUD));
+    if is_aud {
+        nals.remove(0);
     }
 }
 
 /// Whether an access unit (its NAL units) starts with an IDR picture.
 #[must_use]
-pub fn is_keyframe(nals: &[&[u8]]) -> bool {
+pub fn is_keyframe(au: &[u8], nals: &[(usize, usize)]) -> bool {
     nals.iter()
-        .any(|nal| nal.first().is_some_and(|header| header & 0x1F == NAL_IDR))
+        .any(|&(start, _)| au.get(start).is_some_and(|header| header & 0x1F == NAL_IDR))
 }
 
 /// Packetize one access unit into RTP payloads (RFC 6184, packetization mode 1).
@@ -137,26 +140,28 @@ pub fn is_keyframe(nals: &[&[u8]]) -> bool {
 /// implementation batches small NAL units into STAP-A packets and fragments a
 /// large one into FU-A packets.
 pub fn packetize(
-    au: &[Vec<u8>],
+    au: &[u8],
+    nals: &[(usize, usize)],
     max_payload: usize,
     scratch: &mut Vec<u8>,
     mut emit: impl FnMut(&[u8], bool),
 ) {
-    let mut batch: Vec<&[u8]> = Vec::new();
+    let mut batch: Vec<&[u8]> = Vec::with_capacity(4);
     // A STAP-A header byte plus (2-byte length + NALU) per member.
     let mut batch_len = 1usize;
 
-    for nalu in au {
-        let addition = 2 + nalu.len();
+    for &(start, end) in nals {
+        let unit = &au[start..end];
+        let addition = 2 + unit.len();
         if batch_len + addition <= max_payload {
-            batch.push(nalu);
+            batch.push(unit);
             batch_len += addition;
         } else {
             if !batch.is_empty() {
                 write_batch(&batch, false, max_payload, scratch, &mut emit);
             }
             batch.clear();
-            batch.push(nalu);
+            batch.push(unit);
             batch_len = 1 + addition;
         }
     }
@@ -237,6 +242,11 @@ fn write_fragmented(
 mod tests {
     use super::*;
 
+    /// The NAL ranges as byte slices, for readable assertions.
+    fn units<'a>(au: &'a [u8], nals: &[(usize, usize)]) -> Vec<&'a [u8]> {
+        nals.iter().map(|&(start, end)| &au[start..end]).collect()
+    }
+
     #[test]
     fn splits_start_codes_like_mediaconvert() {
         let data = [
@@ -244,10 +254,10 @@ mod tests {
         ];
         let nals = split_annex_b(&data).expect("annex b");
         assert_eq!(nals.len(), 3);
-        assert_eq!(nals[0], [0x67, 1, 2]);
-        assert_eq!(nals[1], [0x68, 3]);
+        assert_eq!(units(&data, &nals)[0], [0x67, 1, 2]);
+        assert_eq!(units(&data, &nals)[1], [0x68, 3]);
         // The final NAL keeps its trailing zero: it can be cabac_zero_word.
-        assert_eq!(nals[2], [0x65, 4, 5, 0]);
+        assert_eq!(units(&data, &nals)[2], [0x65, 4, 5, 0]);
     }
 
     #[test]
@@ -258,8 +268,11 @@ mod tests {
 
     #[test]
     fn removes_the_access_unit_delimiter() {
-        let nals = vec![&[0x09, 0xF0][..], &[0x65, 1][..]];
-        assert_eq!(strip_aud(nals), vec![&[0x65, 1][..]]);
+        let au = [0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 1];
+        let mut nals = split_annex_b(&au).expect("annex b");
+        assert_eq!(nals.len(), 2);
+        strip_aud(&au, &mut nals);
+        assert_eq!(units(&au, &nals), vec![&[0x65, 1][..]]);
     }
 
     #[test]
@@ -276,18 +289,26 @@ mod tests {
 
     #[test]
     fn detects_idr() {
-        assert!(is_keyframe(&[&[0x67, 1], &[0x65, 2]]));
-        assert!(!is_keyframe(&[&[0x41, 2]]));
+        let key = [0x67, 1, 0x65, 2];
+        let delta = [0x41, 2];
+        assert!(is_keyframe(&key, &[(0, 2), (2, 4)]));
+        assert!(!is_keyframe(&delta, &[(0, 2)]));
     }
 
     #[test]
     fn small_nals_are_aggregated() {
         let mut scratch = Vec::new();
         let mut packets = Vec::new();
-        let au = vec![vec![0x67, 1, 2], vec![0x68, 3]];
-        packetize(&au, 1200, &mut scratch, |payload, marker| {
-            packets.push((payload.to_vec(), marker));
-        });
+        let au = [0x67, 1, 2, 0x68, 3];
+        packetize(
+            &au,
+            &[(0, 3), (3, 5)],
+            1200,
+            &mut scratch,
+            |payload, marker| {
+                packets.push((payload.to_vec(), marker));
+            },
+        );
         assert_eq!(packets.len(), 1);
         assert!(packets[0].1);
         assert_eq!(packets[0].0, [24, 0, 3, 0x67, 1, 2, 0, 2, 0x68, 3]);
@@ -295,10 +316,10 @@ mod tests {
 
     #[test]
     fn a_large_nal_is_fragmented() {
-        let au = vec![vec![0x65u8, 1, 2, 3, 4, 5, 6]];
+        let au = [0x65u8, 1, 2, 3, 4, 5, 6];
         let mut scratch = Vec::new();
         let mut packets = Vec::new();
-        packetize(&au, 4, &mut scratch, |payload, marker| {
+        packetize(&au, &[(0, au.len())], 4, &mut scratch, |payload, marker| {
             packets.push((payload.to_vec(), marker));
         });
         assert_eq!(packets.len(), 3);
@@ -312,12 +333,18 @@ mod tests {
     fn only_the_last_batch_carries_the_marker() {
         let mut scratch = Vec::new();
         let mut packets = Vec::new();
-        let au = vec![vec![0x41; 10], vec![0x65; 10]];
+        let au = [[0x41; 10], [0x65; 10]].concat();
         // Two 10-byte NALs do not fit in one 20-byte packet, so each is emitted
         // separately; the marker must only be on the last one.
-        packetize(&au, 20, &mut scratch, |payload, marker| {
-            packets.push((payload[0] & 0x1F, marker));
-        });
+        packetize(
+            &au,
+            &[(0, 10), (10, 20)],
+            20,
+            &mut scratch,
+            |payload, marker| {
+                packets.push((payload[0] & 0x1F, marker));
+            },
+        );
         assert_eq!(packets, [(1, false), (5, true)]);
     }
 }

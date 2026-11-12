@@ -31,7 +31,14 @@ pub struct VideoSample {
     pub pts: i64,
     /// Decode timestamp in 90 kHz units (equals `pts` when no reordering).
     pub dts: i64,
-    pub nals: Vec<Vec<u8>>,
+    /// The access unit's Annex B bytes (access unit delimiter included).
+    ///
+    /// One buffer with [`VideoSample::nals`] ranges into it, instead of a `Vec`
+    /// per NAL: copying the units out cost a second pass over the whole
+    /// elementary stream and thirteen allocations per access unit.
+    pub data: Vec<u8>,
+    /// NAL units of the access unit, as ranges into [`VideoSample::data`].
+    pub nals: Vec<(usize, usize)>,
     pub keyframe: bool,
 }
 
@@ -64,7 +71,12 @@ impl PesBuffer {
         self.data.extend_from_slice(data);
     }
 
-    fn flush(&mut self) -> Option<(i64, i64, Vec<u8>)> {
+    /// Take the completed PES payload as `(pts, dts, payload_start, bytes)`.
+    ///
+    /// Handing the buffer out instead of draining the header off it saves a
+    /// memmove of every payload byte, and [`PesBuffer::recycle`] puts the
+    /// allocation back so a stream allocates once instead of once per PES.
+    fn flush(&mut self) -> Option<(i64, i64, usize, Vec<u8>)> {
         if !self.active {
             return None;
         }
@@ -78,12 +90,18 @@ impl PesBuffer {
         if declared != 0 {
             data.truncate((6 + declared).min(data.len()));
         }
-        data.drain(..header_end);
-        if data.is_empty() {
+        if data.len() <= header_end {
+            self.recycle(data);
             return None;
         }
 
-        Some((pts, dts, data))
+        Some((pts, dts, header_end, data))
+    }
+
+    /// Return a flushed buffer so the next PES reuses its allocation.
+    fn recycle(&mut self, mut data: Vec<u8>) {
+        data.clear();
+        self.data = data;
     }
 
     fn reset(&mut self) {
@@ -314,18 +332,19 @@ impl TsDemuxer {
     }
 
     fn flush_video_pes(&mut self, out: &mut Vec<Sample>) {
-        let Some((pts, dts, data)) = self.video.flush() else {
+        let Some((pts, dts, header_end, data)) = self.video.flush() else {
             return;
         };
+        let payload = &data[header_end..];
 
-        if let Some(offset) = find_aud(&data) {
+        if let Some(offset) = find_aud(payload) {
             // Bytes before the AUD finish the previous access unit.
             if self.video_au_active {
-                self.video_au.extend_from_slice(&data[..offset]);
+                self.video_au.extend_from_slice(&payload[..offset]);
                 self.flush_video_au(out);
             }
             self.video_au.clear();
-            self.video_au.extend_from_slice(&data[offset..]);
+            self.video_au.extend_from_slice(&payload[offset..]);
             self.video_au_pts = pts;
             self.video_au_dts = dts;
             self.video_au_active = true;
@@ -335,8 +354,10 @@ impl TsDemuxer {
                 self.video_au_dts = dts;
                 self.video_au_active = true;
             }
-            self.video_au.extend_from_slice(&data);
+            self.video_au.extend_from_slice(payload);
         }
+
+        self.video.recycle(data);
     }
 
     fn flush_video_au(&mut self, out: &mut Vec<Sample>) {
@@ -346,17 +367,17 @@ impl TsDemuxer {
         self.video_au_active = false;
 
         let data = std::mem::take(&mut self.video_au);
-        let Some(nals) = h264::split_annex_b(&data) else {
+        let Some(mut nals) = h264::split_annex_b(&data) else {
             return;
         };
 
-        let keyframe = h264::is_keyframe(&nals);
-        for nal in &nals {
-            self.video_config.push(nal);
+        let keyframe = h264::is_keyframe(&data, &nals);
+        for &(start, end) in &nals {
+            self.video_config.push(&data[start..end]);
         }
 
         // mediaconvert drops the access unit delimiter before packetization.
-        let nals = h264::strip_aud(nals);
+        h264::strip_aud(&data, &mut nals);
         if nals.is_empty() {
             return;
         }
@@ -364,23 +385,25 @@ impl TsDemuxer {
         out.push(Sample::Video(VideoSample {
             pts: self.video_au_pts,
             dts: self.video_au_dts,
-            nals: nals.into_iter().map(<[u8]>::to_vec).collect(),
+            data,
+            nals,
             keyframe,
         }));
     }
 
     fn flush_audio(&mut self, out: &mut Vec<Sample>) {
-        let Some((pts, _, data)) = self.audio.flush() else {
+        let Some((pts, _, header_end, data)) = self.audio.flush() else {
             return;
         };
+        let payload = &data[header_end..];
 
         let mut offset = 0;
         let mut index = 0i64;
-        while offset + 7 <= data.len() {
-            let Some(frame) = aac::parse_adts(&data[offset..]) else {
+        while offset + 7 <= payload.len() {
+            let Some(frame) = aac::parse_adts(&payload[offset..]) else {
                 break;
             };
-            let Some(raw) = frame.payload(&data[offset..]) else {
+            let Some(raw) = frame.payload(&payload[offset..]) else {
                 break;
             };
 
@@ -398,6 +421,8 @@ impl TsDemuxer {
             index += 1;
             offset += frame.total_len();
         }
+
+        self.audio.recycle(data);
     }
 }
 
@@ -426,21 +451,17 @@ fn psi_section(payload: &[u8]) -> Option<&[u8]> {
 ///
 /// A four-byte start code's leading zero is included in the boundary so the
 /// previous access unit keeps its (harmless) `cabac_zero_word`.
-const fn find_aud(data: &[u8]) -> Option<usize> {
-    let mut index = 0;
-    while index + 4 <= data.len() {
-        if data[index] == 0
-            && data[index + 1] == 0
-            && data[index + 2] == 1
-            && (data[index + 3] & 0x1F) == 9
-        {
-            return Some(if index > 0 && data[index - 1] == 0 {
-                index - 1
+fn find_aud(data: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = h264::find_start_code(data, from) {
+        if data.get(at + 3).is_some_and(|&header| header & 0x1F == 9) {
+            return Some(if at > 0 && data[at - 1] == 0 {
+                at - 1
             } else {
-                index
+                at
             });
         }
-        index += 1;
+        from = at + 3;
     }
     None
 }
@@ -488,6 +509,15 @@ const fn unwrap_pts(pts: i64) -> i64 {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
+
+    /// The NAL units of a sample as byte slices.
+    fn nals_of(sample: &VideoSample) -> Vec<&[u8]> {
+        sample
+            .nals
+            .iter()
+            .map(|&(start, end)| &sample.data[start..end])
+            .collect()
+    }
 
     fn packet(pid: u16, payload_unit_start: bool, payload: &[u8]) -> Vec<u8> {
         let mut packet = vec![0xFFu8; TS_PACKET];
@@ -607,9 +637,9 @@ mod tests {
             panic!("second sample is not video");
         };
         assert_eq!(a.pts, 90_000);
-        assert_eq!(a.nals, [[0x65, 1, 2, 0xAA, 0xBB]]);
+        assert_eq!(nals_of(a), [&[0x65, 1, 2, 0xAA, 0xBB][..]]);
         assert_eq!(b.pts, 91_000);
-        assert_eq!(b.nals, [[0x41, 3, 4]]);
+        assert_eq!(nals_of(b), [&[0x41, 3, 4][..]]);
     }
 
     #[test]

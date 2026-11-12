@@ -785,6 +785,15 @@ mod tests {
         Rc::new(ArenaSet::new())
     }
 
+    /// `assert_invariants` only exists with debug assertions; release builds
+    /// (where the throughput benchmark runs) skip the check.
+    fn check(set: &ArenaSet) {
+        #[cfg(debug_assertions)]
+        set.assert_invariants();
+        #[cfg(not(debug_assertions))]
+        let _ = set;
+    }
+
     /// Allocate exactly `arenas` full arenas worth of slots, in allocation order.
     fn fill(set: &ArenaSet, arenas: usize) -> Vec<SlotId> {
         (0..arenas * SLOTS_PER_ARENA)
@@ -837,7 +846,7 @@ mod tests {
 
         // The bitmap hands the same slot back.
         assert_eq!(set.alloc(), Some(id));
-        set.assert_invariants();
+        check(&set);
     }
 
     #[test]
@@ -857,7 +866,7 @@ mod tests {
 
         set.release(b);
         assert_eq!(set.live_slots(), 0);
-        set.assert_invariants();
+        check(&set);
     }
 
     #[test]
@@ -886,7 +895,7 @@ mod tests {
         drop(reader);
         drop(writer_b);
         assert_eq!(set.live_slots(), 0);
-        set.assert_invariants();
+        check(&set);
     }
 
     #[test]
@@ -917,7 +926,7 @@ mod tests {
         set.release(b);
 
         assert_eq!(set.live_slots(), 0);
-        set.assert_invariants();
+        check(&set);
     }
 
     #[test]
@@ -929,7 +938,7 @@ mod tests {
         assert_eq!(set.arena_count(), 2);
         assert_eq!(set.live_slots(), 2 * SLOTS_PER_ARENA);
         assert_ne!(ids[0].arena, ids[SLOTS_PER_ARENA].arena);
-        set.assert_invariants();
+        check(&set);
 
         for id in ids {
             set.release(id);
@@ -937,7 +946,7 @@ mod tests {
         // One empty arena survives as the spare.
         assert_eq!(set.arena_count(), 1);
         assert_eq!(set.live_slots(), 0);
-        set.assert_invariants();
+        check(&set);
     }
 
     #[test]
@@ -957,11 +966,11 @@ mod tests {
             assert_eq!(id.arena, arena);
             assert_eq!(id.index(), 0);
             assert_eq!(set.arena_count(), 1);
-            set.assert_invariants();
+            check(&set);
 
             set.release(id);
             assert_eq!(set.arena_count(), 1);
-            set.assert_invariants();
+            check(&set);
         }
     }
 
@@ -990,13 +999,13 @@ mod tests {
         }
         assert_eq!(set.arena_count(), 3);
         assert_eq!(set.live_slots(), 2);
-        set.assert_invariants();
+        check(&set);
 
         // Emptying the last arena retires the spare, which frees the middle node.
         set.release(ids[2 * SLOTS_PER_ARENA]);
         assert_eq!(set.arena_count(), 2);
         assert_eq!(set.live_slots(), 1);
-        set.assert_invariants();
+        check(&set);
 
         // The surviving arenas still allocate and release: the first arena is
         // free slots, so it is preferred over the spare.
@@ -1008,7 +1017,7 @@ mod tests {
 
         assert_eq!(set.live_slots(), 0);
         assert_eq!(set.arena_count(), 1);
-        set.assert_invariants();
+        check(&set);
     }
 
     #[test]
@@ -1030,7 +1039,7 @@ mod tests {
             "no growth while an arena has free slots"
         );
         assert!(more.iter().all(|id| id.arena == ids[0].arena));
-        set.assert_invariants();
+        check(&set);
 
         for id in more {
             set.release(id);
@@ -1041,7 +1050,7 @@ mod tests {
         }
         assert_eq!(set.live_slots(), 0);
         assert_eq!(set.arena_count(), 1);
-        set.assert_invariants();
+        check(&set);
     }
 
     #[test]

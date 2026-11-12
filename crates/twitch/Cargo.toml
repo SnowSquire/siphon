@@ -22,6 +22,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http = "1"
 httparse = "1"
 kanal = "0.1.1"
+memchr = "2.8"
 mimalloc = "0.1.52"
 rand = "0.10.2"
 rustls = { version = "0.23", default-features = false, features = [
