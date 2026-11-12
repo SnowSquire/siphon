@@ -9,11 +9,11 @@
 //!   pointer, so there is no id-to-arena lookup either. Splicing a middle node
 //!   walks to its predecessor, but that only happens when an arena empties (once
 //!   per [`SLOTS_PER_ARENA`] slot frees); [`ArenaSet::alloc`] only takes the head.
-//! - **Search**: a second intrusive list (the *partial* list) holds exactly the
+//! - **Search**: a second intrusive list (the *free* list) holds exactly the
 //!   arenas with at least one free slot, so [`ArenaSet::alloc`] is O(1) and never
 //!   scans.
 //! - **The spare**: an emptied arena is kept, empty, as the single spare and is
-//!   consumed by the first allocation the partial list cannot satisfy. Without it
+//!   consumed by the first allocation the free list cannot satisfy. Without it
 //!   a pool hovering at an arena boundary would allocate and free a zeroed
 //!   [`ARENA_BYTES`] arena per slot.
 //! - **No global cap**: failing to allocate an arena surfaces as [`ArenaFull`],
@@ -152,9 +152,9 @@ struct Arena {
 
     /// Next arena in the list of every allocated arena.
     next: Cell<Option<NonNull<Self>>>,
-    /// Next arena in the partial list, and whether this arena is on it.
-    partial_next: Cell<Option<NonNull<Self>>>,
-    on_partial: Cell<bool>,
+    /// Next arena in the free list, and whether this arena is on it.
+    free_next: Cell<Option<NonNull<Self>>>,
+    on_free_list: Cell<bool>,
 }
 
 impl Drop for Arena {
@@ -183,8 +183,8 @@ impl Arena {
             free: Cell::new(u32::MAX),
             used: Cell::new(0),
             next: Cell::new(None),
-            partial_next: Cell::new(None),
-            on_partial: Cell::new(false),
+            free_next: Cell::new(None),
+            on_free_list: Cell::new(false),
         })
     }
 
@@ -291,7 +291,7 @@ pub struct ArenaSet {
     /// Every allocated arena, spare included.
     arenas: Cell<Option<NonNull<Arena>>>,
     /// The arenas with at least one free slot, most recently used first.
-    partial: Cell<Option<NonNull<Arena>>>,
+    free_list: Cell<Option<NonNull<Arena>>>,
     /// One empty arena, kept out of the allocation path.
     spare: Cell<Option<NonNull<Arena>>>,
     /// Allocated arenas, spare included.
@@ -305,7 +305,7 @@ impl ArenaSet {
     pub const fn new() -> Self {
         Self {
             arenas: Cell::new(None),
-            partial: Cell::new(None),
+            free_list: Cell::new(None),
             spare: Cell::new(None),
             count: Cell::new(0),
             live: Cell::new(0),
@@ -318,17 +318,19 @@ impl ArenaSet {
     /// expected to back off.
     #[must_use]
     pub fn alloc(&self) -> Option<SlotId> {
-        let arena = match self.pop_partial() {
+        let arena = match self.pop_free() {
             Some(arena) => arena,
             None => self.grow()?,
         };
 
         // SAFETY: `arena` is a live node of the list.
         let node = unsafe { arena.as_ref() };
-        let index = node.take_free().expect("a partial arena has a free slot");
+        let index = node
+            .take_free()
+            .expect("an arena on the free list has a free slot");
         self.live.set(self.live.get() + 1);
         if node.free.get() != 0 {
-            self.push_partial(arena);
+            self.push_free(arena);
         }
         Some(SlotId { arena, index })
     }
@@ -366,7 +368,7 @@ impl ArenaSet {
             if arena.used.get() == 0 {
                 self.retire(id.arena);
             } else {
-                self.push_partial(id.arena);
+                self.push_free(id.arena);
             }
         }
     }
@@ -374,7 +376,7 @@ impl ArenaSet {
     /// An arena just emptied: keep it as the spare, or free it.
     fn retire(&self, arena: NonNull<Arena>) {
         debug_assert_ne!(self.spare.get(), Some(arena), "the spare holds no slots");
-        self.remove_partial(arena);
+        self.remove_free(arena);
         if let Some(previous) = self.spare.replace(Some(arena)) {
             self.free_arena(previous);
         }
@@ -382,7 +384,7 @@ impl ArenaSet {
 
     /// Unlink `arena` from both lists and free it.
     fn free_arena(&self, arena: NonNull<Arena>) {
-        self.remove_partial(arena);
+        self.remove_free(arena);
         self.remove_arena(arena);
         self.count.set(self.count.get() - 1);
         // SAFETY: the node came from `Box::leak` in `grow`, is not the spare, and
@@ -424,59 +426,63 @@ impl ArenaSet {
         unreachable!("arena is not in the list of allocated arenas");
     }
 
-    /// Put `arena` on the partial list. A no-op when it is already there.
-    fn push_partial(&self, arena: NonNull<Arena>) {
+    /// Put `arena` on the free list. A no-op when it is already there.
+    fn push_free(&self, arena: NonNull<Arena>) {
         // SAFETY: `arena` is a live node of the list.
         let node = unsafe { arena.as_ref() };
         debug_assert!(
             node.free.get() != 0,
-            "an arena without a free slot is not partial"
+            "an arena without a free slot is not on the free list"
         );
-        debug_assert_ne!(self.spare.get(), Some(arena), "the spare is not partial");
-        if node.on_partial.replace(true) {
+        debug_assert_ne!(
+            self.spare.get(),
+            Some(arena),
+            "the spare is not on the free list"
+        );
+        if node.on_free_list.replace(true) {
             return;
         }
-        node.partial_next.set(self.partial.get());
-        self.partial.set(Some(arena));
+        node.free_next.set(self.free_list.get());
+        self.free_list.set(Some(arena));
     }
 
-    /// Take the head of the partial list.
-    fn pop_partial(&self) -> Option<NonNull<Arena>> {
-        let head = self.partial.get()?;
+    /// Take the head of the free list.
+    fn pop_free(&self) -> Option<NonNull<Arena>> {
+        let head = self.free_list.get()?;
         // SAFETY: list nodes are live.
         let node = unsafe { head.as_ref() };
-        debug_assert!(node.on_partial.get(), "partial node without the flag");
-        node.on_partial.set(false);
-        self.partial.set(node.partial_next.take());
+        debug_assert!(node.on_free_list.get(), "free-list node without the flag");
+        node.on_free_list.set(false);
+        self.free_list.set(node.free_next.take());
         Some(head)
     }
 
-    /// Unlink `arena` from the partial list, if it is on it.
+    /// Unlink `arena` from the free list, if it is on it.
     ///
     /// Same trade as [`Self::remove_arena`]: only an arena that empties leaves the
     /// list by anything but the head, so the walk stays off the allocation path.
-    fn remove_partial(&self, arena: NonNull<Arena>) {
+    fn remove_free(&self, arena: NonNull<Arena>) {
         // SAFETY: `arena` is a live node of the list.
         let node = unsafe { arena.as_ref() };
-        if !node.on_partial.get() {
+        if !node.on_free_list.get() {
             return;
         }
-        node.on_partial.set(false);
-        let mut current = self.partial.get();
+        node.on_free_list.set(false);
+        let mut current = self.free_list.get();
         if current == Some(arena) {
-            self.partial.set(node.partial_next.take());
+            self.free_list.set(node.free_next.take());
             return;
         }
         while let Some(link) = current {
             // SAFETY: list nodes are live.
             let link = unsafe { link.as_ref() };
-            if link.partial_next.get() == Some(arena) {
-                link.partial_next.set(node.partial_next.take());
+            if link.free_next.get() == Some(arena) {
+                link.free_next.set(node.free_next.take());
                 return;
             }
-            current = link.partial_next.get();
+            current = link.free_next.get();
         }
-        unreachable!("arena is not in the partial list");
+        unreachable!("arena is not in the free list");
     }
 
     /// Number of allocated slots across every spool.
@@ -524,9 +530,9 @@ impl ArenaSet {
 
             let is_spare = self.spare.get() == Some(ptr);
             assert_eq!(
-                arena.on_partial.get(),
+                arena.on_free_list.get(),
                 arena.free.get() != 0 && !is_spare,
-                "partial list membership out of sync"
+                "free list membership out of sync"
             );
             if is_spare {
                 assert_eq!(arena.used.get(), 0, "the spare holds live slots");
@@ -538,15 +544,15 @@ impl ArenaSet {
         assert_eq!(arenas, self.count.get(), "arena count out of sync");
         assert_eq!(live, self.live.get(), "global live counter out of sync");
 
-        let mut partial = 0;
-        let mut current = self.partial.get();
+        let mut free = 0;
+        let mut current = self.free_list.get();
         while let Some(ptr) = current {
-            partial += 1;
-            assert!(partial <= arenas, "partial list loop");
+            free += 1;
+            assert!(free <= arenas, "free list loop");
             // SAFETY: list nodes are live.
             let arena = unsafe { ptr.as_ref() };
-            assert!(arena.on_partial.get(), "partial node without the flag");
-            current = arena.partial_next.get();
+            assert!(arena.on_free_list.get(), "free-list node without the flag");
+            current = arena.free_next.get();
         }
     }
 }
@@ -993,7 +999,7 @@ mod tests {
         set.assert_invariants();
 
         // The surviving arenas still allocate and release: the first arena is
-        // partial, so it is preferred over the spare.
+        // free slots, so it is preferred over the spare.
         let id = set.alloc().expect("slot");
         assert_eq!(id.arena, first);
         assert_eq!(set.arena_count(), 2);
@@ -1006,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_arena_is_filled_before_growing() {
+    fn an_arena_with_free_slots_is_filled_before_growing() {
         let set = set();
         let ids = fill(&set, 2);
         // Free all but one slot of the first arena; the second stays full.
@@ -1018,7 +1024,11 @@ mod tests {
         let more: Vec<SlotId> = (0..SLOTS_PER_ARENA - 1)
             .map(|_| set.alloc().expect("slot"))
             .collect();
-        assert_eq!(set.arena_count(), 2, "no growth while an arena is partial");
+        assert_eq!(
+            set.arena_count(),
+            2,
+            "no growth while an arena has free slots"
+        );
         assert!(more.iter().all(|id| id.arena == ids[0].arena));
         set.assert_invariants();
 

@@ -28,16 +28,16 @@ not assert on id ordering). The slot index stays slot-relative.
 
 **Arenas are intrusive list nodes.** One singly linked list of every allocated
 arena (middle nodes can be dropped, `Drop for ArenaSet` walks it), plus a second
-singly linked list — the *partial* list — of exactly the arenas with at least one
+singly linked list — the *free* list — of exactly the arenas with at least one
 free slot. Neither needs a `prev` link: the allocation path only ever takes the
 head, and the only other removal is the arena that just emptied (once per 32 slot
 releases), so splicing walks to the predecessor instead of paying for a back-link
-on every node. `alloc()` unlinks the head of the partial list (O(1), no scanning) and
+on every node. `alloc()` unlinks the head of the free list (O(1), no scanning) and
 puts it back if it still has room; a release that frees a slot in a full arena
 pushes it back. The bitmap is still the source of truth for which slot is free.
 
-**One spare.** An arena that empties is unlinked from the partial list and kept
-as the single spare; the next allocation the partial list cannot serve consumes
+**One spare.** An arena that empties is unlinked from the free list and kept
+as the single spare; the next allocation the free list cannot serve consumes
 it. If a spare already existed, the older one is freed. The spare counts in
 `arena_count()`, so a test that releases everything asserts 1, not 0. This is
 what removes the boundary churn: allocate/release at a full arena never moves
@@ -86,7 +86,7 @@ spool write fails.
 
 ## Tests
 
-`arena.rs`: growth on demand, a partial arena filled before growing, the spare
+`arena.rs`: growth on demand, an arena with free slots filled before growing, the spare
 reused at the boundary (`arena_count()` stable), a middle arena dropped, cloned
 cursor continuation, plus the existing refcount/chain tests. `spool.rs`: the
 64-slot cap, a clone starting at the cursor, EOF via `closed`. All run under
