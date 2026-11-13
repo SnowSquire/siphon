@@ -57,14 +57,11 @@ pub struct SlotId {
 }
 
 impl SlotId {
-    /// Index of the slot within its arena.
     #[must_use]
     pub const fn index(self) -> u8 {
         self.index
     }
 
-    /// The arena this slot belongs to.
-    ///
     /// Borrowed from `&self`: holding the id is what keeps the arena alive, so the
     /// returned reference is valid for as long as the caller uses the id.
     const fn owner(&self) -> &Arena {
@@ -73,25 +70,21 @@ impl SlotId {
         unsafe { self.arena.as_ref() }
     }
 
-    /// Next slot of the chain, if the link exists.
     #[must_use]
     pub(crate) fn next(self) -> Option<Self> {
         self.owner().next(self.index)
     }
 
-    /// Published bytes of this slot.
     #[must_use]
     fn published(self) -> usize {
         self.owner().published(self.index)
     }
 
-    /// Number of live references. Debug aid.
     #[must_use]
     fn refs(self) -> usize {
         self.owner().slot(self.index).refs.get()
     }
 
-    /// Add a reference.
     fn retain(self) {
         self.owner().retain(self.index);
     }
@@ -150,7 +143,6 @@ struct Arena {
     /// Slots with `refs > 0`.
     used: Cell<usize>,
 
-    /// Next arena in the list of every allocated arena.
     next: Cell<Option<NonNull<Self>>>,
     /// Next arena in the free list, and whether this arena is on it.
     free_next: Cell<Option<NonNull<Self>>>,
@@ -335,7 +327,6 @@ impl ArenaSet {
         Some(SlotId { arena, index })
     }
 
-    /// Take the spare, or allocate a new arena.
     fn grow(&self) -> Option<NonNull<Arena>> {
         if let Some(spare) = self.spare.take() {
             return Some(spare);
@@ -382,7 +373,6 @@ impl ArenaSet {
         }
     }
 
-    /// Unlink `arena` from both lists and free it.
     fn free_arena(&self, arena: NonNull<Arena>) {
         self.remove_free(arena);
         self.remove_arena(arena);
@@ -392,7 +382,6 @@ impl ArenaSet {
         unsafe { drop(Box::from_raw(arena.as_ptr())) };
     }
 
-    /// Prepend `arena` to the list of all allocated arenas.
     fn push_arena(&self, arena: NonNull<Arena>) {
         // SAFETY: `arena` is a live node of the list.
         let node = unsafe { arena.as_ref() };
@@ -446,7 +435,6 @@ impl ArenaSet {
         self.free_list.set(Some(arena));
     }
 
-    /// Take the head of the free list.
     fn pop_free(&self) -> Option<NonNull<Arena>> {
         let head = self.free_list.get()?;
         // SAFETY: list nodes are live.
@@ -485,7 +473,6 @@ impl ArenaSet {
         unreachable!("arena is not in the free list");
     }
 
-    /// Number of allocated slots across every spool.
     #[must_use]
     pub const fn live_slots(&self) -> usize {
         self.live.get()
@@ -602,7 +589,6 @@ impl SlotMut {
         self.id
     }
 
-    /// Published bytes of this slot.
     #[must_use]
     pub fn published(&self) -> usize {
         self.id.published()

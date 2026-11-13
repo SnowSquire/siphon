@@ -124,7 +124,6 @@ impl Pipeline {
         }
     }
 
-    /// Demux one segment, then packetize everything it completed.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn segment(&mut self, bytes: &[u8], demux: &mut Duration, packetize: &mut Duration) {
         self.totals.bytes += bytes.len() as u64;
@@ -176,7 +175,6 @@ impl Pipeline {
     }
 }
 
-/// One pass over the whole broadcast at faster than real time.
 fn pass(segments: &[Vec<u8>]) -> Timing {
     let mut pipeline = Pipeline::new();
     let mut demux = Duration::ZERO;

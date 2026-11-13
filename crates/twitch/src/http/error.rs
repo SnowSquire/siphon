@@ -1,6 +1,5 @@
 use std::io;
 
-/// Errors from the HTTP client.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("io: {0}")]

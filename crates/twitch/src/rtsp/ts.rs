@@ -15,10 +15,8 @@ const TS_SYNC: u8 = 0x47;
 const PID_PAT: u16 = 0x0000;
 const STREAM_TYPE_H264: u8 = 0x1B;
 const STREAM_TYPE_AAC: u8 = 0x0F;
-/// PTS/DTS wrap at 2^33.
 const PTS_WRAP: i64 = 1 << 33;
 
-/// One demuxed access unit.
 #[derive(Debug)]
 pub enum Sample {
     Video(VideoSample),
@@ -27,7 +25,6 @@ pub enum Sample {
 
 #[derive(Debug)]
 pub struct VideoSample {
-    /// Presentation timestamp in 90 kHz units.
     pub pts: i64,
     /// Decode timestamp in 90 kHz units (equals `pts` when no reordering).
     pub dts: i64,
@@ -157,7 +154,6 @@ impl TsDemuxer {
         }
     }
 
-    /// H.264 parameter sets seen so far.
     #[must_use]
     pub const fn video_config(&self) -> &H264Config {
         &self.video_config
@@ -510,7 +506,6 @@ const fn unwrap_pts(pts: i64) -> i64 {
 mod tests {
     use super::*;
 
-    /// The NAL units of a sample as byte slices.
     fn nals_of(sample: &VideoSample) -> Vec<&[u8]> {
         sample
             .nals

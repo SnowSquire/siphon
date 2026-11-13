@@ -28,12 +28,10 @@ pub struct AdtsFrame {
     pub header_len: usize,
     /// Raw access unit length.
     pub frame_len: usize,
-    /// Codec configuration the header describes.
     pub config: AudioConfig,
 }
 
 impl AdtsFrame {
-    /// Total bytes of the ADTS frame, header included.
     #[must_use]
     pub const fn total_len(&self) -> usize {
         self.header_len + self.frame_len

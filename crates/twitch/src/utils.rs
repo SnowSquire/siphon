@@ -38,7 +38,6 @@ impl<T> RetainUnordered<T> for Vec<T> {
     }
 }
 
-/// Base64-encodes `input` with the standard alphabet and padding.
 pub fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -89,7 +88,6 @@ pub fn encode_component(value: &str) -> String {
     out
 }
 
-/// Builds `key=value&...` with both sides percent-encoded.
 pub fn query_string(params: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (index, (key, value)) in params.iter().enumerate() {
@@ -174,7 +172,6 @@ pub fn parse_iso8601_millis(text: &str) -> Option<i64> {
         return None;
     }
 
-    // Split the time from an optional `Z` or `±HH:MM` suffix.
     let (time, offset_minutes) = if let Some(time) = rest.strip_suffix('Z') {
         (time, 0)
     } else if let Some(position) = rest.rfind(['+', '-']) {
@@ -261,7 +258,6 @@ pub fn attributes(value: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-/// Finds one attribute by name in an HLS tag value.
 #[must_use]
 pub fn attribute<'a>(value: &'a str, name: &str) -> Option<&'a str> {
     attributes(value).find_map(|(key, value)| (key == name).then_some(value))

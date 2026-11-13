@@ -21,7 +21,6 @@ pub struct Carry {
 }
 
 impl Carry {
-    /// Copy the next `dst.len()` bytes out, if any are available.
     pub fn serve(&mut self, dst: &mut [u8]) -> usize {
         let available = self.data.len() - self.off;
         let take = available.min(dst.len());
@@ -96,8 +95,6 @@ pub enum Conn {
 }
 
 impl Conn {
-    /// Connect to `key`, upgrading to TLS when requested.
-    ///
     /// # Errors
     ///
     /// Fails on DNS, TCP, or TLS handshake failure, or when the connect timeout

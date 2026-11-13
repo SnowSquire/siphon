@@ -91,8 +91,6 @@ pub async fn fetch_variant_playlist(
         .await?;
     let payload = response.body.read_to_end(MAX_JSON).await?;
 
-    // setup master playlist -------------------------------------------
-
     let mut tree = PointerTree::new();
     tree.add_path(pointer!["data", "streamPlaybackAccessToken", "value"]);
     tree.add_path(pointer!["data", "streamPlaybackAccessToken", "signature"]);
@@ -116,8 +114,8 @@ pub async fn fetch_variant_playlist(
     let p_value = rand::random_range(0..9_999_999).to_string();
     let session_id = random_id();
     let params = [
-        ("allow_source", "true"),     // enables source variant
-        ("allow_audio_only", "true"), // enables audio only variant
+        ("allow_source", "true"),
+        ("allow_audio_only", "true"),
         ("allow_spectre", "true"), // idk what this adds but twtich-dlp has it, to inspect, maybe the fabled ertmpaudio1?
         ("browser_family", "chrome"),
         ("browser_version", "151.0"),

@@ -411,7 +411,6 @@ mod tests {
         let gate = Gate::default();
         run(async {
             let first = gate.acquire("a").await;
-            // A different key is independent.
             let other = gate.acquire("b").await;
             drop(other);
 

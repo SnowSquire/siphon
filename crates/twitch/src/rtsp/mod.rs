@@ -230,10 +230,6 @@ impl Track {
     }
 
     /// Build one RTP packet around `payload`, consuming a sequence number.
-    ///
-    /// Returned shared: the fan-out hands the same buffer to every session's
-    /// queue, so the packet is allocated once per access unit and not once per
-    /// session.
     fn packet(
         &mut self,
         timestamp: u32,
@@ -264,9 +260,6 @@ impl Track {
         Rc::new(packet)
     }
 
-    /// Forget the per-epoch state. Sequence numbers restart at 1 because the
-    /// receiver resets its own tracking on a seek and expects the next packet
-    /// after the gap to resynchronise.
     /// Forget the per-epoch timestamp state. The RTP **sequence continues**:
     /// ffmpeg resets its `s->seq` counter on a seek but keeps the RTP
     /// statistics (`max_seq`) from before it. Resetting the sequence to 1
@@ -321,10 +314,9 @@ impl Track {
         packet.extend_from_slice(&[0x81, 202]);
         packet.extend_from_slice(&sdes_length.to_be_bytes());
         packet.extend_from_slice(&self.ssrc.to_be_bytes());
-        packet.push(1); // CNAME item
+        packet.push(1);
         packet.push(u8::try_from(SDES_CNAME.len()).expect("cname fits in u8"));
         packet.extend_from_slice(SDES_CNAME);
-        // Pad the SDES packet to a 32-bit boundary.
         while packet.len() % 4 != 0 {
             packet.push(0);
         }
@@ -355,7 +347,6 @@ struct Session {
     /// line until the process is restarted. Control bytes therefore live in
     /// their own unbounded queue that the writer drains before each message.
     control: RefCell<VecDeque<Vec<u8>>>,
-    /// Bit set of tracks this session has set up.
     subscribed: Cell<u8>,
     playing: Cell<bool>,
     /// The client paused. ffmpeg's seek path always sends PAUSE before the PLAY
@@ -367,9 +358,9 @@ struct Session {
     /// absolute media clock this is the playhead at the PLAY (or the seek
     /// target), which is exactly the offset ffmpeg must add to its RTP delta.
     range_start: Cell<f64>,
-    /// A PLAY has already happened. The first PLAY's `npt=0` is ffmpeg's
-    /// default, not a request to rewind, so it starts at the live edge; later
-    /// PLAYs compare their range against the current position.
+    /// A PLAY has already happened. The first PLAY deliberately seeks to the
+    /// stream start, so only later PLAYs compare their range against the
+    /// current position.
     played: Cell<bool>,
     /// Bumped on a seek. The writer drops queued packets from older epochs, so
     /// a burst buffered before the seek cannot leak into the new timeline.
@@ -386,7 +377,6 @@ struct Session {
     /// A live RTSP session joins mid-GOP, where the decoder lacks references
     /// and reports "reference picture missing"; hold video until the next IDR.
     video_synced: Cell<bool>,
-    /// Next RTP sequence number of this session's timeline beacon.
     beacon_seq: Cell<u16>,
     /// Woken whenever this session's outbound queue gains room. Replaced when
     /// the control connection attaches to a stream (DESCRIBE): before that
@@ -465,7 +455,6 @@ enum Transport {
 
 /// Shared state between the RTSP control tasks and the media consumer.
 pub struct Stream {
-    /// Which `(channel, quality)` this presentation serves.
     key: StreamKey,
     /// Streamer/channel name; the SDP session name and player title.
     title: String,
@@ -591,9 +580,6 @@ impl Stream {
     }
 
     /// Fan one RTP packet out to every playing session subscribed to `track`.
-    ///
-    /// The packet is shared, not copied: every queue holds the same `Rc`, so
-    /// the fan-out costs a refcount per session.
     fn send(&self, track: u8, packet: &RtpPacket) {
         let bit = 1u8 << track;
         let keyframe = self.video_keyframe.get();
@@ -665,9 +651,7 @@ impl Stream {
     /// The bounded outbound queue is the receiver's buffer. Short VOD
     /// segments are sent as fast as that buffer drains, which is what lets a
     /// player consume faster than real time; a full queue means "slow down",
-    /// not "drop the client". [`RTCP_HEADROOM`] slots stay free for the sender
-    /// reports that are queued between samples: RTCP is not part of the packet
-    /// count, and a rejected report is a lost NTP/RTP mapping.
+    /// not "drop the client".
     ///
     /// Event-driven: the writer bumps [`DrainSignal`] on every dequeue, and
     /// pausing/seeking/disconnecting bumps it too, so this parks instead of
@@ -694,7 +678,6 @@ impl Stream {
         }
     }
 
-    /// Whether any playing session on `track` is too close to full.
     fn out_queue_blocked(&self, track: u8, packets: usize) -> bool {
         let bit = 1u8 << track;
         self.sessions.borrow().iter().any(|session| {
@@ -707,7 +690,6 @@ impl Stream {
         })
     }
 
-    /// Park until something may have freed outbound capacity.
     async fn wait_drained(&self) {
         let seen = self.drain.generation();
         poll_fn(|context| {
@@ -726,7 +708,6 @@ impl Stream {
         .await;
     }
 
-    /// Something that can unblock the media engine changed state.
     fn notify_drain(&self) {
         self.drain.notify();
     }
@@ -839,7 +820,6 @@ impl Stream {
         }
     }
 
-    /// Absolute NPT position of the live playhead, in seconds.
     #[allow(clippy::cast_precision_loss)] // broadcast durations are far below 2^53 ms
     fn position_seconds(&self) -> f64 {
         self.position_ms.get() as f64 / 1000.0
@@ -869,8 +849,6 @@ pub fn spawn_single(stream: Rc<Stream>) {
     .detach();
 }
 
-/// Both loopback families, on the default port if it is free, else on an
-/// ephemeral one.
 fn loopback_listeners() -> std::io::Result<Vec<TcpListener>> {
     match bind_loopbacks(DEFAULT_RTSP_PORT) {
         Ok(listeners) => Ok(listeners),
@@ -916,9 +894,7 @@ fn bind_loopbacks(port: u16) -> std::io::Result<Vec<TcpListener>> {
     }
 }
 
-/// Bind one loopback address.
-///
-/// compio's binder would do, except it sets `SO_REUSEADDR` unconditionally: on
+/// What compio's binder would do, except it sets `SO_REUSEADDR` unconditionally: on
 /// Windows that lets a second process share the port instead of failing, so the
 /// ephemeral fallback above would never trigger. Unix still sets it, to rebind
 /// over `TIME_WAIT`.
@@ -1109,10 +1085,8 @@ async fn writer(mut stream: TcpStream, rx: AsyncReceiver<Outbound>, session: Rc<
 
 /// Write one interleaved frame (`$`, channel, length, payload).
 ///
-/// Takes and returns the session's framing buffer: `write_all` hands the buffer
-/// back, so the allocation survives across packets. The payload still has to be
-/// copied once to put the four-byte header in front of it, but nothing is
-/// allocated.
+/// Takes and returns the session's framing buffer: `write_all` hands it back
+/// (`BufResult.1`), so framing costs a copy but no allocation per packet.
 async fn write_interleaved(
     stream: &mut TcpStream,
     frame: &mut Vec<u8>,
@@ -1332,7 +1306,6 @@ async fn handle_request(
                 (false, None) => av_info,
                 (true, None) => String::new(),
             };
-            // Keep the offset stable across pause/resume; only a seek changes it.
             let range = format!("npt={:.3}-", session.range_start.get());
             let mut headers = vec![("Range", range.as_str())];
             // RTP-Info seeds ffmpeg's `base_timestamp`. On a seek, the media
@@ -1598,7 +1571,7 @@ fn error_response(cseq: &str, status: &str) -> Vec<u8> {
     format!("RTSP/1.0 {status}\r\nCSeq: {cseq}\r\n\r\n").into_bytes()
 }
 
-/// Parse the start of an NPT range (`npt=12.345-`) into seconds.
+/// Parse an NPT range (`npt=12.345-`) into seconds.
 fn parse_npt_start(range: &str) -> Option<f64> {
     let value = range.trim().strip_prefix("npt=")?;
     let start = value.split('-').next()?.trim();
@@ -1668,7 +1641,6 @@ fn timeline_packet(seq: u16, pts_ms: u64, range_start: f64) -> RtpPacket {
     Rc::new(packet)
 }
 
-/// Queue one beacon (a new sequence number each time).
 fn timeline_step(session: &Session, pts_ms: u64) {
     let seq = session.beacon_seq.get();
     session.beacon_seq.set(seq.wrapping_add(1));
@@ -1692,8 +1664,6 @@ fn live_edge_ms(window: &RefCell<Vec<Segment>>) -> Option<u64> {
         .map(|segment| segment.timestamp_ms.saturating_add(LIVE_SEGMENT_MS))
 }
 
-/// One beacon per second for every playing session that set up the timeline
-/// track.
 async fn timeline_loop(hub: Rc<Stream>, window: Rc<RefCell<Vec<Segment>>>) {
     loop {
         compio::time::sleep(Duration::from_secs(1)).await;
@@ -1785,11 +1755,6 @@ fn media_to_ntp(media_90k: i64) -> u64 {
     (seconds << 32).wrapping_add(fraction)
 }
 
-/// Sleep until `pts` is due, anchored to the wall clock at the first sample.
-///
-/// A stream that arrives faster than real time is clamped to at most [`MAX_LEAD`]
-/// ahead, so the mock at 8x is sent in bursts instead of being starved; a live
-/// stream is paced at exactly 1x.
 /// Maps PES timestamps of the current segment onto the broadcast NPT.
 #[derive(Default)]
 struct Timeline {
@@ -1836,6 +1801,11 @@ impl Pacer {
         self.base_pts = None;
     }
 
+    /// Sleep until `pts` is due, anchored to the wall clock at the first sample.
+    ///
+    /// A stream that arrives faster than real time is clamped to at most
+    /// [`MAX_LEAD`] ahead, so the mock at 8x is sent in bursts instead of being
+    /// starved; a live stream is paced at exactly 1x.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     async fn wait(&mut self, pts: i64) {
         let now = Instant::now();
@@ -1870,7 +1840,6 @@ impl Pacer {
     }
 }
 
-/// Largest DVR segment body accepted from the VOD playlist.
 const MAX_VOD_SEGMENT: usize = 64 * 1024 * 1024;
 /// VOD is sent ahead of real time so players can buffer and consume faster than
 /// 1x. The bounded outbound queue ultimately throttles this to the client's
@@ -1890,7 +1859,6 @@ const LIVE_START_TOLERANCE_MS: u64 = 200;
 /// watch-later seek must not be turned into "play live" because of a slow start.
 const DVR_WAIT: Duration = Duration::from_secs(5);
 
-/// Register the demuxing consumer with the scheduler's fan-out.
 pub fn spawn_media(
     hub: Rc<Stream>,
     client: Rc<Client>,
@@ -1984,7 +1952,6 @@ enum VodOutcome {
 /// Where the media engine is in the DVR -> live transition.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Handover {
-    /// Normal live playback.
     None,
     /// The DVR ended; replay the live playlist window from the playhead.
     Replaying,
@@ -2004,7 +1971,6 @@ struct Media {
     samples: Vec<Sample>,
     last_sequence: u64,
     last_rtcp: Instant,
-    /// Newest live segment seen during normal live playback.
     pending_live: Option<Segment>,
     /// Live segments received while playing VOD, in broadcast order. At the
     /// handover they are replayed from the first one after the DVR playhead, so
@@ -2018,7 +1984,6 @@ struct Media {
     /// Scheduler snapshot of the live playlist window, used to bridge the DVR
     /// lag at the handover.
     live_window: Rc<RefCell<Vec<Segment>>>,
-    /// A discontinuity happened in the live stream while playing VOD.
     live_discontinuity: bool,
 }
 
@@ -2062,10 +2027,6 @@ impl Media {
                 return;
             }
             if self.handover_state != Handover::None {
-                // The DVR playlist lags the live edge by roughly one group.
-                // Replay the live window from the DVR playhead so playback
-                // continues with the first live segment after the last DVR
-                // group instead of jumping to the newest one.
                 if self.handover_state == Handover::Replaying {
                     self.handover_state = Handover::Queue;
                     if let Some(seek) = self.replay_live_window().await {
@@ -2121,9 +2082,7 @@ impl Media {
     }
 
     async fn seek(&mut self, mut target: u64) {
-        // Live segments received during the seek/VOD are kept in order. At the
-        // handover they are replayed from the first one after the DVR playhead,
-        // which is the start of the next live segment below the DVR grouping.
+        // Live segments buffered during the seek are replayed at the handover.
         self.handover.clear();
         self.handover_state = Handover::Replaying;
         self.vod_played = false;
@@ -2383,7 +2342,6 @@ impl Media {
         self.hub.set_position_ms(target_ms);
 
         let Some((mut url, mut start_ms, mut duration_ms)) = self.dvr.segment_at(target_ms) else {
-            // The target is outside the DVR timeline (usually the live window).
             debug!(
                 target_ms,
                 dvr_end_ms = self.dvr.end_ms(),
@@ -2522,7 +2480,6 @@ impl Media {
             let next_position = start_ms.saturating_add(duration_ms);
             let Some((next_url, next_start, next_duration)) = self.dvr.segment_at(next_position)
             else {
-                // Reached the published DVR end: hand over to live.
                 debug!(
                     next_position,
                     dvr_end_ms = self.dvr.end_ms(),
@@ -2667,7 +2624,6 @@ fn vod_start_index(samples: &[Sample], segment_start_ms: u64, target_ms: u64) ->
     chosen.unwrap_or(0)
 }
 
-/// Milliseconds between the first video sample and the chosen start index.
 fn samples_skipped_ms(samples: &[Sample], index: usize) -> u64 {
     let first_pts = samples.iter().find_map(|sample| match sample {
         Sample::Video(video) => Some(video.pts),
@@ -2880,7 +2836,6 @@ mod tests {
         let mut timeline = Timeline::default();
         timeline.start(10_000);
         assert_eq!(timeline.position_ms(90_000), 10_000);
-        // 90 kHz: 90 000 ticks is one second.
         assert_eq!(timeline.position_ms(180_000), 11_000);
     }
 

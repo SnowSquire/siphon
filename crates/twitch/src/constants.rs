@@ -5,8 +5,6 @@
 
 use std::time::Duration;
 
-// ---------------------------------------------------------------- twitch --
-
 pub const PLAYER_VERSION: &str = "1.58.0-rc.2";
 
 pub const TWITCH_GQL_ENDPOINT: &str = "https://gql.twitch.tv/gql";
@@ -14,8 +12,6 @@ pub const TWITCH_OAUTH_ENDPOINT: &str = "https://id.twitch.tv/oauth2/validate";
 pub const TWITCH_HLS_BASE: &str = "https://usher.ttvnw.net/api/v2/channel/hls";
 
 pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
-
-// ----------------------------------------------------------- local server --
 
 /// RTSP control port; RTP/RTCP use ephemeral ports or interleaved TCP.
 pub const DEFAULT_RTSP_PORT: u16 = 7417;
@@ -46,8 +42,6 @@ pub const DOWNLOAD_TASKS: usize = 8;
 /// individual message instead, so this only bites a strict consumer.
 pub const MAX_CONSUMER_LAG: usize = 20;
 
-// ----------------------------------------------------------------- arena --
-
 /// Bytes per slot: `188 * 1024`.
 ///
 /// 188 is the mpegts packet size, so a slot boundary never splits a packet; 1024
@@ -58,10 +52,8 @@ pub const SLOT_SIZE: usize = 192_512;
 /// Slots per arena (one `u32` free bitmap).
 pub const SLOTS_PER_ARENA: usize = 32;
 
-/// Alignment of an arena's payload.
 pub const ARENA_ALIGN: usize = 4096;
 
-/// Payload bytes of one arena.
 pub const ARENA_BYTES: usize = SLOTS_PER_ARENA * SLOT_SIZE;
 
 /// Slots one spool — one segment — may hold.
@@ -72,8 +64,6 @@ pub const ARENA_BYTES: usize = SLOTS_PER_ARENA * SLOT_SIZE;
 /// this is the only way a spool write fails.
 pub const SEGMENT_SLOTS_MAX: usize = 64;
 
-// ------------------------------------------------------------ downloader --
-
 /// Attempts per segment before giving up.
 pub const DOWNLOAD_RETRIES: u32 = 4;
 
@@ -82,8 +72,6 @@ pub const ARENA_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Consecutive slot-arena waits before the segment is abandoned.
 pub const ARENA_RETRIES: u32 = 40;
-
-// --------------------------------------------------------------- http --
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -112,8 +100,6 @@ pub const MAX_CHUNK_LINE: usize = 256;
 pub const POOL_MAX_IDLE: usize = 8;
 pub const POOL_MAX_IDLE_PER_HOST: usize = 4;
 pub const POOL_IDLE_AGE: Duration = Duration::from_secs(30);
-
-// -------------------------------------------------------------- bodies --
 
 /// Cap on a media playlist body.
 pub const MAX_MANIFEST: usize = 1024 * 1024;

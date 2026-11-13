@@ -43,7 +43,6 @@ struct PrefetchSegment {
     reader: Reader,
 }
 
-/// A consumer registering for the live fan-out.
 #[derive(Debug)]
 pub struct ConsumerRegistration {
     pub tx: Sender<SegmentMessage>,
@@ -58,7 +57,6 @@ pub struct ConsumerRegistration {
     pub lossy: bool,
 }
 
-/// One registered consumer of the live fan-out.
 #[derive(Debug)]
 struct Consumer {
     tx: Sender<SegmentMessage>,
@@ -191,7 +189,6 @@ async fn next_reader(
     .await
 }
 
-/// copied and modified from twitch-hls-client directly
 pub struct StreamScheduler {
     client: Rc<Client>,
     arena: Rc<ArenaSet>,
@@ -201,7 +198,6 @@ pub struct StreamScheduler {
     receive: Receiver<ConsumerRegistration>,
     reader_wake: Rc<ConsumerWake>,
 
-    /// hls fmp4 init header, doesn't reqire a discontinuity
     init: Option<(String, Reader)>,
 
     segments: Vec<Segment>,
@@ -416,8 +412,6 @@ impl StreamScheduler {
             match select(sleep, wait).await {
                 Either::Left(((), _)) => return true,
                 Either::Right((None, _)) => return false,
-                // Adopt the new consumer immediately, then keep sleeping out
-                // whatever is left of the interval.
                 Either::Right((Some(reader), _)) => {
                     self.adopt(reader);
                     if !self.handle_new_readers() {

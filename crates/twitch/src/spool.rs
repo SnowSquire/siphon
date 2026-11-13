@@ -38,7 +38,6 @@ pub use crate::arena::SlotRef;
 pub use crate::arena::SlotView;
 use crate::constants::SEGMENT_SLOTS_MAX;
 
-/// One waker slot per consumer task.
 pub struct ConsumerWake {
     waker: Cell<Option<Waker>>,
 }
@@ -105,7 +104,6 @@ pub struct Spool {
 }
 
 impl Spool {
-    /// Open a spool in `arena`, with its wakeups delivered through `wakes`.
     pub fn open(arena: &Rc<ArenaSet>, wakes: &Rc<WakeSet>) -> Result<(Writer, Reader), ArenaFull> {
         let head = arena.alloc().ok_or(ArenaFull)?;
         let spool = Rc::new(Self {
@@ -129,7 +127,6 @@ impl Spool {
     }
 }
 
-/// The single writer of one spool.
 pub struct Writer {
     spool: Rc<Spool>,
     wakes: Rc<WakeSet>,
@@ -154,7 +151,6 @@ impl Writer {
         Ok(self.tail.tail())
     }
 
-    /// Publish `len` more bytes and wake the consumers.
     pub fn commit(&self, len: usize) {
         let published = self.tail.published() + len;
         self.tail.publish(published);
@@ -177,7 +173,6 @@ impl Drop for Writer {
     }
 }
 
-/// A consumer's cursor over one spool.
 pub struct Reader {
     spool: Rc<Spool>,
     cursor: SlotRef,

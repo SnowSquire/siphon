@@ -179,7 +179,6 @@ impl Body {
         Ok(out)
     }
 
-    /// Copy from the carry if it has bytes, otherwise read straight from the socket.
     async fn fill(&mut self, dst: &mut [u8]) -> Result<usize, Error> {
         let available = self.carry.len() - self.off;
         if available > 0 {

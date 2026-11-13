@@ -45,7 +45,6 @@ use crate::http::pool::Pool;
 use crate::http::pool::PoolKey;
 use crate::http::transport::Conn;
 
-/// Run `future` for at most `duration`.
 pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, Error> {
     use futures_util::future::Either;
     use futures_util::future::select;
@@ -73,30 +72,26 @@ impl Client {
         }
     }
 
-    /// `GET url` with no extra headers.
     pub async fn get(&self, url: &str) -> Result<Response, Error> {
         self.get_with(url, &[]).await
     }
 
-    /// `GET url` with extra headers.
     pub async fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, Error> {
         let uri = parse_url(url)?;
         self.execute(Method::GET, uri, headers, None, None).await
     }
 
-    /// `HEAD url` with no extra headers.
     pub async fn head(&self, url: &str) -> Result<Response, Error> {
         self.head_with(url, &[]).await
     }
 
-    /// `HEAD url` with extra headers. The body is always empty; the response
-    /// head is enough for existence probes.
+    /// The body is always empty; the response head is enough for existence
+    /// probes.
     pub async fn head_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Response, Error> {
         let uri = parse_url(url)?;
         self.execute(Method::HEAD, uri, headers, None, None).await
     }
 
-    /// `POST url` with a body.
     pub async fn post(
         &self,
         url: &str,
@@ -191,7 +186,6 @@ struct Head {
     version: u8,
 }
 
-/// Write the request line, headers and optional body, then read the response head.
 async fn send_request(conn: &mut Conn, request: &str, body: Option<&[u8]>) -> Result<Head, Error> {
     conn.write_all(request.as_bytes()).await?;
     if let Some(body) = body

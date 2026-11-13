@@ -1,33 +1,33 @@
 // Debug/stat accessors are exercised by the arena tests and future policies.
 #[allow(dead_code, clippy::future_not_send)]
 mod arena;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod constants;
 // Disk output is disabled for now: RTSP/RTP is the only sink. The module is kept
 // (and mirrors index.hexpat) for when the DVR output comes back.
 // #[allow(clippy::future_not_send)]
 // mod disk;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod daemon;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod downloader;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod spool;
 // compio tasks are deliberately !Send (one thread-per-core reactor).
 // `dead_code`: the client exposes a slightly wider surface than this binary uses.
 #[allow(dead_code, clippy::future_not_send)]
 mod http;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod playlist;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod rtsp;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod scheduler;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod sha1;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod utils;
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 mod variant;
 
 use std::cell::RefCell;
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// One channel, served at the root of every loopback RTSP address.
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 async fn play(cfg: &Config, args: &Play) -> Result<(), VariantPlaylistError> {
     let title = if cfg.debug {
         DEBUG_CHANNEL_TITLE.to_owned()
@@ -251,7 +251,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), VariantPlaylistError> {
 
 /// A long-lived RTSP server: streams are created by `DESCRIBE` and dropped when
 /// their last viewer disconnects.
-#[allow(clippy::future_not_send)] // one thread-per-core reactor, tasks are !Send
+#[allow(clippy::future_not_send)]
 async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::Error>> {
     let client = Rc::new(Client::new());
     let arena = Rc::new(ArenaSet::new());

@@ -84,7 +84,6 @@ impl<'a> Iterator for Playlist<'a> {
                 continue;
             }
 
-            // A bare URI always closes the pending `EXTINF`.
             let Some(tag) = line.strip_prefix('#') else {
                 let Some((duration_ms, is_ad)) = self.extinf.take() else {
                     continue; // stray URI

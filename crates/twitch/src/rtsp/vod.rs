@@ -74,7 +74,6 @@ const DISCOVERY_RETRY: Duration = Duration::from_secs(10);
 /// playlists depends on the scheduler's variant.
 const VARIANT_WAIT: Duration = Duration::from_secs(5);
 
-/// One segment of the DVR playlist, positioned on the broadcast timeline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VodSegment {
     pub start_ms: u64,
@@ -294,7 +293,6 @@ pub fn spawn(client: Rc<Client>, channel: Option<String>, dvr: Rc<Dvr>) {
     .detach();
 }
 
-/// What discovery found.
 enum Discovery {
     /// Private DVR: one media playlist, no variant choice involved.
     Media(String),
@@ -353,7 +351,6 @@ async fn wait_live_variant(dvr: &Dvr) -> Option<String> {
     }
 }
 
-/// Find the full-broadcast playlist for a live channel.
 async fn discover(client: &Client, channel: &str) -> Option<Discovery> {
     let data = gql(
         client,
@@ -565,7 +562,6 @@ async fn fetch_text(client: &Client, url: &str, limit: usize) -> Option<String> 
     String::from_utf8(body).ok()
 }
 
-/// Resolve a segment URI against the playlist URL.
 #[must_use]
 pub fn resolve_url(base_url: &str, uri: &str) -> String {
     if uri.starts_with("http://") || uri.starts_with("https://") {

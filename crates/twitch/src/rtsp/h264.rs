@@ -3,9 +3,7 @@
 //! Ported from `mediacommon/pkg/codecs/h264` and `gortsplib/pkg/format/rtph264`
 //! (both MIT). Packetization mode 1: single NAL, STAP-A and FU-A.
 
-/// NAL unit type of an access unit delimiter.
 const NAL_AUD: u8 = 9;
-/// NAL unit type of a coded slice belonging to an IDR picture.
 const NAL_IDR: u8 = 5;
 const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
@@ -22,7 +20,6 @@ pub struct H264Config {
 }
 
 impl H264Config {
-    /// Record a parameter set found in the elementary stream.
     pub fn push(&mut self, nal: &[u8]) {
         let Some(&header) = nal.first() else {
             return;
@@ -189,7 +186,6 @@ fn write_batch(
         return;
     }
 
-    // Single-time aggregation packet.
     scratch.clear();
     scratch.push(NAL_STAP_A);
     for nalu in batch {
@@ -242,7 +238,6 @@ fn write_fragmented(
 mod tests {
     use super::*;
 
-    /// The NAL ranges as byte slices, for readable assertions.
     fn units<'a>(au: &'a [u8], nals: &[(usize, usize)]) -> Vec<&'a [u8]> {
         nals.iter().map(|&(start, end)| &au[start..end]).collect()
     }

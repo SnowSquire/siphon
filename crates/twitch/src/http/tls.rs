@@ -118,7 +118,6 @@ impl TlsConn {
         Ok(())
     }
 
-    /// Read more ciphertext from the socket.
     async fn refill(&mut self) -> Result<(), Error> {
         let mut buf = std::mem::take(&mut self.inbuf);
         buf.clear();
@@ -134,7 +133,6 @@ impl TlsConn {
         Ok(())
     }
 
-    /// Advance the state machine once.
     async fn pump(&mut self) -> Result<Pump, Error> {
         let plaintext_before = self.plain.data.len();
         let mut discard;
