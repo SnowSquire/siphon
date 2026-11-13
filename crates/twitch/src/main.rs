@@ -116,24 +116,8 @@ fn default_bind() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_RTSP_PORT))
 }
 
-/// Every panic is fatal, in every build.
-///
-/// Tasks are detached, so a panicking task would otherwise just disappear: the
-/// RTSP control plane keeps answering while no media is ever produced again,
-/// and the scheduler keeps running with a dead consumer. Release builds already
-/// get this from `panic = "abort"`; this makes `cargo run` behave the same way
-/// instead of freezing forty minutes into a stream.
-fn abort_on_panic() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default(info);
-        std::process::abort();
-    }));
-}
-
 #[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    abort_on_panic();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();

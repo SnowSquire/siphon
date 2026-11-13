@@ -2,7 +2,7 @@
 target/
 
 # Downloaded/captured state
-manifest/
+manifests/
 captures/
 
 # Player-side repro artefacts
