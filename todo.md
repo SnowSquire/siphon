@@ -7,6 +7,9 @@
 - [ ] move from clap to bpaf (evaluate first)
 - [ ] capture a portrait stream + public VOD (DVR variant set, PDT) for the disk recorder
 - [ ] Hermes WebSocket listener to automatically start recording
+- [ ] disk-backed RTSP seeking (read index/segs; stop the DVR refresh when disk is on)
+- [ ] fMP4 / HEVC / AV1 RTP output
+- [ ] Discord webhook sender behind notify()
 - [ ] final options
   - [x] low latency
   - [x] auth token

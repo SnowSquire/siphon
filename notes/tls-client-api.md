@@ -361,6 +361,12 @@ Driver obligations are enumerated in §2.2. Everything above `http/tls.rs`
 `compio-tls` + `AsyncStream`, or switching to schannel/plaintext later, touches
 one file.
 
+Above the transport, `http/mod.rs` is a small pool keyed by `(tls, host, port)`
+(4 idle connections per host, 8 total, 30 s idle); redirects are followed for
+GET/HEAD; the body decoder is chunked-first (Twitch's segment CDN is mostly
+`Transfer-Encoding: chunked`) and reads payload straight into the caller's
+buffer, so a body is copied at most once.
+
 Testing (we must not debug handshakes against Twitch):
 
 - loopback harness: a `std::net::TcpListener` thread running rustls's *buffered*

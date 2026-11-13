@@ -77,6 +77,19 @@ spool write fails.
 **`SlotView` derives its base from `SlotId`** instead of holding a second
 `Rc<Arena>`; the pinned slot already keeps the arena alive.
 
+## Spool and wakeups
+
+- Slots are `192_512` B (`188 × 1024`, page-aligned), 32 per arena, `alloc_zeroed`
+  so the first touch maps whole pages; every view derives from one base pointer
+  (Miri-checked under Stacked Borrows).
+- A `SlotView` is an `IoBuf`: readers hand arena memory straight to
+  `write_all`/`write_at`, so the fan-out is zero-copy.
+- A spool has no wait list. Each consumer task owns one `ConsumerWake` (one
+  `Waker`, allocated once) registered in the scheduler's `WakeSet`; a publish
+  wakes every registered consumer and each re-checks its own spool frontier.
+  Waking on close only was the old design, and it turned live streaming into one
+  burst per segment. See `spool.rs::Wait`.
+
 ## Deleted
 
 `SpoolId`, `SpoolSlot`, `free_spools`, `alloc_spool`/`retain_spool`/

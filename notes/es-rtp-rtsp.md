@@ -37,6 +37,9 @@ design-only.
   `origin + media presentation time`, so the mapping is the same regardless of
   how far ahead the VOD pacer has sent; a wall-clock NTP would make ffmpeg pull
   the timeline backwards on every report.
+- RTCP fields are big-endian 32-bit words. `ntp >> 32` is still a `u64` in Rust,
+  and the compound-packet length is words-minus-one; both mistakes silently
+  shift the RTP/NTP mapping.
 
 ## VOD / DVR seeking (implemented)
 
@@ -118,6 +121,8 @@ design-only.
 
 - **No FFmpeg.** Codec config and SPS/sequence-header parsing replace the probe.
 - **No MPEG-TS muxer.** fMP4 is never remuxed to TS.
+- **Containers cannot cross disconnect protection.** mpegts ↔ fmp4 is not
+  upgradable or downgradable mid-stream (`notes.txt`).
 - **RTSP with ES-RTP only.** One RTP track per codec; no TS-over-RTP.
 - **Sources stay as they are:**
   - TS source = H.264 + AAC (Twitch only puts these in TS).
