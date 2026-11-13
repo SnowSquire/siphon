@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Twitch HLS live-stream client (Rust) + `servermock/` (Node mock Twitch edge server) used to test it offline. No README; `todo.md` and `notes.txt` are the maintainer's live scratch notes — read them before touching scheduler/disk logic. `notes/` has the longer design documents (transport probe, slot arena / RTSP output, TLS client API).
+Twitch HLS live-stream client (Rust) + `servermock/` (Node mock Twitch edge server) used to test it offline. No README; `todo.md` and `notes.txt` are the maintainer's live scratch notes — read them before touching scheduler/disk logic. `notes/` has the longer design documents (transport probe, slot arena / RTSP output, TLS client API, disk recording).
 
 ## Commands
 

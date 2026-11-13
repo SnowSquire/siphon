@@ -28,3 +28,5 @@ figure out how big the unbounded channels actually get, and bound them
 miri? or some other unsafe verifier? i use unsafe a lot so....
 
 move from clap to bpaf (evaluate first)
+
+capture a portrait stream + public VOD (DVR variant set, PDT) for the disk recorder
