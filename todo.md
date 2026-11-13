@@ -6,6 +6,7 @@
 - [ ] figure out how big the unbounded channels actually get, and bound them
 - [ ] move from clap to bpaf (evaluate first)
 - [ ] capture a portrait stream + public VOD (DVR variant set, PDT) for the disk recorder
+- [ ] Hermes WebSocket listener to automatically start recording
 - [ ] final options
   - [x] low latency
   - [x] auth token
