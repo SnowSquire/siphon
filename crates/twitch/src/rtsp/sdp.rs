@@ -8,6 +8,11 @@ use crate::rtsp::h264::H264Config;
 
 pub const VIDEO_PAYLOAD_TYPE: u8 = 96;
 pub const AUDIO_PAYLOAD_TYPE: u8 = 97;
+/// The timeline beacon: a second audio track whose packets carry only the
+/// current live-edge NPT as silent AAC frames. It produces no audible output
+/// (the real audio track is the default) but its packet timestamps are the only
+/// in-band way to tell a player where the live edge is after DESCRIBE.
+pub const TIMELINE_PAYLOAD_TYPE: u8 = 98;
 pub const VIDEO_CLOCK_RATE: u32 = 90_000;
 
 /// Build the session description from the codec configuration discovered in
@@ -19,13 +24,18 @@ pub const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// The session range starts at NPT 0 deliberately. `npt_end` is the current
 /// end of the broadcast when known: a finite range makes the stream seekable
 /// (clients enable their seek bar), while an omitted end marks it live.
+///
+/// `timeline` appends the live-edge beacon track, which carries no pictures
+/// and exists only so the player can grow its duration after DESCRIBE.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     origin: IpAddr,
     title: &str,
     npt_end: Option<f64>,
     video: Option<&H264Config>,
     audio: Option<&AudioConfig>,
+    timeline: bool,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -91,6 +101,21 @@ pub fn build(
         sdp.push_str("a=control:trackID=1\r\n");
     }
 
+    if timeline {
+        // A second AAC track: silent frames carrying the live-edge timestamps.
+        // The real audio is first, so a player's default audio pick is unchanged.
+        let _ = write!(sdp, "m=audio 0 RTP/AVP {TIMELINE_PAYLOAD_TYPE}\r\n");
+        let _ = write!(
+            sdp,
+            "a=rtpmap:{TIMELINE_PAYLOAD_TYPE} mpeg4-generic/48000/2\r\n"
+        );
+        let _ = write!(
+            sdp,
+            "a=fmtp:{TIMELINE_PAYLOAD_TYPE} streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1190\r\n"
+        );
+        sdp.push_str("a=control:trackID=2\r\n");
+    }
+
     sdp
 }
 
@@ -152,6 +177,7 @@ mod tests {
             Some(123.456),
             Some(&video),
             Some(&audio),
+            true,
         );
         assert!(sdp.contains("s=sunnys\r\n"));
         assert!(sdp.contains("a=range:npt=0-123.456\r\n"));
@@ -164,5 +190,9 @@ mod tests {
         assert!(sdp.contains("mpeg4-generic/48000/2"));
         assert!(sdp.contains("config=1190"));
         assert!(sdp.contains("a=control:trackID=1\r\n"));
+        assert!(sdp.contains("m=audio 0 RTP/AVP 98\r\n"));
+        assert!(sdp.contains("a=rtpmap:98 mpeg4-generic/48000/2\r\n"));
+        assert!(sdp.contains("a=control:trackID=2\r\n"));
+        assert!(sdp.contains("a=fmtp:98"));
     }
 }

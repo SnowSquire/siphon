@@ -66,7 +66,22 @@ use crate::spool::WakeSet;
 
 const TRACK_VIDEO: u8 = 0;
 const TRACK_AUDIO: u8 = 1;
-const TRACK_COUNT: usize = 2;
+/// The live-edge beacon track. It carries no pictures: its RTP timestamps are
+/// the broadcast NPT of the current live edge, so the player's demuxer (which
+/// grows `duration` from the highest packet timestamp) tracks the broadcast
+/// length after DESCRIBE.
+const TRACK_TIMELINE: u8 = 2;
+const TRACK_COUNT: usize = 3;
+
+/// The beacon's own SSRC, independent of the A/V tracks.
+const TIMELINE_SSRC: u32 = 0x5A5A_0003;
+/// AAC-LC silent frame (1024 samples, 48 kHz stereo), 6 raw bytes. The beacon
+/// sends one per second; it is never audible because the real audio track is
+/// the default, but a normal AAC RTP packet is what makes the demuxer emit a
+/// packet and count its timestamp.
+const TIMELINE_AU: &[u8] = &[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c];
+/// The beacon track's RTP clock (the SDP advertises 48 kHz).
+const TIMELINE_CLOCK: u64 = 48_000;
 
 /// Outbound-queue slots kept free for the RTCP sender reports that are queued
 /// between samples. They are not part of `wait_out_capacity`'s packet count, so
@@ -348,8 +363,14 @@ struct Session {
     /// PLAY (or a saved resume position in the initial PLAY).
     paused: Cell<bool>,
     /// NPT offset last advertised in a PLAY response. Kept unchanged for
-    /// pause/resume so ffmpeg's `range_start_offset` does not jump.
+    /// pause/resume so ffmpeg's `range_start_offset` does not jump. With the
+    /// absolute media clock this is the playhead at the PLAY (or the seek
+    /// target), which is exactly the offset ffmpeg must add to its RTP delta.
     range_start: Cell<f64>,
+    /// A PLAY has already happened. The first PLAY's `npt=0` is ffmpeg's
+    /// default, not a request to rewind, so it starts at the live edge; later
+    /// PLAYs compare their range against the current position.
+    played: Cell<bool>,
     /// Bumped on a seek. The writer drops queued packets from older epochs, so
     /// a burst buffered before the seek cannot leak into the new timeline.
     epoch: Cell<u32>,
@@ -365,6 +386,8 @@ struct Session {
     /// A live RTSP session joins mid-GOP, where the decoder lacks references
     /// and reports "reference picture missing"; hold video until the next IDR.
     video_synced: Cell<bool>,
+    /// Next RTP sequence number of this session's timeline beacon.
+    beacon_seq: Cell<u16>,
     /// Woken whenever this session's outbound queue gains room. Replaced when
     /// the control connection attaches to a stream (DESCRIBE): before that
     /// there is nothing to wake.
@@ -460,6 +483,10 @@ pub struct Stream {
     rtp_origin_ntp: Cell<u64>,
     /// Current playhead in milliseconds since the start of the broadcast.
     position_ms: Cell<u64>,
+    /// The scheduler's live edge in milliseconds since the start of the
+    /// broadcast, refreshed by the timeline beacon task. Independent of the
+    /// media engine's playhead, so it remains the live edge during DVR replay.
+    live_edge_ms: Cell<u64>,
     /// Set for the duration of one video access unit, so `send` can decide
     /// whether a session still waiting for an IDR may start.
     video_keyframe: Cell<bool>,
@@ -486,6 +513,7 @@ impl Stream {
             audio_base: Cell::new(None),
             rtp_origin_ntp: Cell::new(0),
             position_ms: Cell::new(0),
+            live_edge_ms: Cell::new(0),
             video_keyframe: Cell::new(false),
             seek_tx: RefCell::new(None),
             video: RefCell::new(Track::new(
@@ -557,6 +585,7 @@ impl Stream {
         match track {
             TRACK_VIDEO => self.video_config.borrow().is_some(),
             TRACK_AUDIO => self.audio_config.borrow().is_some(),
+            TRACK_TIMELINE => true,
             _ => false,
         }
     }
@@ -736,6 +765,7 @@ impl Stream {
         });
     }
 
+    #[allow(dead_code)] // Kept for the epoch bookkeeping; the media clock is absolute now.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn rtp_timestamp(pts: i64, clock_rate: u32, base: &Cell<Option<i64>>) -> u32 {
         let base = base.get().unwrap_or_else(|| {
@@ -968,10 +998,12 @@ async fn control_session(stream: TcpStream, peer: SocketAddr, resolver: Rc<dyn S
         playing: Cell::new(false),
         paused: Cell::new(false),
         range_start: Cell::new(0.0),
+        played: Cell::new(false),
         epoch: Cell::new(0),
         seeking: Cell::new(false),
         seek_started: Cell::new(None),
         video_synced: Cell::new(false),
+        beacon_seq: Cell::new(1),
         drain: RefCell::new(DrainSignal::new()),
     });
     compio::runtime::spawn(writer(write, out_rx.to_async(), Rc::clone(&session))).detach();
@@ -997,7 +1029,7 @@ async fn control_session(stream: TcpStream, peer: SocketAddr, resolver: Rc<dyn S
 }
 
 async fn writer(mut stream: TcpStream, rx: AsyncReceiver<Outbound>, session: Rc<Session>) {
-    let mut transports: [Option<Transport>; TRACK_COUNT] = [None, None];
+    let mut transports: [Option<Transport>; TRACK_COUNT] = [None, None, None];
     // Interleaved framing buffer, allocated once and handed back by every
     // write. `write_all` returns the buffer it was given, so the payload is
     // copied in place instead of into a fresh `Vec` per packet.
@@ -1235,12 +1267,23 @@ async fn handle_request(
             // A PAUSE+PLAY is always a seek. So is a PLAY carrying a new range
             // while already playing: mpv sometimes seeks without pausing, and
             // requiring PAUSE made the first seek silently resume instead.
+            //
+            // The first PLAY starts at the stream start (the DVR's first
+            // segment), not at the live edge: its real first video frame at
+            // NPT 0 is what anchors the player's timeline at 0. ffmpeg's
+            // `npt=0` is the default, so this is one deliberate seek rather
+            // than "resume live". A saved nonzero start is honoured as-is.
             let requested = request.range.as_deref().and_then(parse_npt_start);
             let was_paused = session.paused.replace(false);
+            let position = hub.position_seconds();
+            let first = !session.played.get();
             let seek_requested = requested.is_some_and(|target| {
-                was_paused
-                    || seconds_to_ms(target).abs_diff(seconds_to_ms(session.range_start.get()))
-                        > 1_500
+                let target_ms = seconds_to_ms(target);
+                if first {
+                    true
+                } else {
+                    was_paused || target_ms.abs_diff(seconds_to_ms(position)) > 1_500
+                }
             });
             debug!(
                 range = request.range.as_deref().unwrap_or("-"),
@@ -1264,16 +1307,31 @@ async fn handle_request(
             }
             // A PLAY that did not ask the media engine for a new timeline (first
             // play, plain resume, or a no-op seek) must not leave the session
-            // gated behind `seeking`.
+            // gated behind `seeking`. Its NPT offset is the current playhead:
+            // the media timestamps are absolute, so the player's
+            // `range_start_offset` has to be re-anchored here.
             if !waiting {
                 session.seeking.set(false);
                 session.seek_started.set(None);
+                session.range_start.set(position);
             }
+            session.played.set(true);
             // `playing`/`seeking` just changed, so the engine may no longer be
             // blocked on this session's queue.
             hub.notify_drain();
 
-            let info = rtp_info(&hub, &request.uri, session.subscribed.get());
+            let av_info = rtp_info(&hub, &request.uri, session.subscribed.get());
+            let beacon = (session.subscribed.get() & (1 << TRACK_TIMELINE) != 0)
+                .then(|| timeline_info(&request.uri, session.beacon_seq.get()));
+            // On a seek the A/V RTP-Info is stale (the epoch has not reset yet),
+            // but the beacon lives on its own timestamps and must always be
+            // advertised, or its PTS loses the session's NPT offset.
+            let info = match (seek_requested, beacon) {
+                (false, Some(beacon)) if !av_info.is_empty() => format!("{av_info},{beacon}"),
+                (_, Some(beacon)) => beacon,
+                (false, None) => av_info,
+                (true, None) => String::new(),
+            };
             // Keep the offset stable across pause/resume; only a seek changes it.
             let range = format!("npt={:.3}-", session.range_start.get());
             let mut headers = vec![("Range", range.as_str())];
@@ -1282,7 +1340,7 @@ async fn handle_request(
             // old live timestamp; advertising it makes ffmpeg reject every
             // post-seek packet until the next PLAY. Omit it and let the first
             // packet establish the base.
-            if !seek_requested {
+            if !info.is_empty() {
                 headers.push(("RTP-Info", info.as_str()));
             }
             send_response(session, response(&request.cseq, Some(id), &headers, ""));
@@ -1323,6 +1381,7 @@ async fn handle_request(
 
 /// Resolve the requested `(channel, quality)`, attach the connection to it and
 /// answer with the SDP.
+#[allow(clippy::cast_precision_loss)] // broadcast durations are far below 2^53 ms
 async fn describe(
     resolver: &Rc<dyn StreamResolver>,
     session: &Rc<Session>,
@@ -1349,16 +1408,19 @@ async fn describe(
 
     let video = stream.video_config.borrow();
     let audio = stream.audio_config.borrow();
-    // A finite end makes the stream seekable in the player; the live
-    // playhead is the current end of the broadcast.
-    let end = stream.position_seconds();
-    let end = (end >= 0.5).then_some(end);
+    // A finite end makes the stream seekable in the player; the live edge (the
+    // scheduler's, not the playhead, which may be replaying the DVR) is the
+    // current end of the broadcast. The timeline beacon keeps it growing.
+    let live_edge = stream.live_edge_ms.get();
+    let end_ms = live_edge.max(stream.position_ms.get());
+    let end = (end_ms >= 500).then(|| end_ms as f64 / 1000.0);
     let sdp = sdp::build(
         local.ip(),
         &stream.title,
         end,
         video.as_ref(),
         audio.as_ref(),
+        true,
     );
     drop(video);
     drop(audio);
@@ -1501,7 +1563,8 @@ async fn setup(
 fn track_ssrc(hub: &Stream, track: u8) -> u32 {
     match track {
         TRACK_VIDEO => hub.video.borrow().ssrc,
-        _ => hub.audio.borrow().ssrc,
+        TRACK_AUDIO => hub.audio.borrow().ssrc,
+        _ => TIMELINE_SSRC,
     }
 }
 
@@ -1572,11 +1635,91 @@ fn rtp_info(hub: &Stream, uri: &str, subscribed: u8) -> String {
     entries.join(",")
 }
 
+/// The beacon's `RTP-Info` entry. `rtptime=1` is the base every beacon
+/// timestamp is expressed against; 0 would be ignored by ffmpeg (it treats a
+/// zero base as "unset") and the first packet would then become the base.
+fn timeline_info(uri: &str, seq: u16) -> String {
+    let base = uri.trim_end_matches('/');
+    format!("{base}/trackID=2;seq={seq};rtptime=1")
+}
+
+/// One beacon packet. `pts_ms` is the broadcast NPT it announces, and the RTP
+/// timestamp is shifted by the session's advertised NPT offset so that the
+/// player computes `pts = rtp - 1 + range_start = pts_ms`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+fn timeline_packet(seq: u16, pts_ms: u64, range_start: f64) -> RtpPacket {
+    let ticks = (pts_ms.saturating_mul(TIMELINE_CLOCK / 1000)) as i64;
+    let base = (range_start * TIMELINE_CLOCK as f64) as i64;
+    let timestamp = (ticks + 1 - base) as u32;
+    let payload = aac::packetize(TIMELINE_AU);
+
+    let mut packet = Vec::with_capacity(12 + payload.len());
+    packet.push(0x80);
+    packet.push(0x80 | sdp::TIMELINE_PAYLOAD_TYPE); // marker
+    packet.extend_from_slice(&seq.to_be_bytes());
+    packet.extend_from_slice(&timestamp.to_be_bytes());
+    packet.extend_from_slice(&TIMELINE_SSRC.to_be_bytes());
+    packet.extend_from_slice(&payload);
+    Rc::new(packet)
+}
+
+/// Queue one beacon (a new sequence number each time).
+fn timeline_step(session: &Session, pts_ms: u64) {
+    let seq = session.beacon_seq.get();
+    session.beacon_seq.set(seq.wrapping_add(1));
+    let packet = timeline_packet(seq, pts_ms, session.range_start.get());
+    // The beacon is 1 packet/session/s; if the player's queue is full the
+    // packet is simply dropped and the next one carries a newer edge.
+    let _ = session.out.try_send(Outbound::Rtp {
+        epoch: session.epoch.get(),
+        track: TRACK_TIMELINE,
+        data: packet,
+    });
+}
+
+/// The scheduler's current live edge: the last window segment plus one nominal
+/// segment. Independent of the media engine's playhead, so it stays the live
+/// edge while a viewer is replaying the DVR.
+fn live_edge_ms(window: &RefCell<Vec<Segment>>) -> Option<u64> {
+    let window = window.borrow();
+    window
+        .last()
+        .map(|segment| segment.timestamp_ms.saturating_add(LIVE_SEGMENT_MS))
+}
+
+/// One beacon per second for every playing session that set up the timeline
+/// track.
+async fn timeline_loop(hub: Rc<Stream>, window: Rc<RefCell<Vec<Segment>>>) {
+    loop {
+        compio::time::sleep(Duration::from_secs(1)).await;
+        if hub.stopped() {
+            return;
+        }
+        let Some(edge) = live_edge_ms(&window) else {
+            continue;
+        };
+        hub.live_edge_ms.set(edge);
+        let sessions = hub.sessions.borrow();
+        for session in sessions.iter() {
+            if session.subscribed.get() & (1 << TRACK_TIMELINE) != 0 {
+                timeline_step(session, edge);
+            }
+        }
+    }
+}
+
 fn track_from_uri(uri: &str) -> Option<u8> {
     if uri.contains("trackID=0") {
         Some(TRACK_VIDEO)
     } else if uri.contains("trackID=1") {
         Some(TRACK_AUDIO)
+    } else if uri.contains("trackID=2") {
+        Some(TRACK_TIMELINE)
     } else {
         None
     }
@@ -1779,6 +1922,7 @@ pub fn spawn_media(
     wakes.register(&wake);
 
     compio::runtime::spawn(watchdog(Rc::clone(&hub))).detach();
+    compio::runtime::spawn(timeline_loop(Rc::clone(&hub), Rc::clone(&live_window))).detach();
     compio::runtime::spawn(async move {
         Media::new(hub, client, dvr, rx.to_async(), wake, live_window)
             .run()
@@ -2555,6 +2699,11 @@ fn sync_config(hub: &Stream, demuxer: &TsDemuxer) {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 async fn emit_sample(hub: &Stream, pacer: &mut Pacer, timeline: &mut Timeline, sample: Sample) {
     match sample {
         Sample::Video(video) => {
@@ -2565,14 +2714,14 @@ async fn emit_sample(hub: &Stream, pacer: &mut Pacer, timeline: &mut Timeline, s
             // VOD playback skips the clock and fills the receiver's queue
             // instead, so it can run ahead of real time.
             pacer.wait(video.dts).await;
-            hub.set_position_ms(timeline.position_ms(video.dts));
+            let position = timeline.position_ms(video.dts);
+            hub.set_position_ms(position);
 
-            let timestamp =
-                Stream::rtp_timestamp(video.pts, sdp::VIDEO_CLOCK_RATE, &hub.video_base);
-            let media = media_delta(
-                video.pts,
-                hub.video_base.get().expect("timestamp set the base"),
-            );
+            // The media clock is absolute broadcast NPT, not an epoch offset.
+            // The player's start time is the beacon's 0, so the position it
+            // displays is this value directly.
+            let timestamp = position.saturating_mul(90) as u32;
+            let media = position.saturating_mul(90) as i64;
             hub.wait_out_capacity(TRACK_VIDEO, video_packet_count(&video.nals))
                 .await;
 
@@ -2596,13 +2745,11 @@ async fn emit_sample(hub: &Stream, pacer: &mut Pacer, timeline: &mut Timeline, s
         Sample::Audio(audio) => {
             let clock_rate = hub.audio.borrow().clock_rate;
             pacer.wait(audio.pts).await;
-            hub.set_position_ms(timeline.position_ms(audio.pts));
+            let position = timeline.position_ms(audio.pts);
+            hub.set_position_ms(position);
 
-            let timestamp = Stream::rtp_timestamp(audio.pts, clock_rate, &hub.audio_base);
-            let media = media_delta(
-                audio.pts,
-                hub.audio_base.get().expect("timestamp set the base"),
-            );
+            let timestamp = (position.saturating_mul(u64::from(clock_rate)) / 1000) as u32;
+            let media = position.saturating_mul(90) as i64;
             hub.wait_out_capacity(TRACK_AUDIO, 1).await;
 
             let payload = aac::packetize(&audio.frame);
