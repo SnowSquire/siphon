@@ -150,6 +150,31 @@ renumbered run records into the index hole and the middle bytes into the segs
 hole; on completion the segs are fsynced, `complete` is flipped, the index is
 fsynced and the run pair deleted (unless `--keep-runs`).
 
+### `Init` records and map changes
+
+An init is a prefix, not a timed segment, so it cannot be trimmed by `pdt`.  The
+canonical tracks the **active init hash** (the last top-level `Init` record).
+Every insertion point compares the incoming map hash and writes the init only
+when it differs:
+
+- **DVR chunk:** before `dst_offset` is taken in `start_fetch`.  The chunk's
+  `EXT-X-MAP` (URI + optional `BYTERANGE`) is fetched once and cached; the init
+  bytes and `Init` record are written first, so the chunk and everything after
+  it shift by the init size.
+- **Live run hole:** before the `Run` marker is reserved.  A map change in the
+  live playlist closes the current run, so every run has at most one leading
+  init.  If its hash differs from the active hash, the init is written first;
+  the run's `dst_segs_offset` is after it, and the DVR restart becomes
+  `init_len + segs_len`.
+- **Promoted live:** the same check before appending a run's media.
+
+`Run.segs_len` remains the media middle; the inserted init sits outside the
+reserved hole and outside the copied records.  Dedupe is by hash, never by URI:
+Twitch's live map is a rotating signed CDN path while the bytes are the same
+object as `chunked/init-0.mp4` in the VOD/DVR playlists.  On resume the active
+hash is the last top-level `Init`, and every init record's bytes are
+hash-verified (there are few), so a torn map is detected rather than played.
+
 ## Alignment and the sanity check
 
 - The trim is by `pdt_ms` (a lexer event, below).  PDT is the only absolute clock
@@ -225,25 +250,29 @@ fsynced and the run pair deleted (unless `--keep-runs`).
 
 - `playlist.rs`: `Event::ProgramDateTime(u64)` (RFC 3339 → epoch ms, hand-rolled,
   no new dependency); a pending PDT is applied to the next media item.  Prefetch
-  tags carry no PDT.
+  tags carry no PDT.  `Event::Init(InitSegment)` carries the `EXT-X-MAP` URI and
+  optional `BYTERANGE`.
 - `scheduler.rs`: `Segment.pdt_ms` and `Segment.duration_ms`; the disk writer
   detects a gap from the timestamp jump (no `Ad` message: an ad is just a gap
-  with content in the DVR).
+  with content in the DVR).  A map change is fetched and broadcast to existing
+  consumers before the next media, so the disk can close the run.
 - `spool.rs`/`arena.rs`: the per-spool slot cap (`SEGMENT_SLOTS_MAX = 64` ≈
   12.3 MB) is below a 12 Mbps 10 s DVR chunk (~15 MB); give the DVR spool its own
   cap (~96 slots) and its own `ArenaSet` for the reorder buffer.  Arenas are not
   globally capped, so nothing else changes.
 - `disk.rs`: re-enabled and rewritten around the two sources, runs, holes, the
-  `Run` marker, the copies and the resume repair.
+  `Run` marker, init hashing/insertion, the copies and the resume repair.
 - `main.rs`/`daemon.rs`: `--output`, `--notify`, `--keep-runs`; the disk handle
   and the daemon wiring.
-- `rtsp/vod.rs` → `rtsp/dvr.rs`; `VodTimeline`/`VodSegment` renamed.  The refresh
-  loop keeps running (the RTSP seek path still uses it until the disk-backed
-  reader exists).
+- `rtsp/vod.rs` → `rtsp/dvr.rs`; `VodTimeline`/`VodSegment` renamed, and the
+  timeline now carries the `EXT-X-MAP` objects per segment.  The refresh loop
+  keeps running (the RTSP seek path still uses it until the disk-backed reader
+  exists).
 - `index.hexpat`: v4.
 - `servermock`: a `START_MS` knob so the debug loop can join mid-broadcast and
-  exercise prefill/holes/copies.  The mock (Node) sets `Content-Length`;
-  Twitch's live CDN mostly does not, so tests must not depend on it.
+  exercise prefill/holes/copies; `NO_DVR=1` on the client exercises promotion.
+  The mock (Node) sets `Content-Length`; Twitch's live CDN mostly does not, so
+  tests must not depend on it.
 
 ## Testing
 
@@ -258,6 +287,14 @@ fsynced and the run pair deleted (unless `--keep-runs`).
   hole copies, a mid-prefill kill + restart, a promoted-live kill + restart
   with the DVR back on (the live → DVR switch), and daemon mode through
   `ffprobe`.
+- **fMP4 maps:** a local mock serving an `EXT-X-MAP` live playlist and a DVR
+  playlist with a different map produced the expected canonical order: DVR init
+  A at 0, live init B before the `Run` marker (`Run.dst = B.offset + B.len`),
+  then DVR init A again at the resume point.  With identical maps there is one
+  init at 0 and the `Run` is preceded by a normal segment.  The real 1440p HEVC
+  broadcast checked earlier has the same 1218-byte init
+  (`sha256 082d5b2e…786f0c6`) on live, public VOD and private DVR, so its hole
+  copies insert nothing.
 - `ffprobe` the `segs`; `cargo +nightly miri test -p twitch-hls-client2` for the
   arena/spool changes.
 
@@ -267,8 +304,8 @@ fsynced and the run pair deleted (unless `--keep-runs`).
   Twitch; then the DVR timeline refresh can stop when disk output is on.  The
   format is designed for it (timestamp-ordered records, exact byte ranges, stop
   at a pending `Run`).
-- fMP4/HEVC/AV1 archives: the record format is container-agnostic and `Init`
-  records copy generically; the chunking assumption is TS.
+- fMP4/HEVC/AV1 archives: recording is container-agnostic and init segments
+  are inserted by hash, including map changes; the RTSP sink is still TS-only.
 - DVR → live automatic fallback (deliberately manual).
 
 ## Rejected alternatives

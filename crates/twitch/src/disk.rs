@@ -13,6 +13,7 @@
 //!
 //! On-disk format: see `index.hexpat` and `notes/disk-complete-recording.md`.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Read;
@@ -46,8 +47,10 @@ use xxhash_rust::xxh3::xxh3_128;
 use crate::constants::DVR_SLOTS_MAX;
 use crate::downloader::FetchOutcome;
 use crate::downloader::ToDownloader;
+use crate::http::Client;
 use crate::notify::Notifier;
 use crate::rtsp::dvr::Dvr;
+use crate::rtsp::dvr::DvrMap;
 use crate::rtsp::dvr::DvrSegment;
 use crate::rtsp::dvr::DvrTimeline;
 use crate::scheduler::ConsumerRegistration;
@@ -94,6 +97,9 @@ const DISCOVERY_AFTER_START: Duration = Duration::from_secs(30);
 const DVR_STALL: Duration = Duration::from_secs(60);
 /// Bytes read/written per copy block.
 const COPY_BLOCK: usize = 256 * 1024;
+/// Cap on an `EXT-X-MAP` / live init segment. Real inits are a few KiB; this is
+/// only a guard against a wrong URL returning a whole segment or a playlist.
+const MAX_INIT_BYTES: usize = 8 * 1024 * 1024;
 /// Sanity cap for a `Run` marker's reserved record area. A torn marker cannot
 /// make the resume path reserve an unbounded index range.
 const MAX_RUN_RECORDS: usize = 64 * 1024 * 1024;
@@ -107,6 +113,8 @@ pub enum DiskOutputError {
     InvalidHeader,
     #[error("invalid index record: {0}")]
     Record(String),
+    #[error("http: {0}")]
+    Http(#[from] crate::http::Error),
 }
 
 impl DiskOutputError {
@@ -129,6 +137,9 @@ pub struct DiskOptions {
     pub keep_runs: bool,
     pub notifier: Option<Notifier>,
     pub dvr: Rc<Dvr>,
+    /// Fetches `EXT-X-MAP` objects; the DVR media itself goes through the
+    /// downloader queue.
+    pub client: Rc<Client>,
 }
 
 /// Handle to the recording task. `wait` resolves when the disk subsystem stops;
@@ -676,12 +687,17 @@ enum Mode {
     Promoted,
 }
 
+type MapKey = (String, Option<(u64, u64)>);
+type MapCache = HashMap<MapKey, (u128, Vec<u8>)>;
+
 struct Canonical {
     segs: File,
     index: File,
     segs_end: u64,
     index_end: u64,
     init_counter: u64,
+    /// Hash of the `Init` record currently in effect at the tail.
+    active_init: Option<u128>,
 }
 
 struct RunData {
@@ -692,6 +708,9 @@ struct RunData {
     segs_len: u64,
     index_len: u64,
     init_counter: u64,
+    /// The run's leading `EXT-X-MAP`, if the live playlist had one. A map change
+    /// closes the run, so a run has at most one init and it is always first.
+    init: Option<InitRecord>,
     /// `Some` only for the run currently being recorded.
     files: Option<(File, File)>,
     first_segment: Option<SegmentRecord>,
@@ -746,6 +765,7 @@ struct CopyJob {
 struct Disk {
     options: DiskOptions,
     dir: PathBuf,
+    client: Rc<Client>,
     live_rx: Option<AsyncReceiver<SegmentMessage>>,
     events_rx: AsyncReceiver<Event>,
     events_tx: Sender<Event>,
@@ -754,6 +774,9 @@ struct Disk {
     dvr: Rc<Dvr>,
     dvr_arena: Rc<ArenaSet>,
     dvr_wakes: Rc<WakeSet>,
+    /// `(uri, byterange)` → `(init hash, bytes)`, so an unchanged map is fetched
+    /// once and can still be inserted if the canonical's active map changes.
+    map_cache: MapCache,
 
     mode: Mode,
     canonical: Option<Canonical>,
@@ -806,9 +829,11 @@ async fn run_disk(
 
     let (events_tx, events_rx) = kanal::unbounded();
     let dvr = Rc::clone(&options.dvr);
+    let client = Rc::clone(&options.client);
     let disk = Disk {
         options,
         dir,
+        client,
         live_rx: Some(live_rx.to_async()),
         events_rx: events_rx.to_async(),
         events_tx: events_tx.clone(),
@@ -817,6 +842,7 @@ async fn run_disk(
         dvr: Rc::clone(&dvr),
         dvr_arena: Rc::new(ArenaSet::new()),
         dvr_wakes: WakeSet::new(),
+        map_cache: HashMap::new(),
         mode: Mode::LiveRuns,
         canonical: None,
         current_run: None,
@@ -1162,24 +1188,23 @@ impl Disk {
                 Mode::Promoted => self.write_promoted(segment).await,
                 Mode::LiveRuns | Mode::Dvr => self.write_live(segment).await,
             },
-            // fMP4 init: recorded into the current run when there is one; TS
-            // streams carry none.
+            // fMP4 map. TS streams carry none. A map change closes the current
+            // run, so every run is self-contained: its init is always leading.
             SegmentMessage::Init { mut reader } => {
                 if self.mode == Mode::Promoted {
+                    let bytes =
+                        read_reader_bytes(&mut reader, &self.live_wake, MAX_INIT_BYTES).await?;
                     if let Some(canonical) = &mut self.canonical {
-                        write_init(
-                            &mut canonical.segs,
-                            &mut canonical.index,
-                            &mut canonical.segs_end,
-                            &mut canonical.index_end,
-                            &mut canonical.init_counter,
-                            SOURCE_LIVE,
-                            &mut reader,
-                            &self.live_wake,
-                        )
-                        .await?;
+                        write_init_bytes(canonical, SOURCE_LIVE, &bytes).await?;
                     }
                     return Ok(());
+                }
+                if self
+                    .current_run
+                    .as_ref()
+                    .is_some_and(|run| run.first_segment.is_some())
+                {
+                    self.close_current_run().await?;
                 }
                 if self.current_run.is_none() {
                     let number = self.next_run;
@@ -1190,7 +1215,7 @@ impl Disk {
                     && let Some((segs, index)) = &mut run.files
                 {
                     let mut counter = run.init_counter;
-                    write_init(
+                    let init = write_init(
                         segs,
                         index,
                         &mut run.segs_len,
@@ -1202,6 +1227,7 @@ impl Disk {
                     )
                     .await?;
                     run.init_counter = counter;
+                    run.init = Some(init);
                 }
                 Ok(())
             }
@@ -1281,7 +1307,15 @@ impl Disk {
                 sequence = segment.sequence_num,
                 "disk: live timestamp gap, splitting the run"
             );
-            self.close_current_run().await?;
+            // An empty run may have just been opened for a new map. Keep it: its
+            // init is exactly what the first media after the gap needs.
+            if self
+                .current_run
+                .as_ref()
+                .is_some_and(|run| run.first_segment.is_some())
+            {
+                self.close_current_run().await?;
+            }
         }
 
         if self.current_run.is_none() {
@@ -1377,6 +1411,7 @@ impl Disk {
             segs_len: 0,
             index_len: HEADER_LEN as u64,
             init_counter: 0,
+            init: None,
             files: Some((segs, index)),
             first_segment: None,
             last_segment: None,
@@ -1454,19 +1489,50 @@ impl Disk {
         let mut canonical = create_canonical(&self.dir, self.options.stream_id).await?;
         let runs: Vec<RunData> = self.closed_runs.drain(..).collect();
 
-        let mut init_counter = 0u64;
         for run in &runs {
             let source = OpenOptions::new().read(true).open(&run.segs_path).await?;
+            let media_start = run.init.as_ref().map_or(0, |init| {
+                init.byte_offset.saturating_add(u64::from(init.byte_length))
+            });
+            if let Some(init) = &run.init {
+                let length = usize::try_from(init.byte_length).unwrap_or(usize::MAX);
+                let result = source
+                    .read_exact_at(vec![0u8; length], init.byte_offset)
+                    .await;
+                let bytes = result.1;
+                result.0?;
+                if xxh3_128(&bytes) != init.hash {
+                    return Err(DiskOutputError::Record(format!(
+                        "run {} init failed verification",
+                        run.number
+                    )));
+                }
+                write_init_bytes(&mut canonical, SOURCE_LIVE, &bytes).await?;
+            }
             let dst_start = canonical.segs_end;
-            copy_between(&source, 0, &mut canonical.segs, dst_start, run.segs_len).await?;
+            let media_len = run.segs_len.saturating_sub(media_start);
+            copy_between(
+                &source,
+                media_start,
+                &mut canonical.segs,
+                dst_start,
+                media_len,
+            )
+            .await?;
 
-            // Each run index starts at byte zero, so rebasing is the append
-            // offset; a resumed promoted file also starts at zero.
-            let delta = i64::try_from(dst_start).unwrap_or(i64::MAX);
+            // The run index's byte offsets start at `media_start`; rebasing is
+            // the append offset minus that base. A resumed promoted file has the
+            // same shape (its init is at the front).
+            let first_offset = run
+                .records
+                .first()
+                .map_or(media_start, |meta| meta.segment.byte_offset);
+            let delta = i64::try_from(dst_start).unwrap_or(i64::MAX)
+                - i64::try_from(first_offset).unwrap_or(0);
             let mut buffer = Vec::new();
             for meta in &run.records {
                 let mut record = Record::Segment(meta.segment.clone());
-                record.rebase(delta, &mut init_counter);
+                record.rebase(delta, &mut canonical.init_counter);
                 record.encode(&mut buffer);
             }
             canonical
@@ -1479,9 +1545,8 @@ impl Disk {
                 .iter()
                 .map(|meta| u64::from(meta.record_len))
                 .sum::<u64>();
-            canonical.segs_end += run.segs_len;
+            canonical.segs_end += media_len;
         }
-        canonical.init_counter = init_counter;
         canonical.segs.sync_all().await?;
         canonical.index.sync_all().await?;
         for run in &runs {
@@ -1717,7 +1782,7 @@ impl Disk {
                     self.arm_stall();
                     return Ok(());
                 };
-                self.start_fetch(chunk, false);
+                self.start_fetch(chunk, false, &timeline).await?;
                 return Ok(());
             }
 
@@ -1737,7 +1802,7 @@ impl Disk {
             };
 
             if self.handoff_done {
-                self.start_fetch(chunk, false);
+                self.start_fetch(chunk, false, &timeline).await?;
                 return Ok(());
             }
 
@@ -1754,13 +1819,13 @@ impl Disk {
             if chunk_end <= run_start {
                 // Pre-fill or the ad gap before the run: the whole chunk is
                 // content the live path never had.
-                self.start_fetch(chunk, false);
+                self.start_fetch(chunk, false, &timeline).await?;
                 return Ok(());
             }
             if chunk_start <= run_start {
                 // This chunk crosses the run's start. Write it whole; the run's
                 // leading records are trimmed and supplied by it.
-                self.start_fetch(chunk, true);
+                self.start_fetch(chunk, true, &timeline).await?;
                 return Ok(());
             }
 
@@ -1816,9 +1881,15 @@ impl Disk {
         timeline.segments.get(index).cloned()
     }
 
-    fn start_fetch(&mut self, chunk: DvrSegment, crossing: bool) {
+    async fn start_fetch(
+        &mut self,
+        chunk: DvrSegment,
+        crossing: bool,
+        timeline: &DvrTimeline,
+    ) -> Result<(), DiskOutputError> {
+        self.ensure_map(&chunk, timeline).await?;
         let Some(canonical) = &self.canonical else {
-            return;
+            return Ok(());
         };
         if self.resume_abs.is_some() {
             // Only apply the resume cursor once.
@@ -1831,7 +1902,7 @@ impl Disk {
             let hole_start =
                 chunk_time_of(&chunk, clock, self.dvr_origin).saturating_add(chunk.duration_ms);
             let Some(run) = self.next_unprocessed_run() else {
-                return;
+                return Ok(());
             };
             self.blocked = Some(Blocked {
                 run: run.number,
@@ -1855,6 +1926,43 @@ impl Disk {
         );
         self.dvr_stall = self.dvr_stall.wrapping_add(1);
         self.stall_armed = None;
+        Ok(())
+    }
+
+    /// Make the chunk's `EXT-X-MAP` the active map, inserting it only when its
+    /// hash differs. This runs before `dst_offset` is taken, so the chunk (and
+    /// everything after it) is naturally shifted by the init size.
+    async fn ensure_map(
+        &mut self,
+        chunk: &DvrSegment,
+        timeline: &DvrTimeline,
+    ) -> Result<(), DiskOutputError> {
+        let Some(index) = chunk.map else {
+            return Ok(());
+        };
+        let Some(map) = timeline.maps.get(index) else {
+            return Ok(());
+        };
+        let key = (map.uri.clone(), map.byterange);
+        let (hash, bytes) = if let Some((hash, bytes)) = self.map_cache.get(&key) {
+            (*hash, bytes.clone())
+        } else {
+            let bytes = fetch_map(&self.client, map).await?;
+            let hash = xxh3_128(&bytes);
+            self.map_cache.insert(key, (hash, bytes.clone()));
+            (hash, bytes)
+        };
+        if self
+            .canonical
+            .as_ref()
+            .is_some_and(|canonical| canonical.active_init == Some(hash))
+        {
+            return Ok(());
+        }
+        if let Some(canonical) = &mut self.canonical {
+            write_init_bytes(canonical, SOURCE_DVR, &bytes).await?;
+        }
+        Ok(())
     }
 
     fn ensure_clock(&mut self, timeline: &DvrTimeline) {
@@ -1923,6 +2031,10 @@ impl Disk {
             self.advance_past(timeline, hole_end, clock);
             return Ok(());
         }
+
+        // The live map belongs before the live media, so it is inserted before
+        // the Run marker (and therefore before the DVR resumes).
+        self.insert_run_init(&run).await?;
 
         let Some(canonical) = &mut self.canonical else {
             return Ok(());
@@ -1997,6 +2109,26 @@ impl Disk {
             "disk: reserved run hole"
         );
         self.advance_past(timeline, hole_end, clock);
+        Ok(())
+    }
+
+    async fn insert_run_init(&mut self, run: &RunData) -> Result<(), DiskOutputError> {
+        let Some(init) = &run.init else {
+            return Ok(());
+        };
+        if self
+            .canonical
+            .as_ref()
+            .is_some_and(|canonical| canonical.active_init == Some(init.hash))
+        {
+            return Ok(());
+        }
+        let Some(bytes) = read_run_init(run).await? else {
+            return Ok(());
+        };
+        if let Some(canonical) = &mut self.canonical {
+            write_init_bytes(canonical, SOURCE_LIVE, &bytes).await?;
+        }
         Ok(())
     }
 
@@ -2193,7 +2325,7 @@ async fn write_init(
     source: u8,
     reader: &mut Reader,
     wake: &ConsumerWake,
-) -> Result<(), DiskOutputError> {
+) -> Result<InitRecord, DiskOutputError> {
     let mut hasher = Xxh3::new();
     let start = *segs_end;
     let written = write_segment_body(segs, start, reader, &mut hasher, wake).await?;
@@ -2204,11 +2336,138 @@ async fn write_init(
         byte_length: u32::try_from(written).unwrap_or(u32::MAX),
         hash: hasher.digest128(),
     };
-    write_record(index, *index_end, &Record::Init(record)).await?;
+    write_record(index, *index_end, &Record::Init(record.clone())).await?;
     *segs_end += written;
     *index_end += u64::from(1 + INIT_BODY);
     *init_counter += 1;
-    Ok(())
+    Ok(record)
+}
+
+/// Write an init into the canonical unless the same map is already active.
+/// Returns whether bytes were written. The `segs` sync is what makes the init
+/// durable before the DVR is allowed to write past it.
+async fn write_init_bytes(
+    canonical: &mut Canonical,
+    source: u8,
+    bytes: &[u8],
+) -> Result<bool, DiskOutputError> {
+    let hash = xxh3_128(bytes);
+    if canonical.active_init == Some(hash) {
+        return Ok(false);
+    }
+    let start = canonical.segs_end;
+    let len = bytes.len() as u64;
+    canonical.segs.write_all_at(bytes.to_vec(), start).await.0?;
+    canonical.segs.sync_data().await?;
+    let record = InitRecord {
+        source,
+        counter: canonical.init_counter,
+        byte_offset: start,
+        byte_length: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+        hash,
+    };
+    write_record(
+        &mut canonical.index,
+        canonical.index_end,
+        &Record::Init(record),
+    )
+    .await?;
+    canonical.segs_end += len;
+    canonical.index_end += u64::from(1 + INIT_BODY);
+    canonical.init_counter += 1;
+    canonical.active_init = Some(hash);
+    // The init record must be durable before any media record that depends on
+    // it, not just before the next fsync of the whole index.
+    canonical.index.sync_data().await?;
+    Ok(true)
+}
+
+async fn read_reader_bytes(
+    reader: &mut Reader,
+    wake: &ConsumerWake,
+    limit: usize,
+) -> Result<Vec<u8>, DiskOutputError> {
+    let mut out = Vec::new();
+    while let Some(view) = reader.next_view(wake).await {
+        let bytes = view.as_init();
+        if out.len().saturating_add(bytes.len()) > limit {
+            return Err(DiskOutputError::Record("init segment is too large".into()));
+        }
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+/// Read and verify a run's leading init from its own `segs` file.
+async fn read_run_init(run: &RunData) -> Result<Option<Vec<u8>>, DiskOutputError> {
+    let Some(init) = &run.init else {
+        return Ok(None);
+    };
+    let file = OpenOptions::new().read(true).open(&run.segs_path).await?;
+    let length = usize::try_from(init.byte_length).unwrap_or(usize::MAX);
+    let result = file
+        .read_exact_at(vec![0u8; length], init.byte_offset)
+        .await;
+    let bytes = result.1;
+    result.0?;
+    if xxh3_128(&bytes) != init.hash {
+        return Err(DiskOutputError::Record(format!(
+            "run {} init failed verification",
+            run.number
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+async fn fetch_map(client: &Client, map: &DvrMap) -> Result<Vec<u8>, DiskOutputError> {
+    let range = map.byterange.map(|(offset, length)| {
+        format!(
+            "bytes={offset}-{}",
+            offset.saturating_add(length).saturating_sub(1)
+        )
+    });
+    let mut response = if let Some(range) = range.as_deref() {
+        client.get_with(&map.uri, &[("Range", range)]).await?
+    } else {
+        client.get(&map.uri).await?
+    };
+    if !response.status.is_success() {
+        return Err(DiskOutputError::Io(std::io::Error::other(format!(
+            "map fetch returned {}",
+            response.status
+        ))));
+    }
+    let partial = response.status.as_u16() == 206;
+    let body = response.body.read_to_end(MAX_INIT_BYTES).await?;
+    match map.byterange {
+        None => Ok(body),
+        // A 206 already contains exactly the requested range.
+        Some((_, length)) if partial => {
+            if u64::try_from(body.len()).unwrap_or(u64::MAX) != length {
+                return Err(DiskOutputError::Io(std::io::Error::other(
+                    "map byte range returned the wrong length",
+                )));
+            }
+            Ok(body)
+        }
+        // A server that ignored Range returned the whole object.
+        Some((offset, length)) => {
+            let start = usize::try_from(offset).map_err(|_| {
+                DiskOutputError::Io(std::io::Error::other("map range offset is too large"))
+            })?;
+            let length = usize::try_from(length).map_err(|_| {
+                DiskOutputError::Io(std::io::Error::other("map range length is too large"))
+            })?;
+            let end = start
+                .checked_add(length)
+                .ok_or_else(|| DiskOutputError::Io(std::io::Error::other("map range overflows")))?;
+            body.get(start..end).map(<[u8]>::to_vec).ok_or_else(|| {
+                DiskOutputError::Io(std::io::Error::other(
+                    "map byte range is outside the object",
+                ))
+            })
+        }
+    }
 }
 
 async fn write_record(
@@ -2332,6 +2591,7 @@ struct Snapshot {
     valid_end: u64,
     segs_end: u64,
     init_counter: u64,
+    active_init: Option<u128>,
     next_run: u32,
     live_origin: Option<i64>,
     has_dvr: bool,
@@ -2562,6 +2822,21 @@ async fn read_canonical(
 
     let live_origin =
         (live_first_pdt != 0).then(|| origin_of(live_first_pdt, live_first_elapsed).unwrap_or(0));
+    // Every `Init` is top-level (a run's leading map is inserted before its
+    // marker), so the last one is the map in effect at the tail. Verify them all:
+    // there are few, and a torn init must not be played as garbage.
+    let mut active_init = None;
+    for parsed in &records {
+        if let Record::Init(init) = &parsed.record {
+            if hash_range(&segs, init.byte_offset, init.byte_length).await != Some(init.hash) {
+                return Err(DiskOutputError::Record(format!(
+                    "init record at {} failed verification",
+                    parsed.offset
+                )));
+            }
+            active_init = Some(init.hash);
+        }
+    }
     let (resume_abs, resume_clock) = if resume_pdt != 0 {
         (resume_pdt, Some(Clock::Pdt))
     } else if resume_elapsed != 0 {
@@ -2574,6 +2849,7 @@ async fn read_canonical(
         valid_end,
         segs_end: segs_max,
         init_counter,
+        active_init,
         next_run: next_run.max(scan_run_number(dir)),
         live_origin,
         has_dvr,
@@ -2654,6 +2930,7 @@ async fn create_canonical(dir: &Path, stream_id: u64) -> Result<Canonical, DiskO
         segs_end: 0,
         index_end: HEADER_LEN as u64,
         init_counter: 0,
+        active_init: None,
     })
 }
 
@@ -2674,6 +2951,7 @@ async fn open_canonical(dir: &Path, snapshot: Snapshot) -> Result<Canonical, Dis
         segs_end: snapshot.segs_end,
         index_end: snapshot.valid_end,
         init_counter: snapshot.init_counter,
+        active_init: snapshot.active_init,
     })
 }
 
@@ -2689,11 +2967,21 @@ async fn rename_canonical_to_run(
     let mut records = Vec::new();
     let mut first = None;
     let mut last = None;
+    let mut init = None;
+    let mut first_media_offset = None;
     for parsed in &snapshot.records {
+        if let Record::Init(record) = &parsed.record
+            && first_media_offset.is_none()
+        {
+            // The map in effect for the first live media. Later maps inside the
+            // promoted file are not split retroactively; they stay as bytes.
+            init = Some(record.clone());
+        }
         if let Record::Segment(segment) = &parsed.record {
             if segment.source != SOURCE_LIVE {
                 continue;
             }
+            first_media_offset.get_or_insert(segment.byte_offset);
             records.push(RunRecordMeta {
                 segment: segment.clone(),
                 record_offset: parsed.offset,
@@ -2711,6 +2999,7 @@ async fn rename_canonical_to_run(
         segs_len: snapshot.segs_end,
         index_len: snapshot.valid_end,
         init_counter: snapshot.init_counter,
+        init,
         files: None,
         first_segment: first,
         last_segment: last,
@@ -2817,6 +3106,7 @@ mod tests {
                     pdt_ms: 1_000_000,
                     sequence: 0,
                     url: "a".into(),
+                    map: None,
                 },
                 DvrSegment {
                     start_ms: 10_000,
@@ -2824,6 +3114,7 @@ mod tests {
                     pdt_ms: 1_010_000,
                     sequence: 1,
                     url: "b".into(),
+                    map: None,
                 },
                 DvrSegment {
                     start_ms: 20_000,
@@ -2831,8 +3122,10 @@ mod tests {
                     pdt_ms: 1_020_000,
                     sequence: 2,
                     url: "c".into(),
+                    map: None,
                 },
             ],
+            maps: Vec::new(),
             end_ms: 30_000,
             ended: false,
         };
@@ -3068,6 +3361,84 @@ mod tests {
         assert_eq!(copied.byte_offset, 10);
         assert_eq!(copied.sequence, 7);
         assert_eq!(copied.hash, xxh3_128(middle));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn init_insertion_is_hash_gated_and_shifts_offsets() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "twitch-disk-init-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+
+        compio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let mut canonical = create_canonical(&dir, 0).await.expect("canonical");
+                let first = b"ftypA";
+                let second = b"ftypBBBB";
+
+                assert!(
+                    write_init_bytes(&mut canonical, SOURCE_DVR, first)
+                        .await
+                        .expect("first init")
+                );
+                let segs_after_first = canonical.segs_end;
+                let index_after_first = canonical.index_end;
+
+                // The same map is already active: no bytes, no record.
+                assert!(
+                    !write_init_bytes(&mut canonical, SOURCE_DVR, first)
+                        .await
+                        .expect("duplicate init")
+                );
+                assert_eq!(canonical.segs_end, segs_after_first);
+                assert_eq!(canonical.index_end, index_after_first);
+
+                assert!(
+                    write_init_bytes(&mut canonical, SOURCE_LIVE, second)
+                        .await
+                        .expect("second init")
+                );
+                assert_eq!(
+                    canonical.segs_end,
+                    segs_after_first + u64::try_from(second.len()).unwrap()
+                );
+                assert_eq!(
+                    canonical.index_end,
+                    index_after_first + u64::from(1 + INIT_BODY)
+                );
+                assert_eq!(canonical.active_init, Some(xxh3_128(second)));
+
+                drop(canonical);
+                let snapshot = read_canonical(&dir, 0, false)
+                    .await
+                    .expect("read")
+                    .expect("snapshot");
+                assert_eq!(snapshot.active_init, Some(xxh3_128(second)));
+                let inits: Vec<_> = snapshot
+                    .records
+                    .iter()
+                    .filter_map(|parsed| match &parsed.record {
+                        Record::Init(init) => Some(init.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(inits.len(), 2);
+                assert_eq!(inits[0].counter, 0);
+                assert_eq!(inits[1].counter, 1);
+                assert_eq!(inits[1].byte_offset, segs_after_first);
+                assert_eq!(inits[1].hash, xxh3_128(second));
+            });
 
         fs::remove_dir_all(&dir).ok();
     }

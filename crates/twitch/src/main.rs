@@ -241,6 +241,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
                 keep_runs: args.keep_runs,
                 notifier,
                 dvr: Rc::clone(&dvr),
+                client: Rc::clone(&client),
             },
             &wakes,
             &downloaders_tx.clone().to_async(),

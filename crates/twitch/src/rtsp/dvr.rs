@@ -85,12 +85,23 @@ pub struct DvrSegment {
     /// The playlist's own sequence number for this chunk.
     pub sequence: u64,
     pub url: String,
+    /// Index into [`DvrTimeline::maps`] for the `EXT-X-MAP` in effect.
+    pub map: Option<usize>,
+}
+
+/// One `EXT-X-MAP` object. `byterange` is `(offset, length)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DvrMap {
+    pub uri: String,
+    pub byterange: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct DvrTimeline {
     /// Sorted by `start_ms`.
     pub segments: Vec<DvrSegment>,
+    /// The distinct `EXT-X-MAP` objects referenced by the segments.
+    pub maps: Vec<DvrMap>,
     /// End of the newest segment, in broadcast milliseconds.
     pub end_ms: u64,
     /// The playlist published `#EXT-X-ENDLIST`: no more chunks will appear.
@@ -109,12 +120,29 @@ impl DvrTimeline {
     /// Replace the timeline with a freshly fetched playlist.
     pub fn reload(&mut self, base_url: &str, text: &str) {
         self.segments.clear();
+        self.maps.clear();
         self.end_ms = 0;
         self.ended = false;
+        let mut current_map = None;
 
         for event in Playlist::new(text).flatten() {
             match event {
                 Event::Ended => self.ended = true,
+                Event::Init(init) => {
+                    let uri = resolve_url(base_url, init.uri);
+                    let index = self
+                        .maps
+                        .iter()
+                        .position(|map| map.uri == uri && map.byterange == init.byterange)
+                        .unwrap_or_else(|| {
+                            self.maps.push(DvrMap {
+                                uri,
+                                byterange: init.byterange,
+                            });
+                            self.maps.len() - 1
+                        });
+                    current_map = Some(index);
+                }
                 Event::Media(media) => {
                     let url = resolve_url(base_url, media.uri);
                     self.end_ms = media.timestamp_ms.saturating_add(media.duration_ms);
@@ -124,6 +152,7 @@ impl DvrTimeline {
                         pdt_ms: media.pdt_ms.unwrap_or(0),
                         sequence: media.sequence,
                         url,
+                        map: current_map,
                     });
                 }
                 _ => {}
@@ -737,6 +766,25 @@ https://cdn/audio_only/index-dvr.m3u8
         assert_eq!(timeline.end_ms, 30_000);
         assert_eq!(timeline.segments[1].start_ms, 10_000);
         assert_eq!(timeline.segments[1].url, "http://127.0.0.2:8000/dvr/1.ts");
+    }
+
+    #[test]
+    fn tracks_map_changes() {
+        const MAPS: &str = "\
+#EXTM3U
+#EXT-X-MAP:URI=\"init-a.mp4\"
+#EXTINF:10.000,
+0.ts
+#EXT-X-MAP:URI=\"init-b.mp4\",BYTERANGE=\"100@5\"
+#EXTINF:10.000,
+1.ts
+";
+        let timeline = DvrTimeline::parse("http://host/index-dvr.m3u8", MAPS);
+        assert_eq!(timeline.maps.len(), 2);
+        assert_eq!(timeline.maps[0].uri, "http://host/init-a.mp4");
+        assert_eq!(timeline.maps[1].byterange, Some((5, 100)));
+        assert_eq!(timeline.segments[0].map, Some(0));
+        assert_eq!(timeline.segments[1].map, Some(1));
     }
 
     #[test]

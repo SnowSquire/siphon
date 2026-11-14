@@ -321,6 +321,7 @@ impl Registry {
                     keep_runs: self.options.keep_runs,
                     notifier: self.options.notify.clone(),
                     dvr: Rc::clone(&dvr),
+                    client: Rc::clone(&self.client),
                 },
                 &wakes,
                 &self.downloaders,

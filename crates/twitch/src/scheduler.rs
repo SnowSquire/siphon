@@ -115,12 +115,9 @@ pub enum SegmentMessage {
     },
     Discontinuity(),
     /// The stream's `#EXT-X-MAP` segment, which every consumer must see before
-    /// media.
-    ///
-    /// TS streams carry none and the RTSP sink is TS-only, so nothing reads the
-    /// bytes yet; the fMP4 sink will.
+    /// media. The disk output records it; the RTSP sink is TS-only and ignores
+    /// it.
     Init {
-        #[allow(dead_code)]
         reader: Reader,
     },
     /// Seek request from the RTSP control plane (broadcast milliseconds). Only
@@ -564,10 +561,10 @@ impl StreamScheduler {
 
     async fn apply_init(&mut self, uri: &str) -> eros::Result<(), (ArenaFull, kanal::SendError)> {
         if let Some((old, _)) = &self.init {
-            if old.as_str() != uri {
-                debug!(old, uri, "init segment changed mid-stream");
+            if old.as_str() == uri {
+                return Ok(());
             }
-            return Ok(());
+            debug!(old, uri, "init segment changed mid-stream");
         }
 
         let span = debug_span!("init segment");
@@ -581,7 +578,17 @@ impl StreamScheduler {
             })
             .await
             .union()?;
-        self.init = Some((uri.into(), reader));
+        self.init = Some((uri.into(), reader.clone()));
+        // Media must not overtake the new map: existing consumers get it now,
+        // while a consumer adopted later gets it from `adopt`.
+        self.readers.retain_unordered(|consumer| {
+            consumer.send(
+                SegmentMessage::Init {
+                    reader: reader.clone(),
+                },
+                "init change",
+            )
+        });
 
         Ok(())
     }
@@ -596,6 +603,11 @@ impl StreamScheduler {
         // only the last annotation is a meaningful canary.
         let mut last_checkpoint = None;
 
+        // A media playlist's `EXT-X-MAP` applies to the following media until the
+        // next map. Holding it until a *new* media item avoids re-announcing the
+        // window's old map (the top of a refreshed playlist) and then the newer
+        // map again on every reload.
+        let mut pending_init = None;
         for event in Playlist::new(manifest) {
             match event.union()? {
                 Event::MediaSequence(front) => {
@@ -605,7 +617,7 @@ impl StreamScheduler {
                 Event::ProgramDateTime(pdt_ms) => {
                     debug!(pdt_ms, "new program date time");
                 }
-                Event::Init(uri) => self.apply_init(uri).await.widen()?,
+                Event::Init(init) => pending_init = Some(init.uri),
                 Event::Discontinuity => self.broadcast_discontinuity(),
                 Event::Checkpoint { annotated, next } => last_checkpoint = Some((annotated, next)),
                 Event::Ended => {
@@ -618,6 +630,10 @@ impl StreamScheduler {
                         continue;
                     }
 
+                    if let Some(uri) = pending_init.take() {
+                        debug!(sequence = media.sequence, uri, "applying playlist map");
+                        self.apply_init(uri).await.widen()?;
+                    }
                     self.segment_tail = media.sequence + 1;
                     self.prefetch_tail = self.prefetch_tail.max(self.segment_tail);
                     self.dispatch_main(

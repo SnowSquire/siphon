@@ -21,6 +21,12 @@ use crate::utils::attribute;
 use crate::utils::float_string_to_millis;
 use crate::utils::parse_iso8601_millis;
 
+/// HLS byte ranges are `length[@offset]`; the offset defaults to zero.
+fn parse_byte_range(value: &str) -> Option<(u64, u64)> {
+    let (length, offset) = value.split_once('@').unwrap_or((value, "0"));
+    Some((offset.parse().ok()?, length.parse().ok()?))
+}
+
 #[derive(Error, Debug)]
 pub enum ManifestParseError {
     #[error("invalid integer: {0}")]
@@ -40,9 +46,16 @@ pub struct MediaSegment<'a> {
     pub is_ad: bool,
 }
 
+/// The `EXT-X-MAP` currently in effect. `byterange` is `(offset, length)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitSegment<'a> {
+    pub uri: &'a str,
+    pub byterange: Option<(u64, u64)>,
+}
+
 pub enum Event<'a> {
     MediaSequence(u64),
-    Init(&'a str),
+    Init(InitSegment<'a>),
     Discontinuity,
     /// An `EXT-X-PROGRAM-DATE-TIME` tag, in milliseconds since the Unix epoch.
     ProgramDateTime(u64),
@@ -143,10 +156,19 @@ impl<'a> Iterator for Playlist<'a> {
                     self.timestamp_ms = ms;
                     continue;
                 }
-                "EXT-X-MAP" => match attribute(value, "URI") {
-                    Some(uri) => Event::Init(uri),
-                    None => return Some(Err(ManifestParseError::Split())),
-                },
+                "EXT-X-MAP" => {
+                    let Some(uri) = attribute(value, "URI") else {
+                        return Some(Err(ManifestParseError::Split()));
+                    };
+                    let byterange = match attribute(value, "BYTERANGE") {
+                        Some(range) => match parse_byte_range(range) {
+                            Some(range) => Some(range),
+                            None => return Some(Err(ManifestParseError::Split())),
+                        },
+                        None => None,
+                    };
+                    Event::Init(InitSegment { uri, byterange })
+                }
                 "EXT-X-DISCONTINUITY" => Event::Discontinuity,
                 "EXT-X-PROGRAM-DATE-TIME" => match parse_iso8601_millis(value) {
                     Some(ms) => match u64::try_from(ms) {
@@ -296,11 +318,11 @@ https://a/1.m4s
 ";
         let init: Vec<_> = Playlist::new(text)
             .filter_map(|event| match event.unwrap() {
-                Event::Init(uri) => Some(uri),
+                Event::Init(init) => Some((init.uri, init.byterange)),
                 _ => None,
             })
             .collect();
-        assert_eq!(init, ["main.mp4"]);
+        assert_eq!(init, [("main.mp4", Some((0, 560)))]);
     }
 
     #[test]
