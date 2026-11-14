@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use raw_window_handle::HasWindowHandle;
 use zgui::platform::Surface;
-use zgui_ui::prelude::*;
 use zgui::prelude::*;
 use zgui::reactive::LocalStorage;
 use zgui::render::GpuUnavailable;
@@ -25,7 +24,6 @@ use crate::dxgi::DxgiSwapchain;
 use crate::dxgi::HdrMode;
 use crate::dxgi::hwnd_from_raw;
 use crate::gpu::VideoDecode;
-use crate::pattern;
 use crate::placebo::Placebo;
 use crate::player::Player;
 use crate::renderer::DxgiRenderer;
@@ -33,8 +31,7 @@ use crate::video;
 
 pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
     let file = file.map_or_else(String::new, |path| path.display().to_string());
-    let test_pattern = file.is_empty();
-    let fps = if test_pattern {
+    let fps = if file.is_empty() {
         30.0
     } else {
         video::frame_rate(Path::new(&file))
@@ -57,11 +54,11 @@ pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
     let factory_gpu = Arc::clone(&gpu);
     let factory_file = PathBuf::from(&file);
 
-    // The renderer factory runs before the first view is built, so the monitor's
-    // reported peak luminance is already in `max_nits` by the time the slider
-    // reads its range.
-    let max_nits = RwSignal::new_local(1000.0f64);
-    let brightness = RwSignal::new_local(203.0f64);
+    // What the display turned out to be. The renderer factory runs before the
+    // first view is built, so the values are already set when it reads them.
+    let peak_nits = RwSignal::new_local(0.0f64);
+    let sdr_white = RwSignal::new_local(0.0f64);
+    let hdr_enabled = RwSignal::new_local(false);
 
     app()
         .with_application_id("dev.siphon.video")
@@ -78,16 +75,18 @@ pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
                 hdr,
                 decode,
                 &factory_file,
-                max_nits,
-                brightness,
+                peak_nits,
+                sdr_white,
+                hdr_enabled,
             )
         }))
         .run(move || {
             view! {
                 Panel(
                     file = file.clone(),
-                    brightness = brightness,
-                    max_nits = max_nits,
+                    peak_nits = peak_nits,
+                    sdr_white = sdr_white,
+                    hdr_enabled = hdr_enabled,
                     fps = fps,
                 )
             }
@@ -107,8 +106,9 @@ fn dxgi_renderer(
     hdr: HdrMode,
     decode: Option<VideoDecode>,
     file: &Path,
-    max_nits: RwSignal<f64, LocalStorage>,
-    brightness: RwSignal<f64, LocalStorage>,
+    peak_nits: RwSignal<f64, LocalStorage>,
+    sdr_white: RwSignal<f64, LocalStorage>,
+    hdr_enabled: RwSignal<bool, LocalStorage>,
 ) -> Result<Box<dyn Renderer>, AppError> {
     let gpu_surface = Arc::clone(surface)
         .gpu_shared()
@@ -133,15 +133,9 @@ fn dxgi_renderer(
         swapchain.format(),
         swapchain.hdr()
     );
-    let max = if monitor_max > 0.0 {
-        f64::from(monitor_max)
-    } else {
-        1000.0
-    };
-    max_nits.set(max);
-    if brightness.get_untracked() > max {
-        brightness.set(max);
-    }
+    peak_nits.set(f64::from(reported_peak(monitor_max)));
+    sdr_white.set(f64::from(swapchain.sdr_white()));
+    hdr_enabled.set(swapchain.hdr());
 
     let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("video.ui"),
@@ -189,25 +183,26 @@ fn dxgi_error(reason: impl Into<String>) -> AppError {
     AppError::GpuUnavailable(GpuUnavailable::new().rejected("DXGI", reason))
 }
 
+/// What to show for a peak luminance the display did not report.
+fn reported_peak(reported: f32) -> f32 {
+    if reported > 0.0 { reported } else { 1000.0 }
+}
+
 #[component]
 fn Panel(
     file: String,
-    brightness: RwSignal<f64, LocalStorage>,
-    max_nits: RwSignal<f64, LocalStorage>,
+    peak_nits: RwSignal<f64, LocalStorage>,
+    sdr_white: RwSignal<f64, LocalStorage>,
+    hdr_enabled: RwSignal<bool, LocalStorage>,
     fps: f64,
 ) -> impl IntoView {
     let source = SurfaceHandle::new(SurfaceConfig {
         premultiplied: true,
         intrinsic: SurfaceIntrinsic::ratio(16.0 / 9.0),
     });
-    if file.is_empty() {
-        pattern::spawn(source.clone());
-    } else {
-        video::spawn(source.clone(), fps);
-    }
-
-    eprintln!("UI: brightness slider max {} nits", max_nits.get_untracked());
-    let clicks = RwSignal::new(0u32);
+    // The pump runs for any file; with none, the interface is all there is, and
+    // the window still has to be told when to draw.
+    video::spawn(source.clone(), fps);
 
     view! {
         column(class = "panel") {
@@ -218,24 +213,19 @@ fn Panel(
                 .class("pump")
                 .source(&source)
                 .into_view()}
-            row(class = "brightness") {
-                label(class = "hint") { "HDR test" }
-                Slider(
-                    value = brightness,
-                    min = 0.0,
-                    max = max_nits.get_untracked(),
-                    step = 10.0,
-                    label = "Brightness (nits)".to_owned(),
-                    class = "slider",
-                )
-                label(class = "count") {{move || format!("{:.0} / {:.0} nits", brightness.get(), max_nits.get())}}
+            row(class = "display") {
+                label(class = "hint") {{move || {
+                    format!(
+                        "{} · peak {:.0} nits · SDR white {:.0} nits",
+                        if hdr_enabled.get() { "HDR10 (PQ / Rec.2020)" } else { "SDR" },
+                        peak_nits.get(),
+                        sdr_white.get(),
+                    )
+                }}}
+                label(class = "count") {{move || format!("{fps:.3} fps")}}
             }
             row(class = "footer") {
                 label(class = "hint") {{move || if file.is_empty() { "no file selected".to_owned() } else { file.clone() }}}
-                control(class = "button", on:click = move |_| clicks.update(|count| *count += 1)) {
-                    "click"
-                }
-                label(class = "count") {{move || format!("clicks: {count}", count = clicks.get())}}
             }
         }
     }
@@ -277,13 +267,9 @@ const SHEET: &str = css!(
         height: 1px;
     }
 
-    .brightness {
+    .display {
         align-items: center;
         gap: 14px;
-    }
-
-    .slider {
-        width: 380px;
     }
 
     .footer {
