@@ -1,0 +1,25 @@
+# Line endings: the tree is LF, everywhere, whatever the checkout does.
+#
+# Without this, a Windows checkout with `core.autocrlf` on gives every file a
+# `\r` that the committed blob does not have, and every commit shows whole files
+# rewritten. `eol=lf` also overrides `core.autocrlf` for the working copy.
+#
+# Binaries are detected by content (a NUL byte) and left alone; the explicit
+# list is only for the assets where a future one might not be.
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.jpeg binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.mkv binary
+*.mp4 binary
+
+# Bit-for-bit test material: `servermock/segments` holds real Twitch segments.
+# (`*.ts` is deliberately not listed above: those are TypeScript sources.)
+servermock/segments/** -text
