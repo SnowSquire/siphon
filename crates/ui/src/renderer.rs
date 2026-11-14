@@ -8,22 +8,13 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use libplacebo_sys as pl;
-use siphon_rpc::Snapshot;
 use windows::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
-use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
-use windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow;
-use windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE;
 use zgui::atlas::TextureSink;
 use zgui::bits::DamageSet;
-use zgui::prelude::*;
-use zgui::reactive::LocalStorage;
-use zgui::reactive::RwSignal;
 use zgui::render::ExternalTexture;
 use zgui::render::FrameOutcome;
 use zgui::render::MemoryReport;
@@ -36,34 +27,35 @@ use zgui::render::TextureHandle;
 use zgui::render::VectorStatus;
 use zgui::scene::Scene;
 use zgui::surface::wgpu;
+use zgui_render_wgpu::Gpu;
+use zgui_render_wgpu::SharedGraphics;
 use zgui_render_wgpu::WgpuRenderer;
 
 use crate::dxgi::BUFFERS;
 use crate::dxgi::DxgiSwapchain;
+use crate::dxgi::HdrMode;
 use crate::placebo::Placebo;
-use crate::rpc::UiEvent;
-use crate::rpc::apply_update;
-use crate::tray::TrayAction;
 
 pub struct UiRenderer {
     inner: WgpuRenderer,
-    swapchain: Rc<RefCell<DxgiSwapchain>>,
+    swapchain: RefCell<Option<DxgiSwapchain>>,
     placebo: Placebo,
     /// One libplacebo texture per backbuffer.
     targets: Vec<pl::pl_tex>,
     /// ZGUI's interface, wrapped for the overlay pass.
     ui: pl::pl_tex,
     /// Keeps the image behind `ui` alive; dropped after `ui` in `Drop`.
-    _ui_texture: wgpu::Texture,
+    ui_texture: wgpu::Texture,
     sdr_white: f32,
     handover: pl::VkSemaphore,
     handover_value: Cell<u64>,
     damaged: Cell<bool>,
     presented: Cell<bool>,
+    graphics: SharedGraphics,
+    gpu: Arc<Gpu>,
+    width: u32,
+    height: u32,
     hwnd: HWND,
-    snapshot: RwSignal<Snapshot, LocalStorage>,
-    events: kanal::Receiver<UiEvent>,
-    tray: kanal::Receiver<TrayAction>,
 }
 
 impl UiRenderer {
@@ -73,9 +65,8 @@ impl UiRenderer {
         swapchain: DxgiSwapchain,
         placebo: Placebo,
         ui_texture: wgpu::Texture,
-        snapshot: RwSignal<Snapshot, LocalStorage>,
-        events: kanal::Receiver<UiEvent>,
-        tray: kanal::Receiver<TrayAction>,
+        graphics: SharedGraphics,
+        gpu: Arc<Gpu>,
         hwnd: HWND,
     ) -> anyhow::Result<Self> {
         let ui = placebo.wrap_wgpu(&ui_texture)?;
@@ -108,20 +99,21 @@ impl UiRenderer {
 
         Ok(Self {
             inner,
-            swapchain: Rc::new(RefCell::new(swapchain)),
+            swapchain: RefCell::new(Some(swapchain)),
             placebo,
             targets,
             ui,
-            _ui_texture: ui_texture,
+            ui_texture,
             sdr_white,
             handover,
             handover_value: Cell::new(0),
             damaged: Cell::new(true),
             presented: Cell::new(false),
+            graphics,
+            gpu,
+            width,
+            height,
             hwnd,
-            snapshot,
-            events,
-            tray,
         })
     }
 
@@ -164,58 +156,104 @@ impl UiRenderer {
         }
     }
 
-    /// Drains RPC events into the reactive snapshot and handles tray actions.
-    /// Runs on the UI thread, before the scene is composed for this frame.
-    fn sync(&self) {
-        let mut state = self.snapshot.get_untracked();
-        let mut changed = false;
-        while let Ok(Some(event)) = self.events.try_recv() {
-            match event {
-                UiEvent::Snapshot(snapshot) => state = *snapshot,
-                UiEvent::Update(update) => apply_update(&mut state, update),
-            }
-            changed = true;
+    /// Recreates the swapchain, the UI texture, its libplacebo views and the
+    /// inner ZGUI renderer for a new target extent.
+    fn rebuild(&mut self, target: RenderTarget, width: u32, height: u32) {
+        // DXGI allows one flip-model swapchain per HWND, so the old
+        // presentation and every libplacebo view of its images go first.
+        for target in &mut self.targets {
+            self.placebo.destroy_texture(target);
         }
-        if changed {
-            self.snapshot.set(state);
-            self.damaged.set(true);
+        self.targets.clear();
+        self.placebo.destroy_texture(&mut self.ui);
+        self.swapchain.borrow_mut().take();
+
+        let swapchain = match DxgiSwapchain::new(&self.gpu, self.hwnd, width, height, HdrMode::Off)
+        {
+            Ok(swapchain) => swapchain,
+            Err(error) => {
+                tracing::warn!(target: "ui", "DXGI: resize failed: {error:#}");
+                return;
+            }
+        };
+        let mut targets = Vec::with_capacity(BUFFERS as usize);
+        for index in 0..BUFFERS {
+            let Some(image) = swapchain.image(index) else {
+                return;
+            };
+            match self.placebo.wrap(
+                image,
+                width,
+                height,
+                ash::vk::Format::A2B10G10R10_UNORM_PACK32,
+                ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | ash::vk::ImageUsageFlags::TRANSFER_SRC
+                    | ash::vk::ImageUsageFlags::TRANSFER_DST
+                    | ash::vk::ImageUsageFlags::SAMPLED,
+            ) {
+                Ok(texture) => {
+                    self.placebo
+                        .release(texture, pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
+                    targets.push(texture);
+                }
+                Err(error) => {
+                    tracing::warn!(target: "ui", "libplacebo: resize wrap failed: {error:#}");
+                    return;
+                }
+            }
         }
 
-        while let Ok(Some(action)) = self.tray.try_recv() {
-            match action {
-                TrayAction::Show => {
-                    let hwnd = self.hwnd.0.cast();
-                    // SAFETY: the window is ours and alive for the app's lifetime.
-                    unsafe {
-                        ShowWindow(hwnd, SW_SHOW);
-                        SetForegroundWindow(hwnd);
-                    }
-                }
-                TrayAction::Quit => {
-                    let hwnd = self.hwnd.0.cast();
-                    // SAFETY: the window is ours; WM_CLOSE is the normal close path.
-                    unsafe {
-                        PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                    }
-                }
-                TrayAction::Restart => {
-                    if let Err(error) = std::thread::Builder::new()
-                        .name("service restart".to_owned())
-                        .spawn(crate::service::restart)
-                    {
-                        tracing::error!(
-                            target: "service",
-                            "could not start the restart thread: {error}"
-                        );
-                    }
-                }
+        let ui_texture = self.gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("siphon.ui"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let ui = match self.placebo.wrap_wgpu(&ui_texture) {
+            Ok(ui) => ui,
+            Err(error) => {
+                tracing::warn!(target: "ui", "libplacebo: resized interface wrap failed: {error:#}");
+                return;
             }
-        }
+        };
+        let inner = match self
+            .graphics
+            .renderer_supplied(target, vec![ui_texture.clone()])
+        {
+            Ok(inner) => inner,
+            Err(error) => {
+                tracing::warn!(target: "ui", "ZGUI: resize renderer failed: {error}");
+                return;
+            }
+        };
+
+        self.targets = targets;
+        self.ui = ui;
+        self.ui_texture = ui_texture;
+        *self.swapchain.borrow_mut() = Some(swapchain);
+        self.inner = inner;
+        self.width = width;
+        self.height = height;
+        self.damaged.set(true);
+        self.presented.set(false);
+        tracing::info!(target: "ui", width, height, "resized");
     }
 
     fn present(&self, outcome: FrameOutcome) -> FrameOutcome {
-        let (width, height) = self.swapchain.borrow().size();
-        let index = self.swapchain.borrow().current_index();
+        let swapchain = self.swapchain.borrow();
+        let Some(swapchain) = swapchain.as_ref() else {
+            return outcome;
+        };
+        let (width, height) = swapchain.size();
+        let index = swapchain.current_index();
         let Some(&target_tex) = self.targets.get(usize::try_from(index).unwrap_or(0)) else {
             return outcome;
         };
@@ -223,7 +261,7 @@ impl UiRenderer {
         if !damaged && self.presented.get() {
             return outcome;
         }
-        if !self.swapchain.borrow().wait_for_frame(100) {
+        if !swapchain.wait_for_frame(100) {
             // Occluded or minimized: drop this frame instead of blocking.
             self.damaged.set(true);
             return outcome;
@@ -302,7 +340,7 @@ impl UiRenderer {
             tracing::warn!(target: "ui", "libplacebo: failed to take the interface texture back");
         }
 
-        if let Err(error) = self.swapchain.borrow().present() {
+        if let Err(error) = swapchain.present() {
             tracing::warn!(target: "ui", "DXGI present failed: {error:#}");
         }
         self.presented.set(true);
@@ -326,7 +364,17 @@ impl Renderer for UiRenderer {
     }
 
     fn configure(&mut self, target: RenderTarget) {
-        self.inner.configure(target);
+        let width = u32::try_from(target.size.width).unwrap_or(0);
+        let height = u32::try_from(target.size.height).unwrap_or(0);
+        if width == 0 || height == 0 {
+            self.inner.configure(target);
+            return;
+        }
+        if width == self.width && height == self.height {
+            self.inner.configure(target);
+            return;
+        }
+        self.rebuild(target, width, height);
     }
 
     fn target(&self) -> Option<RenderTarget> {
@@ -334,7 +382,6 @@ impl Renderer for UiRenderer {
     }
 
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
-        self.sync();
         if !self.inner.present_into(0) {
             tracing::warn!(target: "ui", "the UI texture was not supplied");
         }

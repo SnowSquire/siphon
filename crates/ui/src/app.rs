@@ -15,10 +15,10 @@ use zgui::render::GpuUnavailable;
 use zgui::render::RenderTarget;
 use zgui::render::Renderer;
 use zgui::runtime::AppError;
-use zgui::surface::SurfaceConfig;
-use zgui::surface::SurfaceHandle;
-use zgui::surface::SurfaceIntrinsic;
+use zgui::runtime::use_window;
+use zgui::runtime::use_windows;
 use zgui::surface::wgpu;
+use zgui::view::set_interval;
 use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::SharedGraphics;
 use zgui_ui::prelude::*;
@@ -32,6 +32,7 @@ use crate::renderer::UiRenderer;
 use crate::rpc::IntentSender;
 use crate::rpc::UiCommand;
 use crate::rpc::UiEvent;
+use crate::rpc::apply_update;
 use crate::rpc::empty_snapshot;
 use crate::tray::TrayAction;
 
@@ -44,30 +45,26 @@ pub fn run(
     let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
     let factory_gpu = Arc::clone(&gpu);
     let snapshot = RwSignal::new_local(empty_snapshot());
-    let pump = SurfaceHandle::new(SurfaceConfig {
-        premultiplied: true,
-        intrinsic: SurfaceIntrinsic::size(1.0, 1.0),
-    });
-    crate::pump::spawn(pump.clone());
 
     app()
         .with_application_id("com.iken.siphon")
         .with_title("Siphon")
         .with_size(1000.0, 760.0)
-        .with_resizable(false)
+        .with_resizable(true)
         .with_stylesheet(SHEET)
         .with_renderer(Box::new(move |surface, target| {
-            dxgi_renderer(
-                &graphics,
-                &factory_gpu,
-                surface,
-                target,
-                snapshot,
-                events.clone(),
-                tray.clone(),
-            )
+            dxgi_renderer(&graphics, &factory_gpu, surface, target)
         }))
-        .run(move || view! { App(snapshot = snapshot, intents = intents.clone(), pump = pump.clone()) })
+        .run(move || {
+            view! {
+                App(
+                    snapshot = snapshot,
+                    intents = intents.clone(),
+                    events = events.clone(),
+                    tray = tray.clone(),
+                )
+            }
+        })
         .map_err(|error| anyhow::anyhow!("zgui: {error}"))
 }
 
@@ -76,9 +73,6 @@ fn dxgi_renderer(
     gpu: &Arc<Gpu>,
     surface: &Arc<dyn zgui::platform::Surface>,
     target: RenderTarget,
-    snapshot: RwSignal<Snapshot, LocalStorage>,
-    events: kanal::Receiver<UiEvent>,
-    tray: kanal::Receiver<TrayAction>,
 ) -> Result<Box<dyn Renderer>, AppError> {
     let gpu_surface = Arc::clone(surface)
         .gpu_shared()
@@ -115,7 +109,13 @@ fn dxgi_renderer(
         .renderer_supplied(target, vec![ui.clone()])
         .map_err(AppError::from)?;
     let renderer = UiRenderer::new(
-        renderer, swapchain, placebo, ui, snapshot, events, tray, hwnd,
+        renderer,
+        swapchain,
+        placebo,
+        ui,
+        graphics.clone(),
+        Arc::clone(gpu),
+        hwnd,
     )
     .map_err(|error| dxgi_error(format!("{error:#}")))?;
     Ok(Box::new(renderer))
@@ -130,9 +130,47 @@ fn dxgi_error(reason: impl Into<String>) -> AppError {
 fn App(
     snapshot: RwSignal<Snapshot, LocalStorage>,
     intents: IntentSender,
-    pump: SurfaceHandle,
+    events: kanal::Receiver<UiEvent>,
+    tray: kanal::Receiver<TrayAction>,
 ) -> impl IntoView {
     let intents = Rc::new(intents);
+
+    // The RPC worker and the tray feed channels; this interval drains them on
+    // the UI thread and only touches the signal when something changed.
+    let timer = set_interval(std::time::Duration::from_millis(100), move || {
+        let mut state = snapshot.get_untracked();
+        let mut changed = false;
+        while let Ok(Some(event)) = events.try_recv() {
+            match event {
+                UiEvent::Snapshot(update) => state = *update,
+                UiEvent::Update(update) => apply_update(&mut state, update),
+            }
+            changed = true;
+        }
+        if changed {
+            snapshot.set(state);
+        }
+        while let Ok(Some(action)) = tray.try_recv() {
+            match action {
+                TrayAction::Show => use_window().focus(),
+                TrayAction::Quit => use_windows().quit(),
+                TrayAction::Restart => {
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("service restart".to_owned())
+                        .spawn(crate::service::restart)
+                    {
+                        tracing::error!(
+                            target: "service",
+                            "could not start the restart thread: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+    // The interval lives as long as the window; the component has no teardown
+    // hook that owns it.
+    std::mem::forget(timer);
     let draft = RwSignal::new_local(String::new());
     let word_draft = RwSignal::new_local(String::new());
     let expanded = RwSignal::new_local(None::<u64>);
@@ -275,7 +313,6 @@ fn App(
                 }
             }
 
-            {zgui::elements::surface().class("pump").source(&pump).into_view()}
         }
     }
 }

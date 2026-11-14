@@ -31,8 +31,6 @@ mod gpu;
 #[cfg(windows)]
 mod placebo;
 #[cfg(windows)]
-mod pump;
-#[cfg(windows)]
 mod renderer;
 #[cfg(windows)]
 mod rpc;

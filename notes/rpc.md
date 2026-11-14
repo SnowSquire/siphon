@@ -306,9 +306,13 @@ is the video spike's path without the video: ZGUI renders into a `Bgra8Unorm`
 texture, libplacebo composites it into a DXGI `FLIP_DISCARD` backbuffer
 (three buffers, frame-latency waitable object, interval 1), and DXGI presents.
 The swapchain is imported into Vulkan with `pl_vulkan_import`, so there is no
-`VkSurfaceKHR`/`VkSwapchainKHR`. HDR is off for now (`HdrMode::Off`), but the
-SDR white point still comes from DisplayConfig; the video pass and HDR transfer
-functions are the later work.
+`VkSurfaceKHR`/`VkSwapchainKHR`. On a target extent change the renderer drops
+the old swapchain first (DXGI allows one flip chain per window), then recreates
+the swapchain, the ZGUI texture, its libplacebo views and the inner renderer.
+There are no external textures to lose: RPC events and tray actions are drained
+by a 100 ms `set_interval` in the view, not by a surface pump. HDR is off for
+now (`HdrMode::Off`), but the SDR white point still comes from DisplayConfig;
+the video pass and HDR transfer functions are the later work.
 
 ZGUI's `surface` element is the video seam: a producer with its own cadence gets
 the shared `wgpu::Device`/`Queue`, creates textures on that device and
