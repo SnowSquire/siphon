@@ -9,7 +9,7 @@ use std::ptr;
 use anyhow::Context as _;
 use ash::vk;
 use ash::vk::Handle as _;
-use ffcine_libplacebo_sys as pl;
+use libplacebo_sys as pl;
 use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
 

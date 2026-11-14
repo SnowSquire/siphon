@@ -16,7 +16,7 @@ anyhow = "1"
 ash = "0.38"
 clap = { version = "4.6.6", features = ["derive"] }
 ffmpeg-the-third = "6.0.0"
-ffcine-libplacebo-sys = { version = "0.4.0", features = ["libav"] }
+libplacebo-sys = { path = "../libplacebo-sys" }
 pollster = "0.4"
 raw-window-handle = "0.6"
 windows = { version = "0.62.2", features = [
@@ -33,7 +33,6 @@ windows = { version = "0.62.2", features = [
 # The repository is still moving, so a branch would make the prototype drift under us.
 zgui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
 zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
-zgui-ui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
 
 [lints]
 workspace = true

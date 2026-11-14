@@ -1,0 +1,30 @@
+#:schema https://json.schemastore.org/cargo.json
+
+[package]
+name = "libplacebo-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Bindings, link directives and the header-only libav glue for a locally built libplacebo"
+authors = ["Ozeniken"]
+publish = false
+# One of these per native library, so two crates cannot disagree about which
+# libplacebo a binary links.
+links = "placebo"
+build = "build.rs"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "libplacebo_sys"
+path = "src/lib.rs"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.73.2"
+cc = "1.11.1"
+
+[lints]
+workspace = true

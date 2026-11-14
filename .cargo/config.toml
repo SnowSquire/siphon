@@ -1,0 +1,16 @@
+# The one variable Cargo has to supply.
+#
+# `ffmpeg-sys-the-third` finds FFmpeg through `FFMPEG_DIR` or pkg-config, and the
+# scoop package ships neither a pkg-config file nor a registry entry, so the
+# variable is the only way in. It has to come from here rather than a build
+# script in this workspace, because a dependency's build script runs first and
+# cannot see what another crate's build script sets.
+#
+# Nothing else belongs here: `CC`, `INCLUDE` and `PKG_CONFIG_PATH` are what
+# `crates/libplacebo-sys/build.rs` exists to avoid, since setting them for the
+# whole workspace would break the Twitch crate's Linux builds. No other crate in
+# this workspace reads `FFMPEG_DIR`, so leaving it here costs nothing.
+#
+# `force = false` (the default) keeps a value already in the environment.
+[env]
+FFMPEG_DIR = { value = "C:/Users/alex/scoop/apps/ffmpeg-shared/current", force = false }

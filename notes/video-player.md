@@ -71,18 +71,32 @@ like on that display.
 
 ## Building
 
-The native side is a libplacebo shared build plus FFmpeg, both found through
-pkg-config:
+`cargo run --bin video -- --file <path>` needs nothing exported: the native side
+is a libplacebo shared build in `C:/Users/alex/.local/libplacebo-shared`, FFmpeg
+from scoop, the Vulkan SDK, and the xwin splat for the CRT, and
+`crates/libplacebo-sys/build.rs` finds all four.
 
-```
-export FFMPEG_DIR=C:/Users/alex/scoop/apps/ffmpeg-shared/current
-export PKG_CONFIG_PATH=/c/Users/alex/AppData/Local/Temp/video-pkgconfig
-export PKG_CONFIG=C:/Users/alex/scoop/shims/pkg-config.exe
-export LIBCLANG_PATH=C:/Users/alex/scoop/apps/llvm/current/bin
-export CC=clang-cl CXX=clang-cl AR=llvm-lib
-```
+That crate is the whole native story:
 
-`video-pkgconfig` holds hand-written `.pc` files for FFmpeg, Vulkan and the
-libplacebo build in `C:/Users/alex/.local/libplacebo-shared` (whose import
-library needs a `placebo.lib` copy for `-lplacebo`). The `INCLUDE`/`LIB`
-environment must point at the xwin splat, glslang and the Vulkan SDK.
+* bindgen over `wrapper.h`, with the include paths handed to clang directly
+  rather than through `INCLUDE`;
+* `cc` with the compiler named (`clang-cl`, since this machine has no `cl.exe`)
+  to compile `src/libav.c`, the one non-`static inline` part of libplacebo's
+  libav support — that is what `pl_map_avframe_ex` needs;
+* `-L`/`-l libplacebo` from the prefix, no pkg-config and no import-library
+  rename;
+* the DLL copied into `target/<profile>` after the build, because Windows
+  resolves it before `main` and `cargo run` does not apply Cargo's `[env]` to
+  the program it starts.
+
+Every path is a knob with an environment override (`LIBPLACEBO_PREFIX`,
+`FFMPEG_DIR`, `VULKAN_SDK`, `LIBPLACEBO_SPLAT`), so another layout only needs
+those set. The only variable Cargo itself must supply is `FFMPEG_DIR`, for
+`ffmpeg-sys-the-third`; it lives in `.cargo/config.toml`, because a dependency's
+build script cannot see anything a build script here sets, and nothing else in
+the workspace reads it.
+
+`ffcine-libplacebo-sys` would have done this through pkg-config, which needs
+`PKG_CONFIG_PATH`, `CC` and `INCLUDE` in the environment. Cargo's `[env]` would
+then apply them to the whole workspace, where they would break the Twitch
+crate's Linux builds — hence the local crate.

@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use ffcine_libplacebo_sys as pl;
+use libplacebo_sys as pl;
 use ffmpeg_the_third::codec;
 use ffmpeg_the_third::ffi;
 use ffmpeg_the_third::format;

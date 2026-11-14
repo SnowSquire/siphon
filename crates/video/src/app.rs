@@ -156,7 +156,7 @@ fn dxgi_renderer(
         Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error:#}")))?;
     eprintln!(
         "libplacebo: imported (API {}, renderer {:?})",
-        ffcine_libplacebo_sys::PL_API_VER,
+        libplacebo_sys::PL_API_VER,
         placebo.renderer()
     );
 

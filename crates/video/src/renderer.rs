@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
-use ffcine_libplacebo_sys as pl;
+use libplacebo_sys as pl;
 use ffmpeg_the_third::frame;
 use zgui::atlas::TextureSink;
 use zgui::bits::DamageSet;
