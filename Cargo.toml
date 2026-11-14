@@ -45,3 +45,6 @@ codegen-units = 1
 lto = true
 panic = "abort"
 strip = true # moved here from crates/tray (profiles are ignored in member manifests)
+
+[profile.dev]
+panic = "abort"

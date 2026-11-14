@@ -22,6 +22,7 @@ only sink; disk output is disabled and being rebuilt from
 - `tls-client-api.md` — the HTTP/1.1 + rustls client (and why it is unbuffered).
 - `hls-transport-probe.md` — measurements of how Twitch actually delivers.
 - `disk-complete-recording.md` — the disk-recording design.
+- `rpc.md` — the daemon RPC, Siphon backend/UI split, state updates and monitor lifecycle.
 
 ## Commands
 
