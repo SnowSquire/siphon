@@ -2,9 +2,11 @@
 
 Status: phases 0–2 backend landed. `crates/rpc` (`siphon-rpc`) owns the typed
 protocol, postcard framing and client; `crates/daemon` owns config, GQL,
-Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI has
-not moved into this workspace yet. A loopback test covers a monitor add, a
-pipeline update and a pipeline stop over RPC.
+Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI is
+now `crates/ui` (Slint, binary `siphon`) and talks only over the RPC. It starts
+the daemon when the admin port is idle and restarts it at the process level
+(PID file + terminate), never through the socket: a frozen daemon must still be
+restartable from the tray.
 
 ## Goal
 
@@ -225,9 +227,10 @@ like `StreamKey`; changing quality is remove + add.
   it. Package `siphon-rpc`.
 - `crates/daemon`: the backend app and the RPC server module; `registry.rs`
   owns pipelines, `app.rs` owns everything else.
-- UI, still external: the Slint app moves in as `crates/ui` (`siphon-ui`) with
-  a binary named `siphon`, depending on `siphon-rpc`. `crates/tray` goes away
-  when it lands.
+- `crates/ui` (`siphon-ui`, binary `siphon`): the Slint window, tray and RPC
+  worker. It owns the daemon lifecycle (`service.rs`): auto-start on launch and
+  a process-level restart (`daemon.pid` in the app data dir, image-name check,
+  `taskkill` fallback). `crates/tray` is obsolete.
 - `play` keeps its current pipeline and needs no protocol types.
 
 ## Phases

@@ -28,6 +28,8 @@ mod notifier;
 #[allow(clippy::future_not_send)]
 mod notify;
 #[allow(clippy::future_not_send)]
+mod pid;
+#[allow(clippy::future_not_send)]
 mod registry;
 #[allow(clippy::future_not_send)]
 mod rpc;
@@ -399,6 +401,9 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
 
     let config_path = config::default_path(config::APP_ID);
     let config = config::load(&config_path);
+    if let Err(error) = pid::write(config::APP_ID) {
+        error!(%error, "failed to write the daemon pid file");
+    }
     notifier::register_aumid();
 
     let (events_tx, events_rx) = kanal::unbounded();
@@ -433,6 +438,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     // Only returns on a bind error: the RTSP accept loop runs for the process's
     // life.
     rtsp::serve(registry, args.bind).await?;
+    pid::remove(config::APP_ID);
 
     drop(downloaders_rx);
     Ok(())

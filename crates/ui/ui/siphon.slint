@@ -1,0 +1,373 @@
+// Siphon main window (Slint, retained). Purely presentational: every row
+// renders a property of the worker `Snapshot`, every interaction is a
+// callback that `src/app.rs` forwards as a `UiIntent`. Video later lands as
+// an `Image` element backed by a zero-copy `wgpu::Texture` import.
+
+import {
+    Button,
+    LineEdit,
+    CheckBox,
+    ListView,
+    VerticalBox,
+    HorizontalBox,
+    Palette,
+} from "std-widgets.slint";
+
+export enum ConnState { Connecting, Connected, NoChannels }
+export enum SiphonTab { Channels, Words }
+
+struct ChannelRow {
+    id: string,
+    name: string,
+    title: string,
+    viewers: string,
+    detail: string,
+    pending: bool,
+}
+
+// One channel row: status dot, name, inline title, viewers (channel id on
+// hover), expand affordance, and remove button. The entry struct arrives
+// from the worker snapshot, `expanded-id` two-way binds to the window's
+// UI-local expansion state, and `remove` forwards to the window's
+// `remove-channel` callback. (Named `...View`: `ChannelRow` is taken by the
+// data struct, which maps to Rust and cannot be renamed from here.)
+component ChannelRowView inherits HorizontalBox {
+    spacing: 8px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+
+    in property <ChannelRow> entry;
+    in-out property <string> expanded-id;
+    callback remove(string);
+
+    // Liveness keys off the worker's display strings:
+    // `live_viewers` renders offline rows as "offline" and
+    // `detail_line` stays empty while unresolved, so this needs
+    // no new snapshot field.
+    property <bool> is-live: entry.detail != "" && entry.viewers != "offline";
+    property <color> muted: Palette.color-scheme == ColorScheme.dark ? #aaaaaa : #555555;
+
+    row-touch := TouchArea {
+        horizontal-stretch: 1;
+        mouse-cursor: pointer;
+        clicked => {
+            expanded-id = expanded-id == entry.id ? "" : entry.id;
+        }
+
+        VerticalBox {
+            spacing: 2px;
+
+            HorizontalBox {
+                spacing: 8px;
+                // The box centers narrower content by default;
+                // title-less rows would drift right without this.
+                alignment: start;
+
+                Text {
+                    text: "●";
+                    font-size: 11px;
+                    color: is-live ? #2ea043 : (Palette.color-scheme == ColorScheme.dark ? #555555 : #bbbbbb);
+                    vertical-alignment: center;
+                }
+
+                // Fixed name column: with two eliding Texts the box
+                // layout starves one side, so only the title
+                // flexes. 130px fits the vast majority of logins
+                // at 16px; longer ones elide.
+                Text {
+                    text: entry.name;
+                    width: 130px;
+                    font-size: 16px;
+                    overflow: elide;
+                    horizontal-alignment: left;
+                    font-weight: is-live ? 700 : 400;
+                    color: Palette.foreground;
+                    vertical-alignment: center;
+                }
+
+                if !entry.pending && entry.title != "": Text {
+                    text: entry.title;
+                    horizontal-stretch: 1;
+                    font-size: 14px;
+                    overflow: elide;
+                    color: muted;
+                    vertical-alignment: center;
+                }
+
+                // Hover swaps the viewers cell for the channel
+                // id: ids only exist as callback routing data,
+                // so this is the one place they surface.
+                property <bool> showing-id: row-touch.has-hover && entry.id != "";
+                Text {
+                    text: showing-id ? "id " + entry.id : entry.viewers;
+                    font-size: 14px;
+                    font-weight: is-live && !showing-id ? 700 : 400;
+                    color: showing-id ? muted : (is-live ? #2ea043 : muted);
+                    vertical-alignment: center;
+                }
+
+                if entry.detail != "": Text {
+                    text: expanded-id == entry.id ? "–" : "+";
+                    width: 16px;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    color: muted;
+                    vertical-alignment: center;
+                }
+            }
+
+            if entry.detail != "" && expanded-id == entry.id: HorizontalBox {
+                padding-left: 18px;
+
+                Text {
+                    text: entry.detail;
+                    horizontal-stretch: 1;
+                    font-size: 13px;
+                    overflow: elide;
+                    color: muted;
+                }
+            }
+        }
+    }
+
+    // Pinned to the top: without the wrapper the layout
+    // stretches the button across multi-line rows.
+    if !entry.pending: VerticalBox {
+        alignment: start;
+
+        Button {
+            text: "×";
+            width: 32px;
+            clicked => { remove(entry.id); }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Siphon";
+    icon: @image-url("../icons/icon.png");
+    min-width: 420px;
+    min-height: 520px;
+    preferred-width: 460px;
+    preferred-height: 620px;
+    // Every color keys off Palette: std-widgets paint from the same
+    // Slint scheme, so a second theme flag here would drift from them.
+    background: Palette.background;
+
+    // Preview-only mock data: `Platform.uses-mock-data` is a compile-time
+    // constant, true in slint-viewer and the editor preview, false in the
+    // compiled app — so these branches vanish from the real binary, where
+    // Rust's first snapshot overrides every property at startup anyway.
+    in property <ConnState> conn-state: Platform.uses-mock-data ? ConnState.Connected : ConnState.Connecting;
+    in property <string> error-text: "";
+    in property <bool> has-update: false;
+    in property <string> update-text: "";
+    in property <bool> notify-titles: Platform.uses-mock-data ? true : false;
+    in property <bool> sound: true;
+    in property <[ChannelRow]> channels: Platform.uses-mock-data ? [
+        {
+            id: "12345",
+            name: "sunnys",
+            title: "!schedule !socials !discord",
+            viewers: "offline",
+            detail: "sunnys • Just Chatting • — • —/—",
+            pending: false
+        },
+        {
+            id: "23456",
+            name: "catrnado",
+            title: "Ranked grind to Challenger | !builds !discord",
+            viewers: "1234",
+            detail: "catrnado • League of Legends • 2026-09-29T10:02:11.000Z • 1234/56",
+            pending: false
+        },
+        {
+            id: "34567",
+            name: "santipulgaz",
+            title: "",
+            viewers: "offline",
+            detail: "santipulgaz • no game • — • —/—",
+            pending: false
+        },
+        {
+            id: "45678",
+            name: "Arky",
+            title: "farewell farewell summit attempts, PB today maybe",
+            viewers: "87",
+            detail: "Arky • Celeste • 2026-09-29T12:40:00.000Z • 87/—",
+            pending: false
+        },
+        { id: "56789", name: "quietbob", title: "", viewers: "—", detail: "", pending: false },
+        { id: "", name: "newstreamer123", title: "…", viewers: "…", detail: "", pending: true },
+    ] : [];
+    in property <[string]> words: Platform.uses-mock-data ? ["spoiler", "freestuff"] : [];
+    in-out property <SiphonTab> tab: SiphonTab.Channels;
+    // Click-to-expand lives entirely in the UI: the worker ships every
+    // resolved row's detail line, and only the row named here shows its
+    // own. Never set from Rust, so it survives snapshot pumps.
+    in-out property <string> expanded-id: "";
+
+    callback add-login(string);
+    callback remove-channel(string);
+    callback add-word(string);
+    callback remove-word(int);
+    callback set-notify(bool);
+    callback set-sound(bool);
+    callback apply-update();
+    callback clear-error();
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalBox {
+            spacing: 8px;
+            alignment: LayoutAlignment.space-between;
+
+            Text {
+                text: "Siphon";
+                font-size: 20px;
+                font-weight: 700;
+                color: Palette.foreground;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: conn-state == ConnState.Connected ? "Connected" : conn-state == ConnState.NoChannels ? "no channels found for the configured logins" : "Connecting…";
+                color: conn-state == ConnState.Connected ? #2ea043 : #da3633;
+                vertical-alignment: center;
+            }
+        }
+
+        if has-update: Button {
+            text: update-text;
+            clicked => { apply-update(); }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+
+            Button {
+                text: tab == SiphonTab.Channels ? "» Channels" : "Channels";
+                clicked => { tab = SiphonTab.Channels; }
+            }
+
+            Button {
+                text: tab == SiphonTab.Words ? "» Filtered words" : "Filtered words";
+                clicked => { tab = SiphonTab.Words; }
+            }
+        }
+
+        if tab == SiphonTab.Channels: channel-list := ListView {
+            vertical-stretch: 1;
+
+            for row in channels: ChannelRowView {
+                entry: row;
+                expanded-id <=> root.expanded-id;
+                remove(id) => { root.remove-channel(id); }
+            }
+        }
+
+        if tab == SiphonTab.Words: word-list := ListView {
+            vertical-stretch: 1;
+
+            for word[idx] in words: HorizontalBox {
+                Button {
+                    text: word + "  ×";
+                    clicked => { remove-word(idx); }
+                }
+            }
+        }
+
+        if tab == SiphonTab.Words && words.length == 0: Text {
+            text: "No filtered words. Add one below.";
+            color: Palette.color-scheme == ColorScheme.dark ? #aaaaaa : #555555;
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+
+            entry := LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: tab == SiphonTab.Channels ? "Add new streamer" : "Add filtered word";
+                accepted(text) => {
+                    if (tab == SiphonTab.Channels && text != "") { add-login(text); }
+                    if (tab == SiphonTab.Words && text != "") { add-word(text); }
+                    self.text = "";
+                }
+            }
+
+            Button {
+                text: "Add";
+                clicked => {
+                    if (tab == SiphonTab.Channels && entry.text != "") { add-login(entry.text); }
+                    if (tab == SiphonTab.Words && entry.text != "") { add-word(entry.text); }
+                    entry.text = "";
+                }
+            }
+        }
+
+        CheckBox {
+            text: "Notify on title changes while offline";
+            checked: notify-titles;
+            toggled => { set-notify(self.checked); }
+        }
+
+        CheckBox {
+            text: "Notification sound";
+            checked: sound;
+            toggled => { set-sound(self.checked); }
+        }
+
+        if error-text != "": HorizontalBox {
+            spacing: 8px;
+
+            Text {
+                text: error-text;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+                color: #da3633;
+            }
+
+            Button {
+                text: "×";
+                clicked => { clear-error(); }
+            }
+        }
+    }
+}
+
+
+
+
+// Tray icon with an Open/Quit menu; left-click shows the window. A
+// top-level component: it shares no globals with `AppWindow` and has no
+// window of its own. (1.18 generates no Rust accessor for the builtin
+// `clicked`, so it forwards to `show-window` here.)
+export component SiphonTray inherits SystemTrayIcon {
+    icon: @image-url("../icons/icon.png");
+    tooltip: "Siphon";
+
+    callback show-window();
+    callback restart-service();
+    callback quit-app();
+
+    clicked => { show-window(); }
+
+    Menu {
+        MenuItem {
+            title: "Open";
+            activated => { root.show-window(); }
+        }
+
+        MenuItem {
+            title: "Restart service";
+            activated => { root.restart-service(); }
+        }
+
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit-app(); }
+        }
+    }
+}

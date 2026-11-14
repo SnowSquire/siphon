@@ -443,7 +443,6 @@ impl App {
     }
 
     fn handle_request(&mut self, id: u64, request: Request, control: &Rc<Subscriber>) {
-        eprintln!("app: request {id}");
         let result = match request {
             Request::AddLogin(login) => {
                 self.request_add_login(&login);
@@ -509,8 +508,7 @@ impl App {
                 .disk_view(&key)
                 .map_or(Err(RpcError::NotFound), |view| Ok(Response::Disk(view))),
         };
-        let sent = control.control(ServerMessage::Response { id, result });
-        eprintln!("app: response {id} queued={sent}");
+        let _ = control.control(ServerMessage::Response { id, result });
     }
 
     /// Snapshot built on demand from app state, the registry and metrics.

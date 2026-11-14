@@ -32,6 +32,7 @@ only sink; disk output is disabled and being rebuilt from
 - Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
 - Benchmark: `cargo test -p daemon --release -- --ignored --nocapture throughput` (demux/packetize over `servermock/segments`). Cross-compile: `cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl`.
 - Miri: `cargo +nightly miri test -p daemon` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
+- UI: `cargo run -p siphon-ui` (binary `siphon`). It starts `daemon.exe` next to itself if `127.0.0.1:7418` is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
 
 ## Terminology
 
@@ -50,6 +51,7 @@ only sink; disk output is disabled and being rebuilt from
 2. `cargo run -p daemon -- play -c anything -d` — `-c` is required even in debug mode; broadcast id `0`.
 3. `play` serves `rtsp://127.0.0.1:7417/` and `rtsp://[::1]:7417/`; `daemon` binds `--bind` (default `127.0.0.1:7417`) and serves `rtsp://host/<channel>/<quality>/`; DESCRIBE creates the stream.
 4. `ffplay -nodisp rtsp://127.0.0.1:7417/` and `ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:7417/` are the end-to-end checks (`.../sunnys/1080p/` under `daemon -d`).
+5. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
 
 ## Architecture
 
@@ -69,6 +71,7 @@ detail: `notes/architecture.md`.
 - `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`).
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/rpc` (`siphon-rpc`) — the typed protocol, postcard framing and the UI-side client.
+- `crates/ui` (`siphon-ui`, binary `siphon`) — the Slint window and tray, the RPC client worker, and the daemon lifecycle (auto-start, PID-file restart). Windows-only. `notes/rpc.md` has the split; the ZGUI rewrite uses the `video` crate's scaffolding later.
 
 ## Rules (do not "simplify")
 

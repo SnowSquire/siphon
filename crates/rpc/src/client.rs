@@ -148,7 +148,6 @@ impl Client {
                         let _ = events.try_send(ClientEvent::Snapshot(snapshot));
                     }
                     Selected::Incoming(Ok(ServerMessage::Response { id, result })) => {
-                        eprintln!("client: response {id}");
                         if let Some(waiter) = reader_pending.borrow_mut().remove(&id) {
                             let _ = waiter.try_send(result);
                         }
@@ -218,7 +217,6 @@ impl Client {
     /// Sends one request and waits for its typed result.
     pub async fn request(&self, request: Request) -> Result<Response, RpcError> {
         let id = self.next_id.get();
-        eprintln!("client: request {id}");
         self.next_id.set(id.wrapping_add(1));
         let (waiter, receiver) = kanal::bounded(1);
         self.pending.borrow_mut().insert(id, waiter);

@@ -100,7 +100,6 @@ async fn connection(stream: TcpStream, peer: SocketAddr, handle: AppHandle) {
     loop {
         match reader.read::<ClientMessage, _>(&mut read).await {
             Ok(ClientMessage::Request { id, request }) => {
-                eprintln!("server: request {id}");
                 handle.request(id, request, &subscriber);
             }
             Ok(ClientMessage::Hello { .. }) => {}

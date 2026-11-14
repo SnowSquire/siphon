@@ -102,7 +102,6 @@ impl Bus {
             match subscriber.tx.try_send(Outbound::Update(broadcast.clone())) {
                 Ok(true) => true,
                 Ok(false) => {
-                    eprintln!("bus: subscriber full");
                     tracing::warn!("rpc: dropping a lagging UI connection");
                     let _ = subscriber.tx.close();
                     false
