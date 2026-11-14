@@ -48,7 +48,17 @@ pub enum ToDownloader {
         url: Rc<str>,
         writer: Writer,
         span: Span,
+        /// Receives the terminal outcome. The disk output needs to distinguish a
+        /// completed chunk from a fetch that gave up, because a failed DVR chunk
+        /// is skipped instead of being recorded in the canonical index.
+        done: Option<kanal::Sender<FetchOutcome>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchOutcome {
+    Complete,
+    Failed,
 }
 
 pub fn spawn_downloaders<const N: usize>(client: &Rc<Client>, rx: &kanal::Receiver<ToDownloader>) {
@@ -68,9 +78,11 @@ async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
             url,
             mut writer,
             span,
+            done,
         } = message;
 
         let mut attempt = 0;
+        let mut outcome = FetchOutcome::Complete;
         loop {
             match fetch(client, &url, &mut writer, &span).await {
                 Ok(()) => break,
@@ -78,17 +90,20 @@ async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
                     // Retrying would append to a partially written segment.
                     if !writer.is_empty() {
                         warn!(%url, %error, "download failed after writing bytes, giving up");
+                        outcome = FetchOutcome::Failed;
                         break;
                     }
                     // A terminal failure (bad URL, 404, certificate) fails the
                     // same way every time; retrying only delays the next segment.
                     if !error.retryable() {
                         warn!(%url, %error, "download failed, giving up");
+                        outcome = FetchOutcome::Failed;
                         break;
                     }
                     attempt += 1;
                     if attempt > DOWNLOAD_RETRIES {
                         warn!(%url, %error, attempt, "download failed, giving up");
+                        outcome = FetchOutcome::Failed;
                         break;
                     }
                     let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
@@ -96,6 +111,9 @@ async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
                     compio::time::sleep(backoff).await;
                 }
             }
+        }
+        if let Some(done) = done {
+            let _ = done.send(outcome);
         }
     }
 }

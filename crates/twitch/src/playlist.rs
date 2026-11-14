@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::utils::attribute;
 use crate::utils::float_string_to_millis;
+use crate::utils::parse_iso8601_millis;
 
 #[derive(Error, Debug)]
 pub enum ManifestParseError {
@@ -32,6 +33,9 @@ pub struct MediaSegment<'a> {
     pub uri: &'a str,
     pub sequence: u64,
     pub timestamp_ms: u64,
+    /// Absolute `EXT-X-PROGRAM-DATE-TIME` of the segment, or extrapolated from
+    /// the previous segment. `None` before the first PDT of a playlist.
+    pub pdt_ms: Option<u64>,
     pub duration_ms: u64,
     pub is_ad: bool,
 }
@@ -40,6 +44,8 @@ pub enum Event<'a> {
     MediaSequence(u64),
     Init(&'a str),
     Discontinuity,
+    /// An `EXT-X-PROGRAM-DATE-TIME` tag, in milliseconds since the Unix epoch.
+    ProgramDateTime(u64),
     /// A sparse `EXT-X-TWITCH-LIVE-SEQUENCE` annotation together with the
     /// sequence the next item will be assigned.
     Checkpoint {
@@ -58,6 +64,11 @@ pub struct Playlist<'a> {
     lines: Lines<'a>,
     /// Pending `EXTINF`: duration in milliseconds and whether it is an ad.
     extinf: Option<(u64, bool)>,
+    /// Pending `EXT-X-PROGRAM-DATE-TIME`, applied to the next media item.
+    pending_pdt: Option<u64>,
+    /// PDT of the previous media item, used to extrapolate when a tag is absent.
+    last_pdt: Option<u64>,
+    last_duration_ms: u64,
     sequence: u64,
     timestamp_ms: u64,
 }
@@ -67,6 +78,9 @@ impl<'a> Playlist<'a> {
         Self {
             lines: text.lines(),
             extinf: None,
+            pending_pdt: None,
+            last_pdt: None,
+            last_duration_ms: 0,
             sequence: 0,
             timestamp_ms: 0,
         }
@@ -89,10 +103,20 @@ impl<'a> Iterator for Playlist<'a> {
                     continue; // stray URI
                 };
 
+                // A pending PDT applies from this segment on; without one, the
+                // next segment follows the previous segment's end (RFC 8216).
+                let pdt_ms = self.pending_pdt.take().or_else(|| {
+                    self.last_pdt
+                        .map(|pdt| pdt.saturating_add(self.last_duration_ms))
+                });
+                self.last_pdt = pdt_ms;
+                self.last_duration_ms = duration_ms;
+
                 let media = MediaSegment {
                     uri: line,
                     sequence: self.sequence,
                     timestamp_ms: self.timestamp_ms,
+                    pdt_ms,
                     duration_ms,
                     is_ad,
                 };
@@ -124,6 +148,17 @@ impl<'a> Iterator for Playlist<'a> {
                     None => return Some(Err(ManifestParseError::Split())),
                 },
                 "EXT-X-DISCONTINUITY" => Event::Discontinuity,
+                "EXT-X-PROGRAM-DATE-TIME" => match parse_iso8601_millis(value) {
+                    Some(ms) => match u64::try_from(ms) {
+                        Ok(ms) => {
+                            self.pending_pdt = Some(ms);
+                            Event::ProgramDateTime(ms)
+                        }
+                        // Before the Unix epoch: not a broadcast timestamp.
+                        Err(_) => continue,
+                    },
+                    None => return Some(Err(ManifestParseError::Split())),
+                },
                 "EXT-X-ENDLIST" => Event::Ended,
                 "EXT-X-TWITCH-LIVE-SEQUENCE" => match value.parse() {
                     Ok(annotated) => Event::Checkpoint {
@@ -285,5 +320,34 @@ https://a/1.ts
             })
             .collect();
         assert_eq!(events, ["discontinuity", "ended"]);
+    }
+
+    #[test]
+    fn program_date_time_applies_and_extrapolates() {
+        let text = "\
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PROGRAM-DATE-TIME:2026-11-08T06:37:32.191Z
+#EXTINF:2.000,live
+https://a/1.ts
+#EXTINF:2.000,live
+https://a/2.ts
+#EXT-X-PROGRAM-DATE-TIME:2026-11-08T06:37:40.191Z
+#EXTINF:2.000,live
+https://a/3.ts
+";
+        let segments: Vec<_> = Playlist::new(text)
+            .filter_map(|event| match event.unwrap() {
+                Event::Media(media) => Some(media.pdt_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                Some(1_794_119_852_191),
+                Some(1_794_119_854_191),
+                Some(1_794_119_860_191)
+            ]
+        );
     }
 }

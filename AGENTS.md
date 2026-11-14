@@ -64,7 +64,7 @@ detail: `notes/architecture.md`.
 - `daemon.rs` — the stream registry behind `daemon` mode (`notes/rtsp-daemon.md`).
 - `downloader.rs` — bounded fetch workers streaming into spools.
 - `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`).
-- `disk.rs` — disabled; the v3 format in it is superseded by `notes/disk-complete-recording.md`.
+- `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 
 ## Rules (do not "simplify")
 

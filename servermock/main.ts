@@ -30,6 +30,9 @@ const DVR_TARGET_MS = 10_000;
 // Wall-clock multiplier for the simulated broadcast. Set SPEED=1 to replay at
 // real time (the RTSP pacer honors it); the default races ahead.
 const SPEED = Number(process.env.SPEED ?? 8);
+// Pretend the broadcast started this many milliseconds ago, so the debug loop
+// joins mid-broadcast and exercises prefill/holes/copies.
+const START_MS = Number(process.env.START_MS ?? 0);
 
 const session_id = String(Math.floor(Date.now() * 1000 + Math.random() * 1000));
 const dvr_groups = buildDvrGroups(segment_list);
@@ -317,7 +320,7 @@ function notFound(res: ServerResponse): void {
   res.end("dummy");
 }
 
-const spark_time_ms = Date.now();
+const spark_time_ms = Date.now() - START_MS / SPEED;
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -399,5 +402,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(8000, () => {
-  console.log("mock server listening on http://127.0.0.1:8000");
+  console.log(
+    `mock server listening on http://127.0.0.1:8000 (speed ${SPEED}x, start ${START_MS} ms in)`,
+  );
 });

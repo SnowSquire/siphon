@@ -72,7 +72,10 @@ sources and never advance. A clone that starts mid-segment is legal and means
 **Cap per segment.** `SEGMENT_SLOTS_MAX = 64` (12.3 MB) replaces `SLOT_BUDGET`,
 which was derived from the arena sizing that no longer exists. Twitch caps a
 source at 8 Mbps, so a 10 s DVR segment is ~10.6 MB. This is now the only way a
-spool write fails.
+spool write fails.  `Spool::open_with_cap` lets the disk output give DVR chunks
+their own cap (`DVR_SLOTS_MAX = 96`, ~18.5 MB) and their own `ArenaSet`, so a
+12 Mbps 10 s DVR chunk (~15 MB) neither overflows the live cap nor competes with
+live spools for slots.
 
 **`SlotView` derives its base from `SlotId`** instead of holding a second
 `Rc<Arena>`; the pinned slot already keeps the arena alive.

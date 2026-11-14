@@ -64,6 +64,13 @@ pub const ARENA_BYTES: usize = SLOTS_PER_ARENA * SLOT_SIZE;
 /// this is the only way a spool write fails.
 pub const SEGMENT_SLOTS_MAX: usize = 64;
 
+/// Slots one DVR chunk spool may hold.
+///
+/// A 12 Mbps source makes a 10 s DVR chunk ~15 MB, which does not fit the live
+/// cap. The disk output gives these spools their own arena, so this cap only
+/// bounds one chunk and never competes with live segments.
+pub const DVR_SLOTS_MAX: usize = 96;
+
 /// Attempts per segment before giving up.
 pub const DOWNLOAD_RETRIES: u32 = 4;
 

@@ -35,6 +35,7 @@ use crate::http::Client;
 use crate::playlist::Event;
 use crate::playlist::Playlist;
 use crate::sha1;
+use crate::spool::ConsumerWake;
 use crate::utils::attribute;
 use crate::utils::base64_encode;
 use crate::utils::parse_iso8601_millis;
@@ -75,23 +76,29 @@ const DISCOVERY_RETRY: Duration = Duration::from_secs(10);
 const VARIANT_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VodSegment {
+pub struct DvrSegment {
     pub start_ms: u64,
     pub duration_ms: u64,
+    /// Absolute `EXT-X-PROGRAM-DATE-TIME` of the chunk, or `0` when the playlist
+    /// publishes none.
+    pub pdt_ms: u64,
+    /// The playlist's own sequence number for this chunk.
+    pub sequence: u64,
     pub url: String,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct VodTimeline {
+pub struct DvrTimeline {
     /// Sorted by `start_ms`.
-    pub segments: Vec<VodSegment>,
+    pub segments: Vec<DvrSegment>,
     /// End of the newest segment, in broadcast milliseconds.
     pub end_ms: u64,
+    /// The playlist published `#EXT-X-ENDLIST`: no more chunks will appear.
+    pub ended: bool,
 }
 
-impl VodTimeline {
+impl DvrTimeline {
     /// Parse a media playlist. `base_url` resolves relative segment URIs.
-    #[cfg(test)]
     #[must_use]
     pub fn parse(base_url: &str, text: &str) -> Self {
         let mut timeline = Self::default();
@@ -99,22 +106,28 @@ impl VodTimeline {
         timeline
     }
 
-    /// Replace the timeline with a freshly fetched playlist, reusing the vector.
+    /// Replace the timeline with a freshly fetched playlist.
     pub fn reload(&mut self, base_url: &str, text: &str) {
         self.segments.clear();
         self.end_ms = 0;
+        self.ended = false;
 
         for event in Playlist::new(text).flatten() {
-            let Event::Media(media) = event else {
-                continue;
-            };
-            let url = resolve_url(base_url, media.uri);
-            self.end_ms = media.timestamp_ms.saturating_add(media.duration_ms);
-            self.segments.push(VodSegment {
-                start_ms: media.timestamp_ms,
-                duration_ms: media.duration_ms,
-                url,
-            });
+            match event {
+                Event::Ended => self.ended = true,
+                Event::Media(media) => {
+                    let url = resolve_url(base_url, media.uri);
+                    self.end_ms = media.timestamp_ms.saturating_add(media.duration_ms);
+                    self.segments.push(DvrSegment {
+                        start_ms: media.timestamp_ms,
+                        duration_ms: media.duration_ms,
+                        pdt_ms: media.pdt_ms.unwrap_or(0),
+                        sequence: media.sequence,
+                        url,
+                    });
+                }
+                _ => {}
+            }
         }
     }
 
@@ -128,24 +141,42 @@ impl VodTimeline {
         let segment = &self.segments[index];
         (position_ms < segment.start_ms.saturating_add(segment.duration_ms)).then_some(index)
     }
+
+    /// `pdt - elapsed` for the segment at `index`, the broadcast's wall-clock
+    /// origin. Both sources should agree on this constant.
+    #[must_use]
+    pub fn origin_ms(&self, index: usize) -> Option<i64> {
+        let segment = self.segments.get(index)?;
+        if segment.pdt_ms == 0 {
+            return None;
+        }
+        Some(i64::try_from(segment.pdt_ms).ok()? - i64::try_from(segment.start_ms).ok()?)
+    }
 }
 
 #[derive(Default)]
 struct DvrState {
     url: Option<String>,
-    timeline: Option<VodTimeline>,
+    timeline: Option<Rc<DvrTimeline>>,
     /// `STABLE-VARIANT-ID` of the variant the live scheduler picked. The public
     /// archive's master is fetched in parallel, but its media playlist can only
     /// be chosen once this is known.
     live_variant: Option<String>,
+    /// Broadcast start (`stream.createdAt`) from discovery, in Unix epoch ms.
+    broadcast_start_ms: Option<u64>,
 }
 
-/// The discovered DVR playlist shared by the refresh task and the RTSP output.
+/// The discovered DVR playlist shared by the refresh task, the RTSP output and
+/// the disk output.
 pub struct Dvr {
     state: RefCell<DvrState>,
     /// Set when the daemon drops the stream: the refresh task exits instead of
     /// polling a playlist nobody consumes.
     stop: Cell<bool>,
+    /// Bumped on every URL/timeline change; a watcher parks on `wake` and
+    /// compares the generation.
+    generation: Cell<u64>,
+    wake: RefCell<Option<Rc<ConsumerWake>>>,
 }
 
 impl Dvr {
@@ -158,8 +189,11 @@ impl Dvr {
                 url,
                 timeline: None,
                 live_variant: None,
+                broadcast_start_ms: None,
             }),
             stop: Cell::new(false),
+            generation: Cell::new(0),
+            wake: RefCell::new(None),
         })
     }
 
@@ -173,6 +207,25 @@ impl Dvr {
         self.stop.get()
     }
 
+    /// Subscribe to URL/timeline changes. Only the disk output needs this; the
+    /// RTSP seek path reads the current snapshot on demand.
+    pub fn subscribe(&self, wake: &Rc<ConsumerWake>) {
+        *self.wake.borrow_mut() = Some(Rc::clone(wake));
+    }
+
+    /// Current change counter, for a watcher that does not need the value.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    fn changed(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        if let Some(wake) = self.wake.borrow().as_ref() {
+            wake.wake();
+        }
+    }
+
     /// Record the live variant selected by the scheduler (its
     /// `STABLE-VARIANT-ID`).
     pub fn set_live_variant(&self, id: &str) {
@@ -183,26 +236,42 @@ impl Dvr {
         self.state.borrow().live_variant.clone()
     }
 
-    fn url(&self) -> Option<String> {
+    /// The discovered playlist URL, once discovery succeeded.
+    #[must_use]
+    pub fn url(&self) -> Option<String> {
         self.state.borrow().url.clone()
     }
 
     fn set_url(&self, url: String) {
         self.state.borrow_mut().url = Some(url);
+        self.changed();
     }
 
-    /// Parse `text` into the shared timeline, reusing the previous allocation.
+    /// Broadcast start (Unix epoch ms) from discovery.
+    #[must_use]
+    pub fn broadcast_start_ms(&self) -> Option<u64> {
+        self.state.borrow().broadcast_start_ms
+    }
+
+    fn set_broadcast_start(&self, start_ms: u64) {
+        self.state.borrow_mut().broadcast_start_ms = Some(start_ms);
+    }
+
+    /// The current timeline snapshot. The refresh task replaces the `Rc` instead
+    /// of mutating it, so a reader can hold one without blocking the refresh.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<Rc<DvrTimeline>> {
+        self.state.borrow().timeline.clone()
+    }
+
+    /// Parse `text` into the shared timeline, replacing the previous snapshot.
     fn set_timeline(&self, base_url: &str, text: &str) {
-        let mut state = self.state.borrow_mut();
-        let was_empty = state
-            .timeline
-            .as_ref()
-            .is_none_or(|timeline| timeline.segments.is_empty());
-        let timeline = state.timeline.get_or_insert_with(VodTimeline::default);
-        timeline.reload(base_url, text);
-        if was_empty && !timeline.segments.is_empty() {
+        let timeline = Rc::new(DvrTimeline::parse(base_url, text));
+        if !timeline.segments.is_empty() {
             debug!(segments = timeline.segments.len(), "dvr: playlist ready");
         }
+        self.state.borrow_mut().timeline = Some(timeline);
+        self.changed();
     }
 
     /// URL, playlist start and duration of the segment at `position_ms`.
@@ -263,7 +332,7 @@ pub fn spawn(client: Rc<Client>, channel: Option<String>, dvr: Rc<Dvr>) {
                 let Some(channel) = channel.as_deref() else {
                     return;
                 };
-                let Some(discovered) = discover(&client, channel).await else {
+                let Some(discovered) = discover(&client, channel, &dvr).await else {
                     debug!("dvr: no playlist found, retrying");
                     compio::time::sleep(DISCOVERY_RETRY).await;
                     continue;
@@ -298,10 +367,10 @@ enum Discovery {
     Media(String),
     /// Public archive: a master playlist plus its media playlists. The master
     /// URL carries the playback signature; the media playlist URLs do not.
-    Master(Vec<VodVariant>),
+    Master(Vec<DvrVariant>),
 }
 
-struct VodVariant {
+struct DvrVariant {
     /// The same `STABLE-VARIANT-ID` the live master publishes.
     id: Option<String>,
     url: String,
@@ -327,7 +396,7 @@ async fn resolve_discovery(discovery: Discovery, dvr: &Dvr) -> Option<String> {
 
 /// Match the live `STABLE-VARIANT-ID` against the archive master, falling back
 /// to the first media playlist when there is no match.
-fn choose_variant<'a>(variants: &'a [VodVariant], live: Option<&str>) -> Option<&'a VodVariant> {
+fn choose_variant<'a>(variants: &'a [DvrVariant], live: Option<&str>) -> Option<&'a DvrVariant> {
     live.and_then(|id| {
         variants
             .iter()
@@ -351,7 +420,7 @@ async fn wait_live_variant(dvr: &Dvr) -> Option<String> {
     }
 }
 
-async fn discover(client: &Client, channel: &str) -> Option<Discovery> {
+async fn discover(client: &Client, channel: &str, dvr: &Dvr) -> Option<Discovery> {
     let data = gql(
         client,
         sonic_rs::json!({
@@ -373,6 +442,9 @@ async fn discover(client: &Client, channel: &str) -> Option<Discovery> {
     let stream_id = stream.pointer(pointer!["id"])?.as_str()?.to_owned();
     let created_at = stream.pointer(pointer!["createdAt"])?.as_str()?;
     let created_ms = parse_iso8601_millis(created_at)?;
+    if let Ok(created_ms) = u64::try_from(created_ms) {
+        dvr.set_broadcast_start(created_ms);
+    }
 
     if let Some(master) = public_vod(client, channel, &user_id, created_ms).await {
         return Some(Discovery::Master(master));
@@ -392,7 +464,7 @@ async fn public_vod(
     channel: &str,
     user_id: &str,
     stream_created_ms: i64,
-) -> Option<Vec<VodVariant>> {
+) -> Option<Vec<DvrVariant>> {
     let data = gql(
         client,
         sonic_rs::json!({
@@ -481,7 +553,7 @@ async fn public_vod(
 /// Parse the media playlists out of a VOD master. The v2 endpoint publishes the
 /// same `STABLE-VARIANT-ID` as the live master, so the archive can be matched
 /// by the scheduler's chosen variant.
-fn parse_master(text: &str) -> Vec<VodVariant> {
+fn parse_master(text: &str) -> Vec<DvrVariant> {
     let mut variants = Vec::new();
     let mut stream_inf = None;
 
@@ -493,7 +565,7 @@ fn parse_master(text: &str) -> Vec<VodVariant> {
             && !line.starts_with('#')
             && let Some(attributes) = stream_inf.take()
         {
-            variants.push(VodVariant {
+            variants.push(DvrVariant {
                 id: attribute(attributes, "STABLE-VARIANT-ID").map(str::to_owned),
                 url: line.to_owned(),
             });
@@ -660,7 +732,7 @@ https://cdn/audio_only/index-dvr.m3u8
 
     #[test]
     fn parses_positions_and_resolves_urls() {
-        let timeline = VodTimeline::parse("http://127.0.0.2:8000/index-dvr.m3u8", DVR);
+        let timeline = DvrTimeline::parse("http://127.0.0.2:8000/index-dvr.m3u8", DVR);
         assert_eq!(timeline.segments.len(), 3);
         assert_eq!(timeline.end_ms, 30_000);
         assert_eq!(timeline.segments[1].start_ms, 10_000);
@@ -669,7 +741,7 @@ https://cdn/audio_only/index-dvr.m3u8
 
     #[test]
     fn reloads_in_place() {
-        let mut timeline = VodTimeline::parse("http://host/index-dvr.m3u8", DVR);
+        let mut timeline = DvrTimeline::parse("http://host/index-dvr.m3u8", DVR);
         timeline.reload(
             "http://host/index-dvr.m3u8",
             "#EXTM3U\n#EXTINF:2.000,\nx.ts\n",
@@ -681,7 +753,7 @@ https://cdn/audio_only/index-dvr.m3u8
 
     #[test]
     fn finds_the_containing_and_next_segment() {
-        let timeline = VodTimeline::parse("http://host/index-dvr.m3u8", DVR);
+        let timeline = DvrTimeline::parse("http://host/index-dvr.m3u8", DVR);
         assert_eq!(timeline.find(0), Some(0));
         assert_eq!(timeline.find(15_000), Some(1));
         assert_eq!(timeline.find(30_000), None);

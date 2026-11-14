@@ -3,14 +3,14 @@
 mod arena;
 #[allow(clippy::future_not_send)]
 mod constants;
-// Disk output is disabled for now: RTSP/RTP is the only sink. The module is kept
-// (and mirrors index.hexpat) for when the DVR output comes back.
-// #[allow(clippy::future_not_send)]
-// mod disk;
 #[allow(clippy::future_not_send)]
 mod daemon;
 #[allow(clippy::future_not_send)]
+mod disk;
+#[allow(clippy::future_not_send)]
 mod downloader;
+#[allow(clippy::future_not_send)]
+mod notify;
 #[allow(clippy::future_not_send)]
 mod spool;
 // compio tasks are deliberately !Send (one thread-per-core reactor).
@@ -38,6 +38,9 @@ use std::rc::Rc;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use futures_util::future::Either;
+use futures_util::future::select;
+use futures_util::pin_mut;
 #[cfg(not(miri))]
 use mimalloc::MiMalloc;
 use tracing::error;
@@ -99,6 +102,18 @@ struct Play {
     /// STABLE-VARIANT-ID (`720p60`, `chunked`, ...); defaults to the first
     #[arg(short, long)]
     quality: Option<String>,
+
+    /// Record the complete broadcast into this directory
+    #[arg(long)]
+    output: Option<std::path::PathBuf>,
+
+    /// Webhook to notify about skipped DVR chunks and alignment problems
+    #[arg(long)]
+    notify: Option<String>,
+
+    /// Keep `live.NNN` run pairs after their holes are filled
+    #[arg(long)]
+    keep_runs: bool,
 }
 
 #[derive(Args, Debug)]
@@ -110,6 +125,18 @@ struct Daemon {
     /// Streams served at once
     #[arg(long, default_value_t = crate::constants::MAX_STREAMS)]
     max_streams: usize,
+
+    /// Record every stream into this directory
+    #[arg(long)]
+    output: Option<std::path::PathBuf>,
+
+    /// Webhook to notify about skipped DVR chunks and alignment problems
+    #[arg(long)]
+    notify: Option<String>,
+
+    /// Keep `live.NNN` run pairs after their holes are filled
+    #[arg(long)]
+    keep_runs: bool,
 }
 
 fn default_bind() -> SocketAddr {
@@ -124,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Config::parse();
     match &cfg.command {
-        Command::Play(args) => play(&cfg, args).await?,
+        Command::Play(args) => Box::pin(play(&cfg, args)).await?,
         Command::Daemon(args) => daemon(&cfg, args).await?,
     }
     Ok(())
@@ -132,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// One channel, served at the root of every loopback RTSP address.
 #[allow(clippy::future_not_send)]
-async fn play(cfg: &Config, args: &Play) -> Result<(), VariantPlaylistError> {
+async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error>> {
     let title = if cfg.debug {
         DEBUG_CHANNEL_TITLE.to_owned()
     } else {
@@ -145,16 +172,18 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), VariantPlaylistError> {
 
     // Debug mode replays the mock's DVR playlist. Otherwise discovery (GQL plus
     // domain probing) and the periodic playlist refresh run in the background,
-    // concurrently with the live variant and manifest fetches.
-    let dvr = rtsp::vod::Dvr::new(cfg.debug.then(|| DEBUG_DVR_URL.to_owned()));
-    rtsp::vod::spawn(
+    // concurrently with the live variant and manifest fetches. `NO_DVR` turns
+    // the mock's DVR playlist off so the no-URL promotion path can be tested.
+    let debug_dvr = (std::env::var_os("NO_DVR").is_none()).then(|| DEBUG_DVR_URL.to_owned());
+    let dvr = rtsp::dvr::Dvr::new(if cfg.debug { debug_dvr } else { None });
+    rtsp::dvr::spawn(
         Rc::clone(&client),
         (!cfg.debug).then(|| args.channel.clone()),
         Rc::clone(&dvr),
     );
 
-    let variants = if cfg.debug {
-        vec![variant::debug_variant()]
+    let (variants, broadcast_id) = if cfg.debug {
+        (vec![variant::debug_variant()], 0)
     } else {
         // A manifest failure is reported and turned into a non-zero exit; it is
         // not a reason to kill the process from deep inside the request path.
@@ -167,10 +196,10 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), VariantPlaylistError> {
         )
         .await
         {
-            Ok((variants, _stream_id)) => variants,
+            Ok(resolved) => resolved,
             Err(error) => {
                 error!(%error, channel = %args.channel, "failed to resolve variants");
-                return Err(error);
+                return Err(error.into());
             }
         }
     };
@@ -200,6 +229,25 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), VariantPlaylistError> {
     let live_window = Rc::new(RefCell::new(Vec::new()));
     let reader_wake = ConsumerWake::new();
 
+    let notifier = args
+        .notify
+        .as_ref()
+        .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
+    let disk = args.output.as_ref().map(|output| {
+        disk::spawn_disk_output(
+            disk::DiskOptions {
+                output: output.clone(),
+                stream_id: if cfg.debug { 0 } else { broadcast_id },
+                keep_runs: args.keep_runs,
+                notifier,
+                dvr: Rc::clone(&dvr),
+            },
+            &wakes,
+            &downloaders_tx.clone().to_async(),
+            &registration_tx,
+        )
+    });
+
     downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(&client, &downloaders_rx);
     rtsp::spawn_media(
         Rc::clone(&stream),
@@ -225,7 +273,28 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), VariantPlaylistError> {
     )
     .with_live_window(live_window);
 
-    scheduler.main().await;
+    let scheduler_future = scheduler.main();
+    pin_mut!(scheduler_future);
+    if let Some(disk) = disk {
+        let disk_future = disk.wait();
+        pin_mut!(disk_future);
+        match select(scheduler_future.as_mut(), disk_future.as_mut()).await {
+            Either::Left(((), _)) => {
+                // The scheduler ended (offline): let the DVR finish its tail.
+                if let Some(error) = disk_future.await {
+                    return Err(error.into());
+                }
+            }
+            Either::Right((fatal, _)) => {
+                if let Some(error) = fatal {
+                    return Err(error.into());
+                }
+                scheduler_future.await;
+            }
+        }
+    } else {
+        scheduler_future.await;
+    }
 
     // Dropping the runtime cancels the remaining tasks.
     drop(registration_tx);
@@ -244,6 +313,11 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
     downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(&client, &downloaders_rx);
 
+    let notifier = args
+        .notify
+        .as_ref()
+        .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
+
     let registry = Rc::new(daemon::Registry::new(
         client,
         arena,
@@ -254,8 +328,12 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             low_latency: cfg.low_latency,
             debug: cfg.debug,
             max_streams: args.max_streams,
+            output: args.output.clone(),
+            notify: notifier,
+            keep_runs: args.keep_runs,
         },
     ));
+    registry.watch_finished();
 
     // Only returns on a bind error: the accept loop runs for the process's life.
     rtsp::serve(registry, args.bind).await?;

@@ -94,6 +94,11 @@ pub struct Segment {
     /// Presentation time since the start of the broadcast. The RTSP output maps
     /// this to NPT so clients can show the absolute position in the stream.
     pub timestamp_ms: u64,
+    /// Absolute `EXT-X-PROGRAM-DATE-TIME` (Unix epoch ms), or `0` when the
+    /// playlist publishes none. The disk output aligns live and DVR by this.
+    pub pdt_ms: u64,
+    /// Length of the segment, so a reader can compute `start + duration`.
+    pub duration_ms: u64,
     pub sequence_num: u64,
     pub reader: Reader,
 }
@@ -427,6 +432,7 @@ impl StreamScheduler {
         url: &str,
         expected_sequence: u64,
         timestamp_ms: u64,
+        pdt_ms: u64,
         duration_ms: u64,
     ) -> eros::Result<(), (ArenaFull, kanal::SendError)> {
         let prefetch = self
@@ -455,6 +461,8 @@ impl StreamScheduler {
                     sequence_num: expected_sequence,
                     reader: prefetch.reader,
                     timestamp_ms,
+                    pdt_ms,
+                    duration_ms,
                 },
                 None,
             )
@@ -465,6 +473,8 @@ impl StreamScheduler {
                     sequence_num: expected_sequence,
                     reader,
                     timestamp_ms,
+                    pdt_ms,
+                    duration_ms,
                 },
                 Some(writer),
             )
@@ -477,6 +487,7 @@ impl StreamScheduler {
                     url: Rc::from(url),
                     writer,
                     span: span.clone(),
+                    done: None,
                 })
                 .await
                 .union()?;
@@ -521,6 +532,7 @@ impl StreamScheduler {
                 url: url.clone(),
                 writer,
                 span,
+                done: None,
             })
             .await
             .union()?;
@@ -565,6 +577,7 @@ impl StreamScheduler {
                 url: uri.into(),
                 writer,
                 span,
+                done: None,
             })
             .await
             .union()?;
@@ -589,6 +602,9 @@ impl StreamScheduler {
                     debug!("new front {front}");
                     self.segments.retain(|s| s.sequence_num >= front);
                 }
+                Event::ProgramDateTime(pdt_ms) => {
+                    debug!(pdt_ms, "new program date time");
+                }
                 Event::Init(uri) => self.apply_init(uri).await.widen()?,
                 Event::Discontinuity => self.broadcast_discontinuity(),
                 Event::Checkpoint { annotated, next } => last_checkpoint = Some((annotated, next)),
@@ -608,6 +624,7 @@ impl StreamScheduler {
                         media.uri,
                         media.sequence,
                         media.timestamp_ms,
+                        media.pdt_ms.unwrap_or(0),
                         media.duration_ms,
                     )
                     .await

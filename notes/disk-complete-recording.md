@@ -1,8 +1,8 @@
 # Disk output: complete-broadcast recording
 
-Status: design.  `disk.rs` is still disabled (`// mod disk;` in `main.rs`) and its
-v3 format is replaced wholesale by this document.  `index.hexpat` mirrors the
-format.
+Status: implemented in `crates/twitch/src/disk.rs` (v4 index).  `--output` on
+both `play` and `daemon`; `index.hexpat` mirrors the format.  `disk.rs` replaces
+the disabled v3 implementation wholesale.
 
 Goal: with `--output <dir>`, produce one **contiguous, ad-free archive** of a
 broadcast at `<dir>/<stream_id>/segs` + `<dir>/<stream_id>/index` (debug uses
@@ -104,7 +104,11 @@ Header { magic: "OZENIKEN", version: u32 = 4, stream_id: u64 }
 | 0 | `Segment { source: u8, sequence: u64, elapsed_ms: u32, pdt_ms: u64, duration_ms: u32, byte_offset: u64, byte_length: u32, hash: u128, flags: u8 }` |
 | 1 | `Init { source: u8, counter: u64, byte_offset: u64, byte_length: u32, hash: u128 }` |
 | 2 | `Discontinuity { width: u16, height: u16, rate_num: u16, rate_denom: u16 }` |
-| 3 | `Run { dst_segs_offset: u64, segs_len: u64, source_segs_offset: u64, source_index_offset: u64, record_len: u32, complete: u8 }` |
+| 3 | `Run { run: u32, dst_segs_offset: u64, segs_len: u64, source_segs_offset: u64, source_index_offset: u64, record_len: u32, complete: u8 }` |
+
+`Run.run` is the one field beyond the original table: without it a resume has no
+way to name the `live.NNN` pair that backs a pending hole.  It sits immediately
+after the tag, so the rest of the layout is unchanged.
 
 - `source`: `0` live, `1` DVR.  Each record stores **its own source's sequence
   number**.  There is no mapping between DVR and live numbering — the
@@ -167,11 +171,12 @@ fsynced and the run pair deleted (unless `--keep-runs`).
    `segs` to `max(byte_offset + byte_length)` over the surviving records (not to
    the file length, which runs past hole reservations), then read the last
    record's bytes back and verify its xxh3; walk back while it fails.
-3. Pending `Run` → truncate the canonical back to `dst_segs_offset`, redo the
-   index hole from `source_index_offset` (re-deriving the init counter base from
-   the records before the marker) and the segs hole from `source_segs_offset`,
-   fsync, flip, delete the pair.  The run pair was never deleted while pending,
-   so a full redo is always possible.
+3. Pending `Run` → redo it in place: write the rebased records into the index
+   hole and the middle bytes into the segs hole, fsync, flip `complete`, delete
+   the pair (unless `--keep-runs`).  Later DVR records are left untouched (the
+   hole is below them), so a crash during a background copy costs only that
+   copy.  A complete `Run` (even an abandoned, zero-filled one) is final; a
+   missing source pair turns a pending marker into exactly that abandoned hole.
 4. Complete `Run` → delete any leftover run pair unless `--keep-runs`.
 5. Decide the mode from the index:
    - DVR records and a DVR URL now → continue the DVR from the last record
@@ -245,9 +250,14 @@ fsynced and the run pair deleted (unless `--keep-runs`).
 - Unit: v4 round-trip; the hole arithmetic (`run_len - leading - trailing`), the
   trim by `pdt_ms`, the copy transform (rebase `byte_offset`, renumber `Init`
   counters), `Run` recovery.
-- Mock integration: `SPEED=1`, join at a non-zero offset, kill and restart the
-  client; assert the canonical index is contiguous and monotonic, every pending
-  `Run` was completed, and the run pairs are gone (or kept with `--keep-runs`).
+- **Mock integration:** `SPEED=1`, join at a non-zero offset (`START_MS`),
+  kill and restart the client; assert the canonical index is contiguous and
+  monotonic, every pending `Run` was completed, and the run pairs are gone (or
+  kept with `--keep-runs`).  `NO_DVR=1` exercises the promotion path.  The
+  implementation was checked with `START_MS=120000` / `SPEED=16` for prefill +
+  hole copies, a mid-prefill kill + restart, a promoted-live kill + restart
+  with the DVR back on (the live → DVR switch), and daemon mode through
+  `ffprobe`.
 - `ffprobe` the `segs`; `cargo +nightly miri test -p twitch-hls-client2` for the
   arena/spool changes.
 

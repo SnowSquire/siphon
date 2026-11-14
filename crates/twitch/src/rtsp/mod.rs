@@ -8,10 +8,10 @@
 mod aac;
 #[cfg(test)]
 mod bench;
+pub mod dvr;
 mod h264;
 mod sdp;
 mod ts;
-pub mod vod;
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -54,10 +54,10 @@ use crate::constants::MAX_CONSUMER_LAG;
 use crate::constants::RTP_MAX_PAYLOAD;
 use crate::http::Client;
 use crate::rtsp::aac::AudioConfig;
+use crate::rtsp::dvr::Dvr;
 use crate::rtsp::h264::H264Config;
 use crate::rtsp::ts::Sample;
 use crate::rtsp::ts::TsDemuxer;
-use crate::rtsp::vod::Dvr;
 use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::Segment;
 use crate::scheduler::SegmentMessage;
@@ -2242,6 +2242,8 @@ impl Media {
                 );
                 self.play_live_segment(Segment {
                     timestamp_ms,
+                    pdt_ms: 0,
+                    duration_ms: 0,
                     sequence_num: expected_sequence,
                     reader,
                 })
@@ -2543,6 +2545,8 @@ fn drain_messages(
             } => {
                 let candidate = Segment {
                     timestamp_ms,
+                    pdt_ms: 0,
+                    duration_ms: 0,
                     sequence_num: expected_sequence,
                     reader,
                 };
@@ -2732,6 +2736,7 @@ fn video_packet_count(nals: &[(usize, usize)]) -> usize {
 mod tests {
     use super::*;
 
+    #[cfg(not(miri))]
     #[test]
     fn the_play_listeners_share_a_port() {
         compio::runtime::Runtime::new()

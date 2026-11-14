@@ -20,7 +20,7 @@ crate-wide). The driver owns the threads (IOCP on Windows, io_uring on Linux).
 ```
 manifest poll (scheduler) ──► downloader queue ──► spool ──► consumers
        │                                             ├─ RTSP media engine
-       └─ variant resolution (GQL + usher)           └─ disk (planned)
+       └─ variant resolution (GQL + usher)           └─ disk recorder
 ```
 
 The scheduler polls the media playlist, parses Twitch's tags, dispatches
@@ -58,7 +58,20 @@ The registry behind `daemon` mode; `rtsp-daemon.md` has the lifecycle, URI,
 capacity and resolver. In short: one global `Client`, `ArenaSet` and downloader
 queue; `(channel, quality)` maps to a `Stream`; DESCRIBE resolves the channel,
 picks the variant and builds the pipeline; the last viewer leaving stops it;
-`--max-streams` refuses rather than evicting.
+`--max-streams` refuses rather than evicting.  With `--output` a recording keeps
+its stream entry (and counts against the limit) after the last viewer leaves;
+the registry releases it when the disk recorder finishes.
+
+## `disk.rs`
+
+`--output <dir>` records one complete, ad-free archive per broadcast:
+`<dir>/<stream_id>/{segs,index}`.  Live segments are recorded immediately into
+numbered runs, the DVR playlist fills the pre-join span and every ad gap, and
+each run's uncovered middle is copied into a reserved hole; see
+`disk-complete-recording.md` for the file format, the hole arithmetic and the
+resume repair.  The DVR fetch and the copies run as their own tasks, so neither
+source ever waits on the other; only the canonical assembly waits for a hole,
+never for the network.
 
 ## Listeners
 

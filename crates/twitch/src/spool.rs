@@ -105,6 +105,17 @@ pub struct Spool {
 
 impl Spool {
     pub fn open(arena: &Rc<ArenaSet>, wakes: &Rc<WakeSet>) -> Result<(Writer, Reader), ArenaFull> {
+        Self::open_with_cap(arena, wakes, SEGMENT_SLOTS_MAX)
+    }
+
+    /// A spool with an explicit slot cap. The DVR chunks are much larger than a
+    /// live segment, so the disk output opens them against its own arena and cap
+    /// instead of contending with (and overflowing) the live pool.
+    pub fn open_with_cap(
+        arena: &Rc<ArenaSet>,
+        wakes: &Rc<WakeSet>,
+        cap: usize,
+    ) -> Result<(Writer, Reader), ArenaFull> {
         let head = arena.alloc().ok_or(ArenaFull)?;
         let spool = Rc::new(Self {
             arena: Rc::clone(arena),
@@ -121,6 +132,7 @@ impl Spool {
             wakes: Rc::clone(wakes),
             tail: SlotMut::adopt(arena, head),
             slots: 1,
+            slots_max: cap,
         };
 
         Ok((writer, reader))
@@ -133,13 +145,14 @@ pub struct Writer {
     tail: SlotMut,
     /// Slots this spool owns, capped so one lagging segment cannot pin the pool.
     slots: usize,
+    slots_max: usize,
 }
 
 impl Writer {
     /// Writable remainder of the tail slot, linking a new slot when it is full.
     pub fn tail(&mut self) -> Result<&mut [u8], ArenaFull> {
         if self.tail.is_full() {
-            if self.slots >= SEGMENT_SLOTS_MAX {
+            if self.slots >= self.slots_max {
                 return Err(ArenaFull);
             }
             let id = self.spool.arena.alloc().ok_or(ArenaFull)?;
