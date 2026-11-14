@@ -74,11 +74,10 @@ pub enum HdrMode {
     Off,
 }
 
-/// One D3D12 swapchain and the wgpu textures that stand for its backbuffers.
+/// One D3D12 swapchain and the Vulkan images that stand for its backbuffers.
 pub struct DxgiSwapchain {
-    /// Views of the backbuffers; each keeps its imported texture alive. Declared
-    /// before the handles and D3D12 resources so the release callbacks run first.
-    views: Vec<wgpu::TextureView>,
+    /// The Vulkan images and memories libplacebo renders into.
+    images: Vec<(vk::Image, vk::DeviceMemory)>,
     /// The NT handles the Vulkan memories were imported from.
     shared_handles: Vec<HANDLE>,
     /// The D3D12 resources themselves, kept alive while the Vulkan images exist.
@@ -90,9 +89,14 @@ pub struct DxgiSwapchain {
     /// Kept alive with the swapchain; the shared handles came from it.
     #[expect(dead_code, reason = "D3D12 objects the swapchain is associated with")]
     device: ID3D12Device,
+    /// The `vk::Device` the images and memories were created on.
+    device_handle: ash::Device,
     format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
     hdr: bool,
     max_luminance: f32,
+    sdr_white: f32,
 }
 
 impl DxgiSwapchain {
@@ -174,13 +178,13 @@ impl DxgiSwapchain {
         unsafe { factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }
             .context("MakeWindowAssociation")?;
 
-        let (hdr, max_luminance) = configure_hdr(&swapchain, hdr)?;
+        let (hdr, max_luminance, sdr_white) = configure_hdr(&swapchain, hdr)?;
         let format = wgpu::TextureFormat::Rgb10a2Unorm;
 
         let instance = hal_adapter.shared_instance().raw_instance();
-        let mut views = Vec::with_capacity(BUFFERS as usize);
         let mut shared_handles = Vec::with_capacity(BUFFERS as usize);
         let mut backbuffers = Vec::with_capacity(BUFFERS as usize);
+        let mut images = Vec::with_capacity(BUFFERS as usize);
 
         for index in 0..BUFFERS {
             // SAFETY: the swapchain is alive and `index` is below its buffer count.
@@ -200,37 +204,31 @@ impl DxgiSwapchain {
             .with_context(|| format!("CreateSharedHandle({index})"))?;
 
             // SAFETY: the image is created on the same device and memory is bound to it
-            // below; the callback destroys both exactly once, after wgpu has let go.
-            let texture = unsafe {
-                import_backbuffer(
-                    gpu,
-                    &hal_device,
-                    instance,
-                    handle,
-                    width,
-                    height,
-                    format,
-                    VK_FORMAT,
-                )
+            // below; `Drop` destroys both exactly once.
+            let imported = unsafe {
+                import_backbuffer(&hal_device, instance, handle, width, height, VK_FORMAT)
             }
             .with_context(|| format!("import backbuffer {index}"))?;
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-            views.push(view);
+            images.push(imported);
             shared_handles.push(handle);
             backbuffers.push(resource);
         }
 
         Ok(Self {
-            views,
+            images,
             shared_handles,
             backbuffers,
             swapchain,
             queue,
             device,
+            device_handle: hal_device.raw_device().clone(),
             format,
+            width,
+            height,
             hdr,
             max_luminance,
+            sdr_white,
         })
     }
 
@@ -241,10 +239,16 @@ impl DxgiSwapchain {
         unsafe { self.swapchain.GetCurrentBackBufferIndex() }
     }
 
-    /// A view of backbuffer `index`, for the compositor to draw into.
+    /// The Vulkan image standing for backbuffer `index`.
     #[must_use]
-    pub fn view(&self, index: u32) -> Option<&wgpu::TextureView> {
-        self.views.get(usize::try_from(index).ok()?)
+    pub fn image(&self, index: u32) -> Option<vk::Image> {
+        Some(self.images.get(usize::try_from(index).ok()?)?.0)
+    }
+
+    /// The pixel size the swapchain was created with.
+    #[must_use]
+    pub const fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// The format every backbuffer uses.
@@ -265,6 +269,12 @@ impl DxgiSwapchain {
         self.max_luminance
     }
 
+    /// The display's SDR white point in nits.
+    #[must_use]
+    pub const fn sdr_white(&self) -> f32 {
+        self.sdr_white
+    }
+
     /// Hands the current backbuffer to the compositor.
     #[allow(
         clippy::borrow_as_ptr,
@@ -282,9 +292,15 @@ impl DxgiSwapchain {
 
 impl Drop for DxgiSwapchain {
     fn drop(&mut self) {
-        // The wgpu textures are dropped before this runs (field order), so their release
-        // callbacks have destroyed the Vulkan images and memories. The handles and D3D12
-        // resources can go now.
+        // The libplacebo textures over these images are destroyed by the renderer
+        // before the swapchain drops, so nothing can still be rendering into them.
+        for (image, memory) in self.images.drain(..) {
+            // SAFETY: both came from the device below and are freed once.
+            unsafe {
+                self.device_handle.destroy_image(image, None);
+                self.device_handle.free_memory(memory, None);
+            }
+        }
         for handle in self.shared_handles.drain(..) {
             // SAFETY: every handle came from `CreateSharedHandle` and is closed once.
             unsafe {
@@ -316,7 +332,13 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
 }
 
 /// Puts the swapchain in HDR when requested and available.
-fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(bool, f32)> {
+///
+/// Also answers where the user put SDR white, which is what the interface and
+/// any SDR video have to be rendered against.
+fn configure_hdr(
+    swapchain: &IDXGISwapChain3,
+    mode: HdrMode,
+) -> anyhow::Result<(bool, f32, f32)> {
     // SAFETY: the swapchain is alive for the call.
     let output = unsafe { swapchain.GetContainingOutput() }.context("GetContainingOutput")?;
     let output6: IDXGIOutput6 = output.cast().context("IDXGIOutput6")?;
@@ -328,6 +350,13 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(
     }
     .context("CheckColorSpaceSupport")?;
     let supported = support & (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) != 0;
+    eprintln!(
+        "DXGI output: color space {:?}, peak {} nits, max full-frame {} nits, bits {}",
+        desc.ColorSpace,
+        desc.MaxLuminance,
+        desc.MaxFullFrameLuminance,
+        desc.BitsPerColor
+    );
 
     let active = match mode {
         HdrMode::Off => false,
@@ -351,7 +380,17 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(
     if active {
         set_hdr_metadata(swapchain)?;
     }
-    Ok((active, desc.MaxLuminance))
+    let sdr_white = match crate::sdr::white_nits(&desc.DeviceName) {
+        Ok(nits) => nits,
+        Err(error) => {
+            eprintln!("SDR white: {error:#}; assuming 200 nits");
+            200.0
+        }
+    };
+    eprintln!(
+        "SDR white: {sdr_white:.0} nits (level from the display configuration)"
+    );
+    Ok((active, desc.MaxLuminance, sdr_white))
 }
 
 /// Publishes the mastering metadata for the HDR10 container.
@@ -381,27 +420,21 @@ fn set_hdr_metadata(swapchain: &IDXGISwapChain3) -> anyhow::Result<()> {
         .context("SetHDRMetaData")
 }
 
-/// Creates a Vulkan image over a D3D12 backbuffer's shared memory and wraps it in wgpu.
+/// Creates a Vulkan image over a D3D12 backbuffer's shared memory.
 ///
 /// # Safety
 ///
 /// `handle` must be an NT handle from `ID3D12Device::CreateSharedHandle` for a
-/// texture matching `width`, `height` and the format assumed here, and `device` must be
-/// the Vulkan device the handle was created for.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one imported image, all of its handles are separate"
-)]
+/// texture matching `width` and `height`, and `device` must be the Vulkan device
+/// the handle was created for.
 unsafe fn import_backbuffer(
-    gpu: &Gpu,
     device: &wgpu::hal::vulkan::Device,
     instance: &ash::Instance,
     handle: HANDLE,
     width: u32,
     height: u32,
-    format: wgpu::TextureFormat,
     vk_format: vk::Format,
-) -> anyhow::Result<wgpu::Texture> {
+) -> anyhow::Result<(vk::Image, vk::DeviceMemory)> {
     let raw = device.raw_device();
     let physical = device.raw_physical_device();
     let win32 = khr::external_memory_win32::Device::new(instance, raw);
@@ -420,7 +453,15 @@ unsafe fn import_backbuffer(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        // The same usages a D3D12 backbuffer resource has: render target, copy
+        // source/destination and shader resource. libplacebo picks its render
+        // path from these.
+        .usage(
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED,
+        )
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut external);
@@ -474,70 +515,12 @@ unsafe fn import_backbuffer(
         // SAFETY: both objects are ours and nothing else names them.
         unsafe {
             raw.destroy_image(image, None);
-        }
-        // SAFETY: the image is gone, so its memory can be freed.
-        unsafe {
             raw.free_memory(memory, None);
         }
         return Err(error).context("vkBindImageMemory");
     }
 
-    let raw_for_drop = raw.clone();
-    let release: wgpu::hal::DropCallback = Box::new(move || {
-        // SAFETY: wgpu has destroyed the texture that named the image, so no submission
-        // still uses it.
-        unsafe {
-            raw_for_drop.destroy_image(image, None);
-        }
-        // SAFETY: the image is gone, so its memory can be freed.
-        unsafe {
-            raw_for_drop.free_memory(memory, None);
-        }
-    });
-
-    let hal = wgpu::hal::TextureDescriptor {
-        label: Some("video.dxgi"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUses::COLOR_TARGET,
-        memory_flags: wgpu::hal::MemoryFlags::empty(),
-        view_formats: Vec::new(),
-    };
-    // SAFETY: `image` was just created on this device with exactly the descriptor's
-    // shape and usage, and it is bound to memory that outlives it.
-    let hal_texture = unsafe {
-        device.texture_from_raw(
-            image,
-            &hal,
-            Some(release),
-            wgpu::hal::vulkan::TextureMemory::External,
-        )
-    };
-
-    let descriptor = wgpu::TextureDescriptor {
-        label: Some("video.dxgi"),
-        size: hal.size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    };
-    // SAFETY: the hal texture came from this device, the descriptor agrees with it, and
-    // the image is complete because memory is bound.
-    let texture = unsafe {
-        gpu.device()
-            .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &descriptor)
-    };
-    Ok(texture)
+    Ok((image, memory))
 }
 
 /// Converts a raw handle into the Windows `HWND` type.

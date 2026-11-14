@@ -155,11 +155,13 @@ impl HwDevice {
             let mut vk12 = vk::PhysicalDeviceVulkan12Features::default()
                 .host_query_reset(true)
                 .timeline_semaphore(true);
-            let mut features = vk::PhysicalDeviceFeatures::default();
-            features.shader_image_gather_extended = vk::TRUE;
-            features.fragment_stores_and_atomics = vk::TRUE;
-            features.shader_int64 = vk::TRUE;
-            features.vertex_pipeline_stores_and_atomics = vk::TRUE;
+            let features = vk::PhysicalDeviceFeatures {
+                shader_image_gather_extended: vk::TRUE,
+                fragment_stores_and_atomics: vk::TRUE,
+                shader_int64: vk::TRUE,
+                vertex_pipeline_stores_and_atomics: vk::TRUE,
+                ..Default::default()
+            };
             (*vk).device_features = PhysicalDeviceFeatures2 {
                 s_type: PHYSICAL_DEVICE_FEATURES_2,
                 p_next: (&raw mut vk12).cast(),
@@ -199,7 +201,7 @@ impl Drop for HwDevice {
     }
 }
 
-unsafe extern "C" fn ignore_free(_ctx: *mut ffi::AVHWDeviceContext) {}
+const unsafe extern "C" fn ignore_free(_ctx: *mut ffi::AVHWDeviceContext) {}
 
 fn av_error(code: i32) -> String {
     let mut buffer = [0i8; 256];
@@ -244,7 +246,7 @@ pub fn probe(gpu: &Gpu, path: &Path, video: VideoDecode) -> anyhow::Result<()> {
             continue;
         }
         decoder.send_packet(&packet)?;
-        while decoder.receive_frame(&mut picture).is_ok() {
+        if decoder.receive_frame(&mut picture).is_ok() {
             // SAFETY: the frame is live for the borrow.
             let format = unsafe { (*picture.as_ptr()).format };
             eprintln!(
@@ -263,7 +265,7 @@ pub fn probe(gpu: &Gpu, path: &Path, video: VideoDecode) -> anyhow::Result<()> {
 /// # Safety
 ///
 /// `fmt` must be a valid, `AV_PIX_FMT_NONE`-terminated format list.
-pub unsafe extern "C" fn choose_vulkan_format(
+pub const unsafe extern "C" fn choose_vulkan_format(
     _ctx: *mut ffi::AVCodecContext,
     fmt: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {

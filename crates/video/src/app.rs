@@ -1,6 +1,7 @@
 // ZGUI's component macro generates an associated method whose `self` is never read.
 #![allow(clippy::unused_self)]
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,17 +21,24 @@ use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::SharedGraphics;
 
-use crate::composite::Compositor;
 use crate::dxgi::DxgiSwapchain;
 use crate::dxgi::HdrMode;
 use crate::dxgi::hwnd_from_raw;
+use crate::gpu::VideoDecode;
 use crate::pattern;
+use crate::placebo::Placebo;
+use crate::player::Player;
 use crate::renderer::DxgiRenderer;
 use crate::video;
 
 pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
     let file = file.map_or_else(String::new, |path| path.display().to_string());
     let test_pattern = file.is_empty();
+    let fps = if test_pattern {
+        30.0
+    } else {
+        video::frame_rate(Path::new(&file))
+    };
 
     let (gpu, decode) = crate::gpu::create()?;
     match decode {
@@ -43,19 +51,11 @@ pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
     if !file.is_empty() {
         let video = decode
             .ok_or_else(|| anyhow::anyhow!("this device has no Vulkan video decode"))?;
-        crate::hw::probe(&gpu, std::path::Path::new(&file), video)?;
+        crate::hw::probe(&gpu, Path::new(&file), video)?;
     }
     let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
-    let placebo = crate::placebo::Placebo::import(&gpu)
-        .map_err(|error| anyhow::anyhow!("libplacebo: {error:#}"))?;
-    eprintln!(
-        "libplacebo: imported (API {}, gpu {:?}, renderer {:?})",
-        ffcine_libplacebo_sys::PL_API_VER,
-        placebo.gpu(),
-        placebo.renderer()
-    );
-
     let factory_gpu = Arc::clone(&gpu);
+    let factory_file = PathBuf::from(&file);
 
     // The renderer factory runs before the first view is built, so the monitor's
     // reported peak luminance is already in `max_nits` by the time the slider
@@ -76,28 +76,39 @@ pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
                 surface,
                 target,
                 hdr,
+                decode,
+                &factory_file,
                 max_nits,
                 brightness,
-                test_pattern,
             )
         }))
         .run(move || {
             view! {
-                Panel(file = file.clone(), brightness = brightness, max_nits = max_nits)
+                Panel(
+                    file = file.clone(),
+                    brightness = brightness,
+                    max_nits = max_nits,
+                    fps = fps,
+                )
             }
         })
         .map_err(|error| anyhow::anyhow!("zgui: {error}"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one factory call: the app's state is all separate signals"
+)]
 fn dxgi_renderer(
     graphics: &SharedGraphics,
     gpu: &Arc<Gpu>,
     surface: &Arc<dyn Surface>,
     target: RenderTarget,
     hdr: HdrMode,
+    decode: Option<VideoDecode>,
+    file: &Path,
     max_nits: RwSignal<f64, LocalStorage>,
     brightness: RwSignal<f64, LocalStorage>,
-    test_pattern: bool,
 ) -> Result<Box<dyn Renderer>, AppError> {
     let gpu_surface = Arc::clone(surface)
         .gpu_shared()
@@ -146,21 +157,32 @@ fn dxgi_renderer(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let ui_view = ui.create_view(&wgpu::TextureViewDescriptor::default());
-    let compositor = Compositor::new(gpu.device(), &ui_view, swapchain.format(), swapchain.hdr());
+
+    let placebo =
+        Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error:#}")))?;
+    eprintln!(
+        "libplacebo: imported (API {}, renderer {:?})",
+        ffcine_libplacebo_sys::PL_API_VER,
+        placebo.renderer()
+    );
+
+    let player = if file.as_os_str().is_empty() {
+        None
+    } else {
+        let video = decode
+            .ok_or_else(|| dxgi_error("this device has no Vulkan video decode"))?;
+        Some(
+            Player::open(gpu, video, file)
+                .map_err(|error| dxgi_error(format!("{error:#}")))?,
+        )
+    };
 
     let renderer = graphics
-        .renderer_supplied(target, vec![ui])
+        .renderer_supplied(target, vec![ui.clone()])
         .map_err(AppError::from)?;
-    Ok(Box::new(DxgiRenderer::new(
-        renderer,
-        swapchain,
-        Arc::clone(gpu),
-        ui_view,
-        compositor,
-        brightness,
-        test_pattern,
-    )))
+    let renderer = DxgiRenderer::new(renderer, swapchain, placebo, ui, player)
+        .map_err(|error| dxgi_error(format!("{error:#}")))?;
+    Ok(Box::new(renderer))
 }
 
 fn dxgi_error(reason: impl Into<String>) -> AppError {
@@ -172,6 +194,7 @@ fn Panel(
     file: String,
     brightness: RwSignal<f64, LocalStorage>,
     max_nits: RwSignal<f64, LocalStorage>,
+    fps: f64,
 ) -> impl IntoView {
     let source = SurfaceHandle::new(SurfaceConfig {
         premultiplied: true,
@@ -180,7 +203,7 @@ fn Panel(
     if file.is_empty() {
         pattern::spawn(source.clone());
     } else {
-        video::spawn(source.clone(), PathBuf::from(&file));
+        video::spawn(source.clone(), fps);
     }
 
     eprintln!("UI: brightness slider max {} nits", max_nits.get_untracked());
@@ -192,7 +215,7 @@ fn Panel(
                 label(class = "title") { "video" }
             }
             {zgui::elements::surface()
-                .class("preview")
+                .class("pump")
                 .source(&source)
                 .into_view()}
             row(class = "brightness") {
@@ -220,17 +243,21 @@ fn Panel(
 
 const SHEET: &str = css!(
     ":root {
-        background-color: #0e1016;
+        background-color: transparent;
         color: #e8ecf4;
         font-family: sans-serif;
         display: flex;
-        align-items: center;
+        align-items: flex-end;
         justify-content: center;
+        padding-bottom: 24px;
     }
 
     .panel {
         width: 900px;
         gap: 16px;
+        padding: 18px 22px;
+        border-radius: 14px;
+        background-color: rgba(14, 16, 22, 0.6);
     }
 
     .header {
@@ -243,12 +270,11 @@ const SHEET: &str = css!(
         font-weight: 700;
     }
 
-    .preview {
-        width: 900px;
-        height: 375px;
-        border-radius: 12px;
-        overflow: hidden;
-        border: 1px solid #2c3342;
+    /* The frame pump. It asks for a frame at the video's rate and paints
+       nothing, so it takes no space in the layout. */
+    .pump {
+        width: 1px;
+        height: 1px;
     }
 
     .brightness {

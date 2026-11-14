@@ -1,21 +1,23 @@
-//! The renderer ZGUI draws through: the stock wgpu renderer, presenting into a DXGI swapchain.
+//! The renderer ZGUI draws through: the stock wgpu renderer, then one libplacebo
+//! pass that puts the video and the interface into a DXGI backbuffer.
 //!
-//! `renderer_supplied` writes each composed frame into one of the imported DXGI
-//! backbuffers. After the copy has completed, `Present1` hands that backbuffer to
-//! the compositor. Everything else is forwarded to the wgpu renderer, including
-//! `as_any_mut` so the `surface` embed host can still reach it.
+//! ZGUI composes its interface into an ordinary `Bgra8Unorm` texture. libplacebo
+//! renders the decoded frame into the current backbuffer, tone mapping it for the
+//! display, and blends the interface over it as an overlay in the same pass. The
+//! backbuffer is then handed to DXGI, which is the only presentation path: there
+//! is no `VkSurfaceKHR` and no `VkSwapchainKHR` anywhere.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
+use ffcine_libplacebo_sys as pl;
+use ffmpeg_the_third::frame;
 use zgui::atlas::TextureSink;
 use zgui::bits::DamageSet;
-use zgui::prelude::GetUntracked as _;
-use zgui::reactive::LocalStorage;
-use zgui::reactive::RwSignal;
 use zgui::render::ExternalTexture;
 use zgui::render::FrameOutcome;
 use zgui::render::MemoryReport;
@@ -28,78 +30,393 @@ use zgui::render::TextureHandle;
 use zgui::render::VectorStatus;
 use zgui::scene::Scene;
 use zgui::surface::wgpu;
-use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::WgpuRenderer;
 
-use crate::composite::Compositor;
 use crate::dxgi::DxgiSwapchain;
+use crate::placebo::Placebo;
+use crate::player::MappedFrame;
+use crate::player::Player;
 
 pub struct DxgiRenderer {
     inner: WgpuRenderer,
     swapchain: Rc<RefCell<DxgiSwapchain>>,
-    gpu: Arc<Gpu>,
-    /// Kept alive for the compositor's bind group.
-    _ui_view: wgpu::TextureView,
-    compositor: Compositor,
-    brightness: RwSignal<f64, LocalStorage>,
-    test_pattern: bool,
+    placebo: Placebo,
+    /// One libplacebo texture per backbuffer.
+    targets: Vec<pl::pl_tex>,
+    /// ZGUI's interface, wrapped for the overlay pass.
+    ui: pl::pl_tex,
+    /// Keeps the image behind `ui` alive; dropped after `ui` in `Drop`.
+    _ui_texture: wgpu::Texture,
+    /// Absent when no file was given, which leaves the interface on its own.
+    player: Option<Player>,
+    /// The frame being shown, with the instant it became due.
+    current: Option<(MappedFrame, Instant)>,
+    /// The stream time of the first frame, and when the clock started.
+    clock: Option<(f64, Instant)>,
+    /// A frame decoded ahead of time, kept until it is due.
+    pending: Option<(frame::Video, f64)>,
+    /// The display's peak luminance, for the target colour space.
+    peak_nits: Cell<f32>,
+    /// The display's SDR white point, for the interface and SDR video.
+    sdr_white: f32,
+    /// Timeline semaphore for handing the interface texture back to wgpu.
+    handover: pl::VkSemaphore,
+    /// Monotonic value the last handover signalled.
+    handover_value: Cell<u64>,
+    /// Whether the end of the stream was already reported.
+    eof: Cell<bool>,
+    /// Whether the colour spaces were already reported.
+    logged: Cell<bool>,
 }
 
 impl DxgiRenderer {
     pub fn new(
         inner: WgpuRenderer,
         swapchain: DxgiSwapchain,
-        gpu: Arc<Gpu>,
-        ui_view: wgpu::TextureView,
-        compositor: Compositor,
-        brightness: RwSignal<f64, LocalStorage>,
-        test_pattern: bool,
-    ) -> Self {
-        Self {
+        placebo: Placebo,
+        ui_texture: wgpu::Texture,
+        player: Option<Player>,
+    ) -> anyhow::Result<Self> {
+        let ui = placebo.wrap_wgpu(&ui_texture)?;
+        let peak_nits = Cell::new(swapchain.max_luminance());
+        let sdr_white = swapchain.sdr_white();
+
+        let (width, height) = swapchain.size();
+        let mut targets = Vec::with_capacity(2);
+        for index in 0..2 {
+            let image = swapchain
+                .image(index)
+                .ok_or_else(|| anyhow::anyhow!("the swapchain has no backbuffer {index}"))?;
+            let target = placebo.wrap(
+                image,
+                width,
+                height,
+                // Must match the usage `dxgi` created the images with.
+                ash::vk::Format::A2B10G10R10_UNORM_PACK32,
+                ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | ash::vk::ImageUsageFlags::TRANSFER_SRC
+                    | ash::vk::ImageUsageFlags::TRANSFER_DST
+                    | ash::vk::ImageUsageFlags::SAMPLED,
+            )?;
+            // Only libplacebo renders into these, so it keeps them from here on.
+            placebo.release(
+                target,
+                pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+            );
+            targets.push(target);
+        }
+
+        let handover = placebo.create_semaphore();
+        anyhow::ensure!(
+            !handover.is_null(),
+            "libplacebo refused to create the handover semaphore"
+        );
+
+        Ok(Self {
             inner,
             swapchain: Rc::new(RefCell::new(swapchain)),
-            gpu,
-            _ui_view: ui_view,
-            compositor,
-            brightness,
-            test_pattern,
+            placebo,
+            targets,
+            ui,
+            _ui_texture: ui_texture,
+            player,
+            current: None,
+            clock: None,
+            pending: None,
+            peak_nits,
+            sdr_white,
+            handover,
+            handover_value: Cell::new(0),
+            eof: Cell::new(false),
+            logged: Cell::new(false),
+        })
+    }
+
+    /// The colour space the swapchain expects its pixels in.
+    fn target_color(&self) -> pl::pl_color_space {
+        if !self.swapchain.borrow().hdr() {
+            return pl::pl_color_space {
+                primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_709,
+                transfer: pl::pl_color_transfer::PL_COLOR_TRC_BT_1886,
+                hdr: pl::pl_hdr_metadata {
+                    max_luma: self.sdr_white,
+                    max_cll: self.sdr_white,
+                    ..Default::default()
+                },
+            };
+        }
+        let peak = self.peak_nits.get();
+        pl::pl_color_space {
+            primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_2020,
+            transfer: pl::pl_color_transfer::PL_COLOR_TRC_PQ,
+            hdr: pl::pl_hdr_metadata {
+                // A display with no reported peak: PQ's own 10 000 nits is wrong
+                // for tone mapping, so fall back to a typical HDR panel.
+                max_luma: if peak > 0.0 { peak } else { 1000.0 },
+                min_luma: 0.0,
+                max_cll: if peak > 0.0 { peak } else { 1000.0 },
+                max_fall: 0.0,
+                ..Default::default()
+            },
         }
     }
 
-    /// Composites the UI into the current backbuffer and presents it.
+    /// The interface overlay, in the interface texture's own colour space.
+    fn ui_overlay(&self, part: &pl::pl_overlay_part) -> pl::pl_overlay {
+        pl::pl_overlay {
+            tex: self.ui,
+            mode: pl::pl_overlay_mode::PL_OVERLAY_NORMAL,
+            coords: pl::pl_overlay_coords::PL_OVERLAY_COORDS_DST_FRAME,
+            repr: pl::pl_color_repr {
+                sys: pl::pl_color_system::PL_COLOR_SYSTEM_RGB,
+                levels: pl::pl_color_levels::PL_COLOR_LEVELS_FULL,
+                // ZGUI composites its scene premultiplied.
+                alpha: pl::pl_alpha_mode::PL_ALPHA_PREMULTIPLIED,
+                ..Default::default()
+            },
+            color: pl::pl_color_space {
+                primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_709,
+                transfer: pl::pl_color_transfer::PL_COLOR_TRC_SRGB,
+                hdr: pl::pl_hdr_metadata {
+                    // An SDR interface is relative to the display's white, not
+                    // to libplacebo's 203-nit default.
+                    max_luma: self.sdr_white,
+                    max_cll: self.sdr_white,
+                    ..Default::default()
+                },
+            },
+            parts: part,
+            num_parts: 1,
+        }
+    }
+
+    /// Shows the frame that is due, decoding ahead as far as the clock allows.
     ///
-    /// The copy into the UI texture and the composite are wgpu work on one
-    /// queue, so the composite sees the frame's pixels. The wait before
-    /// `Present1` is coarse and the first thing to replace with a fence.
-    #[allow(clippy::cast_possible_truncation)]
-    fn present(&self, outcome: FrameOutcome) -> FrameOutcome {
-        if matches!(outcome, FrameOutcome::Presented(_) | FrameOutcome::Recovered) {
-            let index = self.swapchain.borrow().current_index();
-            let view = self.swapchain.borrow().view(index).cloned();
-            if let Some(view) = view {
-                let mut encoder = self
-                    .gpu
-                    .device()
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("video.composite"),
-                    });
-                let nits = self.brightness.get_untracked() as f32;
-                self.compositor.render(
-                    self.gpu.queue(),
-                    &mut encoder,
-                    &view,
-                    nits,
-                    self.test_pattern,
+    /// The runtime draws more often than the video changes frames, so decoding
+    /// one frame per draw would play the file several times too fast. The stream
+    /// timestamps are the only clock there is: a frame is shown from its
+    /// timestamp until the next one's.
+    fn advance(&mut self) {
+        let Some(player) = self.player.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        loop {
+            if let Some((_, due)) = &self.current
+                && *due > now
+            {
+                return;
+            }
+            let (picture, pts) = if let Some(pending) = self.pending.take() {
+                pending
+            } else {
+                match player.decode() {
+                    Ok(Some(picture)) => {
+                        let pts = player.timestamp(&picture);
+                        (picture, pts)
+                    }
+                    Ok(None) => {
+                        let elapsed = self
+                            .clock
+                            .map_or(0.0, |(_, started)| started.elapsed().as_secs_f64());
+                        if !self.eof.replace(true) {
+                            eprintln!("video: end of stream after {elapsed:.2} s");
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("video: {error:#}");
+                        return;
+                    }
+                }
+            };
+            let (first_pts, started) = *self.clock.get_or_insert((pts, now));
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a stream is minutes long, where f64 is exact to the nanosecond"
+            )]
+            let due = started + Duration::from_secs_f64((pts - first_pts).max(0.0));
+            if due > now {
+                self.pending = Some((picture, pts));
+                return;
+            }
+            match MappedFrame::map(self.placebo.gpu(), &picture) {
+                Ok(mut mapped) => {
+                    mapped.set_sdr_white(self.sdr_white);
+                    self.current = Some((mapped, due));
+                }
+                Err(error) => eprintln!("libplacebo: {error:#}"),
+            }
+        }
+    }
+
+    /// Composes one frame: decode, render video plus interface, present.
+    ///
+    /// Called for every frame the runtime runs, including the ones it considers
+    /// undamaged, because the video changes even when the interface does not.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "frame sizes and nits are well inside f32's exact integer range"
+    )]
+    fn present(&mut self, outcome: FrameOutcome) -> FrameOutcome {
+        let (width, height) = self.swapchain.borrow().size();
+        let index = self.swapchain.borrow().current_index();
+        let Some(&target_tex) = self
+            .targets
+            .get(usize::try_from(index).unwrap_or(0))
+        else {
+            return outcome;
+        };
+
+        self.advance();
+        let image = self.current.as_ref().map(|(frame, _)| frame.frame());
+        if !self.logged.replace(true) {
+            if let Some(image) = image {
+                eprintln!(
+                    "source: {:?}/{:?}, repr {:?}, mastering {:.0} nits",
+                    image.color.primaries,
+                    image.color.transfer,
+                    image.repr.sys,
+                    image.color.hdr.max_luma
                 );
-                self.gpu.queue().submit([encoder.finish()]);
             }
-            self.gpu.wait();
-            if let Err(error) = self.swapchain.borrow().present() {
-                eprintln!("DXGI present failed: {error:#}");
-            }
+            let target = self.target_color();
+            eprintln!(
+                "target: {:?}/{:?}, peak {:.0} nits",
+                target.primaries, target.transfer, target.hdr.max_luma
+            );
+        }
+
+        let mut target = pl::pl_frame {
+            num_planes: 1,
+            planes: [pl::pl_plane {
+                texture: target_tex,
+                components: 3,
+                component_mapping: [0, 1, 2, 0],
+                ..Default::default()
+            }; 4],
+            repr: pl::pl_color_repr {
+                sys: pl::pl_color_system::PL_COLOR_SYSTEM_RGB,
+                levels: pl::pl_color_levels::PL_COLOR_LEVELS_FULL,
+                alpha: pl::pl_alpha_mode::PL_ALPHA_NONE,
+                ..Default::default()
+            },
+            color: self.target_color(),
+            ..Default::default()
+        };
+        target.crop = image.map_or(
+            pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width as f32,
+                y1: height as f32,
+            },
+            |frame| fit(aspect_of(frame), width, height),
+        );
+
+        // The interface covers the whole frame, in destination pixels.
+        let part = pl::pl_overlay_part {
+            src: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width as f32,
+                y1: height as f32,
+            },
+            dst: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width as f32,
+                y1: height as f32,
+            },
+            color: [1.0, 1.0, 1.0, 1.0],
+        };
+        let overlay = self.ui_overlay(&part);
+        target.overlays = &raw const overlay;
+        target.num_overlays = 1;
+
+        // ZGUI just finished a render pass into the interface texture, so it is
+        // in `COLOR_ATTACHMENT_OPTIMAL`; libplacebo samples from it, and has to
+        // put it back there for the next frame's pass.
+        self.placebo
+            .release(self.ui, pl::VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+        if !self.placebo.render(image, &target) {
+            eprintln!("libplacebo: render failed for {width}x{height}");
+        }
+        // Coarse: the flip must not see an unfinished render pass. A fence or a
+        // DXGI frame-latency waitable replaces this once the pipeline is right.
+        self.placebo.finish();
+
+        let value = self.handover_value.get() + 1;
+        self.handover_value.set(value);
+        let held = self.placebo.hold(
+            self.ui,
+            pl::VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            pl::pl_vulkan_sem {
+                sem: self.handover,
+                value,
+            },
+        );
+        if !held {
+            eprintln!("libplacebo: failed to take the interface texture back");
+        }
+
+        if let Err(error) = self.swapchain.borrow().present() {
+            eprintln!("DXGI present failed: {error:#}");
         }
         outcome
     }
+}
+
+impl Drop for DxgiRenderer {
+    fn drop(&mut self) {
+        // The wrapped textures name images owned by the swapchain and the wgpu
+        // texture below, so they are released first. Everything is idle: the
+        // last `present` finished the GPU before presenting.
+        for target in &mut self.targets {
+            self.placebo.destroy_texture(target);
+        }
+        self.placebo.destroy_texture(&mut self.ui);
+        self.placebo.destroy_semaphore(&mut self.handover);
+    }
+}
+
+/// The destination rectangle of a frame with `aspect`, centred and letterboxed.
+fn fit(aspect: f32, width: u32, height: u32) -> pl::pl_rect2df {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "frame sizes are well inside f32's exact integer range"
+    )]
+    let (width, height) = (width as f32, height as f32);
+    if aspect > width / height {
+        let cropped = width / aspect;
+        let y0 = (height - cropped) / 2.0;
+        pl::pl_rect2df {
+            x0: 0.0,
+            y0,
+            x1: width,
+            y1: y0 + cropped,
+        }
+    } else {
+        let cropped = height * aspect;
+        let x0 = (width - cropped) / 2.0;
+        pl::pl_rect2df {
+            x0,
+            y0: 0.0,
+            x1: x0 + cropped,
+            y1: height,
+        }
+    }
+}
+
+/// The display aspect ratio of a mapped frame, crop included.
+fn aspect_of(frame: &pl::pl_frame) -> f32 {
+    let width = frame.crop.x1 - frame.crop.x0;
+    let height = frame.crop.y1 - frame.crop.y0;
+    if width <= 0.0 || height <= 0.0 {
+        return 16.0 / 9.0;
+    }
+    width / height * frame.pixel_aspect_ratio.max(f32::MIN_POSITIVE)
 }
 
 impl Renderer for DxgiRenderer {
@@ -116,8 +433,9 @@ impl Renderer for DxgiRenderer {
     }
 
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
-        // The inner renderer has one destination: the UI texture. The DXGI
-        // backbuffer is chosen by the compositor's pass, not here.
+        // The inner renderer has one destination: the interface texture. The
+        // DXGI backbuffer is written by the libplacebo pass in `present_held`,
+        // which the platform calls once per frame it is ready for.
         if !self.inner.present_into(0) {
             eprintln!("the UI texture was not supplied");
         }
@@ -170,8 +488,9 @@ impl Renderer for DxgiRenderer {
     }
 
     fn present_held(&mut self) -> FrameOutcome {
-        let outcome = self.inner.present_held();
-        self.present(outcome)
+        // The runtime never asks for this window's frame to be handed over
+        // separately; `draw` presents into DXGI itself.
+        self.inner.present_held()
     }
 
     fn texture_sink(&mut self) -> &mut dyn TextureSink {
