@@ -100,3 +100,43 @@ the workspace reads it.
 `PKG_CONFIG_PATH`, `CC` and `INCLUDE` in the environment. Cargo's `[env]` would
 then apply them to the whole workspace, where they would break the Twitch
 crate's Linux builds — hence the local crate.
+
+### libplacebo itself
+
+The prefix above is built once with meson and clang-cl:
+
+```
+meson setup build-clang-shared --native-file native-clang-cl.ini \
+  --buildtype=release --default-library=shared \
+  --prefix=C:/Users/alex/.local/libplacebo-shared \
+  -Dvulkan=enabled -Dopengl=disabled -Dd3d11=disabled \
+  -Dshaderc=enabled -Dglslang=disabled \
+  -Ddovi=enabled -Dlibdovi=disabled -Dlcms=disabled -Dxxhash=disabled \
+  -Ddemos=false -Dtests=false -Dbench=false -Dfuzz=false \
+  -Dvulkan-registry=<checkout>/3rdparty/Vulkan-Headers/registry/vk.xml \
+  -Dvulkan-sdk=C:/Users/alex/scoop/apps/vulkan/current
+```
+
+* **shaderc, not glslang.** libplacebo generates its shaders as GLSL text per
+  pipeline and compiles them at runtime (`pl_pass_params.glsl_shader` is the
+  only shader input; there is no SPIR-V entry point), so it needs a GLSL→SPIR-V
+  compiler at runtime. shaderc is upstream's preferred one and the Vulkan SDK
+  ships `shaderc_combined.lib`; a one-line `shaderc.pc` in a private
+  `PKG_CONFIG_PATH` is all that build needs. One translation per unique
+  pipeline, cached afterwards: ~70 ms on the first frame.
+* **`dovi` on, `libdovi` off.** `dovi` enables Dolby Vision reshaping in the
+  renderer and costs nothing (no dependency). `libdovi` is the external RPU
+  *parser* for it, which needs the `dovi` Rust library; unnecessary while the
+  only source is HDR10.
+* **`lcms` off.** ICC profile support needs lcms2, which is not installed and
+  not used: the display's colour is described by DXGI, not by a profile.
+* **`xxhash` off.** It replaces libplacebo's internal siphash for cache keys;
+  purely a hash speed question, and libxxhash is not installed.
+
+Two environment notes for that build. scoop's perl `pkg-config` comes before
+the real one on `PATH` and fails on a missing module, so the native file names
+`C:/Users/alex/scoop/shims/pkg-config.exe`; and meson drops a pkg-config
+include directory that is already in `INCLUDE`, which silently loses
+`shaderc/shaderc.h`, so this build's `INCLUDE` is the CRT and Windows SDK only.
+The glslang archive-name patch in that checkout's `src/glsl/meson.build` is
+inert now; it only matters for glslang builds.
