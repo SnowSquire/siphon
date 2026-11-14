@@ -290,6 +290,10 @@ pub struct ArenaSet {
     count: Cell<usize>,
     /// Slots with a live reference.
     live: Cell<usize>,
+    high_water: Cell<usize>,
+    alloc_failures: Cell<u64>,
+    spool_cap_failures: Cell<u64>,
+    backoffs: Cell<u64>,
 }
 
 impl ArenaSet {
@@ -301,6 +305,10 @@ impl ArenaSet {
             spare: Cell::new(None),
             count: Cell::new(0),
             live: Cell::new(0),
+            high_water: Cell::new(0),
+            alloc_failures: Cell::new(0),
+            spool_cap_failures: Cell::new(0),
+            backoffs: Cell::new(0),
         }
     }
 
@@ -310,9 +318,13 @@ impl ArenaSet {
     /// expected to back off.
     #[must_use]
     pub fn alloc(&self) -> Option<SlotId> {
-        let arena = match self.pop_free() {
-            Some(arena) => arena,
-            None => self.grow()?,
+        let arena = if let Some(arena) = self.pop_free() {
+            arena
+        } else if let Some(arena) = self.grow() {
+            arena
+        } else {
+            self.alloc_failures.set(self.alloc_failures.get() + 1);
+            return None;
         };
 
         // SAFETY: `arena` is a live node of the list.
@@ -321,6 +333,8 @@ impl ArenaSet {
             .take_free()
             .expect("an arena on the free list has a free slot");
         self.live.set(self.live.get() + 1);
+        self.high_water
+            .set(self.high_water.get().max(self.live.get()));
         if node.free.get() != 0 {
             self.push_free(arena);
         }
@@ -482,6 +496,39 @@ impl ArenaSet {
     #[must_use]
     pub const fn arena_count(&self) -> usize {
         self.count.get()
+    }
+
+    /// Largest `live_slots` ever observed.
+    #[must_use]
+    pub const fn high_water(&self) -> usize {
+        self.high_water.get()
+    }
+
+    /// Slot allocations that failed because the system refused an arena.
+    #[must_use]
+    pub const fn alloc_failures(&self) -> u64 {
+        self.alloc_failures.get()
+    }
+
+    /// Spool writes refused by the per-segment slot cap.
+    #[must_use]
+    pub const fn spool_cap_failures(&self) -> u64 {
+        self.spool_cap_failures.get()
+    }
+
+    /// Downloader waits for a slot held by a lagging consumer.
+    #[must_use]
+    pub const fn backoffs(&self) -> u64 {
+        self.backoffs.get()
+    }
+
+    pub fn note_spool_cap(&self) {
+        self.spool_cap_failures
+            .set(self.spool_cap_failures.get() + 1);
+    }
+
+    pub fn note_backoff(&self) {
+        self.backoffs.set(self.backoffs.get() + 1);
     }
 
     /// Debug-only consistency check: the two lists, the free bitmaps, the per-arena

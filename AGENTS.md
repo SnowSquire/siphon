@@ -59,13 +59,16 @@ deliberate — do not "fix" `clippy::future_not_send`. Pipeline and listener
 detail: `notes/architecture.md`.
 
 - `arena.rs`, `spool.rs` — slots and spools, intrusive refcounts, zero-copy `IoBuf` views (`notes/slot-arena-rework.md`).
-- `http/` — hand-rolled HTTP/1.1 over `rustls::unbuffered` (`notes/tls-client-api.md`).
+- `http/` — hand-rolled HTTP/1.1 over `rustls::unbuffered` (`notes/tls-client-api.md`); `http/ws.rs` is the RFC 6455 client Hermes uses.
 - `scheduler.rs` — manifest poll, Twitch tags, fetch dispatch, consumer fan-out; the `#EXT-X-TWITCH-*` quirks are in `notes.txt`.
 - `variant.rs` — master-playlist resolution through Twitch GQL + usher.
-- `daemon.rs` — the stream registry behind `daemon` mode (`notes/rtsp-daemon.md`).
+- `config.rs`, `gql.rs`, `hermes.rs`, `matcher.rs`, `notifier.rs`, `update.rs` — the Siphon backend: persisted config, GQL, Hermes pubsub, word filter, toasts/webhook, update check (`notes/rpc.md`).
+- `app.rs`, `bus.rs`, `rpc.rs`, `metrics.rs` — the backend app loop, entity update bus, admin RPC server and telemetry.
+- `registry.rs` — the stream registry and monitors behind `daemon` mode (`notes/rtsp-daemon.md`).
 - `downloader.rs` — bounded fetch workers streaming into spools.
 - `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`).
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
+- `crates/rpc` (`siphon-rpc`) — the typed protocol, postcard framing and the UI-side client.
 
 ## Rules (do not "simplify")
 

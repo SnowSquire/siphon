@@ -271,7 +271,10 @@ pub enum Request {
     AddFilteredWord(String),
     RemoveFilteredWord(u32),
     /// Turn the per-channel recording monitor on or off.
-    SetRecord { channel: u64, record: bool },
+    SetRecord {
+        channel: u64,
+        record: bool,
+    },
     ClearError,
     DismissNotification(u64),
     ApplyUpdate,
@@ -279,7 +282,10 @@ pub enum Request {
     PipelineRestart(StreamKey),
     GetSnapshot,
     GetStreamDetail(StreamKey),
-    ListSegments { key: StreamKey, limit: u32 },
+    ListSegments {
+        key: StreamKey,
+        limit: u32,
+    },
     GetArena,
     GetDownloader,
     GetDisk(StreamKey),
@@ -353,6 +359,9 @@ pub enum ServerMessage {
         protocol: u16,
         server_version: String,
     },
+    /// The hello was refused before any state was sent. The client reports
+    /// the reason instead of guessing at a decode error.
+    Rejected(String),
     /// The full state, sent once after `Welcome` and on `GetSnapshot`.
     Snapshot(Box<Snapshot>),
     Update {

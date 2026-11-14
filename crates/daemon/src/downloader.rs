@@ -2,6 +2,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use kanal::AsyncReceiver;
+use siphon_rpc::FetchOutcome as SegmentOutcome;
+use siphon_rpc::SegmentRecord;
 use thiserror::Error;
 use tracing::Instrument;
 use tracing::Span;
@@ -13,6 +15,8 @@ use crate::constants::ARENA_RETRIES;
 use crate::constants::DOWNLOAD_RETRIES;
 use crate::http::Client;
 use crate::http::StatusCode;
+use crate::metrics::DownloaderMetrics;
+use crate::metrics::FetchStats;
 use crate::spool::ArenaFull;
 use crate::spool::Writer;
 
@@ -52,6 +56,9 @@ pub enum ToDownloader {
         /// completed chunk from a fetch that gave up, because a failed DVR chunk
         /// is skipped instead of being recorded in the canonical index.
         done: Option<kanal::Sender<FetchOutcome>>,
+        /// Live telemetry for the segment ring; DVR chunks and prefetches that
+        /// are not part of the live pipeline pass `None`.
+        stats: Option<FetchStats>,
     },
 }
 
@@ -61,25 +68,42 @@ pub enum FetchOutcome {
     Failed,
 }
 
-pub fn spawn_downloaders<const N: usize>(client: &Rc<Client>, rx: &kanal::Receiver<ToDownloader>) {
+pub fn spawn_downloaders<const N: usize>(
+    client: &Rc<Client>,
+    rx: &kanal::Receiver<ToDownloader>,
+    metrics: &Rc<DownloaderMetrics>,
+) {
     for _ in 0..N {
+        let sync_rx = rx.clone();
         let rx = rx.clone().to_async();
         let client = Rc::clone(client);
+        let metrics = Rc::clone(metrics);
         compio::runtime::spawn(async move {
-            worker(rx, &client).await;
+            worker(rx, &sync_rx, &client, &metrics).await;
         })
         .detach();
     }
 }
 
-async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
+async fn worker(
+    rx: AsyncReceiver<ToDownloader>,
+    queued_rx: &kanal::Receiver<ToDownloader>,
+    client: &Rc<Client>,
+    metrics: &Rc<DownloaderMetrics>,
+) {
     while let Ok(message) = rx.recv().await {
+        metrics
+            .queued
+            .set(u32::try_from(queued_rx.len()).unwrap_or(u32::MAX));
         let ToDownloader::FetchURL {
             url,
             mut writer,
             span,
             done,
+            stats,
         } = message;
+        metrics.in_flight.set(metrics.in_flight.get() + 1);
+        let started = std::time::Instant::now();
 
         let mut attempt = 0;
         let mut outcome = FetchOutcome::Complete;
@@ -101,6 +125,7 @@ async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
                         break;
                     }
                     attempt += 1;
+                    metrics.retries.set(metrics.retries.get() + 1);
                     if attempt > DOWNLOAD_RETRIES {
                         warn!(%url, %error, attempt, "download failed, giving up");
                         outcome = FetchOutcome::Failed;
@@ -111,6 +136,24 @@ async fn worker(rx: AsyncReceiver<ToDownloader>, client: &Rc<Client>) {
                     compio::time::sleep(backoff).await;
                 }
             }
+        }
+        metrics
+            .in_flight
+            .set(metrics.in_flight.get().saturating_sub(1));
+        if let Some(stats) = stats {
+            stats.metrics.push_segment(SegmentRecord {
+                sequence: stats.sequence,
+                timestamp_ms: stats.timestamp_ms,
+                duration_ms: stats.duration_ms,
+                pdt_ms: stats.pdt_ms,
+                bytes: u64::try_from(writer.published()).unwrap_or(u64::MAX),
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                retries: attempt,
+                outcome: match outcome {
+                    FetchOutcome::Complete => SegmentOutcome::Complete,
+                    FetchOutcome::Failed => SegmentOutcome::Failed,
+                },
+            });
         }
         if let Some(done) = done {
             let _ = done.send(outcome);
@@ -147,6 +190,7 @@ async fn fetch(
                 if arena_waits > ARENA_RETRIES {
                     return Err(error.into());
                 }
+                writer.note_arena_wait();
                 compio::time::sleep(ARENA_BACKOFF).await;
                 continue;
             }

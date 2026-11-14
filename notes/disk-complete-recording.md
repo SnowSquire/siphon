@@ -262,7 +262,7 @@ hash-verified (there are few), so a torn map is detected rather than played.
   globally capped, so nothing else changes.
 - `disk.rs`: re-enabled and rewritten around the two sources, runs, holes, the
   `Run` marker, init hashing/insertion, the copies and the resume repair.
-- `main.rs`/`daemon.rs`: `--output`, `--notify`, `--keep-runs`; the disk handle
+- `main.rs`/`registry.rs`: `--output`, `--notify`, `--keep-runs`; the disk handle
   and the daemon wiring.
 - `rtsp/vod.rs` → `rtsp/dvr.rs`; `VodTimeline`/`VodSegment` renamed, and the
   timeline now carries the `EXT-X-MAP` objects per segment.  The refresh loop

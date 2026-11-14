@@ -41,7 +41,9 @@ pub enum ConnectError {
     Codec(#[from] CodecError),
     #[error("backend speaks protocol {server}, this build speaks {ours}")]
     Protocol { server: u16, ours: u16 },
-    #[error("backend rejected the hello or sent an unexpected first message")]
+    #[error("backend rejected the hello: {0}")]
+    Rejected(String),
+    #[error("backend sent an unexpected first message")]
     Unexpected,
 }
 
@@ -72,7 +74,10 @@ pub struct Client {
 impl Client {
     /// Connects, performs the Hello/Welcome exchange, and consumes the first
     /// snapshot. The remaining traffic is driven by the connection task.
-    pub async fn connect(addr: SocketAddr, app_version: &str) -> Result<(Self, Snapshot), ConnectError> {
+    pub async fn connect(
+        addr: SocketAddr,
+        app_version: &str,
+    ) -> Result<(Self, Snapshot), ConnectError> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         let (mut read, mut write_half) = stream.into_split();
@@ -89,12 +94,13 @@ impl Client {
 
         let mut reader = FrameReader::new();
         let welcome: ServerMessage = reader.read(&mut read).await?;
-        let ServerMessage::Welcome {
-            protocol,
-            server_version: _,
-        } = welcome
-        else {
-            return Err(ConnectError::Unexpected);
+        let protocol = match welcome {
+            ServerMessage::Welcome {
+                protocol,
+                server_version: _,
+            } => protocol,
+            ServerMessage::Rejected(reason) => return Err(ConnectError::Rejected(reason)),
+            _ => return Err(ConnectError::Unexpected),
         };
         if protocol != PROTOCOL_VERSION {
             return Err(ConnectError::Protocol {
@@ -145,7 +151,9 @@ impl Client {
                         }
                     }
                     // The handshake already consumed the only welcome.
-                    Selected::Incoming(Ok(ServerMessage::Welcome { .. })) => {}
+                    Selected::Incoming(Ok(
+                        ServerMessage::Welcome { .. } | ServerMessage::Rejected(_),
+                    )) => {}
                 }
             }
             for (_, waiter) in task_pending.borrow_mut().drain() {
@@ -199,13 +207,13 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
     use crate::protocol::ArenaSummary;
     use crate::protocol::Config;
     use crate::protocol::ConnHealth;
     use crate::protocol::DownloaderSummary;
     use crate::protocol::ServerMessage;
     use compio::net::TcpListener;
+    use std::future::Future;
 
     fn snapshot() -> Snapshot {
         Snapshot {
@@ -241,12 +249,9 @@ mod tests {
             )
             .await
             .unwrap();
-            write(
-                &mut sink,
-                &ServerMessage::Snapshot(Box::new(snapshot())),
-            )
-            .await
-            .unwrap();
+            write(&mut sink, &ServerMessage::Snapshot(Box::new(snapshot())))
+                .await
+                .unwrap();
             // A version-mismatched client hangs up after the welcome.
             let Ok(message) = reader.read::<ClientMessage, _>(&mut read).await else {
                 return;

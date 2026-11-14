@@ -46,7 +46,13 @@ pub async fn show(
 ) {
     tracing::info!(target: "notifier", "showing notification: {summary} | {body}");
     let image = resolve_image(client, image).await;
-    show_toast(summary, body, sound, image, login.map(str::to_owned));
+    show_toast(
+        summary,
+        body,
+        sound,
+        image.as_deref(),
+        login.map(str::to_owned),
+    );
 }
 
 async fn resolve_image(client: &Client, image: Option<&str>) -> Option<String> {
@@ -63,39 +69,33 @@ async fn resolve_image(client: &Client, image: Option<&str>) -> Option<String> {
     path.into_os_string().into_string().ok()
 }
 
-fn show_toast(
-    summary: &str,
-    body: &str,
-    sound: bool,
-    image: Option<String>,
-    login: Option<String>,
-) {
+fn show_toast(summary: &str, body: &str, sound: bool, image: Option<&str>, login: Option<String>) {
     #[cfg(windows)]
     {
-    use tauri_winrt_notification::Duration;
-    use tauri_winrt_notification::Sound;
-    use tauri_winrt_notification::Toast;
+        use tauri_winrt_notification::Duration;
+        use tauri_winrt_notification::Sound;
+        use tauri_winrt_notification::Toast;
 
-    let mut toast = Toast::new(AUMID)
-        .title(summary)
-        .text2(body)
-        .duration(Duration::Long)
-        .sound(if sound { Some(Sound::Default) } else { None });
-    if login.is_some() {
-        toast = toast.add_button("Watch", "open");
-    }
-    if let Some(image) = &image {
-        toast = toast.image(std::path::Path::new(image), "");
-    }
-    if let Some(login) = login {
-        toast = toast.on_activated(move |_| {
-            open_url(&format!("https://www.twitch.tv/{login}"));
-            Ok(())
-        });
-    }
-    if let Err(error) = toast.show() {
-        tracing::info!(target: "notifier", "failed to show notification: {error}");
-    }
+        let mut toast = Toast::new(AUMID)
+            .title(summary)
+            .text2(body)
+            .duration(Duration::Long)
+            .sound(if sound { Some(Sound::Default) } else { None });
+        if login.is_some() {
+            toast = toast.add_button("Watch", "open");
+        }
+        if let Some(image) = image {
+            toast = toast.image(std::path::Path::new(image), "");
+        }
+        if let Some(login) = login {
+            toast = toast.on_activated(move |_| {
+                open_url(&format!("https://www.twitch.tv/{login}"));
+                Ok(())
+            });
+        }
+        if let Err(error) = toast.show() {
+            tracing::info!(target: "notifier", "failed to show notification: {error}");
+        }
     }
     #[cfg(not(windows))]
     {

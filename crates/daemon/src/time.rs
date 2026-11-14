@@ -122,14 +122,8 @@ mod tests {
     fn formats_utc_without_a_date_crate() {
         assert_eq!(format_iso_ms(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(format_iso_ms(1_000_000_000_000), "2001-09-09T01:46:40.000Z");
-        assert_eq!(
-            format_iso_ms(1_709_208_000_000),
-            "2024-02-29T12:00:00.000Z"
-        );
-        assert_eq!(
-            format_iso_ms(1_788_237_802_868),
-            "2026-09-01T04:43:22.868Z"
-        );
+        assert_eq!(format_iso_ms(1_709_208_000_000), "2024-02-29T12:00:00.000Z");
+        assert_eq!(format_iso_ms(1_788_237_802_868), "2026-09-01T04:43:22.868Z");
     }
 
     #[test]

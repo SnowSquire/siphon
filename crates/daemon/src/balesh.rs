@@ -4,8 +4,8 @@ use core::fmt;
 pub struct NanoId(u128);
 
 impl NanoId {
-    const LEN: usize = 21;
     const ALPHABET: &[u8; 64] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+    const LEN: usize = 21;
 
     pub const fn new(raw: u128) -> Self {
         Self(raw & (u128::MAX >> 2))

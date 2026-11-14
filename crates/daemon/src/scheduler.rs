@@ -27,6 +27,8 @@ use crate::arena::ArenaSet;
 use crate::constants::MAX_MANIFEST;
 use crate::downloader::ToDownloader;
 use crate::http::Client;
+use crate::metrics::FetchStats;
+use crate::metrics::StreamMetrics;
 use crate::playlist::Event;
 use crate::playlist::ManifestParseError;
 use crate::playlist::Playlist;
@@ -216,6 +218,7 @@ pub struct StreamScheduler {
     segment_tail: u64,
     prefetch_tail: u64,
     last_segment_dur: Duration,
+    metrics: Option<Rc<StreamMetrics>>,
 }
 
 impl StreamScheduler {
@@ -249,6 +252,7 @@ impl StreamScheduler {
             segment_tail: 0,
             prefetch_tail: 0,
             last_segment_dur: Duration::from_secs(5),
+            metrics: None,
         }
     }
 
@@ -257,6 +261,13 @@ impl StreamScheduler {
     #[must_use]
     pub fn with_live_window(mut self, live_window: Rc<RefCell<Vec<Segment>>>) -> Self {
         self.live_window = live_window;
+        self
+    }
+
+    /// Attach the pipeline's counters and segment ring.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Rc<StreamMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -273,6 +284,12 @@ impl StreamScheduler {
             match self.mainloop().await {
                 Ok(()) => backoff = MIN_BACKOFF,
                 Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics
+                            .poll_failures
+                            .set(metrics.poll_failures.get().saturating_add(1));
+                        metrics.set_error(Some(error.to_string()));
+                    }
                     if error.is_inner::<Offline>() {
                         info!("stream ended");
                         return;
@@ -373,6 +390,9 @@ impl StreamScheduler {
             .as_secs();
         let span = span!(Level::INFO, "mainloop", time = now);
         let _ = &span;
+        if let Some(metrics) = &self.metrics {
+            metrics.polls.set(metrics.polls.get().saturating_add(1));
+        }
 
         let new_segments = self.reload().await?;
 
@@ -485,6 +505,13 @@ impl StreamScheduler {
                     writer,
                     span: span.clone(),
                     done: None,
+                    stats: self.metrics.as_ref().map(|metrics| FetchStats {
+                        metrics: Rc::clone(metrics),
+                        sequence: expected_sequence,
+                        timestamp_ms,
+                        duration_ms,
+                        pdt_ms,
+                    }),
                 })
                 .await
                 .union()?;
@@ -530,6 +557,13 @@ impl StreamScheduler {
                 writer,
                 span,
                 done: None,
+                stats: self.metrics.as_ref().map(|metrics| FetchStats {
+                    metrics: Rc::clone(metrics),
+                    sequence: expected_sequence,
+                    timestamp_ms,
+                    duration_ms,
+                    pdt_ms: 0,
+                }),
             })
             .await
             .union()?;
@@ -575,6 +609,7 @@ impl StreamScheduler {
                 writer,
                 span,
                 done: None,
+                stats: None,
             })
             .await
             .union()?;
@@ -668,6 +703,14 @@ impl StreamScheduler {
         }
 
         (*self.live_window.borrow_mut()).clone_from(&self.segments);
+        if let Some(metrics) = &self.metrics {
+            metrics.segment_tail.set(self.segment_tail);
+            metrics.prefetch_tail.set(self.prefetch_tail);
+            metrics
+                .window
+                .set(u32::try_from(self.segments.len()).unwrap_or(u32::MAX));
+            metrics.set_error(None);
+        }
         Ok(self.prefetch_tail - original_prefetch_tail)
     }
 }

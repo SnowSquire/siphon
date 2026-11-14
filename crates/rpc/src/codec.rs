@@ -182,7 +182,10 @@ mod tests {
         };
         let mut frame = Vec::new();
         encode(&message, &mut frame).unwrap();
-        assert_eq!(&frame[..4], &u32::try_from(frame.len() - 4).unwrap().to_be_bytes());
+        assert_eq!(
+            &frame[..4],
+            &u32::try_from(frame.len() - 4).unwrap().to_be_bytes()
+        );
 
         let mut decoder = FrameDecoder::new();
         decoder.push(&frame);
@@ -232,14 +235,31 @@ mod tests {
         let mut frame = Vec::new();
         encode(&message, &mut frame).unwrap();
         let payload = &frame[4..frame.len() - 1];
-        assert!(matches!(decode::<ClientMessage>(payload), Err(CodecError::Postcard(_))));
+        assert!(matches!(
+            decode::<ClientMessage>(payload),
+            Err(CodecError::Postcard(_))
+        ));
     }
 
     #[test]
     fn two_frames_in_one_read_are_both_returned() {
         let mut frame = Vec::new();
-        encode(&ClientMessage::Request { id: 1, request: Request::GetSnapshot }, &mut frame).unwrap();
-        encode(&ClientMessage::Request { id: 2, request: Request::GetArena }, &mut frame).unwrap();
+        encode(
+            &ClientMessage::Request {
+                id: 1,
+                request: Request::GetSnapshot,
+            },
+            &mut frame,
+        )
+        .unwrap();
+        encode(
+            &ClientMessage::Request {
+                id: 2,
+                request: Request::GetArena,
+            },
+            &mut frame,
+        )
+        .unwrap();
 
         let mut decoder = FrameDecoder::new();
         decoder.push(&frame);

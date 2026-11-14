@@ -2562,6 +2562,7 @@ fn spawn_fetch(
                 writer,
                 span,
                 done: Some(done_tx),
+                stats: None,
             })
             .await;
         if send.is_err() {

@@ -34,6 +34,8 @@ pub enum UpdateError {
     Invalid(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Only produced on platforms without the MSI hand-off.
+    #[allow(dead_code)]
     #[error("no installer for this build")]
     NoInstaller,
 }
@@ -66,8 +68,9 @@ struct AssetJson {
 pub fn parse_release(body: &[u8]) -> Result<Release, UpdateError> {
     let json: ReleaseJson = sonic_rs::from_slice(body)?;
     let tag = json.tag_name.strip_prefix('v').unwrap_or(&json.tag_name);
-    let version = semver::Version::parse(tag)
-        .map_err(|error| UpdateError::Invalid(format!("bad release tag {}: {error}", json.tag_name)))?;
+    let version = semver::Version::parse(tag).map_err(|error| {
+        UpdateError::Invalid(format!("bad release tag {}: {error}", json.tag_name))
+    })?;
     let msi_url = json
         .assets
         .into_iter()
@@ -83,8 +86,7 @@ pub fn parse_release(body: &[u8]) -> Result<Release, UpdateError> {
 /// True when the release is strictly newer than this build.
 #[must_use]
 pub fn newer_than_current(release: &Release) -> bool {
-    semver::Version::parse(env!("CARGO_PKG_VERSION"))
-        .is_ok_and(|current| release.version > current)
+    semver::Version::parse(env!("CARGO_PKG_VERSION")).is_ok_and(|current| release.version > current)
 }
 
 /// Fetches the latest published release. Draft releases are invisible here.

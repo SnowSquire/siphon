@@ -4,13 +4,12 @@
 //! fragmentation and the close handshake. No extensions, no compression and
 //! no binary payloads; Hermes speaks JSON text frames.
 
-
 use crate::constants::IO_TIMEOUT;
 use crate::http::Error;
 use crate::http::pool::PoolKey;
 use crate::http::read_head;
-use crate::http::tls_config;
 use crate::http::timeout;
+use crate::http::tls_config;
 use crate::http::transport::Conn;
 use crate::sha1;
 
@@ -246,11 +245,7 @@ const fn default_port(tls: bool) -> u16 {
     if tls { 443 } else { 80 }
 }
 
-fn header_is(
-    headers: &http::HeaderMap,
-    name: &str,
-    expected: &str,
-) -> bool {
+fn header_is(headers: &http::HeaderMap, name: &str, expected: &str) -> bool {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
@@ -332,8 +327,7 @@ fn encode_client_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
 
 /// Standard base64 with padding, for the handshake key and accept digest.
 fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];

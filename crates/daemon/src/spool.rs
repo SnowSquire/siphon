@@ -153,6 +153,7 @@ impl Writer {
     pub fn tail(&mut self) -> Result<&mut [u8], ArenaFull> {
         if self.tail.is_full() {
             if self.slots >= self.slots_max {
+                self.spool.arena.note_spool_cap();
                 return Err(ArenaFull);
             }
             let id = self.spool.arena.alloc().ok_or(ArenaFull)?;
@@ -176,6 +177,17 @@ impl Writer {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.spool.published.get() == 0
+    }
+
+    /// Bytes published so far, for the fetch telemetry.
+    #[must_use]
+    pub fn published(&self) -> usize {
+        self.spool.published.get()
+    }
+
+    /// Records that a downloader is waiting for this spool's consumer.
+    pub fn note_arena_wait(&self) {
+        self.spool.arena.note_backoff();
     }
 }
 

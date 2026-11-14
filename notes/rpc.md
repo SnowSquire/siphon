@@ -1,9 +1,11 @@
 # Daemon RPC and the Siphon backend/UI split
 
-Status: planned. Nothing implemented. The daemon currently owns only stream
-pipelines (`daemon.rs`); config, GQL, Hermes, notifications and the channel list
-still live in the external Siphon app. `crates/tray` is obsolete and will be
-replaced by the Siphon UI.
+Status: phases 0–2 backend landed. `crates/rpc` (`siphon-rpc`) owns the typed
+protocol, postcard framing and client; `crates/daemon` owns config, GQL,
+Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI has
+not moved into this workspace yet. Known issue: the RPC writer drops the
+response when a coalesced update is written in the same wake; the loopback
+integration test is ignored until that is fixed.
 
 ## Goal
 
@@ -215,26 +217,29 @@ like `StreamKey`; changing quality is remove + add.
 
 - `crates/rpc`: serde message types, `postcard` codec, frame decoder, compio
   client. No ZGUI and no daemon internals, so the UI and the daemon can share
-  it. Name it `siphon-rpc` once the app rename lands.
-- `crates/daemon`: the daemon app and the RPC server module; `daemon.rs`
-  becomes the backend owner.
-- `crates/siphon`: the UI, brought back into the workspace, depending on
-  `crates/rpc`. `crates/tray` goes away when it lands.
+  it. Package `siphon-rpc`.
+- `crates/daemon`: the backend app and the RPC server module; `registry.rs`
+  owns pipelines, `app.rs` owns everything else.
+- UI, still external: the Slint app moves in as `crates/ui` (`siphon-ui`) with
+  a binary named `siphon`, depending on `siphon-rpc`. `crates/tray` goes away
+  when it lands.
 - `play` keeps its current pipeline and needs no protocol types.
 
 ## Phases
 
 0. **Protocol crate**: messages, postcard codec, incremental decoder, frame
-   limits, Hello/Welcome, loopback client/server tests.
+   limits, Hello/Welcome, loopback client/server tests. **Done.**
 1. **Backend state**: config load/save/migrate, GQL, Hermes, matcher,
-   notifications; snapshot and entity updates; UI can render the channel list,
-   live state and notification center.
+   notifications; snapshot and entity updates. **Done** (the UI is still
+   external, so it does not render them yet).
 2. **Pipelines**: monitor-only runtimes, upgrade on DESCRIBE, capacity rules,
    segment ring, arena/downloader telemetry, `ListSegments`/`GetStreamDetail`.
+   **Done**, except `GetDisk` (returns `Unsupported`).
 3. **Full lifecycle**: monitor add/remove/update, stop/restart, forced viewer
-   disconnect, per-monitor record start/stop.
+   disconnect, per-monitor record start/stop. **Open**; stop/restart exists,
+   forced disconnect and ephemeral recording do not.
 4. **Disk and polish**: run introspection/release, update ownership,
-   multi-client behavior, update throttling/coalescing.
+   multi-client behavior, update throttling/coalescing. **Open.**
 
 ## Tests
 

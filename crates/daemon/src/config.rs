@@ -105,10 +105,15 @@ fn load_versioned(path: &Path) -> Result<Config, ConfigError> {
 /// work thread, never on the reactor's blocking path.
 pub async fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
-        compio::fs::create_dir_all(parent).await.map_err(ConfigError::Io)?;
+        compio::fs::create_dir_all(parent)
+            .await
+            .map_err(ConfigError::Io)?;
     }
     let json = sonic_rs::to_string_pretty(config)?;
-    compio::fs::write(path, json).await.0.map_err(ConfigError::Io)?;
+    compio::fs::write(path, json)
+        .await
+        .0
+        .map_err(ConfigError::Io)?;
     Ok(())
 }
 

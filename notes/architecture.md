@@ -52,7 +52,7 @@ bounded queue and stream the body into the segment's spool. Retries back off
 only while the spool is still empty: retrying after bytes were written would
 append a second copy onto the same segment.
 
-## `daemon.rs`
+## `registry.rs`
 
 The registry behind `daemon` mode; `rtsp-daemon.md` has the lifecycle, URI,
 capacity and resolver. In short: one global `Client`, `ArenaSet` and downloader

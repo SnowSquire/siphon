@@ -35,8 +35,6 @@ pub enum GqlError {
     Status(StatusCode),
     #[error("request timed out")]
     Timeout,
-    #[error("response over {0} bytes")]
-    Oversize(usize),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -64,6 +62,8 @@ pub struct ChannelDetail {
 /// The game a broadcast is categorised under.
 #[derive(Debug, Clone)]
 pub struct StreamGame {
+    /// Kept for game-change matching; the UI renders the display name.
+    #[allow(dead_code)]
     pub id: u64,
     pub name: String,
     pub display_name: String,
@@ -177,7 +177,10 @@ where
             Ok(None)
         }
 
-        fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
             // Re-enter the same visitor on the inner value so a number and a
             // numeric string both land here, and an unparseable id is None.
             deserializer.deserialize_any(self)

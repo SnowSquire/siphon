@@ -60,7 +60,8 @@ impl Matcher {
                 let next = matcher.transitions[index];
 
                 if next == 0 {
-                    let new_node = u32::try_from(matcher.output.len()).expect("node count fits u32");
+                    let new_node =
+                        u32::try_from(matcher.output.len()).expect("node count fits u32");
 
                     matcher.output.push(false);
                     matcher.transitions.extend(std::iter::repeat_n(0, stride));

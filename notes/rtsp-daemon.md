@@ -1,6 +1,6 @@
 # RTSP daemon mode
 
-Status: implemented (`daemon.rs`, `rtsp::StreamResolver`). The arena rework it
+Status: implemented (`registry.rs`, `rtsp::StreamResolver`). The arena rework it
 depended on landed first.
 
 ## Goal
@@ -12,7 +12,7 @@ workers, the listeners.
 
 ## CLI
 
-`daemon daemon [--bind <addr>] [--max-streams N]`. The old
+`daemon daemon [--bind <addr>] [--max-streams N] [--admin-bind <addr>]`. The old
 behaviour moved under an explicit `play` subcommand (`-c/--channel` and
 `-q/--quality` live there). `--bind` defaults to `127.0.0.1:7417`; `daemon`
 binds exactly that address, so the dual-loopback-family fallback is only in

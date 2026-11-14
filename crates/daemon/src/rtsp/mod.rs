@@ -102,15 +102,9 @@ const PTS_WRAP: i64 = 1 << 33;
 const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 const SDES_CNAME: &[u8] = b"daemon";
 
-/// Identity of one RTSP presentation: a channel login and an optional
-/// `STABLE-VARIANT-ID`. `None` means the first variant, like `play`'s default.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StreamKey {
-    /// Twitch login, lowercased.
-    pub login: String,
-    /// `STABLE-VARIANT-ID` (`chunked`, `720p60`, `audio_only`, ...).
-    pub quality: Option<String>,
-}
+/// Identity of one RTSP presentation. The type lives in the RPC crate so a
+/// pipeline key crosses the wire without a second layout.
+pub use siphon_rpc::StreamKey;
 
 /// Why a DESCRIBE could not be served. `status` is the RTSP status line.
 #[derive(Clone, Copy, Debug)]
@@ -626,6 +620,24 @@ impl Stream {
     /// Whether any RTSP client is still connected (playing or paused).
     pub fn has_sessions(&self) -> bool {
         !self.sessions.borrow().is_empty()
+    }
+
+    /// Connected sessions, for the pipeline view.
+    #[must_use]
+    pub fn session_count(&self) -> u32 {
+        u32::try_from(self.sessions.borrow().len()).unwrap_or(u32::MAX)
+    }
+
+    /// The media engine's playhead, milliseconds since the broadcast start.
+    #[must_use]
+    pub const fn position_ms(&self) -> u64 {
+        self.position_ms.get()
+    }
+
+    /// The scheduler's live edge, milliseconds since the broadcast start.
+    #[must_use]
+    pub const fn live_edge_ms(&self) -> u64 {
+        self.live_edge_ms.get()
     }
 
     /// Queue one outbound message, dropping it when the player's buffer is

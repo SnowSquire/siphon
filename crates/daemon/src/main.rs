@@ -1,29 +1,41 @@
 // Debug/stat accessors are exercised by the arena tests and future policies.
 #[allow(dead_code, clippy::future_not_send)]
-mod arena;
+mod app;
 #[allow(dead_code, clippy::future_not_send)]
+mod arena;
+#[allow(clippy::future_not_send)]
 mod balesh;
 #[allow(dead_code, clippy::future_not_send)]
+mod bus;
+#[allow(clippy::future_not_send)]
 mod config;
 #[allow(clippy::future_not_send)]
 mod constants;
 #[allow(clippy::future_not_send)]
-mod daemon;
-#[allow(clippy::future_not_send)]
 mod disk;
 #[allow(clippy::future_not_send)]
 mod downloader;
-#[allow(dead_code, clippy::future_not_send)]
+#[allow(clippy::future_not_send)]
 mod gql;
-#[allow(dead_code, clippy::future_not_send)]
+#[allow(clippy::future_not_send)]
+mod hermes;
+#[allow(clippy::future_not_send)]
 mod matcher;
+#[allow(dead_code, clippy::future_not_send)]
+mod metrics;
+#[allow(clippy::future_not_send)]
+mod notifier;
 #[allow(clippy::future_not_send)]
 mod notify;
 #[allow(clippy::future_not_send)]
+mod registry;
+#[allow(clippy::future_not_send)]
+mod rpc;
+#[allow(clippy::future_not_send)]
 mod spool;
-#[allow(dead_code, clippy::future_not_send)]
+#[allow(clippy::future_not_send)]
 mod time;
-#[allow(dead_code, clippy::future_not_send)]
+#[allow(clippy::future_not_send)]
 mod update;
 // compio tasks are deliberately !Send (one thread-per-core reactor).
 // `dead_code`: the client exposes a slightly wider surface than this binary uses.
@@ -42,7 +54,6 @@ mod utils;
 #[allow(clippy::future_not_send)]
 mod variant;
 
-use std::cell::RefCell;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -55,19 +66,25 @@ use futures_util::future::select;
 use futures_util::pin_mut;
 #[cfg(not(miri))]
 use mimalloc::MiMalloc;
-use tracing::error;
-use tracing_subscriber::EnvFilter;
-
 // Cargo's unused-dependency lint only sees the crate root for target-gated
 // crates; the real use is in `notifier`.
 #[cfg(windows)]
 use tauri_winrt_notification as _;
+use tracing::error;
+use tracing_subscriber::EnvFilter;
 
+use crate::app::App;
+use crate::app::AppHandle;
+use crate::app::AppInit;
 use crate::arena::ArenaSet;
+use crate::bus::Bus;
 use crate::constants::DEBUG_CHANNEL_TITLE;
 use crate::constants::DEBUG_DVR_URL;
 use crate::constants::DEFAULT_RTSP_PORT;
 use crate::http::Client;
+use crate::metrics::DownloaderMetrics;
+use crate::registry::Options as RegistryOptions;
+use crate::registry::Registry;
 use crate::spool::ConsumerWake;
 use crate::spool::WakeSet;
 use crate::variant::VariantPlaylistError;
@@ -80,7 +97,7 @@ use crate::variant::get_variants;
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Twitch HLS client")]
+#[command(author, version, about = "Siphon backend")]
 struct Config {
     /// Twitch client id used for GQL requests
     #[arg(long, global = true)]
@@ -139,11 +156,19 @@ struct Daemon {
     #[arg(long, default_value_t = default_bind())]
     bind: SocketAddr,
 
+    /// Address the admin RPC listener binds
+    #[arg(long, default_value_t = default_admin_bind())]
+    admin_bind: SocketAddr,
+
+    /// Do not listen for the UI
+    #[arg(long)]
+    no_admin: bool,
+
     /// Streams served at once
     #[arg(long, default_value_t = crate::constants::MAX_STREAMS)]
     max_streams: usize,
 
-    /// Record every stream into this directory
+    /// Record monitored streams into this directory
     #[arg(long)]
     output: Option<std::path::PathBuf>,
 
@@ -158,6 +183,10 @@ struct Daemon {
 
 fn default_bind() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_RTSP_PORT))
+}
+
+fn default_admin_bind() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 7418))
 }
 
 #[compio::main]
@@ -239,11 +268,12 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     let stream = Rc::new(rtsp::Stream::new(key, title));
 
     let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
+    let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
     let (registration_tx, registration_rx) = kanal::unbounded();
     // The scheduler publishes its current live playlist window here. When VOD
     // playback reaches the end of the DVR timeline, the RTSP engine replays the
     // live segments in this window up to the live edge, bridging the DVR lag.
-    let live_window = Rc::new(RefCell::new(Vec::new()));
+    let live_window = Rc::new(std::cell::RefCell::new(Vec::new()));
     let reader_wake = ConsumerWake::new();
 
     let notifier = args
@@ -266,7 +296,11 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
         )
     });
 
-    downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(&client, &downloaders_rx);
+    downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(
+        &client,
+        &downloaders_rx,
+        &downloader_metrics,
+    );
     rtsp::spawn_media(
         Rc::clone(&stream),
         Rc::clone(&client),
@@ -320,8 +354,8 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// A long-lived RTSP server: streams are created by `DESCRIBE` and dropped when
-/// their last viewer disconnects.
+/// A long-lived RTSP server plus the Siphon backend: config, Hermes, monitors,
+/// disk, notifications and the admin RPC.
 #[allow(clippy::future_not_send)]
 async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::Error>> {
     let client = Rc::new(Client::new());
@@ -329,18 +363,25 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
 
     // Global: one client, one slot pool, one downloader queue for every stream.
     let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
-    downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(&client, &downloaders_rx);
+    let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
+    downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(
+        &client,
+        &downloaders_rx,
+        &downloader_metrics,
+    );
 
     let notifier = args
         .notify
         .as_ref()
         .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
 
-    let registry = Rc::new(daemon::Registry::new(
-        client,
+    let bus = Bus::new();
+    let registry = Rc::new(Registry::new(
+        Rc::clone(&client),
         arena,
         downloaders_tx.to_async(),
-        daemon::Options {
+        Rc::clone(&downloader_metrics),
+        RegistryOptions {
             client_id: cfg.client_id.clone(),
             auth_token: cfg.auth_token.clone(),
             low_latency: cfg.low_latency,
@@ -350,10 +391,41 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             notify: notifier,
             keep_runs: args.keep_runs,
         },
+        Rc::clone(&bus),
     ));
     registry.watch_finished();
 
-    // Only returns on a bind error: the accept loop runs for the process's life.
+    let config_path = config::default_path(config::APP_ID);
+    let config = config::load(&config_path);
+    notifier::register_aumid();
+
+    let (events_tx, events_rx) = kanal::unbounded();
+    let handle = AppHandle::new(events_tx, Rc::clone(&bus));
+    let app = App::new(AppInit {
+        config,
+        config_path,
+        client: Rc::clone(&client),
+        registry: Rc::clone(&registry),
+        bus,
+        events: events_rx.to_async(),
+        client_id: cfg.client_id.clone(),
+        debug: cfg.debug,
+    });
+
+    if !args.no_admin {
+        let handle = handle.clone();
+        let admin_bind = args.admin_bind;
+        compio::runtime::spawn(async move {
+            if let Err(error) = rpc::serve(admin_bind, handle).await {
+                error!(%error, "rpc: listener failed");
+            }
+        })
+        .detach();
+    }
+    compio::runtime::spawn(app.run()).detach();
+
+    // Only returns on a bind error: the RTSP accept loop runs for the process's
+    // life.
     rtsp::serve(registry, args.bind).await?;
 
     drop(downloaders_rx);
@@ -402,6 +474,8 @@ mod tests {
             panic!("expected daemon");
         };
         assert_eq!(args.bind.port(), 8554);
+        assert_eq!(args.admin_bind.port(), 7418);
+        assert!(!args.no_admin);
         assert_eq!(args.max_streams, constants::MAX_STREAMS);
 
         // `-c` is not a daemon option.
