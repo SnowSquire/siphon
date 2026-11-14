@@ -241,7 +241,7 @@ impl Client {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::protocol::ArenaSummary;

@@ -216,7 +216,7 @@ async fn writer(mut write: TcpStream, outbound_rx: kanal::Receiver<Outbound>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;

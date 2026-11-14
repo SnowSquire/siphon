@@ -7,7 +7,9 @@ use crate::http::Client;
 
 /// `AppUserModelId` the toasts are shown under; registered per user on startup
 /// so the banner shows this app instead of the PowerShell fallback.
+#[cfg(windows)]
 const AUMID: &str = "twitch-siphon";
+#[cfg(windows)]
 const DISPLAY_NAME: &str = "Siphon";
 
 /// Bundled icon, written to disk for the toast registration.
@@ -103,11 +105,10 @@ fn show_toast(summary: &str, body: &str, sound: bool, image: Option<&str>, login
     }
 }
 
+#[cfg(windows)]
 fn open_url(url: &str) {
     #[cfg(windows)]
     let _ = std::process::Command::new("cmd")
         .args(["/C", "start", "", url])
         .spawn();
-    #[cfg(not(windows))]
-    let _ = url;
 }

@@ -18,6 +18,7 @@ use crate::http::Client;
 pub const CHECK_INTERVAL: Duration = Duration::from_hours(6);
 const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(windows)]
 const INSTALL_KEY: &str = "Software\\Ozeniken\\Siphon";
 
 #[derive(Debug, Error)]
@@ -115,6 +116,8 @@ pub async fn fetch_latest(client: &Client) -> Result<Release, UpdateError> {
 /// How this copy was installed: via the per-user MSI or standalone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InstallMode {
+    /// Constructed only by the Windows registry check.
+    #[allow(dead_code)]
     Msi,
     Portable,
 }
