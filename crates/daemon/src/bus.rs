@@ -3,15 +3,20 @@
 //! Publishing never keeps a stream alive: subscribers are weak, and a slow
 //! connection is closed instead of being queued indefinitely. The UI resyncs
 //! from a snapshot after reconnecting.
+//!
+//! Control frames and updates share one bounded queue. A writer that selected
+//! between two receive queues could drop an already-completed receive when both
+//! became ready, losing a response or an update; one queue removes that choice.
 
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::rc::Weak;
 
+use siphon_rpc::ServerMessage;
 use siphon_rpc::Update;
 
-/// How many updates a connection may fall behind before it is disconnected.
+/// How many frames a connection may fall behind before it is disconnected.
 const BACKLOG: usize = 64;
 
 /// One published change with the revision it belongs to.
@@ -21,9 +26,33 @@ pub struct Broadcast {
     pub update: Update,
 }
 
-/// The receiving end of one connection's subscription.
+/// One frame for a connection: a request response or a published update.
+#[derive(Debug, Clone)]
+pub enum Outbound {
+    Control(ServerMessage),
+    Update(Broadcast),
+}
+
+/// The sending end of one connection's queue.
 pub struct Subscriber {
-    tx: kanal::Sender<Broadcast>,
+    tx: kanal::Sender<Outbound>,
+}
+
+impl Subscriber {
+    /// Queues a request response. Returns false when the connection is gone or
+    /// too far behind; the client will resync.
+    #[must_use]
+    pub fn control(&self, message: ServerMessage) -> bool {
+        matches!(
+            self.tx.try_send(Outbound::Control(message)),
+            Ok(true)
+        )
+    }
+
+    /// Closes the queue, which stops the writer after it drains.
+    pub fn close(&self) {
+        let _ = self.tx.close();
+    }
 }
 
 pub struct Bus {
@@ -49,7 +78,7 @@ impl Bus {
     /// Registers one connection. The caller keeps the `Subscriber` alive for
     /// the lifetime of the connection; the bus only holds a weak reference.
     #[must_use]
-    pub fn subscribe(self: &Rc<Self>) -> (Rc<Subscriber>, kanal::Receiver<Broadcast>) {
+    pub fn subscribe(self: &Rc<Self>) -> (Rc<Subscriber>, kanal::Receiver<Outbound>) {
         let (tx, rx) = kanal::bounded(BACKLOG);
         let subscriber = Rc::new(Subscriber { tx });
         self.subscribers
@@ -58,8 +87,8 @@ impl Bus {
         (subscriber, rx)
     }
 
-    /// Publishes one complete entity update. Bounded subscribers that are
-    /// full are closed: the UI reconnects and asks for a snapshot.
+    /// Publishes one complete entity update. Bounded subscribers that are full
+    /// are closed: the UI reconnects and asks for a snapshot.
     pub fn publish(&self, update: Update) {
         let revision = self.revision.get().wrapping_add(1);
         self.revision.set(revision);
@@ -68,7 +97,10 @@ impl Bus {
             let Some(subscriber) = weak.upgrade() else {
                 return false;
             };
-            match subscriber.tx.try_send(broadcast.clone()) {
+            match subscriber
+                .tx
+                .try_send(Outbound::Update(broadcast.clone()))
+            {
                 Ok(true) => true,
                 Ok(false) => {
                     tracing::warn!("rpc: dropping a lagging UI connection");
@@ -87,6 +119,13 @@ mod tests {
 
     use super::*;
 
+    fn revision(frame: Option<Outbound>) -> Option<u64> {
+        match frame {
+            Some(Outbound::Update(broadcast)) => Some(broadcast.revision),
+            Some(Outbound::Control(_)) | None => None,
+        }
+    }
+
     #[test]
     fn publishing_reaches_every_live_subscriber() {
         let bus = Bus::new();
@@ -94,11 +133,24 @@ mod tests {
         let (second, second_rx) = bus.subscribe();
         bus.publish(Update::Conn(ConnHealth::Connected));
         assert_eq!(bus.revision(), 1);
-        assert_eq!(first_rx.try_recv().unwrap().unwrap().revision, 1);
-        assert_eq!(second_rx.try_recv().unwrap().unwrap().revision, 1);
+        assert_eq!(revision(first_rx.try_recv().unwrap()), Some(1));
+        assert_eq!(revision(second_rx.try_recv().unwrap()), Some(1));
         drop(first);
         drop(second);
         bus.publish(Update::Conn(ConnHealth::Connecting));
         assert_eq!(bus.revision(), 2);
+    }
+
+    #[test]
+    fn control_and_updates_share_one_ordered_queue() {
+        let bus = Bus::new();
+        let (subscriber, rx) = bus.subscribe();
+        assert!(subscriber.control(ServerMessage::Rejected("x".to_owned())));
+        bus.publish(Update::Conn(ConnHealth::Connected));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Some(Outbound::Control(ServerMessage::Rejected(_)))
+        ));
+        assert_eq!(revision(rx.try_recv().unwrap()), Some(1));
     }
 }

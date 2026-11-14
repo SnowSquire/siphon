@@ -56,10 +56,11 @@ pub enum ClientEvent {
 
 type Pending = Rc<RefCell<HashMap<u64, Sender<Result<Response, RpcError>>>>>;
 
-/// Which half of the connection task woke up.
+/// Which half of the connection woke up.
 enum Selected {
     Outgoing(Result<ClientMessage, kanal::ReceiveError>),
     Incoming(Result<ServerMessage, CodecError>),
+    Stop,
 }
 
 /// A connected RPC client. Requests are correlated by id; updates arrive on
@@ -118,19 +119,66 @@ impl Client {
         let (out_tx, out_rx) = kanal::unbounded();
         let (events_tx, events_rx) = kanal::unbounded();
         let pending: Pending = Rc::new(RefCell::new(HashMap::new()));
-        let task_pending = Rc::clone(&pending);
+        let reader_pending = Rc::clone(&pending);
+        let writer_pending = Rc::clone(&pending);
 
-        // One task owns both socket halves: a failed write tears the whole
-        // connection down instead of leaving a reader parked on a dead socket.
+        // Read and write are separate tasks: a select between the two would
+        // drop an already-completed receive when both sides woke together,
+        // losing the frame it had just consumed. A shutdown signal stops the
+        // other half instead.
+        let (stop_tx, stop_rx) = kanal::bounded(1);
+        let reader_stop = stop_rx.clone();
+        let reader_stop_tx = stop_tx.clone();
         compio::runtime::spawn(async move {
-            let out_rx = out_rx.to_async();
+            let stop = reader_stop.to_async();
+            let events = events_tx;
             loop {
-                let outgoing = out_rx.recv().fuse();
                 let incoming = reader.read::<ServerMessage, _>(&mut read).fuse();
-                futures_util::pin_mut!(outgoing, incoming);
+                let stopped = stop.recv().fuse();
+                futures_util::pin_mut!(incoming, stopped);
+                let selected = futures_util::select! {
+                    message = incoming => Selected::Incoming(message),
+                    _ = stopped => Selected::Stop,
+                };
+                match selected {
+                    Selected::Incoming(Ok(ServerMessage::Update { revision, update })) => {
+                        let _ = events.try_send(ClientEvent::Update { revision, update });
+                    }
+                    Selected::Incoming(Ok(ServerMessage::Snapshot(snapshot))) => {
+                        let _ = events.try_send(ClientEvent::Snapshot(snapshot));
+                    }
+                    Selected::Incoming(Ok(ServerMessage::Response { id, result })) => {
+                        if let Some(waiter) = reader_pending.borrow_mut().remove(&id) {
+                            let _ = waiter.try_send(result);
+                        }
+                    }
+                    // The handshake already consumed the only welcome; the
+                    // writer variant cannot be produced by this select.
+                    Selected::Incoming(Ok(
+                        ServerMessage::Welcome { .. } | ServerMessage::Rejected(_),
+                    ))
+                    | Selected::Outgoing(_) => {}
+                    Selected::Incoming(Err(_)) | Selected::Stop => break,
+                }
+            }
+            for (_, waiter) in reader_pending.borrow_mut().drain() {
+                let _ = waiter.try_send(Err(RpcError::Disconnected));
+            }
+            let _ = reader_stop_tx.try_send(());
+        })
+        .detach();
+
+        let writer_stop = stop_rx;
+        compio::runtime::spawn(async move {
+            let out = out_rx.to_async();
+            let stop = writer_stop.to_async();
+            loop {
+                let outgoing = out.recv().fuse();
+                let stopped = stop.recv().fuse();
+                futures_util::pin_mut!(outgoing, stopped);
                 let selected = futures_util::select! {
                     message = outgoing => Selected::Outgoing(message),
-                    message = incoming => Selected::Incoming(message),
+                    _ = stopped => Selected::Stop,
                 };
                 match selected {
                     Selected::Outgoing(Ok(message)) => {
@@ -138,27 +186,14 @@ impl Client {
                             break;
                         }
                     }
-                    Selected::Outgoing(Err(_)) | Selected::Incoming(Err(_)) => break,
-                    Selected::Incoming(Ok(ServerMessage::Update { revision, update })) => {
-                        let _ = events_tx.try_send(ClientEvent::Update { revision, update });
-                    }
-                    Selected::Incoming(Ok(ServerMessage::Snapshot(snapshot))) => {
-                        let _ = events_tx.try_send(ClientEvent::Snapshot(snapshot));
-                    }
-                    Selected::Incoming(Ok(ServerMessage::Response { id, result })) => {
-                        if let Some(waiter) = task_pending.borrow_mut().remove(&id) {
-                            let _ = waiter.try_send(result);
-                        }
-                    }
-                    // The handshake already consumed the only welcome.
-                    Selected::Incoming(Ok(
-                        ServerMessage::Welcome { .. } | ServerMessage::Rejected(_),
-                    )) => {}
+                    Selected::Outgoing(Err(_)) | Selected::Stop => break,
+                    Selected::Incoming(_) => {}
                 }
             }
-            for (_, waiter) in task_pending.borrow_mut().drain() {
+            for (_, waiter) in writer_pending.borrow_mut().drain() {
                 let _ = waiter.try_send(Err(RpcError::Disconnected));
             }
+            let _ = stop_tx.try_send(());
         })
         .detach();
 

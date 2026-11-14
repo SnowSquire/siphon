@@ -3,9 +3,8 @@
 Status: phases 0–2 backend landed. `crates/rpc` (`siphon-rpc`) owns the typed
 protocol, postcard framing and client; `crates/daemon` owns config, GQL,
 Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI has
-not moved into this workspace yet. Known issue: the RPC writer drops the
-response when a coalesced update is written in the same wake; the loopback
-integration test is ignored until that is fixed.
+not moved into this workspace yet. A loopback test covers a monitor add, a
+pipeline update and a pipeline stop over RPC.
 
 ## Goal
 

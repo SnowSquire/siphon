@@ -31,6 +31,7 @@ use siphon_rpc::UpdateView;
 use crate::balesh::CheapRng;
 use crate::balesh::NanoId;
 use crate::bus::Bus;
+use crate::bus::Subscriber;
 use crate::config;
 use crate::config::ConfigError;
 use crate::gql;
@@ -66,7 +67,7 @@ pub enum AppEvent {
     Request {
         id: u64,
         request: Request,
-        control: kanal::Sender<ServerMessage>,
+        control: Rc<Subscriber>,
     },
 }
 
@@ -90,11 +91,11 @@ impl AppHandle {
     }
 
     /// Forwards one request; the app answers through `control`.
-    pub fn request(&self, id: u64, request: Request, control: &kanal::Sender<ServerMessage>) {
+    pub fn request(&self, id: u64, request: Request, control: &Rc<Subscriber>) {
         let _ = self.tx.try_send(AppEvent::Request {
             id,
             request,
-            control: control.clone(),
+            control: Rc::clone(control),
         });
     }
 
@@ -389,7 +390,7 @@ impl App {
         &mut self,
         id: u64,
         request: Request,
-        control: &kanal::Sender<ServerMessage>,
+        control: &Rc<Subscriber>,
     ) {
         let result = match request {
             Request::AddLogin(login) => {
@@ -448,7 +449,7 @@ impl App {
             Request::GetDownloader => Ok(Response::Downloader(self.registry.downloader_summary())),
             Request::GetDisk(_) => Err(RpcError::Unsupported),
         };
-        let _ = control.try_send(ServerMessage::Response { id, result });
+        let _ = control.control(ServerMessage::Response { id, result });
     }
 
     /// Snapshot built on demand from app state, the registry and metrics.

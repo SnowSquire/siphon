@@ -6,11 +6,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::rc::Rc;
 
 use compio::net::TcpListener;
 use compio::net::TcpStream;
-use futures_util::FutureExt as _;
 use siphon_rpc::ClientMessage;
 use siphon_rpc::FrameReader;
 use siphon_rpc::MAGIC;
@@ -23,7 +21,7 @@ use tracing::warn;
 
 use crate::app::AppHandle;
 use crate::bus::Broadcast;
-use crate::bus::Subscriber;
+use crate::bus::Outbound;
 
 /// Binds the admin address and serves forever.
 pub async fn serve(addr: SocketAddr, handle: AppHandle) -> std::io::Result<()> {
@@ -72,7 +70,7 @@ async fn connection(stream: TcpStream, peer: SocketAddr, handle: AppHandle) {
     info!(%peer, %app_version, "rpc: client connected");
 
     let bus = handle.bus();
-    let (subscriber, updates) = bus.subscribe();
+    let (subscriber, outbound) = bus.subscribe();
     let Some(snapshot) = handle.snapshot().await else {
         return;
     };
@@ -95,20 +93,19 @@ async fn connection(stream: TcpStream, peer: SocketAddr, handle: AppHandle) {
         return;
     }
 
-    let (control_tx, control_rx) = kanal::unbounded();
-    compio::runtime::spawn(writer(write, control_rx, updates)).detach();
+    compio::runtime::spawn(writer(write, outbound)).detach();
 
-    // Holding the subscriber here closes the update channel when the reader
-    // ends, which is what stops the writer and the socket.
-    let _subscriber: Rc<Subscriber> = subscriber;
+    // The reader owns the last strong reference to the subscriber. Closing it
+    // on exit stops the writer after it drains, even if a request is in flight.
     loop {
         match reader.read::<ClientMessage, _>(&mut read).await {
             Ok(ClientMessage::Request { id, request }) => {
-                handle.request(id, request, &control_tx);
+                handle.request(id, request, &subscriber);
             }
             Ok(ClientMessage::Hello { .. }) => {}
             Err(error) => {
                 info!(%peer, %error, "rpc: client disconnected");
+                subscriber.close();
                 return;
             }
         }
@@ -182,51 +179,38 @@ impl Coalescer {
     }
 }
 
-async fn writer(
-    mut write: TcpStream,
-    control_rx: kanal::Receiver<ServerMessage>,
-    updates_rx: kanal::Receiver<Broadcast>,
-) {
-    let control = control_rx.clone().to_async();
-    let updates = updates_rx.clone().to_async();
+async fn writer(mut write: TcpStream, outbound_rx: kanal::Receiver<Outbound>) {
+    let outbound = outbound_rx.clone().to_async();
     loop {
-        enum Selected {
-            Control(Result<ServerMessage, kanal::ReceiveError>),
-            Update(Result<Broadcast, kanal::ReceiveError>),
-        }
-        let control_fut = control.recv().fuse();
-        let update_fut = updates.recv().fuse();
-        futures_util::pin_mut!(control_fut, update_fut);
-        let selected = futures_util::select! {
-            message = control_fut => Selected::Control(message),
-            update = update_fut => Selected::Update(update),
+        let Ok(first) = outbound.recv().await else {
+            return;
         };
-        match selected {
-            Selected::Control(Ok(message)) => {
-                if codec::write(&mut write, &message).await.is_err() {
-                    return;
-                }
-                while let Ok(Some(message)) = control_rx.try_recv() {
-                    if codec::write(&mut write, &message).await.is_err() {
-                        return;
-                    }
-                }
+        // One queue and one receive future: draining synchronously cannot drop
+        // a completed receive the way a select between two queues could.
+        let mut controls = Vec::new();
+        let mut coalescer = Coalescer::default();
+        match first {
+            Outbound::Control(message) => controls.push(message),
+            Outbound::Update(broadcast) => coalescer.push(broadcast),
+        }
+        while let Ok(Some(item)) = outbound_rx.try_recv() {
+            match item {
+                Outbound::Control(message) => controls.push(message),
+                Outbound::Update(broadcast) => coalescer.push(broadcast),
             }
-            Selected::Update(Ok(first)) => {
-                let mut coalescer = Coalescer::default();
-                coalescer.push(first);
-                while let Ok(Some(update)) = updates_rx.try_recv() {
-                    coalescer.push(update);
-                }
-                for (revision, update) in coalescer.finish() {
-                    let result =
-                        codec::write(&mut write, &ServerMessage::Update { revision, update }).await;
-                    if result.is_err() {
-                        return;
-                    }
-                }
+        }
+        for message in controls {
+            if codec::write(&mut write, &message).await.is_err() {
+                return;
             }
-            Selected::Control(Err(_)) | Selected::Update(Err(_)) => return,
+        }
+        for (revision, update) in coalescer.finish() {
+            if codec::write(&mut write, &ServerMessage::Update { revision, update })
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
     }
 }
@@ -234,6 +218,7 @@ async fn writer(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use compio::net::TcpListener;
@@ -283,10 +268,6 @@ mod tests {
         panic!("pipeline update for {login} did not arrive");
     }
 
-    // Known issue: the second request's response is not routed to the client
-    // when a pipeline update is written in the same writer wake. The daemon
-    // paths themselves work; the client/writer handshake needs another pass.
-    #[ignore = "flaky: response routing after a coalesced update burst"]
     #[test]
     fn monitor_add_watch_and_stop_round_trip_over_rpc() {
         let dir = scratch_dir();
