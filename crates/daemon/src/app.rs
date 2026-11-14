@@ -15,10 +15,13 @@ use std::time::Duration;
 use std::time::Instant;
 
 use futures_util::FutureExt as _;
+use siphon_rpc::ArenaSummary;
 use siphon_rpc::ChannelView;
 use siphon_rpc::Config;
 use siphon_rpc::ConnHealth;
+use siphon_rpc::DownloaderSummary;
 use siphon_rpc::NotificationView;
+use siphon_rpc::PipelineView;
 use siphon_rpc::Request;
 use siphon_rpc::Response;
 use siphon_rpc::RpcError;
@@ -216,6 +219,10 @@ pub struct App {
     pub(crate) update_busy: bool,
     pub(crate) update_check_at: Instant,
 
+    last_arena: ArenaSummary,
+    last_downloader: DownloaderSummary,
+    last_pipelines: HashMap<StreamKey, PipelineView>,
+
     pub(crate) pending_unsubscribes: Vec<(NanoId, Topic)>,
 
     save_dirty: bool,
@@ -283,6 +290,9 @@ impl App {
             update: None,
             update_busy: false,
             update_check_at: Instant::now(),
+            last_arena: ArenaSummary::default(),
+            last_downloader: DownloaderSummary::default(),
+            last_pipelines: HashMap::new(),
             pending_unsubscribes: Vec::new(),
             save_dirty: false,
             save_running: false,
@@ -561,6 +571,45 @@ impl App {
     pub fn clear_error(&mut self) {
         if self.error.take().is_some() {
             self.bus.publish(Update::Error(None));
+        }
+    }
+
+    /// Publishes telemetry that only the snapshot used to expose, so a UI
+    /// showing live counters updates without polling.
+    pub(crate) fn publish_telemetry(&mut self) {
+        let arena = self.registry.arena_summary();
+        if arena != self.last_arena {
+            self.last_arena = arena;
+            self.bus.publish(Update::Arena(arena));
+        }
+        let downloader = self.registry.downloader_summary();
+        if downloader != self.last_downloader {
+            self.last_downloader = downloader;
+            self.bus.publish(Update::Downloader(downloader));
+        }
+        let views = self.registry.views();
+        let mut seen = Vec::with_capacity(views.len());
+        for view in views {
+            let changed = self
+                .last_pipelines
+                .get(&view.key)
+                .is_none_or(|old| old != &view);
+            if changed {
+                self.bus
+                    .publish(Update::PipelineUpsert(view.clone()));
+            }
+            seen.push(view.key.clone());
+            self.last_pipelines.insert(view.key.clone(), view);
+        }
+        let removed: Vec<StreamKey> = self
+            .last_pipelines
+            .keys()
+            .filter(|key| !seen.contains(key))
+            .cloned()
+            .collect();
+        for key in removed {
+            self.last_pipelines.remove(&key);
+            self.bus.publish(Update::PipelineRemove(key));
         }
     }
 

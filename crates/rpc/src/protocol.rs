@@ -120,7 +120,7 @@ pub enum PipelineState {
 }
 
 /// One running (or last-known) pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineView {
     pub key: StreamKey,
@@ -164,7 +164,7 @@ pub struct SegmentRecord {
 }
 
 /// Arena occupancy summary.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArenaSummary {
     pub live_slots: u32,
@@ -176,7 +176,7 @@ pub struct ArenaSummary {
 }
 
 /// Downloader queue summary.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloaderSummary {
     pub queued: u32,
