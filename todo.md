@@ -6,6 +6,7 @@
 - [ ] capture a portrait stream + public VOD (DVR variant set, PDT) for the disk recorder
 - [ ] bring down binary size
 - [ ] figure out how big the unbounded channels actually get, and bound them
+- [ ] some protocol to monitor and control daemon mode. obvious is a rest api but that's not realtime, and also shitty
 - [ ] move from clap to bpaf (evaluate first)
 - [ ] Hermes WebSocket listener to automatically start recording
 - [ ] include hermes updates in index, possibly even chat and other stuff (redeems, bits, the horse animation)
