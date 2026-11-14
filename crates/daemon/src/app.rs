@@ -25,6 +25,7 @@ use siphon_rpc::Response;
 use siphon_rpc::RpcError;
 use siphon_rpc::ServerMessage;
 use siphon_rpc::Snapshot;
+use siphon_rpc::StreamKey;
 use siphon_rpc::Update;
 use siphon_rpc::UpdateView;
 
@@ -424,14 +425,19 @@ impl App {
                 self.handle_apply_update();
                 Ok(Response::Ack)
             }
-            Request::PipelineStop(key) => {
-                self.registry.stop_pipeline(&key);
+            Request::PipelineStop { key, force } => {
+                self.registry.stop_pipeline(&key, force);
                 Ok(Response::Ack)
             }
             Request::PipelineRestart(key) => {
                 self.registry.restart_pipeline(&key);
                 Ok(Response::Ack)
             }
+            Request::DisconnectViewers(key) => {
+                self.registry.disconnect_viewers(&key);
+                Ok(Response::Ack)
+            }
+            Request::RecordOnce { login, quality } => self.apply_record_once(&login, quality),
             Request::GetSnapshot => Ok(Response::Snapshot(Box::new(self.snapshot()))),
             Request::GetStreamDetail(key) => self
                 .registry
@@ -774,6 +780,22 @@ impl App {
         self.matcher = crate::hermes::build_matcher(&self.config.filtered_words);
         self.publish_config();
         self.queue_save();
+        Ok(Response::Ack)
+    }
+
+    fn apply_record_once(
+        &self,
+        login: &str,
+        quality: Option<String>,
+    ) -> Result<Response, RpcError> {
+        if !self.registry.can_record() {
+            return Err(RpcError::Failed("recording needs --output".to_owned()));
+        }
+        let login = login.trim().to_lowercase();
+        if login.is_empty() {
+            return Err(RpcError::BadRequest("empty login".to_owned()));
+        }
+        self.registry.record_once(StreamKey::new(login, quality));
         Ok(Response::Ack)
     }
 

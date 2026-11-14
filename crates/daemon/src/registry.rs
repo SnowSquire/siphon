@@ -84,6 +84,10 @@ pub struct Registry {
     streams: RefCell<HashMap<StreamKey, Rc<StreamRuntime>>>,
     /// Recording desired, whether or not a runtime exists yet.
     monitors: RefCell<HashSet<StreamKey>>,
+    /// One-shot recordings: they end with the stream and are not persisted.
+    once: RefCell<HashSet<StreamKey>>,
+    /// Explicitly stopped pipelines; `stream-up` must not restart them.
+    suppressed: RefCell<HashSet<StreamKey>>,
     gate: Gate,
     /// Disk recordings that finished, so the stream entry can be released.
     finished: kanal::Sender<StreamKey>,
@@ -184,6 +188,8 @@ impl Registry {
             channels: RefCell::new(HashMap::new()),
             streams: RefCell::new(HashMap::new()),
             monitors: RefCell::new(HashSet::new()),
+            once: RefCell::new(HashSet::new()),
+            suppressed: RefCell::new(HashSet::new()),
             gate: Gate::default(),
             finished: finished_tx,
             finished_rx: RefCell::new(Some(finished_rx)),
@@ -318,6 +324,7 @@ impl Registry {
                 if runtime.stream.has_sessions()
                     || runtime.recording.get()
                     || monitors.contains(key)
+                    || self.once.borrow().contains(key)
                 {
                     return true;
                 }
@@ -471,10 +478,30 @@ impl Registry {
         self.publish_pipeline(runtime);
     }
 
+    fn wanted(&self, key: &StreamKey) -> bool {
+        self.monitors.borrow().contains(key) || self.once.borrow().contains(key)
+    }
+
     /// A channel went live with recording on: start its monitor runtime now.
     pub fn monitor_set(self: &Rc<Self>, login: &str) {
         let key = StreamKey::new(login, None);
+        self.suppressed.borrow_mut().remove(&key);
         self.monitors.borrow_mut().insert(key.clone());
+        if let Some(runtime) = self.streams.borrow().get(&key).cloned() {
+            self.start_recording(&runtime);
+            return;
+        }
+        let registry = Rc::clone(self);
+        compio::runtime::spawn(async move {
+            registry.activate_monitor(key).await;
+        })
+        .detach();
+    }
+
+    /// Record one stream without persisting a monitor.
+    pub fn record_once(self: &Rc<Self>, key: StreamKey) {
+        self.suppressed.borrow_mut().remove(&key);
+        self.once.borrow_mut().insert(key.clone());
         if let Some(runtime) = self.streams.borrow().get(&key).cloned() {
             self.start_recording(&runtime);
             return;
@@ -493,7 +520,10 @@ impl Registry {
             key.quality.as_deref().unwrap_or_default()
         );
         let _guard = self.gate.acquire(&gate_key).await;
-        if !self.monitors.borrow().contains(&key) || self.streams.borrow().contains_key(&key) {
+        if !self.wanted(&key)
+            || self.suppressed.borrow().contains(&key)
+            || self.streams.borrow().contains_key(&key)
+        {
             return;
         }
         if self.options.output.is_none() {
@@ -545,7 +575,7 @@ impl Registry {
             let runtime = self.streams.borrow().get(&key).cloned();
             if let Some(runtime) = runtime {
                 self.stop_recording(&runtime);
-                if runtime.stream.has_sessions() {
+                if runtime.stream.has_sessions() || self.once.borrow().contains(&key) {
                     self.publish_pipeline(&runtime);
                 } else {
                     self.remove_runtime(&key);
@@ -558,6 +588,8 @@ impl Registry {
     /// `ENDLIST` so the tail is not cut; watch-only runtimes stay for their
     /// viewers.
     pub fn stream_down(&self, login: &str) {
+        self.once.borrow_mut().retain(|key| key.login != login);
+        self.suppressed.borrow_mut().retain(|key| key.login != login);
         let keys: Vec<StreamKey> = self
             .streams
             .borrow()
@@ -575,19 +607,40 @@ impl Registry {
         }
     }
 
-    pub fn stop_pipeline(&self, key: &StreamKey) {
+    /// Stops serving. Without `force` a watched pipeline keeps running and
+    /// only its recording stops; with `force` the sessions are disconnected.
+    pub fn stop_pipeline(&self, key: &StreamKey, force: bool) {
+        self.suppressed.borrow_mut().insert(key.clone());
+        let runtime = self.streams.borrow().get(key).cloned();
+        let Some(runtime) = runtime else {
+            return;
+        };
+        if force {
+            runtime.stream.disconnect_viewers();
+        } else if runtime.stream.has_sessions() {
+            self.stop_recording(&runtime);
+            self.publish_pipeline(&runtime);
+            return;
+        }
         self.remove_runtime(key);
     }
 
     pub fn restart_pipeline(self: &Rc<Self>, key: &StreamKey) {
+        self.suppressed.borrow_mut().remove(key);
         self.remove_runtime(key);
-        if self.monitors.borrow().contains(key) {
+        if self.wanted(key) {
             let registry = Rc::clone(self);
             let key = key.clone();
             compio::runtime::spawn(async move {
                 registry.activate_monitor(key).await;
             })
             .detach();
+        }
+    }
+
+    pub fn disconnect_viewers(&self, key: &StreamKey) {
+        if let Some(runtime) = self.streams.borrow().get(key) {
+            runtime.stream.disconnect_viewers();
         }
     }
 
@@ -617,7 +670,7 @@ impl Registry {
         let keep = self.streams.borrow().get(key).is_none_or(|runtime| {
             runtime.stream.has_sessions()
                 || runtime.recording.get()
-                || self.monitors.borrow().contains(key)
+                || self.wanted(key)
         });
         if keep {
             return;
@@ -631,6 +684,7 @@ impl Registry {
     }
 
     fn remove_runtime(&self, key: &StreamKey) {
+        self.once.borrow_mut().remove(key);
         let removed = self.streams.borrow_mut().remove(key);
         let Some(runtime) = removed else {
             return;
@@ -680,7 +734,7 @@ impl Registry {
             title: runtime.title.clone(),
             variant: metrics.variant(),
             state,
-            pinned: runtime.recording.get() || self.monitors.borrow().contains(&runtime.key),
+            pinned: runtime.recording.get() || self.wanted(&runtime.key),
             recording: runtime.recording.get(),
             sessions: runtime.stream.session_count(),
             position_ms: runtime.stream.position_ms(),

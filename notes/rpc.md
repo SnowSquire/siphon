@@ -108,10 +108,10 @@ scalars; the segment ring is queryable and updates append to it.
 Requests:
 
 - intents: `AddLogin`, `RemoveChannel`, `SetNotifyTitleChanges`, `SetSound`,
-  `AddFilteredWord`, `RemoveFilteredWord`, `ClearError`, `DismissNotification`,
-  `MonitorAdd { login, quality, record }`, `MonitorRemove { key, force }`,
-  `MonitorUpdate { key, record, quality }`, `PipelineStop { key, force }`,
-  `PipelineRestart { key }`, `DisconnectViewers { key }`, update actions;
+  `AddFilteredWord`, `RemoveFilteredWord`, `SetRecord { channel, record }`,
+  `ClearError`, `DismissNotification`, `ApplyUpdate`, `PipelineStop { key,
+  force }`, `PipelineRestart(StreamKey)`, `DisconnectViewers(StreamKey)`,
+  `RecordOnce { login, quality }`;
 - queries: `GetSnapshot`, `GetStreamDetail { key }`, `ListSegments { key,
   limit }`, `GetArena`, `GetDownloader`, `GetDisk { key }`.
 
@@ -235,8 +235,9 @@ like `StreamKey`; changing quality is remove + add.
    segment ring, arena/downloader telemetry, `ListSegments`/`GetStreamDetail`.
    **Done**, except `GetDisk` (returns `Unsupported`).
 3. **Full lifecycle**: monitor add/remove/update, stop/restart, forced viewer
-   disconnect, per-monitor record start/stop. **Open**; stop/restart exists,
-   forced disconnect and ephemeral recording do not.
+   disconnect, per-monitor record start/stop. **Done**, including one-shot
+   `RecordOnce` and `PipelineStop { force }`; the per-channel `record` flag
+   starts and stops the disk on a live runtime.
 4. **Disk and polish**: run introspection/release, update ownership,
    multi-client behavior, update throttling/coalescing. **Open.**
 

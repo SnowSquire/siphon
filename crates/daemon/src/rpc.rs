@@ -339,9 +339,10 @@ mod tests {
             next_pipeline(&events, "sunnys", false).await;
 
             let response = client
-                .request(Request::PipelineStop(siphon_rpc::StreamKey::new(
-                    "sunnys", None,
-                )))
+                .request(Request::PipelineStop {
+                    key: siphon_rpc::StreamKey::new("sunnys", None),
+                    force: true,
+                })
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));

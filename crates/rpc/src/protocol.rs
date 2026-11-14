@@ -278,8 +278,15 @@ pub enum Request {
     ClearError,
     DismissNotification(u64),
     ApplyUpdate,
-    PipelineStop(StreamKey),
+    /// Stop serving; `force` also disconnects the viewers. The recording
+    /// monitor (if any) stays desired.
+    PipelineStop { key: StreamKey, force: bool },
     PipelineRestart(StreamKey),
+    /// Disconnect every RTSP session without touching the pipeline.
+    DisconnectViewers(StreamKey),
+    /// Record this stream only; nothing is persisted and it ends at
+    /// `stream-down`.
+    RecordOnce { login: String, quality: Option<String> },
     GetSnapshot,
     GetStreamDetail(StreamKey),
     ListSegments {

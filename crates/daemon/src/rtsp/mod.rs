@@ -38,7 +38,11 @@ use compio::io::AsyncWriteExt;
 use compio::net::TcpListener;
 use compio::net::TcpStream;
 use compio::net::UdpSocket;
+use futures_util::FutureExt as _;
+use futures_util::future::Either;
 use futures_util::future::LocalBoxFuture;
+use futures_util::future::select;
+use futures_util::pin_mut;
 use kanal::AsyncReceiver;
 use socket2::Domain;
 use socket2::Protocol;
@@ -376,6 +380,37 @@ struct Session {
     /// the control connection attaches to a stream (DESCRIBE): before that
     /// there is nothing to wake.
     drain: RefCell<Rc<DrainSignal>>,
+    /// Set by `kill`: the control loop and writer stop, the outbound queue is
+    /// closed and the session detaches from its stream.
+    close: Cell<bool>,
+    wake: Rc<ConsumerWake>,
+}
+
+impl Session {
+    fn kill(&self) {
+        if self.close.replace(true) {
+            return;
+        }
+        let _ = self.out.as_sync().close();
+        self.wake.wake();
+    }
+
+    /// Resolves once the session is killed. Cancel-safe: it only reads a flag
+    /// and parks the control loop's waker.
+    async fn wait_close(&self) {
+        poll_fn(|context| {
+            if self.close.get() {
+                return Poll::Ready(());
+            }
+            self.wake.park(context);
+            if self.close.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
 }
 
 /// Whether the outbound queue has room for the media engine, without polling.
@@ -620,6 +655,14 @@ impl Stream {
     /// Whether any RTSP client is still connected (playing or paused).
     pub fn has_sessions(&self) -> bool {
         !self.sessions.borrow().is_empty()
+    }
+
+    /// Closes every session's control and media paths. Used by a forced
+    /// pipeline stop and by `DisconnectViewers`.
+    pub fn disconnect_viewers(&self) {
+        for session in self.sessions.borrow().iter() {
+            session.kill();
+        }
     }
 
     /// Connected sessions, for the pipeline view.
@@ -993,13 +1036,27 @@ async fn control_session(stream: TcpStream, peer: SocketAddr, resolver: Rc<dyn S
         video_synced: Cell::new(false),
         beacon_seq: Cell::new(1),
         drain: RefCell::new(DrainSignal::new()),
+        close: Cell::new(false),
+        wake: ConsumerWake::new(),
     });
     compio::runtime::spawn(writer(write, out_rx.to_async(), Rc::clone(&session))).detach();
     let id = next_session_id();
     debug!(%peer, %id, "rtsp client connected");
 
     let mut buffer = Vec::new();
-    while let Some(request) = read_request(&mut read, &mut buffer).await {
+    loop {
+        let request = {
+            let read_fut = read_request(&mut read, &mut buffer).fuse();
+            let close_fut = session.wait_close().fuse();
+            pin_mut!(read_fut, close_fut);
+            match select(read_fut, close_fut).await {
+                Either::Left((request, _)) => request,
+                Either::Right(_) => None,
+            }
+        };
+        let Some(request) = request else {
+            break;
+        };
         if !handle_request(&resolver, &session, &id, local, peer, &request).await {
             break;
         }
