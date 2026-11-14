@@ -15,6 +15,7 @@ mod error;
 mod pool;
 mod tls;
 mod transport;
+pub mod ws;
 
 use std::cell::RefCell;
 use std::future::Future;

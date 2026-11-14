@@ -117,3 +117,9 @@ pub const MAX_VOD_MANIFEST: usize = 8 * 1024 * 1024;
 
 /// Cap on a GQL / OAuth JSON body.
 pub const MAX_JSON: usize = 256 * 1024;
+
+/// Cap on one notification avatar.
+pub const MAX_IMAGE: usize = 4 * 1024 * 1024;
+
+/// Cap on one downloaded installer.
+pub const MAX_UPDATE: usize = 64 * 1024 * 1024;

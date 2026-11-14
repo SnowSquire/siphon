@@ -1,6 +1,10 @@
 // Debug/stat accessors are exercised by the arena tests and future policies.
 #[allow(dead_code, clippy::future_not_send)]
 mod arena;
+#[allow(dead_code, clippy::future_not_send)]
+mod balesh;
+#[allow(dead_code, clippy::future_not_send)]
+mod config;
 #[allow(clippy::future_not_send)]
 mod constants;
 #[allow(clippy::future_not_send)]
@@ -9,10 +13,18 @@ mod daemon;
 mod disk;
 #[allow(clippy::future_not_send)]
 mod downloader;
+#[allow(dead_code, clippy::future_not_send)]
+mod gql;
+#[allow(dead_code, clippy::future_not_send)]
+mod matcher;
 #[allow(clippy::future_not_send)]
 mod notify;
 #[allow(clippy::future_not_send)]
 mod spool;
+#[allow(dead_code, clippy::future_not_send)]
+mod time;
+#[allow(dead_code, clippy::future_not_send)]
+mod update;
 // compio tasks are deliberately !Send (one thread-per-core reactor).
 // `dead_code`: the client exposes a slightly wider surface than this binary uses.
 #[allow(dead_code, clippy::future_not_send)]
@@ -45,6 +57,11 @@ use futures_util::pin_mut;
 use mimalloc::MiMalloc;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
+
+// Cargo's unused-dependency lint only sees the crate root for target-gated
+// crates; the real use is in `notifier`.
+#[cfg(windows)]
+use tauri_winrt_notification as _;
 
 use crate::arena::ArenaSet;
 use crate::constants::DEBUG_CHANNEL_TITLE;

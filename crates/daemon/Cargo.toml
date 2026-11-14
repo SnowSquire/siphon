@@ -17,6 +17,7 @@ compio = { version = "0.19", features = [
     "time",
     "signal",
 ] }
+dirs = "6"
 eros = { version = "=0.9.0-rc.0", default-features = false, features = [
     "alloc",
 ] }
@@ -33,6 +34,9 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
     "tls12",
 ] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+siphon-rpc = { path = "../rpc" }
 socket2 = "0.6"
 sonic-rs = "0.5.8"
 thiserror = "2.0.20"
@@ -41,8 +45,14 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
+# OS toasts and the AUMID/install registry keys. The backend is the only
+# process that shows notifications, so these stay here rather than in the UI.
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.8"
+winreg = "0.55"
 
 [lints]
 workspace = true
+
 
 

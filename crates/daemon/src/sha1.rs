@@ -16,6 +16,15 @@ const INITIAL: [u32; 5] = [
 
 /// Hex-encoded SHA-1 of `input`, lowercase.
 pub fn hex(input: &[u8]) -> String {
+    let mut out = String::with_capacity(40);
+    for byte in digest(input) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Raw 20-byte SHA-1 digest of `input`.
+pub fn digest(input: &[u8]) -> [u8; 20] {
     let mut state = INITIAL;
     let bit_len = (input.len() as u64).wrapping_mul(8);
 
@@ -35,9 +44,9 @@ pub fn hex(input: &[u8]) -> String {
         compress(&mut state, block);
     }
 
-    let mut out = String::with_capacity(40);
-    for word in state {
-        let _ = write!(out, "{word:08x}");
+    let mut out = [0u8; 20];
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        *chunk = word.to_be_bytes();
     }
     out
 }
