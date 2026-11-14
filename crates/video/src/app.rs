@@ -30,6 +30,7 @@ use crate::video;
 
 pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
     let file = file.map_or_else(String::new, |path| path.display().to_string());
+    let test_pattern = file.is_empty();
 
     let graphics = SharedGraphics::with_backends(wgpu::Backends::VULKAN);
     let gpu = graphics
@@ -59,6 +60,7 @@ pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
                 hdr,
                 max_nits,
                 brightness,
+                test_pattern,
             )
         }))
         .run(move || {
@@ -77,6 +79,7 @@ fn dxgi_renderer(
     hdr: HdrMode,
     max_nits: RwSignal<f64, LocalStorage>,
     brightness: RwSignal<f64, LocalStorage>,
+    test_pattern: bool,
 ) -> Result<Box<dyn Renderer>, AppError> {
     let gpu_surface = Arc::clone(surface)
         .gpu_shared()
@@ -138,6 +141,7 @@ fn dxgi_renderer(
         ui_view,
         compositor,
         brightness,
+        test_pattern,
     )))
 }
 
@@ -223,7 +227,7 @@ const SHEET: &str = css!(
 
     .preview {
         width: 900px;
-        height: 470px;
+        height: 375px;
         border-radius: 12px;
         overflow: hidden;
         border: 1px solid #2c3342;

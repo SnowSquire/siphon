@@ -42,6 +42,7 @@ pub struct DxgiRenderer {
     _ui_view: wgpu::TextureView,
     compositor: Compositor,
     brightness: RwSignal<f64, LocalStorage>,
+    test_pattern: bool,
 }
 
 impl DxgiRenderer {
@@ -52,6 +53,7 @@ impl DxgiRenderer {
         ui_view: wgpu::TextureView,
         compositor: Compositor,
         brightness: RwSignal<f64, LocalStorage>,
+        test_pattern: bool,
     ) -> Self {
         Self {
             inner,
@@ -60,6 +62,7 @@ impl DxgiRenderer {
             _ui_view: ui_view,
             compositor,
             brightness,
+            test_pattern,
         }
     }
 
@@ -81,8 +84,13 @@ impl DxgiRenderer {
                         label: Some("video.composite"),
                     });
                 let nits = self.brightness.get_untracked() as f32;
-                self.compositor
-                    .render(self.gpu.queue(), &mut encoder, &view, nits);
+                self.compositor.render(
+                    self.gpu.queue(),
+                    &mut encoder,
+                    &view,
+                    nits,
+                    self.test_pattern,
+                );
                 self.gpu.queue().submit([encoder.finish()]);
             }
             self.gpu.wait();

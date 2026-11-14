@@ -137,9 +137,11 @@ impl Compositor {
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
         nits: f32,
+        test_pattern: bool,
     ) {
         let mut bytes = [0u8; 16];
         bytes[0..4].copy_from_slice(&nits.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&u32::from(test_pattern).to_ne_bytes());
         queue.write_buffer(&self.params, 0, &bytes);
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -229,7 +231,7 @@ fn fs_hdr(in: VertexOut) -> @location(0) vec4<f32> {
     var nits = (to2020 * linear709) * 203.0;
 
     // The HDR test patch: a horizontal ramp from black to the slider's value.
-    if (in.uv.x > 0.05 && in.uv.x < 0.95 && in.uv.y > 0.12 && in.uv.y < 0.72) {
+    if (params.nits.y > 0.5 && in.uv.x > 0.05 && in.uv.x < 0.95 && in.uv.y > 0.12 && in.uv.y < 0.72) {
         let across = (in.uv.x - 0.05) / 0.90;
         nits = vec3<f32>(params.nits.x * across);
     }
