@@ -48,6 +48,29 @@ frame is shown from its timestamp until the next one's.
 `pl_gpu_finish` before every present is the coarse part: a fence or a DXGI
 frame-latency waitable should replace it.
 
+## Presentation
+
+`DXGI_SWAP_EFFECT_FLIP_DISCARD`, three buffers, `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`
+and `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`, `SetMaximumFrameLatency(2)`,
+and every present is `Present1(1, DXGI_PRESENT(0), …)`.
+
+* **Discard, not sequential.** Every frame is drawn from scratch, so preserving
+  the backbuffer's contents buys nothing.
+* **Interval 1 is both modes.** In the flip model a present at interval 1 waits
+  for the next vblank: fixed refresh where the display has no VRR, and
+  content-paced where it does, because the driver only latches a frame when one
+  is ready. The tear flag is never passed, so nothing tears; interval 0 with
+  `DXGI_PRESENT_ALLOW_TEARING` is the other mode and is not what a player wants.
+* **The waitable object** turns a full queue into a wait instead of a stall. The
+  renderer waits on it before composing and drops the frame if it never arrives,
+  which is what an occluded or minimized window looks like.
+* **Present only when something changed** — a new video frame, or damage from
+  ZGUI. VRR follows the present rate, so presenting duplicates would run the
+  panel at the interface's repaint rate rather than the video's.
+* VRR needs DWM's independent-flip path, which it only grants to a window that
+  covers the output. The flags are right for it; a 1000×760 window will not
+  engage it until there is a borderless fullscreen mode.
+
 ## Interface
 
 `app.rs` builds the ZGUI view. Its texture is `Bgra8Unorm` and must be

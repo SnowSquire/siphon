@@ -67,6 +67,13 @@ pub struct DxgiRenderer {
     eof: Cell<bool>,
     /// Whether the colour spaces were already reported.
     logged: Cell<bool>,
+    /// Whether the frame just composed carries interface damage.
+    damaged: Cell<bool>,
+    /// Whether anything has been presented yet.
+    presented: Cell<bool>,
+    /// Frames shown and frames presented, for the end-of-stream line.
+    shown: Cell<u64>,
+    presents: Cell<u64>,
 }
 
 impl DxgiRenderer {
@@ -82,8 +89,8 @@ impl DxgiRenderer {
         let sdr_white = swapchain.sdr_white();
 
         let (width, height) = swapchain.size();
-        let mut targets = Vec::with_capacity(2);
-        for index in 0..2 {
+        let mut targets = Vec::with_capacity(crate::dxgi::BUFFERS as usize);
+        for index in 0..crate::dxgi::BUFFERS {
             let image = swapchain
                 .image(index)
                 .ok_or_else(|| anyhow::anyhow!("the swapchain has no backbuffer {index}"))?;
@@ -129,6 +136,10 @@ impl DxgiRenderer {
             handover_value: Cell::new(0),
             eof: Cell::new(false),
             logged: Cell::new(false),
+            damaged: Cell::new(true),
+            presented: Cell::new(false),
+            shown: Cell::new(0),
+            presents: Cell::new(0),
         })
     }
 
@@ -196,16 +207,17 @@ impl DxgiRenderer {
     /// one frame per draw would play the file several times too fast. The stream
     /// timestamps are the only clock there is: a frame is shown from its
     /// timestamp until the next one's.
-    fn advance(&mut self) {
+    fn advance(&mut self) -> bool {
         let Some(player) = self.player.as_mut() else {
-            return;
+            return false;
         };
         let now = Instant::now();
+        let mut changed = false;
         loop {
             if let Some((_, due)) = &self.current
                 && *due > now
             {
-                return;
+                return changed;
             }
             let (picture, pts) = if let Some(pending) = self.pending.take() {
                 pending
@@ -220,13 +232,17 @@ impl DxgiRenderer {
                             .clock
                             .map_or(0.0, |(_, started)| started.elapsed().as_secs_f64());
                         if !self.eof.replace(true) {
-                            eprintln!("video: end of stream after {elapsed:.2} s");
+                            eprintln!(
+                            "video: end of stream after {elapsed:.2} s                              ({} frames shown, {} presented)",
+                            self.shown.get(),
+                            self.presents.get()
+                        );
                         }
-                        return;
+                        return changed;
                     }
                     Err(error) => {
                         eprintln!("video: {error:#}");
-                        return;
+                        return changed;
                     }
                 }
             };
@@ -238,12 +254,14 @@ impl DxgiRenderer {
             let due = started + Duration::from_secs_f64((pts - first_pts).max(0.0));
             if due > now {
                 self.pending = Some((picture, pts));
-                return;
+                return changed;
             }
             match MappedFrame::map(self.placebo.gpu(), &picture) {
                 Ok(mut mapped) => {
                     mapped.set_sdr_white(self.sdr_white);
                     self.current = Some((mapped, due));
+                    self.shown.set(self.shown.get() + 1);
+                    changed = true;
                 }
                 Err(error) => eprintln!("libplacebo: {error:#}"),
             }
@@ -268,7 +286,21 @@ impl DxgiRenderer {
             return outcome;
         };
 
-        self.advance();
+        let advanced = self.advance();
+        let damaged = self.damaged.replace(false);
+        // Variable refresh follows the present rate, so a duplicate present
+        // would run the panel at the interface's repaint rate instead of the
+        // video's. Present only when something actually changed.
+        if !advanced && !damaged && self.presented.get() {
+            return outcome;
+        }
+        if !self.swapchain.borrow().wait_for_frame(100) {
+            // The compositor is not taking frames (occluded or minimized).
+            // Dropping this one beats blocking the event loop; the next pump
+            // tick asks again.
+            self.damaged.set(damaged);
+            return outcome;
+        }
         let image = self.current.as_ref().map(|(frame, _)| frame.frame());
         if !self.logged.replace(true) {
             if let Some(image) = image {
@@ -364,6 +396,8 @@ impl DxgiRenderer {
         if let Err(error) = self.swapchain.borrow().present() {
             eprintln!("DXGI present failed: {error:#}");
         }
+        self.presented.set(true);
+        self.presents.set(self.presents.get() + 1);
         outcome
     }
 }
@@ -439,6 +473,7 @@ impl Renderer for DxgiRenderer {
         if !self.inner.present_into(0) {
             eprintln!("the UI texture was not supplied");
         }
+        self.damaged.set(self.damaged.get() || !damage.is_empty());
         let outcome = self.inner.draw(scene, damage);
         self.present(outcome)
     }

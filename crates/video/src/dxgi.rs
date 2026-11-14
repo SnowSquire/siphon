@@ -40,24 +40,29 @@ use windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS;
 use windows::Win32::Graphics::Dxgi::DXGI_SCALING_NONE;
+use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
-use windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+use windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_DISCARD;
 use windows::Win32::Graphics::Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT;
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter4;
 use windows::Win32::Graphics::Dxgi::IDXGIFactory7;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
+use windows::Win32::Graphics::Dxgi::IDXGISwapChain2;
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain3;
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain4;
+use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface as _;
 use windows::core::PCWSTR;
 use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
 
-/// The backbuffer count. Two is the minimum for a flip model swapchain; three would
-/// give the compositor more slack.
-const BUFFERS: u32 = 2;
+/// Three buffers: the compositor can hold one while the GPU renders into the next
+/// and the third stays free, which is the configuration the flip-model guides
+/// recommend and what keeps `Present` from stalling on a queue of one.
+pub const BUFFERS: u32 = 3;
 
 /// The Vulkan spelling of the 10-bit swapchain format.
 const VK_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
@@ -89,6 +94,8 @@ pub struct DxgiSwapchain {
     /// Kept alive with the swapchain; the shared handles came from it.
     #[expect(dead_code, reason = "D3D12 objects the swapchain is associated with")]
     device: ID3D12Device,
+    /// Signalled when there is room for another frame in the flip queue.
+    latency: HANDLE,
     /// The `vk::Device` the images and memories were created on.
     device_handle: ash::Device,
     format: wgpu::TextureFormat,
@@ -164,9 +171,14 @@ impl DxgiSwapchain {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: BUFFERS,
             Scaling: DXGI_SCALING_NONE,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            // Discard, not sequential: every frame is drawn from scratch, so
+            // preserving the backbuffer's contents buys nothing and rules out
+            // the independent-flip paths that variable refresh needs.
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: 0,
+            Flags: (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0
+                | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0)
+                as u32,
         };
         // SAFETY: the queue and HWND are alive, and the descriptor is a valid local.
         let swapchain1 = unsafe {
@@ -174,6 +186,13 @@ impl DxgiSwapchain {
         }
         .context("CreateSwapChainForHwnd")?;
         let swapchain: IDXGISwapChain3 = swapchain1.cast().context("swapchain vtable")?;
+        let swapchain2: IDXGISwapChain2 = swapchain1.cast().context("swapchain vtable")?;
+        // Two frames outstanding at most; the waitable object below is what
+        // makes that a wait instead of a stall.
+        // SAFETY: the swapchain is alive and nothing has been presented yet.
+        unsafe { swapchain2.SetMaximumFrameLatency(2) }.context("SetMaximumFrameLatency")?;
+        // SAFETY: the swapchain is alive; the handle is closed in `Drop`.
+        let latency = unsafe { swapchain2.GetFrameLatencyWaitableObject() };
         // SAFETY: the factory and HWND are alive for the call.
         unsafe { factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }
             .context("MakeWindowAssociation")?;
@@ -222,6 +241,7 @@ impl DxgiSwapchain {
             swapchain,
             queue,
             device,
+            latency,
             device_handle: hal_device.raw_device().clone(),
             format,
             width,
@@ -275,6 +295,17 @@ impl DxgiSwapchain {
         self.sdr_white
     }
 
+    /// Waits until the flip queue has room for another frame.
+    ///
+    /// Returns false on timeout, which means the compositor is not consuming
+    /// frames (occluded, minimized, or a stalled display); the caller can still
+    /// render and present, it just cannot be sure the queue is free.
+    pub fn wait_for_frame(&self, timeout_ms: u32) -> bool {
+        // SAFETY: the handle came from this swapchain and lives in `self`.
+        let result = unsafe { WaitForSingleObject(self.latency, timeout_ms) };
+        result == windows::Win32::Foundation::WAIT_OBJECT_0
+    }
+
     /// Hands the current backbuffer to the compositor.
     #[allow(
         clippy::borrow_as_ptr,
@@ -300,6 +331,11 @@ impl Drop for DxgiSwapchain {
                 self.device_handle.destroy_image(image, None);
                 self.device_handle.free_memory(memory, None);
             }
+        }
+        // SAFETY: the handle came from `GetFrameLatencyWaitableObject`, names
+        // nothing else, and is closed once.
+        unsafe {
+            let _ = CloseHandle(self.latency);
         }
         for handle in self.shared_handles.drain(..) {
             // SAFETY: every handle came from `CreateSharedHandle` and is closed once.
