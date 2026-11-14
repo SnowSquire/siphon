@@ -8,6 +8,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,8 +33,10 @@ use zgui_render_wgpu::SharedGraphics;
 use zgui_render_wgpu::WgpuRenderer;
 
 use crate::dxgi::BUFFERS;
+use crate::dxgi::D3d12;
 use crate::dxgi::DxgiSwapchain;
 use crate::dxgi::HdrMode;
+use crate::dxgi::canvas_size;
 use crate::placebo::Placebo;
 
 pub struct UiRenderer {
@@ -53,8 +56,13 @@ pub struct UiRenderer {
     presented: Cell<bool>,
     graphics: SharedGraphics,
     gpu: Arc<Gpu>,
+    d3d12: Rc<D3d12>,
+    /// The extent the UI texture and inner renderer are built for.
     width: u32,
     height: u32,
+    /// The extent of the chain's canvas, which is never smaller than the UI.
+    chain_width: u32,
+    chain_height: u32,
     hwnd: HWND,
 }
 
@@ -67,11 +75,17 @@ impl UiRenderer {
         ui_texture: wgpu::Texture,
         graphics: SharedGraphics,
         gpu: Arc<Gpu>,
+        d3d12: Rc<D3d12>,
         hwnd: HWND,
+        target: RenderTarget,
     ) -> anyhow::Result<Self> {
         let ui = placebo.wrap_wgpu(&ui_texture)?;
         let sdr_white = swapchain.sdr_white();
-        let (width, height) = swapchain.size();
+        let (width, height) = (
+            u32::try_from(target.size.width).unwrap_or(1),
+            u32::try_from(target.size.height).unwrap_or(1),
+        );
+        let (chain_width, chain_height) = swapchain.size();
         let mut targets = Vec::with_capacity(BUFFERS as usize);
         for index in 0..BUFFERS {
             let image = swapchain
@@ -79,8 +93,8 @@ impl UiRenderer {
                 .ok_or_else(|| anyhow::anyhow!("the swapchain has no backbuffer {index}"))?;
             let target = placebo.wrap(
                 image,
-                width,
-                height,
+                chain_width,
+                chain_height,
                 ash::vk::Format::A2B10G10R10_UNORM_PACK32,
                 ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | ash::vk::ImageUsageFlags::TRANSFER_SRC
@@ -111,8 +125,11 @@ impl UiRenderer {
             presented: Cell::new(false),
             graphics,
             gpu,
+            d3d12,
             width,
             height,
+            chain_width,
+            chain_height,
             hwnd,
         })
     }
@@ -131,7 +148,7 @@ impl UiRenderer {
     }
 
     /// The interface overlay, in ZGUI's sRGB space.
-    fn ui_overlay(&self, part: &pl::pl_overlay_part) -> pl::pl_overlay {
+    fn ui_overlay(&self, parts: &[pl::pl_overlay_part]) -> pl::pl_overlay {
         pl::pl_overlay {
             tex: self.ui,
             mode: pl::pl_overlay_mode::PL_OVERLAY_NORMAL,
@@ -151,56 +168,31 @@ impl UiRenderer {
                     ..Default::default()
                 },
             },
-            parts: part,
-            num_parts: 1,
+            parts: parts.as_ptr(),
+            num_parts: parts.len() as std::os::raw::c_int,
         }
     }
 
-    /// Recreates the swapchain, the UI texture, its libplacebo views and the
-    /// inner ZGUI renderer for a new target extent.
-    fn rebuild(&mut self, target: RenderTarget, width: u32, height: u32) {
-        // DXGI allows one flip-model swapchain per HWND, so the old
-        // presentation and every libplacebo view of its images go first.
-        for target in &mut self.targets {
-            self.placebo.destroy_texture(target);
-        }
-        self.targets.clear();
+    /// Rebuilds the presentation for a new target extent: the chain's
+    /// backbuffers when `chain` names a new size, the UI texture, its
+    /// libplacebo view and the inner renderer.
+    ///
+    /// `chain` is `None` while the chain's canvas already covers the window;
+    /// only the UI side is rebuilt then, which keeps the per-event cost at
+    /// layout plus one texture and one renderer.
+    fn rebuild(
+        &mut self,
+        target: RenderTarget,
+        width: u32,
+        height: u32,
+        chain: Option<(u32, u32)>,
+    ) {
+        let started = std::time::Instant::now();
         self.placebo.destroy_texture(&mut self.ui);
-        self.swapchain.borrow_mut().take();
-
-        let swapchain = match DxgiSwapchain::new(&self.gpu, self.hwnd, width, height, HdrMode::Off)
+        if let Some((chain_width, chain_height)) = chain
+            && !self.resize_chain(chain_width, chain_height)
         {
-            Ok(swapchain) => swapchain,
-            Err(error) => {
-                tracing::warn!(target: "ui", "DXGI: resize failed: {error:#}");
-                return;
-            }
-        };
-        let mut targets = Vec::with_capacity(BUFFERS as usize);
-        for index in 0..BUFFERS {
-            let Some(image) = swapchain.image(index) else {
-                return;
-            };
-            match self.placebo.wrap(
-                image,
-                width,
-                height,
-                ash::vk::Format::A2B10G10R10_UNORM_PACK32,
-                ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | ash::vk::ImageUsageFlags::TRANSFER_SRC
-                    | ash::vk::ImageUsageFlags::TRANSFER_DST
-                    | ash::vk::ImageUsageFlags::SAMPLED,
-            ) {
-                Ok(texture) => {
-                    self.placebo
-                        .release(texture, pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
-                    targets.push(texture);
-                }
-                Err(error) => {
-                    tracing::warn!(target: "ui", "libplacebo: resize wrap failed: {error:#}");
-                    return;
-                }
-            }
+            return;
         }
 
         let ui_texture = self.gpu.device().create_texture(&wgpu::TextureDescriptor {
@@ -242,16 +234,88 @@ impl UiRenderer {
         // exists. Rects are plain geometry and survive either way.
         std::mem::swap(self.inner.atlas(), inner.atlas());
 
-        self.targets = targets;
         self.ui = ui;
         self.ui_texture = ui_texture;
-        *self.swapchain.borrow_mut() = Some(swapchain);
         self.inner = inner;
         self.width = width;
         self.height = height;
         self.damaged.set(true);
         self.presented.set(false);
-        tracing::info!(target: "ui", width, height, "resized");
+        tracing::debug!(
+            target: "ui",
+            width,
+            height,
+            elapsed = ?started.elapsed(),
+            "rebuilt"
+        );
+    }
+
+    /// Resizes the chain and re-wraps its backbuffers.
+    fn resize_chain(&mut self, width: u32, height: u32) -> bool {
+        for target in &mut self.targets {
+            self.placebo.destroy_texture(target);
+        }
+        self.targets.clear();
+
+        // The chain is reused through `ResizeBuffers`; creating a new one would
+        // make the window association and the flip queue start over. A chain
+        // that cannot be resized is dropped, and the next attempt creates one.
+        let mut chain = self.swapchain.borrow_mut().take();
+        let resized = match &mut chain {
+            Some(existing) => existing.resize(&self.d3d12, &self.gpu, width, height),
+            None => match DxgiSwapchain::new(
+                &self.d3d12,
+                &self.gpu,
+                self.hwnd,
+                width,
+                height,
+                HdrMode::Off,
+            ) {
+                Ok(fresh) => {
+                    chain = Some(fresh);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+        };
+        if let Err(error) = resized {
+            tracing::warn!(target: "ui", "DXGI: resize failed: {error:#}");
+            return false;
+        }
+        let Some(swapchain) = chain else {
+            return false;
+        };
+        let mut targets = Vec::with_capacity(BUFFERS as usize);
+        for index in 0..BUFFERS {
+            let Some(image) = swapchain.image(index) else {
+                return false;
+            };
+            match self.placebo.wrap(
+                image,
+                width,
+                height,
+                ash::vk::Format::A2B10G10R10_UNORM_PACK32,
+                ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | ash::vk::ImageUsageFlags::TRANSFER_SRC
+                    | ash::vk::ImageUsageFlags::TRANSFER_DST
+                    | ash::vk::ImageUsageFlags::SAMPLED,
+            ) {
+                Ok(texture) => {
+                    self.placebo
+                        .release(texture, pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
+                    targets.push(texture);
+                }
+                Err(error) => {
+                    tracing::warn!(target: "ui", "libplacebo: resize wrap failed: {error:#}");
+                    return false;
+                }
+            }
+        }
+        self.targets = targets;
+        self.chain_width = width;
+        self.chain_height = height;
+        *self.swapchain.borrow_mut() = Some(swapchain);
+        true
     }
 
     fn present(&self, outcome: FrameOutcome) -> FrameOutcome {
@@ -278,7 +342,7 @@ impl UiRenderer {
             clippy::cast_precision_loss,
             reason = "window sizes are well inside f32's exact integer range"
         )]
-        let (width_f, height_f) = (width as f32, height as f32);
+        let (ui_width_f, ui_height_f) = (self.width as f32, self.height as f32);
         let mut target = pl::pl_frame {
             num_planes: 1,
             planes: [pl::pl_plane {
@@ -299,26 +363,86 @@ impl UiRenderer {
         target.crop = pl::pl_rect2df {
             x0: 0.0,
             y0: 0.0,
-            x1: width_f,
-            y1: height_f,
+            x1: width as f32,
+            y1: height as f32,
         };
 
-        let part = pl::pl_overlay_part {
+        // The canvas is larger than the UI whenever a drag is growing the
+        // window. Extending the UI's own edge texels over the rest means the
+        // area a frame exposes is the page background already, not black.
+        let (width_f, height_f) = (width as f32, height as f32);
+        let full = pl::pl_overlay_part {
             src: pl::pl_rect2df {
                 x0: 0.0,
                 y0: 0.0,
-                x1: width_f,
-                y1: height_f,
+                x1: ui_width_f,
+                y1: ui_height_f,
             },
             dst: pl::pl_rect2df {
                 x0: 0.0,
                 y0: 0.0,
-                x1: width_f,
-                y1: height_f,
+                x1: ui_width_f,
+                y1: ui_height_f,
             },
             color: [1.0, 1.0, 1.0, 1.0],
         };
-        let overlay = self.ui_overlay(&part);
+        let mut parts = [full; 4];
+        let mut count = 1;
+        if width_f > ui_width_f {
+            parts[count] = pl::pl_overlay_part {
+                src: pl::pl_rect2df {
+                    x0: ui_width_f - 1.0,
+                    y0: 0.0,
+                    x1: ui_width_f,
+                    y1: ui_height_f,
+                },
+                dst: pl::pl_rect2df {
+                    x0: ui_width_f,
+                    y0: 0.0,
+                    x1: width_f,
+                    y1: ui_height_f,
+                },
+                color: [1.0, 1.0, 1.0, 1.0],
+            };
+            count += 1;
+        }
+        if height_f > ui_height_f {
+            parts[count] = pl::pl_overlay_part {
+                src: pl::pl_rect2df {
+                    x0: 0.0,
+                    y0: ui_height_f - 1.0,
+                    x1: ui_width_f,
+                    y1: ui_height_f,
+                },
+                dst: pl::pl_rect2df {
+                    x0: 0.0,
+                    y0: ui_height_f,
+                    x1: ui_width_f,
+                    y1: height_f,
+                },
+                color: [1.0, 1.0, 1.0, 1.0],
+            };
+            count += 1;
+        }
+        if width_f > ui_width_f && height_f > ui_height_f {
+            parts[count] = pl::pl_overlay_part {
+                src: pl::pl_rect2df {
+                    x0: ui_width_f - 1.0,
+                    y0: ui_height_f - 1.0,
+                    x1: ui_width_f,
+                    y1: ui_height_f,
+                },
+                dst: pl::pl_rect2df {
+                    x0: ui_width_f,
+                    y0: ui_height_f,
+                    x1: width_f,
+                    y1: height_f,
+                },
+                color: [1.0, 1.0, 1.0, 1.0],
+            };
+            count += 1;
+        }
+        let overlay = self.ui_overlay(&parts[..count]);
         target.overlays = &raw const overlay;
         target.num_overlays = 1;
 
@@ -381,7 +505,13 @@ impl Renderer for UiRenderer {
             self.inner.configure(target);
             return;
         }
-        self.rebuild(target, width, height);
+        // The UI follows the window exactly. The chain is a canvas that only
+        // has to be at least as large as the window, so a drag never pays for
+        // a backbuffer reallocation: the window shows the canvas's top-left
+        // corner, cropped by the compositor.
+        let chain = (self.chain_width < width || self.chain_height < height)
+            .then(|| canvas_size(width, height));
+        self.rebuild(target, width, height, chain);
     }
 
     fn target(&self) -> Option<RenderTarget> {

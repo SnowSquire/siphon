@@ -33,6 +33,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::Graphics::Dxgi::CreateDXGIFactory2;
 use windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS;
@@ -44,6 +45,7 @@ use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS;
 use windows::Win32::Graphics::Dxgi::DXGI_SCALING_NONE;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1;
+use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -81,62 +83,50 @@ pub enum HdrMode {
     Off,
 }
 
-/// One D3D12 swapchain and the Vulkan images that stand for its backbuffers.
-pub struct DxgiSwapchain {
-    /// The Vulkan images and memories libplacebo renders into.
-    images: Vec<(vk::Image, vk::DeviceMemory)>,
-    /// The NT handles the Vulkan memories were imported from.
-    shared_handles: Vec<HANDLE>,
-    /// The D3D12 resources themselves, kept alive while the Vulkan images exist.
-    backbuffers: Vec<ID3D12Resource>,
-    swapchain: IDXGISwapChain3,
-    /// Kept alive with the swapchain; DXGI holds the association.
-    #[expect(dead_code, reason = "D3D12 objects the swapchain is associated with")]
-    queue: ID3D12CommandQueue,
-    /// Kept alive with the swapchain; the shared handles came from it.
-    #[expect(dead_code, reason = "D3D12 objects the swapchain is associated with")]
-    device: ID3D12Device,
-    /// Signalled when there is room for another frame in the flip queue.
-    latency: HANDLE,
-    /// The `vk::Device` the images and memories were created on.
-    device_handle: ash::Device,
-    format: wgpu::TextureFormat,
-    width: u32,
-    height: u32,
-    hdr: bool,
-    max_luminance: f32,
-    sdr_white: f32,
+/// The chain extent a window is presented through.
+///
+///
+/// The UI is composed for the window's exact extent and presented 1:1 at the
+/// top-left of a chain this large; `DXGI_SCALING_NONE` means the compositor
+/// shows that corner cropped to the window, so nothing is ever scaled. The
+/// canvas covers every monitor the window could be dragged over, and a target
+/// larger than it simply grows it.
+pub fn canvas_size(width: u32, height: u32) -> (u32, u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN;
+
+    // SAFETY: the metric indices are the two documented ones; GetSystemMetrics
+    // takes no pointers and fails by returning 0, which `max(1)` covers.
+    let (screen_width, screen_height) = unsafe {
+        (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let screen_width = u32::try_from(screen_width).unwrap_or(1).max(1);
+    let screen_height = u32::try_from(screen_height).unwrap_or(1).max(1);
+    (screen_width.max(width), screen_height.max(height))
 }
 
-impl DxgiSwapchain {
-    /// Builds a swapchain for `hwnd` on the same physical adapter as `gpu`.
-    #[allow(
-        clippy::borrow_as_ptr,
-        reason = "the Windows bindings take pointers to descriptors"
-    )]
-    pub fn new(
-        gpu: &Gpu,
-        hwnd: HWND,
-        width: u32,
-        height: u32,
-        hdr: HdrMode,
-    ) -> anyhow::Result<Self> {
-        anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
+/// The D3D12 device, queue and factory a window's swapchains share.
+///
+/// Creating them costs hundreds of milliseconds, and a rebuild for a new
+/// extent needs neither a new device nor a new queue: the swapchain is the
+/// only thing that has to be made again.
+pub struct D3d12 {
+    factory: IDXGIFactory7,
+    device: ID3D12Device,
+    queue: ID3D12CommandQueue,
+}
 
+impl D3d12 {
+    /// Opens the D3D12 device for the adapter `gpu` runs on.
+    pub fn new(gpu: &Gpu) -> anyhow::Result<Self> {
         // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
-        // borrow. Both wgpu handles are alive for the whole call.
+        // borrow. The adapter handle is alive for the whole call.
         let hal_adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Vulkan>() }
             .context("the video device is not Vulkan")?;
-        // SAFETY: as above.
-        let hal_device = unsafe { gpu.device().as_hal::<wgpu::hal::api::Vulkan>() }
-            .context("the video device is not Vulkan")?;
-
-        let enabled = hal_device.enabled_device_extensions();
-        anyhow::ensure!(
-            enabled.contains(&khr::external_memory_win32::NAME),
-            "the Vulkan device does not have VK_KHR_external_memory_win32"
-        );
-
         let luid = vulkan_luid(&hal_adapter)?;
         // SAFETY: no pointers are passed; the factory is created on the default adapter set.
         let factory: IDXGIFactory7 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
@@ -161,6 +151,65 @@ impl DxgiSwapchain {
         let queue: ID3D12CommandQueue =
             unsafe { device.CreateCommandQueue(&queue_desc) }.context("CreateCommandQueue")?;
 
+        Ok(Self {
+            factory,
+            device,
+            queue,
+        })
+    }
+}
+
+/// One D3D12 swapchain and the Vulkan images that stand for its backbuffers.
+pub struct DxgiSwapchain {
+    /// The Vulkan images and memories libplacebo renders into.
+    images: Vec<(vk::Image, vk::DeviceMemory)>,
+    /// The NT handles the Vulkan memories were imported from.
+    shared_handles: Vec<HANDLE>,
+    /// The D3D12 resources themselves, kept alive while the Vulkan images exist.
+    backbuffers: Vec<ID3D12Resource>,
+    swapchain: IDXGISwapChain3,
+    /// Signalled when there is room for another frame in the flip queue.
+    latency: HANDLE,
+    /// The `vk::Device` the images and memories were created on.
+    device_handle: ash::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    hdr: bool,
+    max_luminance: f32,
+    sdr_white: f32,
+}
+
+impl DxgiSwapchain {
+    /// Builds a swapchain for `hwnd` on the same physical adapter as `gpu`.
+    #[allow(
+        clippy::borrow_as_ptr,
+        reason = "the Windows bindings take pointers to descriptors"
+    )]
+    pub fn new(
+        d3d12: &D3d12,
+        gpu: &Gpu,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        hdr: HdrMode,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
+
+        // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
+        // borrow. The device handle is alive for the whole call.
+        let hal_device = unsafe { gpu.device().as_hal::<wgpu::hal::api::Vulkan>() }
+            .context("the video device is not Vulkan")?;
+
+        let enabled = hal_device.enabled_device_extensions();
+        anyhow::ensure!(
+            enabled.contains(&khr::external_memory_win32::NAME),
+            "the Vulkan device does not have VK_KHR_external_memory_win32"
+        );
+
+        let factory = &d3d12.factory;
+        let queue = &d3d12.queue;
+
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
@@ -172,6 +221,8 @@ impl DxgiSwapchain {
             },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: BUFFERS,
+            // Native: while a drag moves, the chain is a canvas larger than
+            // the window and the compositor shows its top-left corner 1:1.
             Scaling: DXGI_SCALING_NONE,
             // Discard, not sequential: every frame is drawn from scratch, so
             // preserving the backbuffer's contents buys nothing and rules out
@@ -183,7 +234,7 @@ impl DxgiSwapchain {
         };
         // SAFETY: the queue and HWND are alive, and the descriptor is a valid local.
         let swapchain1 = unsafe {
-            factory.CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None::<&IDXGIOutput>)
+            factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None::<&IDXGIOutput>)
         }
         .context("CreateSwapChainForHwnd")?;
         let swapchain: IDXGISwapChain3 = swapchain1.cast().context("swapchain vtable")?;
@@ -201,41 +252,11 @@ impl DxgiSwapchain {
         let (hdr, max_luminance, sdr_white) = configure_hdr(&swapchain, hdr)?;
         let format = wgpu::TextureFormat::Rgb10a2Unorm;
 
-        let instance = hal_adapter.shared_instance().raw_instance();
-        let mut shared_handles = Vec::with_capacity(BUFFERS as usize);
-        let mut backbuffers = Vec::with_capacity(BUFFERS as usize);
-        let mut images = Vec::with_capacity(BUFFERS as usize);
-
-        for index in 0..BUFFERS {
-            // SAFETY: the swapchain is alive and `index` is below its buffer count.
-            let resource: ID3D12Resource = unsafe { swapchain.GetBuffer(index) }
-                .with_context(|| format!("GetBuffer({index})"))?;
-            let child: ID3D12DeviceChild = resource.cast().context("backbuffer child")?;
-            // SAFETY: the resource is a D3D12 texture, the handle is an NT handle, and
-            // `GENERIC_ALL` is what the reference DXGI interop path uses.
-            let handle =
-                unsafe { device.CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null()) }
-                    .with_context(|| format!("CreateSharedHandle({index})"))?;
-
-            // SAFETY: the image is created on the same device and memory is bound to it
-            // below; `Drop` destroys both exactly once.
-            let imported = unsafe {
-                import_backbuffer(&hal_device, instance, handle, width, height, VK_FORMAT)
-            }
-            .with_context(|| format!("import backbuffer {index}"))?;
-
-            images.push(imported);
-            shared_handles.push(handle);
-            backbuffers.push(resource);
-        }
-
-        Ok(Self {
-            images,
-            shared_handles,
-            backbuffers,
+        let mut this = Self {
+            images: Vec::with_capacity(BUFFERS as usize),
+            shared_handles: Vec::with_capacity(BUFFERS as usize),
+            backbuffers: Vec::with_capacity(BUFFERS as usize),
             swapchain,
-            queue,
-            device,
             latency,
             device_handle: hal_device.raw_device().clone(),
             format,
@@ -244,7 +265,111 @@ impl DxgiSwapchain {
             hdr,
             max_luminance,
             sdr_white,
-        })
+        };
+        this.attach_backbuffers(d3d12, gpu, width, height)?;
+        Ok(this)
+    }
+
+    /// Replaces the backbuffers with ones of a new extent on the same chain.
+    ///
+    /// The caller has already destroyed every libplacebo texture over the old
+    /// images; this releases the D3D12 resources the old buffer set held, so
+    /// `ResizeBuffers` sees the last reference go.
+    pub fn resize(
+        &mut self,
+        d3d12: &D3d12,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
+        self.release_buffers();
+        // SAFETY: every reference to the old buffers has been dropped, and the
+        // flags are the ones the chain was created with.
+        unsafe {
+            self.swapchain.ResizeBuffers(
+                BUFFERS,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0
+                        | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0,
+                ),
+            )
+        }
+        .context("ResizeBuffers")?;
+        self.attach_backbuffers(d3d12, gpu, width, height)?;
+        self.width = width;
+        self.height = height;
+        // The colour space, HDR metadata and SDR white point are decisions
+        // about the display and survive a resize; only a window that moved to
+        // another output changes them, which is the next feature's problem.
+        Ok(())
+    }
+
+    /// Imports the chain's current backbuffers into Vulkan.
+    fn attach_backbuffers(
+        &mut self,
+        d3d12: &D3d12,
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
+        // borrow. Both wgpu handles are alive for the whole call.
+        let hal_adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Vulkan>() }
+            .context("the video device is not Vulkan")?;
+        // SAFETY: as above.
+        let hal_device = unsafe { gpu.device().as_hal::<wgpu::hal::api::Vulkan>() }
+            .context("the video device is not Vulkan")?;
+        let instance = hal_adapter.shared_instance().raw_instance();
+
+        for index in 0..BUFFERS {
+            // SAFETY: the swapchain is alive and `index` is below its buffer count.
+            let resource: ID3D12Resource = unsafe { self.swapchain.GetBuffer(index) }
+                .with_context(|| format!("GetBuffer({index})"))?;
+            let child: ID3D12DeviceChild = resource.cast().context("backbuffer child")?;
+            // SAFETY: the resource is a D3D12 texture, the handle is an NT handle, and
+            // `GENERIC_ALL` is what the reference DXGI interop path uses.
+            let handle = unsafe {
+                d3d12
+                    .device
+                    .CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null())
+            }
+            .with_context(|| format!("CreateSharedHandle({index})"))?;
+
+            // Kept before the import so a failed import is still cleaned up by
+            // `release_buffers` rather than leaking the handle and resource.
+            self.shared_handles.push(handle);
+            self.backbuffers.push(resource);
+            // SAFETY: the image is created on the same device and memory is bound to it
+            // below; `release_buffers` destroys both exactly once.
+            let imported = unsafe {
+                import_backbuffer(&hal_device, instance, handle, width, height, VK_FORMAT)
+            }
+            .with_context(|| format!("import backbuffer {index}"))?;
+            self.images.push(imported);
+        }
+        Ok(())
+    }
+
+    /// Destroys the Vulkan images and closes everything that names a backbuffer.
+    fn release_buffers(&mut self) {
+        for (image, memory) in self.images.drain(..) {
+            // SAFETY: both came from `device_handle` and are freed once.
+            unsafe {
+                self.device_handle.destroy_image(image, None);
+                self.device_handle.free_memory(memory, None);
+            }
+        }
+        for handle in self.shared_handles.drain(..) {
+            // SAFETY: every handle came from `CreateSharedHandle` and is closed once.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+        self.backbuffers.clear();
     }
 
     /// The backbuffer DXGI will present next.
@@ -319,25 +444,12 @@ impl Drop for DxgiSwapchain {
     fn drop(&mut self) {
         // The libplacebo textures over these images are destroyed by the renderer
         // before the swapchain drops, so nothing can still be rendering into them.
-        for (image, memory) in self.images.drain(..) {
-            // SAFETY: both came from the device below and are freed once.
-            unsafe {
-                self.device_handle.destroy_image(image, None);
-                self.device_handle.free_memory(memory, None);
-            }
-        }
+        self.release_buffers();
         // SAFETY: the handle came from `GetFrameLatencyWaitableObject`, names
         // nothing else, and is closed once.
         unsafe {
             let _ = CloseHandle(self.latency);
         }
-        for handle in self.shared_handles.drain(..) {
-            // SAFETY: every handle came from `CreateSharedHandle` and is closed once.
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-        }
-        self.backbuffers.clear();
     }
 }
 

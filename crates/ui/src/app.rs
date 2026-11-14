@@ -23,6 +23,7 @@ use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::SharedGraphics;
 use zgui_ui::prelude::*;
 
+use crate::dxgi::D3d12;
 use crate::dxgi::DxgiSwapchain;
 use crate::dxgi::HdrMode;
 use crate::dxgi::hwnd_from_raw;
@@ -86,7 +87,11 @@ fn dxgi_renderer(
     let height = u32::try_from(target.size.height)
         .map_err(|_| dxgi_error("the target height is not positive"))?;
 
-    let swapchain = DxgiSwapchain::new(gpu, hwnd, width, height, HdrMode::Off)
+    let d3d12 = Rc::new(D3d12::new(gpu).map_err(|error| dxgi_error(format!("D3D12: {error:#}")))?);
+    // The chain is a canvas the window is cropped out of; the UI texture is
+    // the window's own extent and is never scaled.
+    let (chain_width, chain_height) = crate::dxgi::canvas_size(width, height);
+    let swapchain = DxgiSwapchain::new(&d3d12, gpu, hwnd, chain_width, chain_height, HdrMode::Off)
         .map_err(|error| dxgi_error(format!("{error:#}")))?;
     let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("siphon.ui"),
@@ -115,7 +120,9 @@ fn dxgi_renderer(
         ui,
         graphics.clone(),
         Arc::clone(gpu),
+        d3d12,
         hwnd,
+        target,
     )
     .map_err(|error| dxgi_error(format!("{error:#}")))?;
     Ok(Box::new(renderer))

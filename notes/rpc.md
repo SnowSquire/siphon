@@ -306,18 +306,36 @@ is the video spike's path without the video: ZGUI renders into a `Bgra8Unorm`
 texture, libplacebo composites it into a DXGI `FLIP_DISCARD` backbuffer
 (three buffers, frame-latency waitable object, interval 1), and DXGI presents.
 The swapchain is imported into Vulkan with `pl_vulkan_import`, so there is no
-`VkSurfaceKHR`/`VkSwapchainKHR`. On a target extent change the renderer drops
-the old swapchain first (DXGI allows one flip chain per window), then recreates
-the swapchain, the ZGUI texture, its libplacebo views and the inner renderer.
+`VkSurfaceKHR`/`VkSwapchainKHR`. A drag emits an extent per resize event, so
+the presentation is rebuilt on the per-frame path and has to be cheap. The ZGUI
+texture and the inner renderer are rebuilt for the exact window extent every
+time, which is what makes the content reflow at the display's rate. The chain's
+backbuffers are the expensive part (`ResizeBuffers` costs ~3-6 ms), so the chain
+is a canvas the size of the virtual screen (`dxgi::canvas_size`) and the UI is
+presented 1:1 at its top-left. `DXGI_SCALING_NONE` makes DWM show that corner
+cropped to the window, so nothing is scaled during a drag and no resize happens
+per event. The overlay also stretches the UI's edge texels over the rest of the
+canvas, so the area a growing window uncovers is the page background rather
+than black for the frame before the new extent is drawn. The chain only grows
+if a window exceeds the canvas, which a normal drag cannot do.
+
+The D3D12 device, command queue and DXGI factory are created once per window by
+`dxgi::D3d12` and shared by every swapchain. Recreating them per resize cost
+~280 ms, almost all of it `D3D12CreateDevice`, which is what made a drag crawl.
+The dev profile optimises the dependencies (ZGUI's layout and paint, wgpu, the
+Win32 bindings) and `siphon-ui`, because a drag is a CPU-bound frame loop.
+
 The inner renderer's atlas textures are moved onto the replacement: the atlas
 *policy* (which tile holds which glyph) lives in the window's content cache,
 above the renderer, and it believes every tile it placed is resident. A fresh
 empty atlas would therefore draw the rectangles and nothing else — the scene
-still names glyph tiles no texture backs. There are no external textures to
-lose: RPC events and tray actions are drained by a 100 ms `set_interval` in the
-view, not by a surface pump. HDR is off for now (`HdrMode::Off`), but the SDR
-white point still comes from DisplayConfig; the video pass and HDR transfer
-functions are the later work.
+still names glyph tiles no texture backs. The colour space, HDR metadata and SDR
+white point are decisions about the display and survive a resize; only a window
+that moved to another output changes them, which is the next feature's problem.
+There are no external textures to lose: RPC events and tray actions are drained
+by a 100 ms `set_interval` in the view, not by a surface pump. HDR is off for
+now (`HdrMode::Off`), but the SDR white point still comes from DisplayConfig;
+the video pass and HDR transfer functions are the later work.
 
 ZGUI's `surface` element is the video seam: a producer with its own cadence gets
 the shared `wgpu::Device`/`Queue`, creates textures on that device and
