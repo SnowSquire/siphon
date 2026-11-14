@@ -122,8 +122,14 @@ backend remains authoritative.
 ## Ordering and backpressure
 
 - One reader task per connection handles requests; one writer task drains a
-  bounded outbound queue and the per-connection control queue. Never block the
-  reactor: `try_send` only, exactly like RTSP `Session::out`.
+  bounded outbound queue. Control responses and updates share that queue: a
+  writer that selected between two receive queues would drop an already-
+  completed receive when both became ready. Never block the reactor: `try_send`
+  only, exactly like RTSP `Session::out`.
+- The app loop's own event wait is lossless too: senders wake a `ConsumerWake`
+  and the loop drains with `try_recv`; background jobs are delivered through
+  the same queue. The loop's biased select puts the Hermes socket read first,
+  so a completed websocket read is never dropped for a queued request.
 - A slow UI is disconnected, never queued indefinitely. It reconnects and
   resyncs from `Snapshot`.
 - Updates are published through an event bus of weak subscribers
@@ -239,7 +245,9 @@ like `StreamKey`; changing quality is remove + add.
    `RecordOnce` and `PipelineStop { force }`; the per-channel `record` flag
    starts and stops the disk on a live runtime.
 4. **Disk and polish**: run introspection/release, update ownership,
-   multi-client behavior, update throttling/coalescing. **Open.**
+   multi-client behavior, update throttling/coalescing. **Mostly done**:
+   `GetDisk` reports live recorder counters and a loopback test covers two UI
+   clients; releasing finished runs by hand and per-run history are open.
 
 ## Tests
 

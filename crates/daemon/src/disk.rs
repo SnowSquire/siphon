@@ -48,6 +48,7 @@ use crate::constants::DVR_SLOTS_MAX;
 use crate::downloader::FetchOutcome;
 use crate::downloader::ToDownloader;
 use crate::http::Client;
+use crate::metrics::DiskMetrics;
 use crate::notify::Notifier;
 use crate::rtsp::dvr::Dvr;
 use crate::rtsp::dvr::DvrMap;
@@ -140,6 +141,8 @@ pub struct DiskOptions {
     /// Fetches `EXT-X-MAP` objects; the DVR media itself goes through the
     /// downloader queue.
     pub client: Rc<Client>,
+    /// Read by `GetDisk`.
+    pub metrics: Rc<DiskMetrics>,
 }
 
 /// Handle to the recording task. `wait` resolves when the disk subsystem stops;
@@ -188,8 +191,14 @@ pub fn spawn_disk_output(
     wakes.register(&live_wake);
 
     let downloaders = downloaders.clone();
+    let metrics = Rc::clone(&options.metrics);
     compio::runtime::spawn(async move {
+        metrics.active.set(true);
         let result = run_disk(options, live_rx, stop_rx, &downloaders, live_wake).await;
+        metrics.active.set(false);
+        if let Err(error) = &result {
+            *metrics.last_error.borrow_mut() = Some(error.to_string());
+        }
         match result {
             Ok(()) => {
                 let _ = done_tx.send(DiskOutcome::Done);
@@ -1271,6 +1280,9 @@ impl Disk {
             flags: 0,
         };
         canonical.segs_end += written;
+        self.options
+            .metrics
+            .note_written(segment.timestamp_ms, written);
         write_record(
             &mut canonical.index,
             canonical.index_end,
@@ -1362,6 +1374,7 @@ impl Disk {
         });
         run.segs_len += written;
         run.index_len += u64::from(1 + SEGMENT_BODY);
+        self.options.metrics.note_written(elapsed, written);
         run.first_segment.get_or_insert_with(|| record.clone());
         run.last_segment = Some(record);
 
@@ -1402,6 +1415,10 @@ impl Disk {
         // Touch the segs file so it exists before the run is ever a hole.
         segs.write_all_at(Vec::<u8>::new(), 0).await.0?;
 
+        self.options
+            .metrics
+            .runs
+            .set(self.options.metrics.runs.get().saturating_add(1));
         debug!(run = number, "disk: opened live run");
         self.current_run = Some(RunData {
             number,

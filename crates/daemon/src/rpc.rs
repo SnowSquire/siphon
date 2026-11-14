@@ -100,6 +100,7 @@ async fn connection(stream: TcpStream, peer: SocketAddr, handle: AppHandle) {
     loop {
         match reader.read::<ClientMessage, _>(&mut read).await {
             Ok(ClientMessage::Request { id, request }) => {
+                eprintln!("server: request {id}");
                 handle.request(id, request, &subscriber);
             }
             Ok(ClientMessage::Hello { .. }) => {}
@@ -247,6 +248,23 @@ mod tests {
         dir
     }
 
+    async fn next_config(events: &kanal::AsyncReceiver<ClientEvent>) {
+        for _ in 0..50 {
+            let event = compio::time::timeout(Duration::from_millis(200), events.recv())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            if let Some(ClientEvent::Update {
+                update: Update::Config(_),
+                ..
+            }) = event
+            {
+                return;
+            }
+        }
+        panic!("config update did not arrive");
+    }
+
     async fn next_pipeline(events: &kanal::AsyncReceiver<ClientEvent>, login: &str, removed: bool) {
         for _ in 0..50 {
             let event = compio::time::timeout(Duration::from_millis(200), events.recv())
@@ -299,7 +317,9 @@ mod tests {
             registry.watch_finished();
 
             let (events_tx, events_rx) = kanal::unbounded();
-            let handle = AppHandle::new(events_tx, Rc::clone(&bus));
+            let wake = crate::spool::ConsumerWake::new();
+            let sender = crate::app::EventSender::new(events_tx, Rc::clone(&wake));
+            let handle = AppHandle::new(sender.clone(), Rc::clone(&bus));
             let app = App::new(AppInit {
                 config: Config {
                     channels: vec![Channel {
@@ -314,7 +334,9 @@ mod tests {
                 client: Rc::clone(&http),
                 registry,
                 bus,
-                events: events_rx.to_async(),
+                events: events_rx,
+                sender,
+                wake,
                 client_id: None,
                 debug: true,
             });
@@ -327,6 +349,10 @@ mod tests {
             let (client, snapshot) = Client::connect(addr, "test").await.unwrap();
             assert_eq!(snapshot.channels.len(), 1);
             let events = client.events();
+            // A second UI must receive the same entity updates.
+            let (second, second_snapshot) = Client::connect(addr, "test-2").await.unwrap();
+            assert_eq!(second_snapshot.channels.len(), 1);
+            let second_events = second.events();
 
             let response = client
                 .request(Request::SetRecord {
@@ -337,6 +363,13 @@ mod tests {
                 .unwrap();
             assert!(matches!(response, Response::Ack));
             next_pipeline(&events, "sunnys", false).await;
+            next_config(&second_events).await;
+
+            let response = client
+                .request(Request::GetDisk(siphon_rpc::StreamKey::new("sunnys", None)))
+                .await
+                .unwrap();
+            assert!(matches!(response, Response::Disk(_)));
 
             let response = client
                 .request(Request::PipelineStop {

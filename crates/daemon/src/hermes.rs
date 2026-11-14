@@ -125,7 +125,7 @@ impl App {
         self.connecting = true;
         let client = std::rc::Rc::clone(&self.client);
         let client_id = self.client_id.clone();
-        self.jobs.push(Box::pin(async move {
+        self.spawn_job(async move {
             let fetched = gql::fetch_channels(&client, client_id.as_deref(), &ids).await;
             let ok = fetched.is_ok();
             let (channels, missing) = match fetched {
@@ -170,7 +170,7 @@ impl App {
                 missing,
                 socket,
             }))
-        }));
+        });
     }
 
     /// Applies a finished connection attempt. Users for channels removed
@@ -467,7 +467,7 @@ impl App {
                 compio::time::sleep(WELCOME_TIMEOUT).await;
                 JobDone::SubscribeCheckDue(topic, sub_id, attempt)
             };
-            self.jobs.push(Box::pin(timeout));
+            self.spawn_job(timeout);
         }
     }
 
@@ -686,10 +686,10 @@ impl App {
                 }
                 let client = std::rc::Rc::clone(&self.client);
                 let client_id = self.client_id.clone();
-                self.jobs.push(Box::pin(async move {
+                self.spawn_job(async move {
                     let result = gql::fetch_channels(&client, client_id.as_deref(), &[id]).await;
                     JobDone::LiveRefreshed(id, result)
-                }));
+                });
             }
             Some("stream-down") => {
                 let Some(user) = self.channels.get(&id) else {

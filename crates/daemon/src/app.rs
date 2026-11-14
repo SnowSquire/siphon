@@ -7,15 +7,14 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::future::poll_fn;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
 use futures_util::FutureExt as _;
-use futures_util::StreamExt as _;
-use futures_util::stream::FuturesUnordered;
 use siphon_rpc::ChannelView;
 use siphon_rpc::Config;
 use siphon_rpc::ConnHealth;
@@ -47,6 +46,7 @@ use crate::http::ws::WsStream;
 use crate::matcher::Matcher;
 use crate::notifier;
 use crate::registry::Registry;
+use crate::spool::ConsumerWake;
 use crate::time::now_ms;
 use crate::update;
 
@@ -56,7 +56,6 @@ enum Event {
     Text(String),
     SocketClosed,
     Tick,
-    Job(Box<JobDone>),
 }
 
 /// Most notifications kept for the UI center.
@@ -70,19 +69,60 @@ pub enum AppEvent {
         request: Request,
         control: Rc<Subscriber>,
     },
+    /// A finished background job, delivered through the same lossless queue.
+    Job(Box<JobDone>),
+}
+
+/// Sends an app event and wakes the loop. The event stays in the channel until
+/// the loop drains it, so a wake that races a tick cannot drop it.
+#[derive(Clone)]
+pub struct EventSender {
+    tx: kanal::Sender<AppEvent>,
+    wake: Rc<ConsumerWake>,
+}
+
+impl EventSender {
+    #[must_use]
+    pub const fn new(tx: kanal::Sender<AppEvent>, wake: Rc<ConsumerWake>) -> Self {
+        Self { tx, wake }
+    }
+
+    fn send(&self, event: AppEvent) {
+        let _ = self.tx.try_send(event);
+        self.wake.wake();
+    }
+}
+
+/// Waits for one event without consuming it unless it is returned. Dropping
+/// this future at a tick boundary cannot lose a queued request.
+async fn wait_event(events: &kanal::Receiver<AppEvent>, wake: &ConsumerWake) -> Option<AppEvent> {
+    poll_fn(|context| {
+        match events.try_recv() {
+            Ok(Some(event)) => return Poll::Ready(Some(event)),
+            Ok(None) => {}
+            Err(_) => return Poll::Ready(None),
+        }
+        wake.park(context);
+        match events.try_recv() {
+            Ok(Some(event)) => Poll::Ready(Some(event)),
+            Ok(None) => Poll::Pending,
+            Err(_) => Poll::Ready(None),
+        }
+    })
+    .await
 }
 
 /// What the RPC server tasks use to reach the app.
 #[derive(Clone)]
 pub struct AppHandle {
-    tx: kanal::Sender<AppEvent>,
+    sender: EventSender,
     bus: Rc<Bus>,
 }
 
 impl AppHandle {
     #[must_use]
-    pub const fn new(tx: kanal::Sender<AppEvent>, bus: Rc<Bus>) -> Self {
-        Self { tx, bus }
+    pub const fn new(sender: EventSender, bus: Rc<Bus>) -> Self {
+        Self { sender, bus }
     }
 
     /// The bus this connection subscribes to.
@@ -93,7 +133,7 @@ impl AppHandle {
 
     /// Forwards one request; the app answers through `control`.
     pub fn request(&self, id: u64, request: Request, control: &Rc<Subscriber>) {
-        let _ = self.tx.try_send(AppEvent::Request {
+        self.sender.send(AppEvent::Request {
             id,
             request,
             control: Rc::clone(control),
@@ -103,7 +143,7 @@ impl AppHandle {
     /// Asks the app for a fresh snapshot. `None` means it did not answer.
     pub async fn snapshot(&self) -> Option<Snapshot> {
         let (tx, rx) = kanal::bounded(1);
-        self.tx.try_send(AppEvent::Snapshot(tx)).ok()?;
+        self.sender.send(AppEvent::Snapshot(tx));
         compio::time::timeout(Duration::from_secs(5), rx.to_async().recv())
             .await
             .ok()?
@@ -118,7 +158,9 @@ pub struct AppInit {
     pub client: Rc<Client>,
     pub registry: Rc<Registry>,
     pub bus: Rc<Bus>,
-    pub events: kanal::AsyncReceiver<AppEvent>,
+    pub events: kanal::Receiver<AppEvent>,
+    pub sender: EventSender,
+    pub wake: Rc<ConsumerWake>,
     pub client_id: Option<String>,
     pub debug: bool,
 }
@@ -136,8 +178,6 @@ pub enum JobDone {
 }
 
 /// One in-flight job. `!Send` is fine: everything stays on the reactor thread.
-pub type JobFuture = Pin<Box<dyn Future<Output = JobDone>>>;
-
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub(crate) config: Config,
@@ -145,7 +185,9 @@ pub struct App {
     pub(crate) client: Rc<Client>,
     pub(crate) registry: Rc<Registry>,
     pub(crate) bus: Rc<Bus>,
-    pub(crate) events: kanal::AsyncReceiver<AppEvent>,
+    pub(crate) events: kanal::Receiver<AppEvent>,
+    pub(crate) sender: EventSender,
+    pub(crate) wake: Rc<ConsumerWake>,
     pub(crate) client_id: Option<String>,
     pub(crate) debug: bool,
 
@@ -174,7 +216,6 @@ pub struct App {
     pub(crate) update_busy: bool,
     pub(crate) update_check_at: Instant,
 
-    pub(crate) jobs: FuturesUnordered<JobFuture>,
     pub(crate) pending_unsubscribes: Vec<(NanoId, Topic)>,
 
     save_dirty: bool,
@@ -191,6 +232,8 @@ impl App {
             registry,
             bus,
             events,
+            sender,
+            wake,
             client_id,
             debug,
         } = init;
@@ -209,6 +252,8 @@ impl App {
             registry,
             bus,
             events,
+            sender,
+            wake,
             client_id,
             debug,
             channels: HashMap::new(),
@@ -238,7 +283,6 @@ impl App {
             update: None,
             update_busy: false,
             update_check_at: Instant::now(),
-            jobs: FuturesUnordered::new(),
             pending_unsubscribes: Vec::new(),
             save_dirty: false,
             save_running: false,
@@ -261,7 +305,10 @@ impl App {
             }
 
             let event = {
-                let app_fut = self.events.recv().fuse();
+                // Biased, with the socket first: a completed read is never
+                // dropped in favour of a queued request. The event wait does
+                // not consume anything unless it returns, so losing it to a
+                // tick is safe. Jobs arrive through the same event queue.
                 let socket_fut = async {
                     match self.socket.as_mut() {
                         Some(socket) => socket.next_text().await,
@@ -269,15 +316,11 @@ impl App {
                     }
                 }
                 .fuse();
+                let app_fut = wait_event(&self.events, &self.wake).fuse();
                 let tick_fut = tick.tick().fuse();
-                let job_fut = Self::next_job(&mut self.jobs).fuse();
 
-                futures_util::pin_mut!(app_fut, socket_fut, tick_fut, job_fut);
-                futures_util::select! {
-                    event = app_fut => match event {
-                        Ok(event) => Event::App(event),
-                        Err(_) => break,
-                    },
+                futures_util::pin_mut!(socket_fut, app_fut, tick_fut);
+                futures_util::select_biased! {
                     message = socket_fut => match message {
                         Ok(Some(text)) => Event::Text(text),
                         Ok(None) => {
@@ -289,11 +332,11 @@ impl App {
                             Event::SocketClosed
                         }
                     },
-                    _ = tick_fut => Event::Tick,
-                    done = job_fut => match done {
-                        Some(done) => Event::Job(Box::new(done)),
-                        None => continue,
+                    event = app_fut => match event {
+                        Some(event) => Event::App(event),
+                        None => break,
                     },
+                    _ = tick_fut => Event::Tick,
                 }
             };
             match event {
@@ -305,22 +348,24 @@ impl App {
                     request,
                     control,
                 }) => self.handle_request(id, request, &control),
+                Event::App(AppEvent::Job(done)) => self.handle_job(*done).await,
                 Event::Text(text) => self.handle_message(&text).await,
                 Event::SocketClosed => self.on_disconnect().await,
                 Event::Tick => self.on_tick().await,
-                Event::Job(done) => self.handle_job(*done).await,
             }
             self.flush_unsubscribes().await;
         }
     }
 
-    async fn next_job(jobs: &mut FuturesUnordered<JobFuture>) -> Option<JobDone> {
-        if jobs.is_empty() {
-            std::future::pending::<()>().await;
-            None
-        } else {
-            jobs.next().await
-        }
+    /// Runs one background future and delivers its result through the app
+    /// queue, so no select ever polls a job future and drops a completed one.
+    pub fn spawn_job<F: Future<Output = JobDone> + 'static>(&self, future: F) {
+        let sender = self.sender.clone();
+        compio::runtime::spawn(async move {
+            let done = future.await;
+            sender.send(AppEvent::Job(Box::new(done)));
+        })
+        .detach();
     }
 
     async fn handle_job(&mut self, done: JobDone) {
@@ -387,12 +432,8 @@ impl App {
         }
     }
 
-    fn handle_request(
-        &mut self,
-        id: u64,
-        request: Request,
-        control: &Rc<Subscriber>,
-    ) {
+    fn handle_request(&mut self, id: u64, request: Request, control: &Rc<Subscriber>) {
+        eprintln!("app: request {id}");
         let result = match request {
             Request::AddLogin(login) => {
                 self.request_add_login(&login);
@@ -453,9 +494,13 @@ impl App {
                 }),
             Request::GetArena => Ok(Response::Arena(self.registry.arena_summary())),
             Request::GetDownloader => Ok(Response::Downloader(self.registry.downloader_summary())),
-            Request::GetDisk(_) => Err(RpcError::Unsupported),
+            Request::GetDisk(key) => self
+                .registry
+                .disk_view(&key)
+                .map_or(Err(RpcError::NotFound), |view| Ok(Response::Disk(view))),
         };
-        let _ = control.control(ServerMessage::Response { id, result });
+        let sent = control.control(ServerMessage::Response { id, result });
+        eprintln!("app: response {id} queued={sent}");
     }
 
     /// Snapshot built on demand from app state, the registry and metrics.
@@ -546,9 +591,7 @@ impl App {
         self.save_dirty = false;
         let config = self.config.clone();
         let path = self.config_path.clone();
-        self.jobs.push(Box::pin(async move {
-            JobDone::SaveFinished(config::save(&config, &path).await)
-        }));
+        self.spawn_job(async move { JobDone::SaveFinished(config::save(&config, &path).await) });
     }
 
     pub fn queue_notification(
@@ -578,7 +621,7 @@ impl App {
 
         let client = Rc::clone(&self.client);
         let sound = self.config.sound;
-        self.jobs.push(Box::pin(async move {
+        self.spawn_job(async move {
             notifier::show(
                 &client,
                 &summary,
@@ -589,7 +632,7 @@ impl App {
             )
             .await;
             JobDone::ToastShown
-        }));
+        });
     }
 
     fn dismiss_notification(&mut self, id: u64) -> Result<Response, RpcError> {
@@ -626,10 +669,10 @@ impl App {
         let client = Rc::clone(&self.client);
         let client_id = self.client_id.clone();
         let job_login = login.clone();
-        self.jobs.push(Box::pin(async move {
+        self.spawn_job(async move {
             let result = gql::fetch_channel(&client, client_id.as_deref(), &job_login).await;
             JobDone::AddResolved(job_login, result)
-        }));
+        });
         Some(login)
     }
 
@@ -838,9 +881,9 @@ impl App {
             self.update_busy = true;
             let client = Rc::clone(&self.client);
             let version = offer.version;
-            self.jobs.push(Box::pin(async move {
+            self.spawn_job(async move {
                 JobDone::UpdateDownloadFinished(update::download_msi(&client, &url, &version).await)
-            }));
+            });
         } else {
             update::open_page(&offer.page_url);
         }
@@ -874,9 +917,9 @@ impl App {
         }
         self.update_busy = true;
         let client = Rc::clone(&self.client);
-        self.jobs.push(Box::pin(async move {
-            JobDone::UpdateCheckFinished(update::fetch_latest(&client).await)
-        }));
+        self.spawn_job(
+            async move { JobDone::UpdateCheckFinished(update::fetch_latest(&client).await) },
+        );
     }
 }
 

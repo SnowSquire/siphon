@@ -19,6 +19,7 @@ use std::task::Waker;
 use futures_util::future::LocalBoxFuture;
 use kanal::AsyncSender;
 use siphon_rpc::ArenaSummary;
+use siphon_rpc::DiskView;
 use siphon_rpc::DownloaderSummary;
 use siphon_rpc::PipelineState;
 use siphon_rpc::PipelineView;
@@ -39,6 +40,7 @@ use crate::disk::DiskOptions;
 use crate::disk::DiskOutput;
 use crate::downloader::ToDownloader;
 use crate::http::Client;
+use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::metrics::StreamMetrics;
 use crate::notify::Notifier;
@@ -114,6 +116,7 @@ struct StreamRuntime {
     registration: RefCell<Option<kanal::Sender<ConsumerRegistration>>>,
     reader_wake: Rc<ConsumerWake>,
     disk: RefCell<Option<Rc<DiskOutput>>>,
+    disk_metrics: RefCell<Option<Rc<DiskMetrics>>>,
     recording: Cell<bool>,
     media_spawned: Cell<bool>,
     dvr_spawned: Cell<bool>,
@@ -396,6 +399,7 @@ impl Registry {
             registration: RefCell::new(Some(registration)),
             reader_wake,
             disk: RefCell::new(None),
+            disk_metrics: RefCell::new(None),
             recording: Cell::new(false),
             media_spawned: Cell::new(false),
             dvr_spawned: Cell::new(false),
@@ -433,6 +437,8 @@ impl Registry {
             runtime.recording.set(false);
             return;
         };
+        let metrics = Rc::new(DiskMetrics::new());
+        *runtime.disk_metrics.borrow_mut() = Some(Rc::clone(&metrics));
         let disk = Rc::new(crate::disk::spawn_disk_output(
             DiskOptions {
                 output,
@@ -441,6 +447,7 @@ impl Registry {
                 notifier: self.options.notify.clone(),
                 dvr: Rc::clone(&runtime.dvr),
                 client: Rc::clone(&runtime.client),
+                metrics,
             },
             &runtime.wakes,
             &self.downloaders,
@@ -589,7 +596,9 @@ impl Registry {
     /// viewers.
     pub fn stream_down(&self, login: &str) {
         self.once.borrow_mut().retain(|key| key.login != login);
-        self.suppressed.borrow_mut().retain(|key| key.login != login);
+        self.suppressed
+            .borrow_mut()
+            .retain(|key| key.login != login);
         let keys: Vec<StreamKey> = self
             .streams
             .borrow()
@@ -668,9 +677,7 @@ impl Registry {
     /// The last viewer left. Keep a recording or monitored runtime.
     fn release_stream(&self, key: &StreamKey) {
         let keep = self.streams.borrow().get(key).is_none_or(|runtime| {
-            runtime.stream.has_sessions()
-                || runtime.recording.get()
-                || self.wanted(key)
+            runtime.stream.has_sessions() || runtime.recording.get() || self.wanted(key)
         });
         if keep {
             return;
@@ -764,6 +771,20 @@ impl Registry {
         Some(StreamDetail {
             pipeline: self.pipeline_view(&runtime),
             segments: runtime.metrics.recent(limit),
+        })
+    }
+
+    #[must_use]
+    pub fn disk_view(&self, key: &StreamKey) -> Option<DiskView> {
+        let runtime = self.streams.borrow().get(key).cloned()?;
+        let metrics = runtime.disk_metrics.borrow().clone()?;
+        Some(DiskView {
+            active: metrics.active.get(),
+            runs: metrics.runs.get(),
+            segments: metrics.segments.get(),
+            bytes: metrics.bytes.get(),
+            position_ms: metrics.position_ms.get(),
+            last_error: metrics.last_error.borrow().clone(),
         })
     }
 

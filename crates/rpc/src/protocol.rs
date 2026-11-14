@@ -185,6 +185,18 @@ pub struct DownloaderSummary {
     pub retries: u64,
 }
 
+/// Live counters from the recorder behind one pipeline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskView {
+    pub active: bool,
+    pub runs: u32,
+    pub segments: u64,
+    pub bytes: u64,
+    pub position_ms: u64,
+    pub last_error: Option<String>,
+}
+
 /// One entry of the daemon-owned notification center.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,6 +320,7 @@ pub enum Response {
     Segments(Vec<SegmentRecord>),
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
+    Disk(DiskView),
 }
 
 /// Typed failure. The UI renders the message; the daemon never sends a raw

@@ -103,6 +103,46 @@ impl DownloaderMetrics {
     }
 }
 
+/// Live counters from one recording task. The disk owns the values; the
+/// registry only reads them for `GetDisk`.
+pub struct DiskMetrics {
+    pub active: Cell<bool>,
+    pub runs: Cell<u32>,
+    pub segments: Cell<u64>,
+    pub bytes: Cell<u64>,
+    pub position_ms: Cell<u64>,
+    pub last_error: RefCell<Option<String>>,
+}
+
+impl DiskMetrics {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            active: Cell::new(false),
+            runs: Cell::new(0),
+            segments: Cell::new(0),
+            bytes: Cell::new(0),
+            position_ms: Cell::new(0),
+            last_error: RefCell::new(None),
+        }
+    }
+}
+
+impl Default for DiskMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DiskMetrics {
+    pub fn note_written(&self, position_ms: u64, bytes: u64) {
+        self.segments.set(self.segments.get().saturating_add(1));
+        self.bytes.set(self.bytes.get().saturating_add(bytes));
+        self.position_ms
+            .set(self.position_ms.get().max(position_ms));
+    }
+}
+
 /// Identifies the segment a fetch belongs to, for the ring entry it produces.
 #[derive(Clone)]
 pub struct FetchStats {

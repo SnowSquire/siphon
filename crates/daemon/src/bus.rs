@@ -43,10 +43,12 @@ impl Subscriber {
     /// too far behind; the client will resync.
     #[must_use]
     pub fn control(&self, message: ServerMessage) -> bool {
-        matches!(
-            self.tx.try_send(Outbound::Control(message)),
-            Ok(true)
-        )
+        let sent = matches!(self.tx.try_send(Outbound::Control(message)), Ok(true));
+        if sent {
+        } else {
+            let _ = self.tx.close();
+        }
+        sent
     }
 
     /// Closes the queue, which stops the writer after it drains.
@@ -97,12 +99,10 @@ impl Bus {
             let Some(subscriber) = weak.upgrade() else {
                 return false;
             };
-            match subscriber
-                .tx
-                .try_send(Outbound::Update(broadcast.clone()))
-            {
+            match subscriber.tx.try_send(Outbound::Update(broadcast.clone())) {
                 Ok(true) => true,
                 Ok(false) => {
+                    eprintln!("bus: subscriber full");
                     tracing::warn!("rpc: dropping a lagging UI connection");
                     let _ = subscriber.tx.close();
                     false

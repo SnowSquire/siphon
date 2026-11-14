@@ -82,6 +82,7 @@ use crate::constants::DEBUG_CHANNEL_TITLE;
 use crate::constants::DEBUG_DVR_URL;
 use crate::constants::DEFAULT_RTSP_PORT;
 use crate::http::Client;
+use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::registry::Options as RegistryOptions;
 use crate::registry::Registry;
@@ -289,6 +290,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
                 notifier,
                 dvr: Rc::clone(&dvr),
                 client: Rc::clone(&client),
+                metrics: Rc::new(DiskMetrics::new()),
             },
             &wakes,
             &downloaders_tx.clone().to_async(),
@@ -400,14 +402,18 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     notifier::register_aumid();
 
     let (events_tx, events_rx) = kanal::unbounded();
-    let handle = AppHandle::new(events_tx, Rc::clone(&bus));
+    let wake = ConsumerWake::new();
+    let sender = app::EventSender::new(events_tx, Rc::clone(&wake));
+    let handle = AppHandle::new(sender.clone(), Rc::clone(&bus));
     let app = App::new(AppInit {
         config,
         config_path,
         client: Rc::clone(&client),
         registry: Rc::clone(&registry),
         bus,
-        events: events_rx.to_async(),
+        events: events_rx,
+        sender,
+        wake,
         client_id: cfg.client_id.clone(),
         debug: cfg.debug,
     });
