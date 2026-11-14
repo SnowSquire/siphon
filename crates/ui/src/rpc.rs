@@ -1,7 +1,7 @@
-//! The UI-side RPC worker: connect, keep a local snapshot, forward intents.
+//! The UI-side RPC worker: connect, forward snapshots and updates, send intents.
 //!
-//! The worker runs on its own compio thread. The UI thread only reads
-//! [`SharedSnapshot`] and sends [`UiCommand`]s; it never blocks on the socket.
+//! The worker runs on its own compio thread. The UI thread only renders the
+//! latest snapshot and sends [`UiCommand`]s; it never blocks on the socket.
 
 #![allow(clippy::future_not_send)]
 
@@ -12,7 +12,6 @@ use std::future::poll_fn;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
@@ -30,14 +29,21 @@ use siphon_rpc::Update;
 /// The daemon's admin listener on loopback.
 pub const BACKEND: &str = "127.0.0.1:7418";
 
-/// One UI action. Kept as a wrapper so local-only commands can join later.
+/// One UI action.
 #[derive(Debug)]
 pub enum UiCommand {
     Request(Request),
 }
 
-/// A single-waiter wake, shared between the UI thread (intent sender) and
-/// the RPC thread (worker). `Waker` is thread-safe, so the slot is a mutex.
+/// One snapshot or entity update for the UI thread.
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    Snapshot(Box<Snapshot>),
+    Update(Update),
+}
+
+/// A single-waiter wake, shared between the UI thread (intent sender) and the
+/// RPC thread (worker). `Waker` is thread-safe, so the slot is a mutex.
 pub struct Wake {
     waker: Mutex<Option<Waker>>,
 }
@@ -77,66 +83,30 @@ pub struct IntentSender {
 
 impl IntentSender {
     /// Queues an intent and wakes the worker. The command stays in the channel
-    /// until the worker drains it, so a wake that races an update cannot drop
-    /// a user action.
+    /// until the worker drains it, so a wake that races an update cannot drop a
+    /// user action.
     pub fn send(&self, command: UiCommand) {
         let _ = self.tx.try_send(command);
         self.wake.wake();
     }
 }
 
-/// Latest snapshot shared with the Slint pump thread.
-pub struct SharedSnapshot {
-    inner: RwLock<Snapshot>,
-    tx: kanal::Sender<GuiEvent>,
+/// Creates the intent channel, its sender and the shared wake.
+#[must_use]
+pub fn intent_channel() -> (IntentSender, kanal::Receiver<UiCommand>, Arc<Wake>) {
+    let (tx, rx) = kanal::unbounded();
+    let wake = Wake::new();
+    (
+        IntentSender {
+            tx,
+            wake: Arc::clone(&wake),
+        },
+        rx,
+        wake,
+    )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GuiEvent {
-    Snapshot,
-    Tray(TrayAction),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TrayAction {
-    Show,
-}
-
-impl SharedSnapshot {
-    #[must_use]
-    pub fn pair(initial: Snapshot) -> (Arc<Self>, kanal::Receiver<GuiEvent>) {
-        let (tx, rx) = kanal::unbounded();
-        (
-            Arc::new(Self {
-                inner: RwLock::new(initial),
-                tx,
-            }),
-            rx,
-        )
-    }
-
-    pub fn update(&self, apply: impl FnOnce(&mut Snapshot)) {
-        apply(
-            &mut self
-                .inner
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let _ = self.tx.send(GuiEvent::Snapshot);
-    }
-
-    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Snapshot> {
-        self.inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    pub fn notify_tray(&self, action: TrayAction) {
-        let _ = self.tx.send(GuiEvent::Tray(action));
-    }
-}
-
-/// A fresh snapshot for the first frame and for reconnect failures.
+/// A fresh snapshot for the first frame.
 #[must_use]
 pub fn empty_snapshot() -> Snapshot {
     Snapshot {
@@ -154,26 +124,11 @@ pub fn empty_snapshot() -> Snapshot {
     }
 }
 
-/// Creates the intent channel and its sender.
-#[must_use]
-pub fn intent_channel() -> (IntentSender, kanal::Receiver<UiCommand>, Arc<Wake>) {
-    let (tx, rx) = kanal::unbounded();
-    let wake = Wake::new();
-    (
-        IntentSender {
-            tx,
-            wake: Arc::clone(&wake),
-        },
-        rx,
-        wake,
-    )
-}
-
 /// Runs forever, reconnecting with backoff. One connection at a time.
 pub async fn run(
     intents: kanal::Receiver<UiCommand>,
     wake: Arc<Wake>,
-    shared: Arc<SharedSnapshot>,
+    events: kanal::Sender<UiEvent>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -185,22 +140,20 @@ pub async fn run(
         {
             Ok((client, snapshot)) => {
                 backoff = Duration::from_secs(1);
-                shared.update(|state| *state = snapshot);
-                serve_connection(client, &intents, &wake, &shared).await
+                let _ = events.try_send(UiEvent::Snapshot(Box::new(snapshot)));
+                serve_connection(client, &intents, &wake, &events).await
             }
             Err(error) => {
-                shared.update(|state| {
-                    state.error = Some(format!("backend: {error}"));
-                });
+                let _ = events.try_send(UiEvent::Update(Update::Error(Some(format!(
+                    "backend: {error}"
+                )))));
                 false
             }
         };
         if !connected {
-            shared.update(|state| {
-                if state.error.is_none() {
-                    state.error = Some("backend disconnected".to_owned());
-                }
-            });
+            let _ = events.try_send(UiEvent::Update(Update::Error(Some(
+                "backend disconnected".to_owned(),
+            ))));
         }
         compio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(2));
@@ -212,21 +165,21 @@ async fn serve_connection(
     client: Client,
     intents: &kanal::Receiver<UiCommand>,
     wake: &Arc<Wake>,
-    shared: &Arc<SharedSnapshot>,
+    events: &kanal::Sender<UiEvent>,
 ) -> bool {
     let client = Rc::new(client);
     let stream = client.events();
-    let events: Rc<RefCell<VecDeque<ClientEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
+    let queue: Rc<RefCell<VecDeque<ClientEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
     let closed = Rc::new(Cell::new(false));
 
     // The forwarder owns the async receive; the worker drains its queue. A
     // select between the two receivers would drop a completed receive.
-    let feed_events = Rc::clone(&events);
+    let feed_queue = Rc::clone(&queue);
     let feed_closed = Rc::clone(&closed);
     let feed_wake = Arc::clone(wake);
     compio::runtime::spawn(async move {
         while let Ok(event) = stream.recv().await {
-            feed_events.borrow_mut().push_back(event);
+            feed_queue.borrow_mut().push_back(event);
             feed_wake.wake();
         }
         feed_closed.set(true);
@@ -236,28 +189,28 @@ async fn serve_connection(
 
     loop {
         wait(wake, || {
-            closed.get() || !events.borrow().is_empty() || !intents.is_empty()
+            closed.get() || !queue.borrow().is_empty() || !intents.is_empty()
         })
         .await;
 
-        let disconnected = closed.get() && events.borrow().is_empty();
+        let disconnected = closed.get() && queue.borrow().is_empty();
 
         while let Ok(Some(command)) = intents.try_recv() {
             let UiCommand::Request(request) = command;
             if let Err(error) = client.request(request).await {
-                shared.update(|state| {
-                    state.error = Some(error.to_string());
-                });
+                let _ = events.try_send(UiEvent::Update(Update::Error(Some(error.to_string()))));
             }
         }
 
         loop {
-            let event = events.borrow_mut().pop_front();
+            let event = queue.borrow_mut().pop_front();
             let Some(event) = event else { break };
             match event {
-                ClientEvent::Snapshot(snapshot) => shared.update(|state| *state = *snapshot),
+                ClientEvent::Snapshot(snapshot) => {
+                    let _ = events.try_send(UiEvent::Snapshot(snapshot));
+                }
                 ClientEvent::Update { update, .. } => {
-                    shared.update(|state| apply(state, update));
+                    let _ = events.try_send(UiEvent::Update(update));
                 }
             }
         }
@@ -265,7 +218,7 @@ async fn serve_connection(
         if disconnected {
             return true;
         }
-        if intents.is_closed() && intents.is_empty() {
+        if (intents.is_closed() && intents.is_empty()) || events.is_closed() {
             return false;
         }
     }
@@ -286,7 +239,9 @@ async fn wait(wake: &Wake, ready: impl Fn() -> bool) {
     .await;
 }
 
-fn apply(state: &mut Snapshot, update: Update) {
+/// Applies one entity update to a snapshot. Idempotent: applying it twice is
+/// harmless.
+pub fn apply_update(state: &mut Snapshot, update: Update) {
     match update {
         Update::Config(config) => {
             state.config = config;
@@ -320,7 +275,6 @@ fn apply(state: &mut Snapshot, update: Update) {
             }
         }
         Update::PipelineRemove(key) => state.pipelines.retain(|row| row.key != key),
-        // The UI does not draw the segment ring; queries cover it.
         Update::Segment { .. } => {}
         Update::Arena(arena) => state.arena = arena,
         Update::Downloader(downloader) => state.downloader = downloader,

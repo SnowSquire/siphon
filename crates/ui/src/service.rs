@@ -168,7 +168,7 @@ fn terminate_pid(pid: u32) -> bool {
         unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &raw mut length) };
     let path = String::from_utf16_lossy(&buffer[..usize::try_from(length).unwrap_or(0)]);
     // A stale PID may have been reused: only kill the daemon image.
-    let is_daemon = read != 0 && path.to_ascii_lowercase().ends_with("daemon.exe");
+    let is_daemon = read != 0 && path.to_ascii_lowercase().ends_with("siphon-daemon.exe");
     if !is_daemon {
         // SAFETY: the handle is valid and owned here.
         unsafe { CloseHandle(handle) };
@@ -195,7 +195,7 @@ fn kill_by_name() {
         use std::os::windows::process::CommandExt as _;
 
         let _ = Command::new("taskkill")
-            .args(["/IM", "daemon.exe", "/F"])
+            .args(["/IM", "siphon-daemon.exe", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -218,7 +218,7 @@ fn daemon_path() -> PathBuf {
         return PathBuf::from(path);
     }
     let name = if cfg!(windows) {
-        "daemon.exe"
+        "siphon-daemon.exe"
     } else {
         "daemon"
     };

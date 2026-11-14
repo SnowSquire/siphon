@@ -1,28 +1,56 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The DXGI/Vulkan glue is FFI: one unsafe block per call site with one SAFETY
+// comment covers the few calls it makes. API names are names, not code.
+#![allow(
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::doc_markdown,
+    clippy::borrow_as_ptr,
+    clippy::ptr_as_ptr,
+    clippy::ptr_cast_constness,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_ptr_alignment,
+    clippy::unnecessary_cast
+)]
 
-//! Siphon UI: a Slint window and tray rendered from the daemon's RPC.
+//! Siphon UI: a ZGUI window presented through DXGI, fed by the daemon RPC.
+//!
+//! Windows-only: the DXGI flip chain, the native tray and the service control
+//! are all Win32.
 
+#[cfg(windows)]
 mod app;
+#[cfg(windows)]
+mod dxgi;
+#[cfg(windows)]
 mod format;
+#[cfg(windows)]
+mod gpu;
+#[cfg(windows)]
+mod placebo;
+#[cfg(windows)]
+mod pump;
+#[cfg(windows)]
+mod renderer;
+#[cfg(windows)]
 mod rpc;
+#[cfg(windows)]
+mod sdr;
+#[cfg(windows)]
 mod service;
-mod ui;
+#[cfg(windows)]
+mod tray;
 
-use std::sync::Arc;
-
-use slint::ComponentHandle as _;
-use tracing_subscriber::EnvFilter;
-
-use crate::app::ViewParams;
-use crate::app::build;
-use crate::rpc::SharedSnapshot;
-use crate::rpc::TrayAction;
-use crate::rpc::empty_snapshot;
-use crate::rpc::intent_channel;
-use crate::rpc::run;
-use crate::service::APP_ID;
-
+#[cfg(windows)]
 fn main() {
+    use tracing_subscriber::EnvFilter;
+
+    use crate::rpc::intent_channel;
+    use crate::rpc::run;
+    use crate::service::APP_ID;
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -42,32 +70,33 @@ fn main() {
     service::ensure_running();
 
     let (intents, intent_rx, wake) = intent_channel();
-    let (shared, gui_rx) = SharedSnapshot::pair(empty_snapshot());
-
-    let work = Arc::clone(&shared);
+    let (event_tx, event_rx) = kanal::unbounded();
     std::thread::Builder::new()
         .name("rpc worker".to_owned())
         .spawn(move || {
             compio::runtime::Runtime::new()
                 .expect("compio runtime")
-                .block_on(run(intent_rx, wake, work));
+                .block_on(run(intent_rx, wake, event_tx));
         })
         .expect("rpc thread");
 
-    // Second launches wake the window through the frame channel the foreground
-    // pump awaits, so showing works even while hidden.
-    let wake_shared = Arc::clone(&shared);
-    let single = app_single_instance::start_primary(APP_ID, move || {
-        tracing::info!(target: "single", "wake signal received");
-        wake_shared.notify_tray(TrayAction::Show);
-    });
+    let (tray_tx, tray_rx) = kanal::unbounded();
+    let tray = match tray::build(tray_tx) {
+        Ok(tray) => Some(tray),
+        Err(error) => {
+            tracing::error!(target: "tray", "tray build failed: {error:#}");
+            None
+        }
+    };
 
-    let (ui, guards) = build(ViewParams {
-        intents,
-        shared,
-        gui_rx,
-        single,
-    });
-    ui.run().expect("slint event loop");
-    drop(guards);
+    let result = app::run(event_rx, tray_rx, intents);
+    drop(tray);
+    if let Err(error) = result {
+        tracing::error!(target: "app", "{error:#}");
+    }
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("Siphon UI is Windows-only");
 }

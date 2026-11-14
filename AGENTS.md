@@ -32,7 +32,7 @@ only sink; disk output is disabled and being rebuilt from
 - Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
 - Benchmark: `cargo test -p daemon --release -- --ignored --nocapture throughput` (demux/packetize over `servermock/segments`). Cross-compile: `cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl`.
 - Miri: `cargo +nightly miri test -p daemon` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
-- UI: `cargo run -p siphon-ui` (binary `siphon`). It starts `daemon.exe` next to itself if `127.0.0.1:7418` is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
+- UI: `cargo run -p siphon-ui` (binary `siphon`, ZGUI + DXGI). It starts `siphon-daemon.exe` next to itself if `127.0.0.1:7418` is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
 
 ## Terminology
 
@@ -71,7 +71,7 @@ detail: `notes/architecture.md`.
 - `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`).
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/rpc` (`siphon-rpc`) — the typed protocol, postcard framing and the UI-side client.
-- `crates/ui` (`siphon-ui`, binary `siphon`) — the Slint window and tray, the RPC client worker, and the daemon lifecycle (auto-start, PID-file restart). Windows-only. `notes/rpc.md` has the split; the ZGUI rewrite uses the `video` crate's scaffolding later.
+- `crates/ui` (`siphon-ui`, binary `siphon`) — the ZGUI window presented through the video spike's DXGI flip chain and libplacebo pass, the native tray, the RPC client worker, and the daemon lifecycle (auto-start, PID-file restart). Windows-only; `notes/rpc.md` has the split and the SDR/HDR state.
 
 ## Rules (do not "simplify")
 

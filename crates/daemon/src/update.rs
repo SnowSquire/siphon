@@ -265,13 +265,13 @@ mod tests {
     fn relaunch_script_installs_before_reopening_and_quotes_paths() {
         let script = relaunch_script(
             Path::new("C:\\My Dir\\siphon-update-0.2.0.msi"),
-            Path::new("C:\\App Dir\\daemon.exe"),
+            Path::new("C:\\App Dir\\siphon-daemon.exe"),
         );
         let install = script.find("msiexec.exe").expect("installs via msiexec");
-        let open = script.find("daemon.exe").expect("reopens the app");
+        let open = script.find("siphon-daemon.exe").expect("reopens the app");
         assert!(install < open, "reopen must wait for the install");
         assert!(script.contains("-Wait"));
         assert!(script.contains("'C:\\My Dir\\siphon-update-0.2.0.msi'"));
-        assert!(script.contains("'C:\\App Dir\\daemon.exe'"));
+        assert!(script.contains("'C:\\App Dir\\siphon-daemon.exe'"));
     }
 }

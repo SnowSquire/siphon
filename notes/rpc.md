@@ -3,10 +3,11 @@
 Status: phases 0–2 backend landed. `crates/rpc` (`siphon-rpc`) owns the typed
 protocol, postcard framing and client; `crates/daemon` owns config, GQL,
 Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI is
-now `crates/ui` (Slint, binary `siphon`) and talks only over the RPC. It starts
-the daemon when the admin port is idle and restarts it at the process level
-(PID file + terminate), never through the socket: a frozen daemon must still be
-restartable from the tray.
+now `crates/ui` (ZGUI, binary `siphon`) and talks only over the RPC. It presents
+through the video spike's DXGI flip chain and libplacebo pass (SDR for now; the
+HDR path is kept dormant), starts the daemon when the admin port is idle and
+restarts it at the process level (PID file + terminate), never through the
+socket: a frozen daemon must still be restartable from the tray.
 
 ## Goal
 
@@ -227,8 +228,8 @@ like `StreamKey`; changing quality is remove + add.
   it. Package `siphon-rpc`.
 - `crates/daemon`: the backend app and the RPC server module; `registry.rs`
   owns pipelines, `app.rs` owns everything else.
-- `crates/ui` (`siphon-ui`, binary `siphon`): the Slint window, tray and RPC
-  worker. It owns the daemon lifecycle (`service.rs`): auto-start on launch and
+- `crates/ui` (`siphon-ui`, binary `siphon`): the ZGUI window presented through
+  the DXGI/libplacebo renderer, the native tray and the RPC worker. It owns the daemon lifecycle (`service.rs`): auto-start on launch and
   a process-level restart (`daemon.pid` in the app data dir, image-name check,
   `taskkill` fallback). `crates/tray` is obsolete.
 - `play` keeps its current pipeline and needs no protocol types.
@@ -296,9 +297,15 @@ like `StreamKey`; changing quality is remove + add.
 
 ## UI and video context
 
-The UI is planned to move from Slint to ZGUI (fine-grained `reactive_graph`
-signals), so `Snapshot`/`Update` map directly onto per-entity signals; the
-protocol stays free of ZGUI types.
+The UI is ZGUI (fine-grained `reactive_graph` signals); `Snapshot`/`Update` map
+onto the reactive state, and the protocol stays free of ZGUI types. The renderer
+is the video spike's path without the video: ZGUI renders into a `Bgra8Unorm`
+texture, libplacebo composites it into a DXGI `FLIP_DISCARD` backbuffer
+(three buffers, frame-latency waitable object, interval 1), and DXGI presents.
+The swapchain is imported into Vulkan with `pl_vulkan_import`, so there is no
+`VkSurfaceKHR`/`VkSwapchainKHR`. HDR is off for now (`HdrMode::Off`), but the
+SDR white point still comes from DisplayConfig; the video pass and HDR transfer
+functions are the later work.
 
 ZGUI's `surface` element is the video seam: a producer with its own cadence gets
 the shared `wgpu::Device`/`Queue`, creates textures on that device and

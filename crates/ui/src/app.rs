@@ -1,436 +1,510 @@
-//! Slint foreground: applies RPC snapshots to the retained window and forwards
-//! callbacks to the RPC worker as requests.
+//! The ZGUI view: header, channels, filters, and the DXGI renderer setup.
 
 use std::rc::Rc;
 use std::sync::Arc;
 
-use kanal::Receiver;
+use raw_window_handle::HasWindowHandle as _;
 use siphon_rpc::ChannelView;
 use siphon_rpc::ConnHealth;
 use siphon_rpc::Request;
-use slint::ComponentHandle as _;
-use slint::SharedString;
-use slint::VecModel;
+use siphon_rpc::Snapshot;
+use zgui::prelude::*;
+use zgui::reactive::LocalStorage;
+use zgui::reactive::RwSignal;
+use zgui::render::GpuUnavailable;
+use zgui::render::RenderTarget;
+use zgui::render::Renderer;
+use zgui::runtime::AppError;
+use zgui::surface::SurfaceConfig;
+use zgui::surface::SurfaceHandle;
+use zgui::surface::SurfaceIntrinsic;
+use zgui::surface::wgpu;
+use zgui_render_wgpu::Gpu;
+use zgui_render_wgpu::SharedGraphics;
+use zgui_ui::prelude::*;
 
+use crate::dxgi::DxgiSwapchain;
+use crate::dxgi::HdrMode;
+use crate::dxgi::hwnd_from_raw;
 use crate::format::format_iso_ms;
-use crate::rpc::GuiEvent;
+use crate::placebo::Placebo;
+use crate::renderer::UiRenderer;
 use crate::rpc::IntentSender;
-use crate::rpc::SharedSnapshot;
-use crate::rpc::TrayAction;
 use crate::rpc::UiCommand;
-use crate::ui::AppWindow;
-use crate::ui::ChannelRow;
-use crate::ui::ConnState;
-use crate::ui::SiphonTray;
+use crate::rpc::UiEvent;
+use crate::rpc::empty_snapshot;
+use crate::tray::TrayAction;
 
-pub struct ViewParams {
-    pub intents: IntentSender,
-    pub shared: Arc<SharedSnapshot>,
-    pub gui_rx: Receiver<GuiEvent>,
-    pub single: app_single_instance::PrimaryHandle,
-}
-
-/// Owns the tray icon and the primary-instance guard: dropping either removes
-/// the icon or releases primary status, so both outlive `run`.
-pub struct Guards {
-    _tray: Option<SiphonTray>,
-    _single: app_single_instance::PrimaryHandle,
-}
-
-pub fn build(params: ViewParams) -> (AppWindow, Guards) {
-    let ui = AppWindow::new().expect("slint window");
-    wire(&ui, &params.intents);
-    {
-        let snapshot = params.shared.read().clone();
-        apply_snapshot(&ui, &snapshot);
-    }
-    let tray = build_tray(&ui);
-    let has_tray = tray.is_some();
-    arm_minimize_to_tray(&ui, has_tray);
-    ui.window().on_close_requested(move || {
-        if has_tray {
-            trim_working_set();
-        } else {
-            // Without a tray a hidden window would strand invisible.
-            let _ = slint::quit_event_loop();
-        }
-        slint::CloseRequestResponse::HideWindow
+pub fn run(
+    events: kanal::Receiver<UiEvent>,
+    tray: kanal::Receiver<TrayAction>,
+    intents: IntentSender,
+) -> anyhow::Result<()> {
+    let (gpu, _decode) = crate::gpu::create()?;
+    let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
+    let factory_gpu = Arc::clone(&gpu);
+    let snapshot = RwSignal::new_local(empty_snapshot());
+    let pump = SurfaceHandle::new(SurfaceConfig {
+        premultiplied: true,
+        intrinsic: SurfaceIntrinsic::size(1.0, 1.0),
     });
-    spawn_pump(&ui, Arc::clone(&params.shared), params.gui_rx);
-    let guards = Guards {
-        _tray: tray,
-        _single: params.single,
-    };
-    (ui, guards)
-}
+    crate::pump::spawn(pump.clone());
 
-fn build_tray(ui: &AppWindow) -> Option<SiphonTray> {
-    let tray = match SiphonTray::new() {
-        Ok(tray) => tray,
-        Err(error) => {
-            tracing::error!(target: "tray", "tray build failed: {error}");
-            return None;
-        }
-    };
-    let weak = ui.as_weak();
-    tray.on_show_window(move || {
-        if let Some(ui) = weak.upgrade() {
-            tracing::info!(target: "tray", "tray Open, showing window");
-            let _ = ui.show();
-        }
-    });
-    tray.on_restart_service(|| {
-        tracing::info!(target: "tray", "restart service requested");
-        if let Err(error) = std::thread::Builder::new()
-            .name("service restart".to_owned())
-            .spawn(crate::service::restart)
-        {
-            tracing::error!(target: "service", "could not start the restart thread: {error}");
-        }
-    });
-    tray.on_quit_app(|| {
-        let _ = slint::quit_event_loop();
-    });
-    if let Err(error) = tray.show() {
-        tracing::error!(target: "tray", "tray show failed: {error}");
-        return None;
-    }
-    Some(tray)
-}
-
-const MINIMIZE_SUBCLASS_ID: usize = 1;
-const MINIMIZE_HOOK_ATTEMPTS: u32 = 50;
-const MINIMIZE_HOOK_RETRY_IN: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Minimize hides to the tray instead of the taskbar. Slint exposes no
-/// minimize event, so a comctl subclass swallows `SC_MINIMIZE`.
-fn arm_minimize_to_tray(ui: &AppWindow, has_tray: bool) {
-    if !has_tray {
-        return;
-    }
-    let weak = ui.as_weak();
-    slint::Timer::single_shot(MINIMIZE_HOOK_RETRY_IN, move || {
-        install_minimize_hook(&weak, MINIMIZE_HOOK_ATTEMPTS);
-    });
-}
-
-fn install_minimize_hook(weak: &slint::Weak<AppWindow>, attempts: u32) {
-    let Some(ui) = weak.upgrade() else { return };
-    let Some(hwnd) = slint_hwnd(&ui) else {
-        if attempts > 0 {
-            let weak = weak.clone();
-            slint::Timer::single_shot(MINIMIZE_HOOK_RETRY_IN, move || {
-                install_minimize_hook(&weak, attempts - 1);
-            });
-        } else {
-            tracing::info!(target: "app", "minimize-to-tray hook found no window");
-        }
-        return;
-    };
-    // SAFETY: `hwnd` is our own live window on this GUI thread; the subclass
-    // chains to winit's procedure and comctl drops it with the window.
-    let installed = unsafe {
-        windows_sys::Win32::UI::Shell::SetWindowSubclass(
-            hwnd,
-            Some(minimize_subclass),
-            MINIMIZE_SUBCLASS_ID,
-            0,
-        )
-    };
-    if installed == 0 {
-        tracing::info!(target: "app", "minimize-to-tray hook failed to install");
-    }
-}
-
-fn slint_hwnd(ui: &AppWindow) -> Option<windows_sys::Win32::Foundation::HWND> {
-    use raw_window_handle::HasWindowHandle as _;
-    use raw_window_handle::RawWindowHandle;
-
-    let provider = ui.window().window_handle();
-    let raw = provider.window_handle().ok()?;
-    match raw.as_raw() {
-        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as _),
-        _ => None,
-    }
-}
-
-/// SAFETY: our own live window; hiding only toggles visibility.
-unsafe extern "system" fn minimize_subclass(
-    hwnd: windows_sys::Win32::Foundation::HWND,
-    msg: u32,
-    wparam: windows_sys::Win32::Foundation::WPARAM,
-    lparam: windows_sys::Win32::Foundation::LPARAM,
-    _id: usize,
-    _data: usize,
-) -> windows_sys::Win32::Foundation::LRESULT {
-    if is_minimize_command(msg, wparam) {
-        // SAFETY: our own live window; hiding only toggles visibility.
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                hwnd,
-                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+    app()
+        .with_application_id("com.iken.siphon")
+        .with_title("Siphon")
+        .with_size(1000.0, 760.0)
+        .with_resizable(false)
+        .with_stylesheet(SHEET)
+        .with_renderer(Box::new(move |surface, target| {
+            dxgi_renderer(
+                &graphics,
+                &factory_gpu,
+                surface,
+                target,
+                snapshot,
+                events.clone(),
+                tray.clone(),
             )
-        };
-        trim_working_set();
-        tracing::info!(target: "tray", "minimize hid to tray");
-        return 0;
-    }
-    // SAFETY: default subclass chaining for everything else.
-    unsafe { windows_sys::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }))
+        .run(move || view! { App(snapshot = snapshot, intents = intents.clone(), pump = pump.clone()) })
+        .map_err(|error| anyhow::anyhow!("zgui: {error}"))
 }
 
-const fn is_minimize_command(msg: u32, wparam: usize) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
+fn dxgi_renderer(
+    graphics: &SharedGraphics,
+    gpu: &Arc<Gpu>,
+    surface: &Arc<dyn zgui::platform::Surface>,
+    target: RenderTarget,
+    snapshot: RwSignal<Snapshot, LocalStorage>,
+    events: kanal::Receiver<UiEvent>,
+    tray: kanal::Receiver<TrayAction>,
+) -> Result<Box<dyn Renderer>, AppError> {
+    let gpu_surface = Arc::clone(surface)
+        .gpu_shared()
+        .ok_or_else(|| dxgi_error("the surface has no native window handle"))?;
+    let window = gpu_surface
+        .window_handle()
+        .map_err(|error| dxgi_error(format!("window handle: {error}")))?;
+    let hwnd = hwnd_from_raw(window.as_raw()).map_err(|error| dxgi_error(format!("{error:#}")))?;
+    let width = u32::try_from(target.size.width)
+        .map_err(|_| dxgi_error("the target width is not positive"))?;
+    let height = u32::try_from(target.size.height)
+        .map_err(|_| dxgi_error("the target height is not positive"))?;
 
-    msg == wam::WM_SYSCOMMAND && wparam & 0xFFF0 == wam::SC_MINIMIZE as usize
+    let swapchain = DxgiSwapchain::new(gpu, hwnd, width, height, HdrMode::Off)
+        .map_err(|error| dxgi_error(format!("{error:#}")))?;
+    let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("siphon.ui"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+
+    let placebo =
+        Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error:#}")))?;
+    let renderer = graphics
+        .renderer_supplied(target, vec![ui.clone()])
+        .map_err(AppError::from)?;
+    let renderer = UiRenderer::new(
+        renderer, swapchain, placebo, ui, snapshot, events, tray, hwnd,
+    )
+    .map_err(|error| dxgi_error(format!("{error:#}")))?;
+    Ok(Box::new(renderer))
 }
 
-fn wire(ui: &AppWindow, intents: &IntentSender) {
-    let send = {
-        let intents = intents.clone();
-        move |request| intents.send(UiCommand::Request(request))
+fn dxgi_error(reason: impl Into<String>) -> AppError {
+    AppError::GpuUnavailable(GpuUnavailable::new().rejected("DXGI", reason))
+}
+
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn App(
+    snapshot: RwSignal<Snapshot, LocalStorage>,
+    intents: IntentSender,
+    pump: SurfaceHandle,
+) -> impl IntoView {
+    let intents = Rc::new(intents);
+    let draft = RwSignal::new_local(String::new());
+    let word_draft = RwSignal::new_local(String::new());
+    let expanded = RwSignal::new_local(None::<u64>);
+
+    let add_login = {
+        let intents = Rc::clone(&intents);
+        move || {
+            let login = draft.get_untracked().trim().to_owned();
+            if login.is_empty() {
+                return;
+            }
+            intents.send(UiCommand::Request(Request::AddLogin(login)));
+            draft.set(String::new());
+        }
+    };
+    let add_word = {
+        let intents = Rc::clone(&intents);
+        move || {
+            let word = word_draft.get_untracked().trim().to_owned();
+            if word.is_empty() {
+                return;
+            }
+            intents.send(UiCommand::Request(Request::AddFilteredWord(word)));
+            word_draft.set(String::new());
+        }
     };
 
-    ui.on_add_login({
-        let send = send.clone();
-        move |text| {
-            let value = text.trim().to_owned();
-            if !value.is_empty() {
-                send(Request::AddLogin(value));
-            }
-        }
-    });
-    ui.on_remove_channel({
-        let send = send.clone();
-        move |id| {
-            if let Ok(channel) = id.parse::<u64>() {
-                send(Request::RemoveChannel(channel));
-            } else {
-                tracing::info!(target: "app", "bad channel id {id}");
-            }
-        }
-    });
-    ui.on_add_word({
-        let send = send.clone();
-        move |text| {
-            let value = text.trim().to_owned();
-            if !value.is_empty() {
-                send(Request::AddFilteredWord(value));
-            }
-        }
-    });
-    ui.on_remove_word({
-        let send = send.clone();
-        move |index| {
-            if index >= 0 {
-                send(Request::RemoveFilteredWord(
-                    u32::try_from(index).unwrap_or(u32::MAX),
-                ));
-            }
-        }
-    });
-    ui.on_set_notify({
-        let send = send.clone();
-        move |checked| send(Request::SetNotifyTitleChanges(checked))
-    });
-    ui.on_set_sound({
-        let send = send.clone();
-        move |checked| send(Request::SetSound(checked))
-    });
-    ui.on_apply_update({
-        let send = send.clone();
-        move || send(Request::ApplyUpdate)
-    });
-    ui.on_clear_error(move || send(Request::ClearError));
-}
+    let update = Rc::clone(&intents);
+    let dismiss = Rc::clone(&intents);
+    let titles = Rc::clone(&intents);
+    let sound = Rc::clone(&intents);
+    let rows = Rc::clone(&intents);
+    let words = Rc::clone(&intents);
 
-/// Dedicated pump thread: blocks on the worker channel and replays each event
-/// onto the UI thread through the weak handle.
-fn spawn_pump(ui: &AppWindow, shared: Arc<SharedSnapshot>, gui_rx: Receiver<GuiEvent>) {
-    let weak = ui.as_weak();
-    std::thread::Builder::new()
-        .name("slint pump".to_owned())
-        .spawn(move || {
-            while let Ok(event) = gui_rx.recv() {
-                match event {
-                    GuiEvent::Snapshot => {
-                        let snapshot = shared.read().clone();
-                        if weak
-                            .upgrade_in_event_loop(move |ui| apply_snapshot(&ui, &snapshot))
-                            .is_err()
-                        {
-                            break;
-                        }
+    view! {
+        column(class = "app") {
+            row(class = "header") {
+                text(class = "brand") {"Siphon"}
+                text(class = "conn") {{move || conn_label(snapshot.get().conn)}}
+                spacer()
+                if move || snapshot.get().update.is_some() {
+                    row(class = "banner") {
+                        text {{move || snapshot.get().update.map_or_else(String::new, |update| format!("Update to {}", update.version))}}
+                        Button(
+                            variant = ButtonVariant::Outline,
+                            on:click = {
+                                let update = Rc::clone(&update);
+                                move |_| update.send(UiCommand::Request(Request::ApplyUpdate))
+                            }
+                        ) {"Install"}
                     }
-                    GuiEvent::Tray(action) => {
-                        let snapshot = shared.read().clone();
-                        if weak
-                            .upgrade_in_event_loop(move |ui| {
-                                apply_snapshot(&ui, &snapshot);
-                                match action {
-                                    TrayAction::Show => {
-                                        let _ = ui.window().show();
-                                    }
-                                }
-                            })
-                            .is_err()
-                        {
-                            break;
+                }
+            }
+
+            if move || snapshot.get().error.is_some() {
+                row(class = "error") {
+                    text(class = "error__text") {{move || snapshot.get().error.clone().unwrap_or_default()}}
+                    spacer()
+                    Button(
+                        size = ButtonSize::Sm,
+                        variant = ButtonVariant::Ghost,
+                        on:click = {
+                            let dismiss = Rc::clone(&dismiss);
+                            move |_| dismiss.send(UiCommand::Request(Request::ClearError))
+                        }
+                    ) {"Dismiss"}
+                }
+            }
+
+            row(class = "add") {
+                Input(value = draft, placeholder = "twitch login")
+                Button(on:click = move |_| add_login()) {"Add"}
+            }
+
+            ScrollArea(class = "channels") {
+                column(class = "list") {
+                    for channel in move || snapshot.get().channels, key = |channel: &ChannelView| channel.id {
+                        ChannelRow(
+                            channel = channel.clone(),
+                            expanded = expanded,
+                            intents = Rc::clone(&rows),
+                        )
+                    }
+                    for login in move || snapshot.get().pending, key = |login: &String| login.clone() {
+                        row(class = "channel pending") {
+                            text(class = "channel__name") {{login.clone()}}
+                            text(class = "channel__title") {"resolving…"}
                         }
                     }
                 }
             }
-        })
-        .expect("slint pump thread");
-}
 
-fn apply_snapshot(ui: &AppWindow, snapshot: &siphon_rpc::Snapshot) {
-    ui.set_conn_state(match snapshot.conn {
-        ConnHealth::Connected => ConnState::Connected,
-        ConnHealth::Connecting => ConnState::Connecting,
-        ConnHealth::NoChannels => ConnState::NoChannels,
-    });
-    ui.set_error_text(SharedString::from(
-        snapshot.error.as_deref().unwrap_or_default(),
-    ));
-    if let Some(offer) = &snapshot.update {
-        ui.set_has_update(true);
-        ui.set_update_text(SharedString::from(
-            format!("Update to {}", offer.version).as_str(),
-        ));
-    } else {
-        ui.set_has_update(false);
-        ui.set_update_text(SharedString::new());
-    }
-    ui.set_notify_titles(snapshot.config.notify_title_changes);
-    ui.set_sound(snapshot.config.sound);
-
-    let rows: Vec<ChannelRow> = snapshot
-        .config
-        .channels
-        .iter()
-        .map(|channel| {
-            let resolved = snapshot.channels.iter().find(|view| view.id == channel.id);
-            let name = resolved
-                .map(|view| view.display_name.as_str())
-                .or(channel.display_name.as_deref())
-                .unwrap_or(channel.login.as_str());
-            let title = resolved
-                .and_then(|view| view.title.clone())
-                .unwrap_or_default();
-            let viewers = resolved.map_or_else(|| "—".to_owned(), live_viewers);
-            let detail =
-                resolved.map_or_else(String::new, |view| detail_line(&channel.login, view));
-            ChannelRow {
-                id: SharedString::from(channel.id.to_string().as_str()),
-                name: SharedString::from(name),
-                title: SharedString::from(title.as_str()),
-                viewers: SharedString::from(viewers.as_str()),
-                detail: SharedString::from(detail.as_str()),
-                pending: false,
+            row(class = "options") {
+                Button(
+                    variant = ButtonVariant::Outline,
+                    on:click = move |_| {
+                        let on = snapshot.get_untracked().config.notify_title_changes;
+                        titles.send(UiCommand::Request(Request::SetNotifyTitleChanges(!on)));
+                    }
+                ) {
+                    text {
+                        {move || if snapshot.get().config.notify_title_changes { "Titles: on" } else { "Titles: off" }}
+                    }
+                }
+                Button(
+                    variant = ButtonVariant::Outline,
+                    on:click = move |_| {
+                        let on = snapshot.get_untracked().config.sound;
+                        sound.send(UiCommand::Request(Request::SetSound(!on)));
+                    }
+                ) {
+                    text {
+                        {move || if snapshot.get().config.sound { "Sound: on" } else { "Sound: off" }}
+                    }
+                }
             }
-        })
-        .chain(snapshot.pending.iter().map(|login| ChannelRow {
-            id: SharedString::new(),
-            name: SharedString::from(login.as_str()),
-            title: SharedString::from("…"),
-            viewers: SharedString::from("…"),
-            detail: SharedString::new(),
-            pending: true,
-        }))
-        .collect();
-    ui.set_channels(Rc::new(VecModel::from(rows)).into());
 
-    let words: Vec<SharedString> = snapshot
-        .config
-        .filtered_words
-        .iter()
-        .map(|word| SharedString::from(word.as_str()))
-        .collect();
-    ui.set_words(Rc::new(VecModel::from(words)).into());
+            row(class = "add") {
+                Input(value = word_draft, placeholder = "filtered word")
+                Button(on:click = move |_| add_word()) {"Add"}
+            }
+
+            ScrollArea(class = "words") {
+                column(class = "list") {
+                    for word in move || {
+                        snapshot
+                            .get()
+                            .config
+                            .filtered_words
+                            .iter()
+                            .enumerate()
+                            .map(|(index, word)| WordRow {
+                                index: u32::try_from(index).unwrap_or(u32::MAX),
+                                text: word.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                    }, key = |word: &WordRow| word.index {
+                        WordRowView(word = word.clone(), intents = Rc::clone(&words))
+                    }
+                }
+            }
+
+            {zgui::elements::surface().class("pump").source(&pump).into_view()}
+        }
+    }
 }
 
-fn detail_line(login: &str, view: &ChannelView) -> String {
-    let game = view.game.as_deref().unwrap_or("no game");
-    let start = view
-        .stream_start_ms
-        .map_or_else(|| "—".to_owned(), format_iso_ms);
-    let counts = format!(
-        "{}/{}",
-        viewers_text(view.viewers),
-        viewers_text(view.collaboration_viewers)
-    );
-    format!("{login} • {game} • {start} • {counts}")
+#[derive(Clone, Debug)]
+struct WordRow {
+    index: u32,
+    text: String,
 }
 
-fn live_viewers(view: &ChannelView) -> String {
-    if !view.live {
+#[component]
+#[allow(clippy::needless_pass_by_value)]
+fn ChannelRow(
+    channel: ChannelView,
+    expanded: RwSignal<Option<u64>, LocalStorage>,
+    intents: Rc<IntentSender>,
+) -> impl IntoView {
+    let id = channel.id;
+    let live = channel.live;
+    view! {
+        column(class = "channel") {
+            row(
+                class = "channel__line",
+                on:click = move |_| {
+                    expanded.update(|expanded| {
+                        *expanded = if *expanded == Some(id) { None } else { Some(id) };
+                    });
+                }
+            ) {
+                text(class = if live { "dot dot--live" } else { "dot" }) {"●"}
+                text(class = "channel__name") {{channel.display_name.clone()}}
+                text(class = "channel__title") {{channel.title.clone().unwrap_or_default()}}
+                spacer()
+                text(class = "channel__viewers") {{viewers(&channel)}}
+                Button(
+                    size = ButtonSize::IconSm,
+                    variant = ButtonVariant::Ghost,
+                    on:click:stop = {
+                        let intents = Rc::clone(&intents);
+                        move |_| intents.send(UiCommand::Request(Request::RemoveChannel(id)))
+                    }
+                ) {"×"}
+            }
+            if move || expanded.get() == Some(id) {
+                text(class = "channel__detail") {{detail(&channel)}}
+            }
+        }
+    }
+}
+
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn WordRowView(word: WordRow, intents: Rc<IntentSender>) -> impl IntoView {
+    let index = word.index;
+    view! {
+        row(class = "word") {
+            text {{word.text.clone()}}
+            spacer()
+            Button(
+                size = ButtonSize::IconSm,
+                variant = ButtonVariant::Ghost,
+                on:click = {
+                    let intents = Rc::clone(&intents);
+                    move |_| intents.send(UiCommand::Request(Request::RemoveFilteredWord(index)))
+                }
+            ) {"×"}
+        }
+    }
+}
+
+const fn conn_label(conn: ConnHealth) -> &'static str {
+    match conn {
+        ConnHealth::Connected => "connected",
+        ConnHealth::Connecting => "connecting…",
+        ConnHealth::NoChannels => "no channels",
+    }
+}
+
+fn viewers(channel: &ChannelView) -> String {
+    if !channel.live {
         return "offline".to_owned();
     }
-    view.viewers
+    channel
+        .viewers
         .map_or_else(|| "—".to_owned(), |viewers| viewers.to_string())
 }
 
-fn viewers_text(viewers: Option<u32>) -> String {
-    viewers.map_or_else(|| "—".to_owned(), |viewers| viewers.to_string())
+fn detail(channel: &ChannelView) -> String {
+    let game = channel.game.as_deref().unwrap_or("no game");
+    let start = channel
+        .stream_start_ms
+        .map_or_else(|| "—".to_owned(), format_iso_ms);
+    let count =
+        |value: Option<u32>| value.map_or_else(|| "—".to_owned(), |value| value.to_string());
+    format!(
+        "{} • {} • {} • {}/{}",
+        channel.login,
+        game,
+        start,
+        count(channel.viewers),
+        count(channel.collaboration_viewers)
+    )
 }
 
-/// A hidden tray app needs no resident pages: page everything out and let
-/// faults bring back only what the threads touch.
-fn trim_working_set() {
-    use windows_sys::Win32::System::ProcessStatus::GetProcessMemoryInfo;
-    use windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    use windows_sys::Win32::System::Threading::SetProcessWorkingSetSize;
-
-    // SAFETY: the process handle is ours and the size arguments are sentinels
-    // that ask Windows to trim the working set.
-    let process = unsafe { GetCurrentProcess() };
-    // SAFETY: the process handle is ours.
-    unsafe { SetProcessWorkingSetSize(process, usize::MAX, usize::MAX) };
-    // SAFETY: `PROCESS_MEMORY_COUNTERS` is a plain C struct; all zeroes is its
-    // valid initial state.
-    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-    // SAFETY: `counters` is a live, correctly sized struct; the handle is ours.
-    let read = unsafe {
-        GetProcessMemoryInfo(
-            process,
-            &raw mut counters,
-            u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap_or(u32::MAX),
-        )
-    };
-    if read != 0 {
-        tracing::info!(
-            target: "app",
-            "trimmed working set to {} MB",
-            counters.WorkingSetSize / 1024 / 1024,
-        );
+const SHEET: &str = css!(
+    ":root {
+        background-color: #12141a;
+        color: #e8ecf4;
+        font-family: sans-serif;
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
-
-    use super::is_minimize_command;
-
-    #[test]
-    fn minimize_command_masks_sys_bits() {
-        assert!(is_minimize_command(
-            wam::WM_SYSCOMMAND,
-            wam::SC_MINIMIZE as usize
-        ));
-        assert!(is_minimize_command(
-            wam::WM_SYSCOMMAND,
-            wam::SC_MINIMIZE as usize | 0x000F
-        ));
-        assert!(!is_minimize_command(
-            wam::WM_SYSCOMMAND,
-            wam::SC_CLOSE as usize
-        ));
-        assert!(!is_minimize_command(
-            wam::WM_CLOSE,
-            wam::SC_MINIMIZE as usize
-        ));
+    .app {
+        padding: 16px 18px;
+        gap: 10px;
+        flex-grow: 1;
     }
-}
+
+    .header {
+        align-items: center;
+        gap: 12px;
+    }
+
+    .brand {
+        font-size: 22px;
+        font-weight: 700;
+    }
+
+    .conn {
+        color: #7d879b;
+        font-size: 12px;
+    }
+
+    .banner {
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        border-radius: 8px;
+        background-color: #1c2a1e;
+        color: #b9e4bd;
+        font-size: 13px;
+    }
+
+    .error {
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background-color: #3a1d22;
+        color: #f0b8be;
+        font-size: 13px;
+    }
+
+    .error__text { flex-grow: 1; }
+
+    .add {
+        gap: 8px;
+        align-items: center;
+    }
+
+    .channels {
+        height: 360px;
+        border-radius: 10px;
+        border: 1px solid #262b36;
+        background-color: #171b24;
+    }
+
+    .words {
+        height: 110px;
+        border-radius: 10px;
+        border: 1px solid #262b36;
+        background-color: #171b24;
+    }
+
+    .list { gap: 2px; padding: 6px; }
+
+    .channel { padding: 2px 4px; }
+
+    .channel__line {
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: 7px;
+    }
+
+    .channel__line:hover { background-color: #1e2430; }
+
+    .dot {
+        color: #555b68;
+        font-size: 11px;
+    }
+
+    .dot--live { color: #2ea043; }
+
+    .channel__name {
+        width: 140px;
+        font-size: 15px;
+    }
+
+    .channel__title {
+        flex-grow: 1;
+        font-size: 13px;
+        color: #9aa4b6;
+    }
+
+    .channel__viewers {
+        font-size: 13px;
+        color: #9aa4b6;
+    }
+
+    .channel__detail {
+        padding-left: 30px;
+        padding-bottom: 4px;
+        font-size: 12px;
+        color: #7d879b;
+    }
+
+    .pending .channel__title { color: #7d879b; }
+
+    .options { gap: 8px; }
+
+    .word {
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        font-size: 13px;
+    }
+
+    .pump {
+        width: 1px;
+        height: 1px;
+    }"
+);
