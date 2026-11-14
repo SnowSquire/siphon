@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use raw_window_handle::HasWindowHandle;
 use zgui::platform::Surface;
+use zgui_ui::prelude::*;
 use zgui::prelude::*;
+use zgui::reactive::LocalStorage;
 use zgui::render::GpuUnavailable;
 use zgui::render::RenderTarget;
 use zgui::render::Renderer;
@@ -18,16 +20,16 @@ use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::SharedGraphics;
 
+use crate::composite::Compositor;
 use crate::dxgi::DxgiSwapchain;
+use crate::dxgi::HdrMode;
 use crate::dxgi::hwnd_from_raw;
 use crate::pattern;
 use crate::renderer::DxgiRenderer;
+use crate::video;
 
-pub fn run(file: Option<PathBuf>) -> anyhow::Result<()> {
-    let file = file.map_or_else(
-        || "no file selected".to_owned(),
-        |path| path.display().to_string(),
-    );
+pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
+    let file = file.map_or_else(String::new, |path| path.display().to_string());
 
     let graphics = SharedGraphics::with_backends(wgpu::Backends::VULKAN);
     let gpu = graphics
@@ -36,16 +38,34 @@ pub fn run(file: Option<PathBuf>) -> anyhow::Result<()> {
 
     let factory_gpu = Arc::clone(&gpu);
 
+    // The renderer factory runs before the first view is built, so the monitor's
+    // reported peak luminance is already in `max_nits` by the time the slider
+    // reads its range.
+    let max_nits = RwSignal::new_local(1000.0f64);
+    let brightness = RwSignal::new_local(203.0f64);
+
     app()
         .with_application_id("dev.siphon.video")
         .with_title("video")
-        .with_size(1000.0, 660.0)
+        .with_size(1000.0, 760.0)
         .with_resizable(false)
         .with_stylesheet(SHEET)
         .with_renderer(Box::new(move |surface, target| {
-            dxgi_renderer(&graphics, &factory_gpu, surface, target)
+            dxgi_renderer(
+                &graphics,
+                &factory_gpu,
+                surface,
+                target,
+                hdr,
+                max_nits,
+                brightness,
+            )
         }))
-        .run(move || view! { Panel(file = file.clone()) })
+        .run(move || {
+            view! {
+                Panel(file = file.clone(), brightness = brightness, max_nits = max_nits)
+            }
+        })
         .map_err(|error| anyhow::anyhow!("zgui: {error}"))
 }
 
@@ -54,6 +74,9 @@ fn dxgi_renderer(
     gpu: &Arc<Gpu>,
     surface: &Arc<dyn Surface>,
     target: RenderTarget,
+    hdr: HdrMode,
+    max_nits: RwSignal<f64, LocalStorage>,
+    brightness: RwSignal<f64, LocalStorage>,
 ) -> Result<Box<dyn Renderer>, AppError> {
     let gpu_surface = Arc::clone(surface)
         .gpu_shared()
@@ -67,16 +90,54 @@ fn dxgi_renderer(
     let height = u32::try_from(target.size.height)
         .map_err(|_| dxgi_error("the target height is not positive"))?;
 
-    let swapchain = DxgiSwapchain::new(gpu, hwnd, width, height)
+    let swapchain = DxgiSwapchain::new(gpu, hwnd, width, height, hdr)
         .map_err(|error| dxgi_error(format!("{error:#}")))?;
-    let textures = swapchain.textures();
+
+    let monitor_max = swapchain.max_luminance();
+    eprintln!(
+        "DXGI: {}x{}, {:?}, HDR {}, peak {monitor_max} nits",
+        target.size.width,
+        target.size.height,
+        swapchain.format(),
+        swapchain.hdr()
+    );
+    let max = if monitor_max > 0.0 {
+        f64::from(monitor_max)
+    } else {
+        1000.0
+    };
+    max_nits.set(max);
+    if brightness.get_untracked() > max {
+        brightness.set(max);
+    }
+
+    let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("video.ui"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let ui_view = ui.create_view(&wgpu::TextureViewDescriptor::default());
+    let compositor = Compositor::new(gpu.device(), &ui_view, swapchain.format(), swapchain.hdr());
+
     let renderer = graphics
-        .renderer_supplied(target, textures)
+        .renderer_supplied(target, vec![ui])
         .map_err(AppError::from)?;
     Ok(Box::new(DxgiRenderer::new(
         renderer,
         swapchain,
         Arc::clone(gpu),
+        ui_view,
+        compositor,
+        brightness,
     )))
 }
 
@@ -85,13 +146,22 @@ fn dxgi_error(reason: impl Into<String>) -> AppError {
 }
 
 #[component]
-fn Panel(file: String) -> impl IntoView {
-    let video = SurfaceHandle::new(SurfaceConfig {
+fn Panel(
+    file: String,
+    brightness: RwSignal<f64, LocalStorage>,
+    max_nits: RwSignal<f64, LocalStorage>,
+) -> impl IntoView {
+    let source = SurfaceHandle::new(SurfaceConfig {
         premultiplied: true,
         intrinsic: SurfaceIntrinsic::ratio(16.0 / 9.0),
     });
-    pattern::spawn(video.clone());
+    if file.is_empty() {
+        pattern::spawn(source.clone());
+    } else {
+        video::spawn(source.clone(), PathBuf::from(&file));
+    }
 
+    eprintln!("UI: brightness slider max {} nits", max_nits.get_untracked());
     let clicks = RwSignal::new(0u32);
 
     view! {
@@ -101,10 +171,22 @@ fn Panel(file: String) -> impl IntoView {
             }
             {zgui::elements::surface()
                 .class("preview")
-                .source(&video)
+                .source(&source)
                 .into_view()}
+            row(class = "brightness") {
+                label(class = "hint") { "HDR test" }
+                Slider(
+                    value = brightness,
+                    min = 0.0,
+                    max = max_nits.get_untracked(),
+                    step = 10.0,
+                    label = "Brightness (nits)".to_owned(),
+                    class = "slider",
+                )
+                label(class = "count") {{move || format!("{:.0} / {:.0} nits", brightness.get(), max_nits.get())}}
+            }
             row(class = "footer") {
-                label(class = "hint") {{move || file.clone()}}
+                label(class = "hint") {{move || if file.is_empty() { "no file selected".to_owned() } else { file.clone() }}}
                 control(class = "button", on:click = move |_| clicks.update(|count| *count += 1)) {
                     "click"
                 }
@@ -141,10 +223,19 @@ const SHEET: &str = css!(
 
     .preview {
         width: 900px;
-        height: 506px;
+        height: 470px;
         border-radius: 12px;
         overflow: hidden;
         border: 1px solid #2c3342;
+    }
+
+    .brightness {
+        align-items: center;
+        gap: 14px;
+    }
+
+    .slider {
+        width: 380px;
     }
 
     .footer {

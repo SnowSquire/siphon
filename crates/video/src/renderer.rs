@@ -13,6 +13,9 @@ use std::time::Duration;
 
 use zgui::atlas::TextureSink;
 use zgui::bits::DamageSet;
+use zgui::prelude::GetUntracked as _;
+use zgui::reactive::LocalStorage;
+use zgui::reactive::RwSignal;
 use zgui::render::ExternalTexture;
 use zgui::render::FrameOutcome;
 use zgui::render::MemoryReport;
@@ -24,35 +27,66 @@ use zgui::render::TargetPoolReport;
 use zgui::render::TextureHandle;
 use zgui::render::VectorStatus;
 use zgui::scene::Scene;
+use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::WgpuRenderer;
 
+use crate::composite::Compositor;
 use crate::dxgi::DxgiSwapchain;
 
 pub struct DxgiRenderer {
     inner: WgpuRenderer,
     swapchain: Rc<RefCell<DxgiSwapchain>>,
     gpu: Arc<Gpu>,
+    /// Kept alive for the compositor's bind group.
+    _ui_view: wgpu::TextureView,
+    compositor: Compositor,
+    brightness: RwSignal<f64, LocalStorage>,
 }
 
 impl DxgiRenderer {
-    pub fn new(inner: WgpuRenderer, swapchain: DxgiSwapchain, gpu: Arc<Gpu>) -> Self {
+    pub fn new(
+        inner: WgpuRenderer,
+        swapchain: DxgiSwapchain,
+        gpu: Arc<Gpu>,
+        ui_view: wgpu::TextureView,
+        compositor: Compositor,
+        brightness: RwSignal<f64, LocalStorage>,
+    ) -> Self {
         Self {
             inner,
             swapchain: Rc::new(RefCell::new(swapchain)),
             gpu,
+            _ui_view: ui_view,
+            compositor,
+            brightness,
         }
     }
 
-    /// Presents a frame that reached the supplied backbuffer.
+    /// Composites the UI into the current backbuffer and presents it.
     ///
-    /// The copy into the imported image is wgpu work, so wait for it before DXGI
-    /// hands the buffer to the compositor. This is a coarse wait and the first
-    /// thing to replace with a fence or semaphore once timing matters.
+    /// The copy into the UI texture and the composite are wgpu work on one
+    /// queue, so the composite sees the frame's pixels. The wait before
+    /// `Present1` is coarse and the first thing to replace with a fence.
+    #[allow(clippy::cast_possible_truncation)]
     fn present(&self, outcome: FrameOutcome) -> FrameOutcome {
         if matches!(outcome, FrameOutcome::Presented(_) | FrameOutcome::Recovered) {
+            let index = self.swapchain.borrow().current_index();
+            let view = self.swapchain.borrow().view(index).cloned();
+            if let Some(view) = view {
+                let mut encoder = self
+                    .gpu
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("video.composite"),
+                    });
+                let nits = self.brightness.get_untracked() as f32;
+                self.compositor
+                    .render(self.gpu.queue(), &mut encoder, &view, nits);
+                self.gpu.queue().submit([encoder.finish()]);
+            }
             self.gpu.wait();
-            if let Err(error) = self.swapchain.borrow_mut().present() {
+            if let Err(error) = self.swapchain.borrow().present() {
                 eprintln!("DXGI present failed: {error:#}");
             }
         }
@@ -74,9 +108,10 @@ impl Renderer for DxgiRenderer {
     }
 
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
-        let index = self.swapchain.borrow().current_index() as usize;
-        if !self.inner.present_into(index) {
-            eprintln!("DXGI backbuffer index {index} is outside the supplied textures");
+        // The inner renderer has one destination: the UI texture. The DXGI
+        // backbuffer is chosen by the compositor's pass, not here.
+        if !self.inner.present_into(0) {
+            eprintln!("the UI texture was not supplied");
         }
         let outcome = self.inner.draw(scene, damage);
         self.present(outcome)

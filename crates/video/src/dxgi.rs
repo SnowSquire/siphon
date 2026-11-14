@@ -5,6 +5,7 @@
 //! backbuffer to DXGI. There is no `VkSurfaceKHR` and no `VkSwapchainKHR`.
 
 use std::ffi::c_void;
+use std::mem::size_of;
 
 use anyhow::Context as _;
 use anyhow::anyhow;
@@ -27,21 +28,28 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::Win32::Graphics::Direct3D12::ID3D12DeviceChild;
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 use windows::Win32::Graphics::Dxgi::CreateDXGIFactory2;
 use windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS;
+use windows::Win32::Graphics::Dxgi::DXGI_HDR_METADATA_HDR10;
+use windows::Win32::Graphics::Dxgi::DXGI_HDR_METADATA_TYPE_HDR10;
 use windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS;
 use windows::Win32::Graphics::Dxgi::DXGI_SCALING_NONE;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1;
+use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
 use windows::Win32::Graphics::Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT;
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter4;
 use windows::Win32::Graphics::Dxgi::IDXGIFactory7;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput;
+use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain3;
+use windows::Win32::Graphics::Dxgi::IDXGISwapChain4;
 use windows::core::Interface as _;
 use windows::core::PCWSTR;
 use zgui::surface::wgpu;
@@ -51,11 +59,26 @@ use zgui_render_wgpu::Gpu;
 /// give the compositor more slack.
 const BUFFERS: u32 = 2;
 
+/// The Vulkan spelling of the 10-bit swapchain format.
+const VK_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
+
+/// What to do with HDR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum HdrMode {
+    /// Enable HDR when the display is already in HDR mode.
+    #[default]
+    Auto,
+    /// Require HDR; fail if the display cannot present PQ/Rec.2020.
+    On,
+    /// Present SDR.
+    Off,
+}
+
 /// One D3D12 swapchain and the wgpu textures that stand for its backbuffers.
 pub struct DxgiSwapchain {
-    /// The textures ZGUI copies into. Declared first so they are dropped before the
-    /// handles and D3D12 resources their release callbacks close.
-    textures: Vec<wgpu::Texture>,
+    /// Views of the backbuffers; each keeps its imported texture alive. Declared
+    /// before the handles and D3D12 resources so the release callbacks run first.
+    views: Vec<wgpu::TextureView>,
     /// The NT handles the Vulkan memories were imported from.
     shared_handles: Vec<HANDLE>,
     /// The D3D12 resources themselves, kept alive while the Vulkan images exist.
@@ -67,6 +90,9 @@ pub struct DxgiSwapchain {
     /// Kept alive with the swapchain; the shared handles came from it.
     #[expect(dead_code, reason = "D3D12 objects the swapchain is associated with")]
     device: ID3D12Device,
+    format: wgpu::TextureFormat,
+    hdr: bool,
+    max_luminance: f32,
 }
 
 impl DxgiSwapchain {
@@ -75,7 +101,13 @@ impl DxgiSwapchain {
         clippy::borrow_as_ptr,
         reason = "the Windows bindings take pointers to descriptors"
     )]
-    pub fn new(gpu: &Gpu, hwnd: HWND, width: u32, height: u32) -> anyhow::Result<Self> {
+    pub fn new(
+        gpu: &Gpu,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        hdr: HdrMode,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
 
         // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
@@ -119,7 +151,7 @@ impl DxgiSwapchain {
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: DXGI_FORMAT_R10G10B10A2_UNORM,
             Stereo: FALSE,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -142,8 +174,11 @@ impl DxgiSwapchain {
         unsafe { factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }
             .context("MakeWindowAssociation")?;
 
+        let (hdr, max_luminance) = configure_hdr(&swapchain, hdr)?;
+        let format = wgpu::TextureFormat::Rgb10a2Unorm;
+
         let instance = hal_adapter.shared_instance().raw_instance();
-        let mut textures = Vec::with_capacity(BUFFERS as usize);
+        let mut views = Vec::with_capacity(BUFFERS as usize);
         let mut shared_handles = Vec::with_capacity(BUFFERS as usize);
         let mut backbuffers = Vec::with_capacity(BUFFERS as usize);
 
@@ -167,29 +202,36 @@ impl DxgiSwapchain {
             // SAFETY: the image is created on the same device and memory is bound to it
             // below; the callback destroys both exactly once, after wgpu has let go.
             let texture = unsafe {
-                import_backbuffer(gpu, &hal_device, instance, handle, width, height)
+                import_backbuffer(
+                    gpu,
+                    &hal_device,
+                    instance,
+                    handle,
+                    width,
+                    height,
+                    format,
+                    VK_FORMAT,
+                )
             }
             .with_context(|| format!("import backbuffer {index}"))?;
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-            textures.push(texture);
+            views.push(view);
             shared_handles.push(handle);
             backbuffers.push(resource);
         }
 
         Ok(Self {
-            textures,
+            views,
             shared_handles,
             backbuffers,
             swapchain,
             queue,
             device,
+            format,
+            hdr,
+            max_luminance,
         })
-    }
-
-    /// The textures to hand to `SharedGraphics::renderer_supplied`.
-    #[must_use]
-    pub fn textures(&self) -> Vec<wgpu::Texture> {
-        self.textures.clone()
     }
 
     /// The backbuffer DXGI will present next.
@@ -197,6 +239,30 @@ impl DxgiSwapchain {
     pub fn current_index(&self) -> u32 {
         // SAFETY: the swapchain is alive for the borrow.
         unsafe { self.swapchain.GetCurrentBackBufferIndex() }
+    }
+
+    /// A view of backbuffer `index`, for the compositor to draw into.
+    #[must_use]
+    pub fn view(&self, index: u32) -> Option<&wgpu::TextureView> {
+        self.views.get(usize::try_from(index).ok()?)
+    }
+
+    /// The format every backbuffer uses.
+    #[must_use]
+    pub const fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    /// Whether the swapchain is presenting PQ/Rec.2020.
+    #[must_use]
+    pub const fn hdr(&self) -> bool {
+        self.hdr
+    }
+
+    /// The display's reported peak luminance in nits, or zero when unknown.
+    #[must_use]
+    pub const fn max_luminance(&self) -> f32 {
+        self.max_luminance
     }
 
     /// Hands the current backbuffer to the compositor.
@@ -249,6 +315,72 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
     })
 }
 
+/// Puts the swapchain in HDR when requested and available.
+fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(bool, f32)> {
+    // SAFETY: the swapchain is alive for the call.
+    let output = unsafe { swapchain.GetContainingOutput() }.context("GetContainingOutput")?;
+    let output6: IDXGIOutput6 = output.cast().context("IDXGIOutput6")?;
+    // SAFETY: `output6` is a live output.
+    let desc = unsafe { output6.GetDesc1() }.context("GetDesc1")?;
+    // SAFETY: the swapchain is alive for the call.
+    let support = unsafe {
+        swapchain.CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+    }
+    .context("CheckColorSpaceSupport")?;
+    let supported = support & (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) != 0;
+
+    let active = match mode {
+        HdrMode::Off => false,
+        HdrMode::On => {
+            anyhow::ensure!(supported, "the display does not support PQ/Rec.2020");
+            true
+        }
+        HdrMode::Auto => {
+            supported && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+        }
+    };
+
+    let space = if active {
+        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+    } else {
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    };
+    // SAFETY: the swapchain is alive and `space` is one it just reported supporting
+    // (or the default SDR space).
+    unsafe { swapchain.SetColorSpace1(space) }.context("SetColorSpace1")?;
+    if active {
+        set_hdr_metadata(swapchain)?;
+    }
+    Ok((active, desc.MaxLuminance))
+}
+
+/// Publishes the mastering metadata for the HDR10 container.
+fn set_hdr_metadata(swapchain: &IDXGISwapChain3) -> anyhow::Result<()> {
+    let swapchain4: IDXGISwapChain4 = swapchain.cast().context("IDXGISwapChain4")?;
+    let metadata = DXGI_HDR_METADATA_HDR10 {
+        // Rec.2020 primaries and D65 white, in 1/50000 units.
+        RedPrimary: [35400, 14600],
+        GreenPrimary: [8500, 39850],
+        BluePrimary: [6550, 2300],
+        WhitePoint: [15635, 16450],
+        // 1000 nits mastering, 0.005 nits black, 1000/400 nits content.
+        MaxMasteringLuminance: 1000,
+        MinMasteringLuminance: 50,
+        MaxContentLightLevel: 1000,
+        MaxFrameAverageLightLevel: 400,
+    };
+    // SAFETY: the struct is plain data and the slice covers exactly it.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const metadata).cast::<u8>(),
+            size_of::<DXGI_HDR_METADATA_HDR10>(),
+        )
+    };
+    // SAFETY: the swapchain is alive and `bytes` outlives the call.
+    unsafe { swapchain4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, Some(bytes)) }
+        .context("SetHDRMetaData")
+}
+
 /// Creates a Vulkan image over a D3D12 backbuffer's shared memory and wraps it in wgpu.
 ///
 /// # Safety
@@ -256,6 +388,10 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
 /// `handle` must be an NT handle from `ID3D12Device::CreateSharedHandle` for a
 /// texture matching `width`, `height` and the format assumed here, and `device` must be
 /// the Vulkan device the handle was created for.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one imported image, all of its handles are separate"
+)]
 unsafe fn import_backbuffer(
     gpu: &Gpu,
     device: &wgpu::hal::vulkan::Device,
@@ -263,6 +399,8 @@ unsafe fn import_backbuffer(
     handle: HANDLE,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
+    vk_format: vk::Format,
 ) -> anyhow::Result<wgpu::Texture> {
     let raw = device.raw_device();
     let physical = device.raw_physical_device();
@@ -272,7 +410,7 @@ unsafe fn import_backbuffer(
         .handle_types(vk::ExternalMemoryHandleTypeFlags::D3D12_RESOURCE);
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::B8G8R8A8_UNORM)
+        .format(vk_format)
         .extent(vk::Extent3D {
             width,
             height,
@@ -367,7 +505,7 @@ unsafe fn import_backbuffer(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8Unorm,
+        format,
         usage: wgpu::TextureUses::COLOR_TARGET,
         memory_flags: wgpu::hal::MemoryFlags::empty(),
         view_formats: Vec::new(),
@@ -389,7 +527,7 @@ unsafe fn import_backbuffer(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8Unorm,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     };
