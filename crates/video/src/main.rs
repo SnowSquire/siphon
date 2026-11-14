@@ -9,7 +9,13 @@ mod composite;
 #[cfg(windows)]
 mod dxgi;
 #[cfg(windows)]
+mod gpu;
+#[cfg(windows)]
+mod hw;
+#[cfg(windows)]
 mod pattern;
+#[cfg(windows)]
+mod placebo;
 #[cfg(windows)]
 mod renderer;
 #[cfg(windows)]

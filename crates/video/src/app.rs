@@ -32,10 +32,28 @@ pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
     let file = file.map_or_else(String::new, |path| path.display().to_string());
     let test_pattern = file.is_empty();
 
-    let graphics = SharedGraphics::with_backends(wgpu::Backends::VULKAN);
-    let gpu = graphics
-        .open_gpu()
-        .map_err(|error| anyhow::anyhow!("no Vulkan device: {error}"))?;
+    let (gpu, decode) = crate::gpu::create()?;
+    match decode {
+        Some(video) => eprintln!(
+            "vulkan video: decoding HEVC on queue family {} (ops {:#x})",
+            video.family, video.operations
+        ),
+        None => eprintln!("vulkan video: this device has no hardware HEVC decode"),
+    }
+    if !file.is_empty() {
+        let video = decode
+            .ok_or_else(|| anyhow::anyhow!("this device has no Vulkan video decode"))?;
+        crate::hw::probe(&gpu, std::path::Path::new(&file), video)?;
+    }
+    let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
+    let placebo = crate::placebo::Placebo::import(&gpu)
+        .map_err(|error| anyhow::anyhow!("libplacebo: {error:#}"))?;
+    eprintln!(
+        "libplacebo: imported (API {}, gpu {:?}, renderer {:?})",
+        ffcine_libplacebo_sys::PL_API_VER,
+        placebo.gpu(),
+        placebo.renderer()
+    );
 
     let factory_gpu = Arc::clone(&gpu);
 

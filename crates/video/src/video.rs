@@ -24,14 +24,27 @@ use zgui::surface::SurfaceIntrinsic;
 use zgui::surface::wgpu;
 
 pub fn spawn(handle: SurfaceHandle, path: PathBuf) {
+    // Install the event sink before the view is built. `Attached` is emitted
+    // once, when the surface element is mounted; a sink installed after that
+    // would miss it and wait forever for a device that already exists.
+    let (events, receiver) = mpsc::channel();
+    handle.set_events(move |event| {
+        let _ = events.send(event);
+    });
+    handle.set_intrinsic(SurfaceIntrinsic::ratio(16.0 / 9.0));
+
     thread::spawn(move || {
-        if let Err(error) = play(&handle, &path) {
+        if let Err(error) = play(&handle, &receiver, &path) {
             eprintln!("video: {error:#}");
         }
     });
 }
 
-fn play(handle: &SurfaceHandle, path: &Path) -> anyhow::Result<()> {
+fn play(
+    handle: &SurfaceHandle,
+    receiver: &mpsc::Receiver<SurfaceEvent>,
+    path: &Path,
+) -> anyhow::Result<()> {
     let mut input = format::input(path).with_context(|| format!("open {}", path.display()))?;
     let (stream_index, mut decoder, frame_rate) = {
         let stream = input
@@ -47,11 +60,6 @@ fn play(handle: &SurfaceHandle, path: &Path) -> anyhow::Result<()> {
     let height = decoder.height();
     #[allow(clippy::cast_precision_loss)]
     handle.set_intrinsic(SurfaceIntrinsic::size(width as f32, height as f32));
-
-    let (events, receiver) = mpsc::channel();
-    handle.set_events(move |event| {
-        let _ = events.send(event);
-    });
 
     // Wait for the element to be mounted so the device and its epoch are known.
     let mut visible = true;
@@ -76,7 +84,7 @@ fn play(handle: &SurfaceHandle, path: &Path) -> anyhow::Result<()> {
         }
         decoder.send_packet(&packet)?;
         while decoder.receive_frame(&mut picture).is_ok() {
-            drain_events(&receiver, &mut gpu, &mut visible);
+            drain_events(receiver, &mut gpu, &mut visible);
             if !visible {
                 continue;
             }
@@ -87,7 +95,7 @@ fn play(handle: &SurfaceHandle, path: &Path) -> anyhow::Result<()> {
 
     decoder.send_eof()?;
     while decoder.receive_frame(&mut picture).is_ok() {
-        drain_events(&receiver, &mut gpu, &mut visible);
+        drain_events(receiver, &mut gpu, &mut visible);
         if visible {
             present(handle, &gpu, &picture, &mut scaler, &mut rgba)?;
             thread::sleep(interval);
