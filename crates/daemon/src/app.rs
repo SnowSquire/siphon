@@ -595,8 +595,7 @@ impl App {
                 .get(&view.key)
                 .is_none_or(|old| old != &view);
             if changed {
-                self.bus
-                    .publish(Update::PipelineUpsert(view.clone()));
+                self.bus.publish(Update::PipelineUpsert(view.clone()));
             }
             seen.push(view.key.clone());
             self.last_pipelines.insert(view.key.clone(), view);

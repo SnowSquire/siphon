@@ -380,6 +380,32 @@ mod tests {
                 .unwrap();
             assert!(matches!(response, Response::Ack));
             next_pipeline(&events, "sunnys", true).await;
+
+            // A one-shot recording starts without a persisted monitor and can
+            // be stopped again with the same lifecycle.
+            let key = siphon_rpc::StreamKey::new("sunnys", None);
+            let response = client
+                .request(Request::RecordOnce {
+                    login: "sunnys".to_owned(),
+                    quality: None,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(response, Response::Ack));
+            next_pipeline(&events, "sunnys", false).await;
+
+            let response = client
+                .request(Request::DisconnectViewers(key.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(response, Response::Ack));
+
+            let response = client
+                .request(Request::PipelineStop { key, force: false })
+                .await
+                .unwrap();
+            assert!(matches!(response, Response::Ack));
+            next_pipeline(&events, "sunnys", true).await;
         });
         let _ = std::fs::remove_dir_all(dir);
     }
