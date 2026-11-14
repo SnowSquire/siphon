@@ -12,7 +12,7 @@ workers, the listeners.
 
 ## CLI
 
-`twitch-hls-client2 daemon [--bind <addr>] [--max-streams N]`. The old
+`daemon daemon [--bind <addr>] [--max-streams N]`. The old
 behaviour moved under an explicit `play` subcommand (`-c/--channel` and
 `-q/--quality` live there). `--bind` defaults to `127.0.0.1:7417`; `daemon`
 binds exactly that address, so the dual-loopback-family fallback is only in

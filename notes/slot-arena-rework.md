@@ -1,6 +1,6 @@
 # Slot arena rework
 
-Status: implemented in `crates/twitch/src/{arena,spool,constants}.rs`. This note
+Status: implemented in `crates/daemon/src/{arena,spool,constants}.rs`. This note
 keeps the reasoning, which is not obvious from the code.
 
 ## Problem

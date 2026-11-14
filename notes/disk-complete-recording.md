@@ -1,6 +1,6 @@
 # Disk output: complete-broadcast recording
 
-Status: implemented in `crates/twitch/src/disk.rs` (v4 index).  `--output` on
+Status: implemented in `crates/daemon/src/disk.rs` (v4 index).  `--output` on
 both `play` and `daemon`; `index.hexpat` mirrors the format.  `disk.rs` replaces
 the disabled v3 implementation wholesale.
 
@@ -295,7 +295,7 @@ hash-verified (there are few), so a torn map is detected rather than played.
   broadcast checked earlier has the same 1218-byte init
   (`sha256 082d5b2e…786f0c6`) on live, public VOD and private DVR, so its hole
   copies insert nothing.
-- `ffprobe` the `segs`; `cargo +nightly miri test -p twitch-hls-client2` for the
+- `ffprobe` the `segs`; `cargo +nightly miri test -p daemon` for the
   arena/spool changes.
 
 ## Deferred

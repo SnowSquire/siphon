@@ -45,7 +45,7 @@ pub fn build(
         .filter(|&character| !character.is_control())
         .collect();
     let title = match title.trim() {
-        "" => "twitch-hls-client2",
+        "" => "daemon",
         title => title,
     };
 

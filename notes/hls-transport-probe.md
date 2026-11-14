@@ -199,7 +199,7 @@ ALPN set to `[h2, http/1.1]`, per-read timing, and a CTE parser that logs the
 declared chunk size before reading it.
 
 ```sh
-RUST_LOG=info ./target/debug/twitch-hls-client2 -c sunnys
+RUST_LOG=info ./target/debug/daemon -c sunnys
 ```
 
 ## 5. Results

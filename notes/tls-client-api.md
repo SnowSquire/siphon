@@ -336,7 +336,7 @@ mostly expires.
 4. The cost that is *not* paid: read sizing. `unbuffered` lets us read 64 KiB at
    a time, same as `AsyncStream(64K)`, so the syscall count is already solved.
 
-Shape, confined to `crates/twitch/src/http/tls.rs`:
+Shape, confined to `crates/daemon/src/http/tls.rs`:
 
 ```rust
 // public surface of the transport module — no rustls types outside tls.rs

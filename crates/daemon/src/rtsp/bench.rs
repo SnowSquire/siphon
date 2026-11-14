@@ -11,16 +11,16 @@
 //! with:
 //!
 //! ```text
-//! cargo test -p twitch-hls-client2 --release -- --ignored --nocapture throughput
+//! cargo test -p daemon --release -- --ignored --nocapture throughput
 //! ```
 //!
 //! For a Linux test box, cross-compile instead of building there: zig supplies
 //! the musl toolchain and linker, so the target needs no compiler at all.
 //!
 //! ```text
-//! cargo zigbuild --release --tests -p twitch-hls-client2 --target x86_64-unknown-linux-musl
-//! scp target/x86_64-unknown-linux-musl/release/deps/twitch_hls_client2-* host:~/bench/
-//! ssh host 'cd ~/bench && taskset -c 2 ./twitch_hls_client2-* throughput --ignored --nocapture'
+//! cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl
+//! scp target/x86_64-unknown-linux-musl/release/deps/daemon-* host:~/bench/
+//! ssh host 'cd ~/bench && taskset -c 2 ./daemon-* throughput --ignored --nocapture'
 //! ```
 //!
 //! Run it from a directory that holds `servermock/` (the binary carries the

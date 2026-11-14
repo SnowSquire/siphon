@@ -100,7 +100,7 @@ type RtpPacket = Rc<Vec<u8>>;
 const PTS_WRAP: i64 = 1 << 33;
 
 const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
-const SDES_CNAME: &[u8] = b"twitch-hls-client2";
+const SDES_CNAME: &[u8] = b"daemon";
 
 /// Identity of one RTSP presentation: a channel login and an optional
 /// `STABLE-VARIANT-ID`. `None` means the first variant, like `play`'s default.

@@ -216,7 +216,7 @@ like `StreamKey`; changing quality is remove + add.
 - `crates/rpc`: serde message types, `postcard` codec, frame decoder, compio
   client. No ZGUI and no daemon internals, so the UI and the daemon can share
   it. Name it `siphon-rpc` once the app rename lands.
-- `crates/twitch`: the daemon app and the RPC server module; `daemon.rs`
+- `crates/daemon`: the daemon app and the RPC server module; `daemon.rs`
   becomes the backend owner.
 - `crates/siphon`: the UI, brought back into the workspace, depending on
   `crates/rpc`. `crates/tray` goes away when it lands.
@@ -246,7 +246,7 @@ like `StreamKey`; changing quality is remove + add.
   against a freshly built snapshot (debug hash).
 - Monitor lifecycle in `--debug`: add, activate, DESCRIBE upgrade, remove,
   restart; no network.
-- `cargo clippy -p twitch-hls-client2 --all-targets`, `cargo +nightly fmt`.
+- `cargo clippy -p daemon --all-targets`, `cargo +nightly fmt`.
   No new unsafe in the RPC path, so no Miri requirement.
 
 ## Open questions

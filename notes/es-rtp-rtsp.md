@@ -1,6 +1,6 @@
 # ES-RTP / RTSP output design
 
-Status: implemented for the TS source (H.264 + AAC) in `crates/twitch/src/rtsp/`.
+Status: implemented for the TS source (H.264 + AAC) in `crates/daemon/src/rtsp/`.
 Disk output is disabled while this is the only sink. fMP4 / HEVC / AV1 are still
 design-only.
 

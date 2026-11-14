@@ -26,12 +26,12 @@ only sink; disk output is disabled and being rebuilt from
 
 ## Commands
 
-- Build/check: `cargo clippy -p twitch-hls-client2`, `cargo build -p twitch-hls-client2`
-- Lint: `cargo clippy -p twitch-hls-client2 --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean.
-- Format: `cargo +nightly fmt` — `crates/twitch/rustfmt.toml` uses unstable options (import grouping/granularity, `reorder_impl_items`, LF) that stable `cargo fmt` silently ignores.
-- Tests: `cargo test -p twitch-hls-client2` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
-- Benchmark: `cargo test -p twitch-hls-client2 --release -- --ignored --nocapture throughput` (demux/packetize over `servermock/segments`). Cross-compile: `cargo zigbuild --release --tests -p twitch-hls-client2 --target x86_64-unknown-linux-musl`.
-- Miri: `cargo +nightly miri test -p twitch-hls-client2` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
+- Build/check: `cargo clippy -p daemon`, `cargo build -p daemon`
+- Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean.
+- Format: `cargo +nightly fmt` — `crates/daemon/rustfmt.toml` uses unstable options (import grouping/granularity, `reorder_impl_items`, LF) that stable `cargo fmt` silently ignores.
+- Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
+- Benchmark: `cargo test -p daemon --release -- --ignored --nocapture throughput` (demux/packetize over `servermock/segments`). Cross-compile: `cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl`.
+- Miri: `cargo +nightly miri test -p daemon` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
 
 ## Terminology
 
@@ -47,7 +47,7 @@ only sink; disk output is disabled and being rebuilt from
 `--debug` bypasses Twitch and fetches `http://127.0.0.2:8000/index.m3u8`.
 
 1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs real files in `servermock/segments/` (~556 MB, gitignored); the worktree hook hardlinks `segments/` and `captures/` from the base checkout. `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
-2. `cargo run -p twitch-hls-client2 -- play -c anything -d` — `-c` is required even in debug mode; broadcast id `0`.
+2. `cargo run -p daemon -- play -c anything -d` — `-c` is required even in debug mode; broadcast id `0`.
 3. `play` serves `rtsp://127.0.0.1:7417/` and `rtsp://[::1]:7417/`; `daemon` binds `--bind` (default `127.0.0.1:7417`) and serves `rtsp://host/<channel>/<quality>/`; DESCRIBE creates the stream.
 4. `ffplay -nodisp rtsp://127.0.0.1:7417/` and `ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:7417/` are the end-to-end checks (`.../sunnys/1080p/` under `daemon -d`).
 
@@ -78,7 +78,7 @@ detail: `notes/architecture.md`.
 7. A completion read learns its size from the buffer capacity; `reserve` a fresh `Vec` first.
 8. Every panic is fatal (`abort_on_panic`); `main` returns a `Result`.
 9. The manifest poll is the only polling; everything else is event-driven.
-10. `crates/twitch/src/index.hexpat` mirrors the on-disk format; keep both in sync.
+10. `crates/daemon/src/index.hexpat` mirrors the on-disk format; keep both in sync.
 
 ## Repo conventions
 

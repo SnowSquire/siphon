@@ -1,10 +1,10 @@
 #:schema https://www.schemastore.org/cargo.json
 
 [package]
-name = "twitch-hls-client2"
+name = "daemon"
 version = "0.1.0"
 edition = "2024"
-description = "A package to consume streams from twitch.tv in a variety of ways"
+description = "Siphon backend: Twitch HLS pipelines over RTSP, with monitors and RPC"
 authors = ["Ozeniken"]
 
 

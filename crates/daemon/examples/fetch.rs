@@ -1,7 +1,7 @@
 //! Throwaway smoke test for the compio runtime, the completion IO path and (later)
 //! the custom HTTP client. Not part of the shipped binary.
 //!
-//! `cargo run -p twitch-hls-client2 --example fetch -- http://127.0.0.2:8000/index.m3u8`
+//! `cargo run -p daemon --example fetch -- http://127.0.0.2:8000/index.m3u8`
 
 use std::io::Write;
 
