@@ -224,7 +224,7 @@ impl UiRenderer {
                 return;
             }
         };
-        let inner = match self
+        let mut inner = match self
             .graphics
             .renderer_supplied(target, vec![ui_texture.clone()])
         {
@@ -234,6 +234,13 @@ impl UiRenderer {
                 return;
             }
         };
+        // The atlas *policy* lives above the renderer: the scene names its
+        // glyph and image tiles by texture id and the window's content cache
+        // believes those tiles are resident. A fresh renderer starts with
+        // empty atlas textures, so without moving the old ones over every
+        // piece of text would be sampled from a texture that no longer
+        // exists. Rects are plain geometry and survive either way.
+        std::mem::swap(self.inner.atlas(), inner.atlas());
 
         self.targets = targets;
         self.ui = ui;

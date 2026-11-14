@@ -309,10 +309,15 @@ The swapchain is imported into Vulkan with `pl_vulkan_import`, so there is no
 `VkSurfaceKHR`/`VkSwapchainKHR`. On a target extent change the renderer drops
 the old swapchain first (DXGI allows one flip chain per window), then recreates
 the swapchain, the ZGUI texture, its libplacebo views and the inner renderer.
-There are no external textures to lose: RPC events and tray actions are drained
-by a 100 ms `set_interval` in the view, not by a surface pump. HDR is off for
-now (`HdrMode::Off`), but the SDR white point still comes from DisplayConfig;
-the video pass and HDR transfer functions are the later work.
+The inner renderer's atlas textures are moved onto the replacement: the atlas
+*policy* (which tile holds which glyph) lives in the window's content cache,
+above the renderer, and it believes every tile it placed is resident. A fresh
+empty atlas would therefore draw the rectangles and nothing else — the scene
+still names glyph tiles no texture backs. There are no external textures to
+lose: RPC events and tray actions are drained by a 100 ms `set_interval` in the
+view, not by a surface pump. HDR is off for now (`HdrMode::Off`), but the SDR
+white point still comes from DisplayConfig; the video pass and HDR transfer
+functions are the later work.
 
 ZGUI's `surface` element is the video seam: a producer with its own cadence gets
 the shared `wgpu::Device`/`Queue`, creates textures on that device and
