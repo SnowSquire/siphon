@@ -21,5 +21,15 @@
       "branch": "master",
       "description": "mpv player sources - reference for how RTSP start_time, duration and live streams are displayed",
     },
+    "zgui": {
+      "repository": "zortax/zgui",
+      "branch": "main",
+      "description": "zgui native Rust UI (fine-grained reactive, wgpu/Vello renderer) - reference for surface elements, external textures, Gpu::from_existing, renderer_supplied and the wgpu 29.0.4/ash 0.38 pin",
+    },
+    "libplacebo": {
+      "repository": "haasn/libplacebo",
+      "branch": "master",
+      "description": "libplacebo sources - reference for pl_vulkan_import/hold/release, pl_vulkan_wrap, pl_render_image, swapchain and HDR color-space APIs",
+    },
   },
 }
