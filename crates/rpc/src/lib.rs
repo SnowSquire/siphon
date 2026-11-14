@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod endpoint;
 pub mod protocol;
 
 pub use client::Client;
@@ -18,6 +19,8 @@ pub use client::ConnectError;
 pub use codec::CodecError;
 pub use codec::FrameDecoder;
 pub use codec::FrameReader;
+pub use endpoint::admin_endpoint;
+pub use endpoint::probe;
 pub use protocol::ArenaSummary;
 pub use protocol::Channel;
 pub use protocol::ChannelView;

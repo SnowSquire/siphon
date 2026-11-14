@@ -159,9 +159,10 @@ struct Daemon {
     #[arg(long, default_value_t = default_bind())]
     bind: SocketAddr,
 
-    /// Address the admin RPC listener binds
-    #[arg(long, default_value_t = default_admin_bind())]
-    admin_bind: SocketAddr,
+    /// Admin RPC endpoint: a named pipe on Windows, a socket path on Unix.
+    /// Defaults to the per-app endpoint derived from the app id.
+    #[arg(long)]
+    admin: Option<String>,
 
     /// Do not listen for the UI
     #[arg(long)]
@@ -186,10 +187,6 @@ struct Daemon {
 
 fn default_bind() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_RTSP_PORT))
-}
-
-fn default_admin_bind() -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::LOCALHOST, 7418))
 }
 
 #[compio::main]
@@ -425,9 +422,12 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
 
     if !args.no_admin {
         let handle = handle.clone();
-        let admin_bind = args.admin_bind;
+        let endpoint = args
+            .admin
+            .clone()
+            .unwrap_or_else(|| siphon_rpc::admin_endpoint(config::APP_ID));
         compio::runtime::spawn(async move {
-            if let Err(error) = rpc::serve(admin_bind, handle).await {
+            if let Err(error) = rpc::serve(endpoint, handle).await {
                 error!(%error, "rpc: listener failed");
             }
         })
@@ -486,7 +486,7 @@ mod tests {
             panic!("expected daemon");
         };
         assert_eq!(args.bind.port(), 8554);
-        assert_eq!(args.admin_bind.port(), 7418);
+        assert!(args.admin.is_none());
         assert!(!args.no_admin);
         assert_eq!(args.max_streams, constants::MAX_STREAMS);
 

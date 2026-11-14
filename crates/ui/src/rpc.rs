@@ -26,9 +26,6 @@ use siphon_rpc::Request;
 use siphon_rpc::Snapshot;
 use siphon_rpc::Update;
 
-/// The daemon's admin listener on loopback.
-pub const BACKEND: &str = "127.0.0.1:7418";
-
 /// One UI action.
 #[derive(Debug)]
 pub enum UiCommand {
@@ -130,14 +127,11 @@ pub async fn run(
     wake: Arc<Wake>,
     events: kanal::Sender<UiEvent>,
 ) {
+    let endpoint = siphon_rpc::admin_endpoint(crate::service::APP_ID);
+    tracing::info!(target: "rpc", %endpoint, "admin endpoint");
     let mut backoff = Duration::from_secs(1);
     loop {
-        let connected = match Client::connect(
-            BACKEND.parse().expect("loopback address"),
-            env!("CARGO_PKG_VERSION"),
-        )
-        .await
-        {
+        let connected = match Client::connect(&endpoint, env!("CARGO_PKG_VERSION")).await {
             Ok((client, snapshot)) => {
                 backoff = Duration::from_secs(1);
                 let _ = events.try_send(UiEvent::Snapshot(Box::new(snapshot)));

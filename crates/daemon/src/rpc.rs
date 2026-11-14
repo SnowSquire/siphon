@@ -5,10 +5,10 @@
 //! by entity and disconnects a client that falls too far behind.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::io;
 
-use compio::net::TcpListener;
-use compio::net::TcpStream;
+use compio::io::AsyncRead;
+use compio::io::AsyncWrite;
 use siphon_rpc::ClientMessage;
 use siphon_rpc::FrameReader;
 use siphon_rpc::MAGIC;
@@ -17,40 +17,69 @@ use siphon_rpc::ServerMessage;
 use siphon_rpc::Update;
 use siphon_rpc::codec;
 use tracing::info;
+#[cfg(unix)]
 use tracing::warn;
 
 use crate::app::AppHandle;
 use crate::bus::Broadcast;
 use crate::bus::Outbound;
 
-/// Binds the admin address and serves forever.
-pub async fn serve(addr: SocketAddr, handle: AppHandle) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    serve_on(listener, handle).await
+/// Serves the admin endpoint forever.
+#[cfg(windows)]
+pub async fn serve(endpoint: String, handle: AppHandle) -> io::Result<()> {
+    use compio::fs::named_pipe::ServerOptions;
+
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&endpoint)?;
+    info!(%endpoint, "rpc: listening");
+    loop {
+        server.connect().await?;
+        let connected = server;
+        // Create the next instance before handing this one to a task, so a
+        // client never finds the pipe briefly absent.
+        server = ServerOptions::new().create(&endpoint)?;
+        compio::runtime::spawn(connection(connected, handle.clone())).detach();
+    }
 }
 
-/// Serves an already-bound listener. Split out so tests can use an ephemeral
-/// port without racing for its number.
-pub async fn serve_on(listener: TcpListener, handle: AppHandle) -> std::io::Result<()> {
-    let local = listener.local_addr()?;
-    info!(%local, "rpc: listening");
+/// Serves the admin endpoint forever.
+#[cfg(unix)]
+pub async fn serve(endpoint: String, handle: AppHandle) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use compio::net::UnixListener;
+
+    if siphon_rpc::probe(&endpoint) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "admin socket is already in use",
+        ));
+    }
+    let _ = std::fs::remove_file(&endpoint);
+    let listener = UnixListener::bind(&endpoint).await?;
+    std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600))?;
+    info!(%endpoint, "rpc: listening");
     loop {
         match listener.accept().await {
-            Ok((stream, peer)) => {
-                compio::runtime::spawn(connection(stream, peer, handle.clone())).detach();
+            Ok((stream, _)) => {
+                compio::runtime::spawn(connection(stream, handle.clone())).detach();
             }
             Err(error) => warn!(%error, "rpc: accept failed"),
         }
     }
 }
 
-async fn connection(stream: TcpStream, peer: SocketAddr, handle: AppHandle) {
-    let (mut read, mut write) = stream.into_split();
+async fn connection<S: AsyncRead + AsyncWrite + Clone + Unpin + 'static>(
+    stream: S,
+    handle: AppHandle,
+) {
+    let (mut read, mut write) = (stream.clone(), stream);
     let mut reader = FrameReader::new();
     let hello: ClientMessage = match reader.read(&mut read).await {
         Ok(message) => message,
         Err(error) => {
-            info!(%peer, %error, "rpc: handshake read failed");
+            info!(%error, "rpc: handshake read failed");
             return;
         }
     };
@@ -67,7 +96,7 @@ async fn connection(stream: TcpStream, peer: SocketAddr, handle: AppHandle) {
         let _ = codec::write(&mut write, &ServerMessage::Rejected(reason)).await;
         return;
     }
-    info!(%peer, %app_version, "rpc: client connected");
+    info!(%app_version, "rpc: client connected");
 
     let bus = handle.bus();
     let (subscriber, outbound) = bus.subscribe();
@@ -104,7 +133,7 @@ async fn connection(stream: TcpStream, peer: SocketAddr, handle: AppHandle) {
             }
             Ok(ClientMessage::Hello { .. }) => {}
             Err(error) => {
-                info!(%peer, %error, "rpc: client disconnected");
+                info!(%error, "rpc: client disconnected");
                 subscriber.close();
                 return;
             }
@@ -179,7 +208,7 @@ impl Coalescer {
     }
 }
 
-async fn writer(mut write: TcpStream, outbound_rx: kanal::Receiver<Outbound>) {
+async fn writer<W: AsyncWrite + Unpin>(mut write: W, outbound_rx: kanal::Receiver<Outbound>) {
     let outbound = outbound_rx.clone().to_async();
     loop {
         let Ok(first) = outbound.recv().await else {
@@ -221,7 +250,6 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use compio::net::TcpListener;
     use siphon_rpc::Channel;
     use siphon_rpc::Client;
     use siphon_rpc::ClientEvent;
@@ -341,15 +369,25 @@ mod tests {
             });
             compio::runtime::spawn(app.run()).detach();
 
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            compio::runtime::spawn(serve_on(listener, handle)).detach();
+            let endpoint = siphon_rpc::admin_endpoint(&format!(
+                "test-{}-{}",
+                std::process::id(),
+                dir.file_name().unwrap().to_string_lossy()
+            ));
+            let serve_endpoint = endpoint.clone();
+            compio::runtime::spawn(serve(serve_endpoint, handle)).detach();
+            for _ in 0..50 {
+                if siphon_rpc::probe(&endpoint) {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(20)).await;
+            }
 
-            let (client, snapshot) = Client::connect(addr, "test").await.unwrap();
+            let (client, snapshot) = Client::connect(&endpoint, "test").await.unwrap();
             assert_eq!(snapshot.channels.len(), 1);
             let events = client.events();
             // A second UI must receive the same entity updates.
-            let (second, second_snapshot) = Client::connect(addr, "test-2").await.unwrap();
+            let (second, second_snapshot) = Client::connect(&endpoint, "test-2").await.unwrap();
             assert_eq!(second_snapshot.channels.len(), 1);
             let second_events = second.events();
 

@@ -36,11 +36,14 @@ Siphon UI (ZGUI)  ── typed RPC ──  Siphon backend (compio)
 
 ## Transport
 
-- TCP on loopback, separate from RTSP: `daemon --admin-bind`, default
-  `127.0.0.1:7418`. RTSP `--bind` may be `0.0.0.0`; the admin surface must not
-  follow it. `--no-admin` disables it.
+- A Windows named pipe (`\\.\pipe\siphon-<app id>`) or a Unix domain socket
+  (`$XDG_RUNTIME_DIR/siphon-<app id>.sock`, 0600), separate from RTSP.
+  `daemon --admin <endpoint>` overrides it; `--no-admin` disables it. RTSP
+  `--bind` may be `0.0.0.0`; the admin surface cannot follow it, and OS access
+  control is the process user's.
 - No HTTP, WebSocket or gRPC: the client and server are both compio in this
-  workspace, and the only missing part is an envelope. No auth on loopback.
+  workspace, and the only missing part is an envelope. No auth beyond the
+  pipe/socket permissions.
 - Frame: `u32` big-endian payload length, then a `postcard`-encoded message.
   Cap the frame (`RPC_MAX_FRAME`, 1 MiB) and reject before allocating. The
   codec is one module, so the encoding can be swapped without touching the
@@ -237,7 +240,7 @@ like `StreamKey`; changing quality is remove + add.
 ## Phases
 
 0. **Protocol crate**: messages, postcard codec, incremental decoder, frame
-   limits, Hello/Welcome, loopback client/server tests. **Done.**
+   limits, Hello/Welcome, named-pipe/socket client/server tests. **Done.**
 1. **Backend state**: config load/save/migrate, GQL, Hermes, matcher,
    notifications; snapshot and entity updates. **Done** (the UI is still
    external, so it does not render them yet).
@@ -250,7 +253,7 @@ like `StreamKey`; changing quality is remove + add.
    starts and stops the disk on a live runtime.
 4. **Disk and polish**: run introspection/release, update ownership,
    multi-client behavior, update throttling/coalescing. **Mostly done**:
-   `GetDisk` reports live recorder counters and a loopback test covers two UI
+   `GetDisk` reports live recorder counters and an endpoint test covers two UI
    clients; releasing finished runs by hand and per-run history are open.
 
 ## Tests

@@ -9,8 +9,6 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
 
-use crate::rpc::BACKEND;
-
 #[cfg(debug_assertions)]
 pub const APP_ID: &str = "com.iken.siphon.debug";
 #[cfg(not(debug_assertions))]
@@ -22,10 +20,14 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The RTSP listener the daemon binds alongside its admin port.
 const RTSP: &str = "127.0.0.1:7417";
 
-/// Whether the daemon's admin listener accepts a connection.
+fn endpoint() -> String {
+    siphon_rpc::admin_endpoint(APP_ID)
+}
+
+/// Whether the daemon's admin endpoint accepts a connection.
 #[must_use]
 pub fn reachable() -> bool {
-    port_open(BACKEND)
+    siphon_rpc::probe(&endpoint())
 }
 
 fn port_open(address: &str) -> bool {
@@ -36,7 +38,7 @@ fn port_open(address: &str) -> bool {
 }
 
 fn healthy() -> bool {
-    port_open(BACKEND) && port_open(RTSP)
+    reachable() && port_open(RTSP)
 }
 
 /// Starts the daemon when the UI comes up and nothing is listening yet.
@@ -52,7 +54,7 @@ pub fn restart() {
     tracing::info!(target: "service", "restarting the daemon");
     terminate();
     wait_ports_closed(40);
-    if port_open(BACKEND) || port_open(RTSP) {
+    if reachable() || port_open(RTSP) {
         tracing::warn!(target: "service", "daemon still listening, killing by name");
         kill_by_name();
         wait_ports_closed(20);
@@ -75,7 +77,7 @@ pub fn restart() {
 
 fn wait_ports_closed(iterations: usize) {
     for _ in 0..iterations {
-        if !port_open(BACKEND) && !port_open(RTSP) {
+        if !reachable() && !port_open(RTSP) {
             return;
         }
         std::thread::sleep(Duration::from_millis(100));

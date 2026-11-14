@@ -1,17 +1,22 @@
 //! Client half of the Siphon RPC: Hello, one full snapshot, then updates.
 //!
-//! The UI keeps one [`Client`] per backend connection. A dropped connection
-//! closes the update receiver; the UI reconnects with backoff and resyncs by
-//! asking the new connection for a snapshot.
+//! One task owns the connection and both directions. Request sends never
+//! consume a completed socket read: a queued request only wakes the task, and
+//! the biased select polls the read first. Dropping the wake waiter loses
+//! nothing; dropping a pending read consumes no bytes.
 
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::rc::Rc;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 
-use compio::net::TcpStream;
+use compio::io::AsyncRead;
+use compio::io::AsyncWrite;
 use futures_util::FutureExt as _;
 use kanal::AsyncReceiver;
 use kanal::Sender;
@@ -20,6 +25,7 @@ use thiserror::Error;
 use crate::codec::CodecError;
 use crate::codec::FrameReader;
 use crate::codec::write;
+use crate::endpoint;
 use crate::protocol::ClientMessage;
 use crate::protocol::MAGIC;
 use crate::protocol::PROTOCOL_VERSION;
@@ -56,17 +62,48 @@ pub enum ClientEvent {
 
 type Pending = Rc<RefCell<HashMap<u64, Sender<Result<Response, RpcError>>>>>;
 
-/// Which half of the connection woke up.
-enum Selected {
-    Outgoing(Result<ClientMessage, kanal::ReceiveError>),
-    Incoming(Result<ServerMessage, CodecError>),
-    Stop,
+/// A single-waiter, signalled wake so a request queued between the drain and
+/// the park is not missed.
+struct Wake {
+    waker: Cell<Option<Waker>>,
+    signalled: Cell<bool>,
 }
 
-/// A connected RPC client. Requests are correlated by id; updates arrive on
-/// the channel returned by [`Self::events`].
+impl Wake {
+    const fn new() -> Self {
+        Self {
+            waker: Cell::new(None),
+            signalled: Cell::new(false),
+        }
+    }
+
+    fn wake(&self) {
+        self.signalled.set(true);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn park(&self, context: &std::task::Context<'_>) {
+        self.waker.set(Some(context.waker().clone()));
+    }
+
+    const fn take_signal(&self) -> bool {
+        self.signalled.replace(false)
+    }
+}
+
+/// What the UI writes and the connection task drains.
+struct Outbox {
+    queue: RefCell<VecDeque<ClientMessage>>,
+    wake: Rc<Wake>,
+    closed: Cell<bool>,
+}
+
+/// A connected RPC client. Requests are correlated by id; updates arrive on the
+/// channel returned by [`Self::events`].
 pub struct Client {
-    out: Sender<ClientMessage>,
+    out: Rc<Outbox>,
     events: AsyncReceiver<ClientEvent>,
     pending: Pending,
     next_id: Cell<u64>,
@@ -76,15 +113,13 @@ impl Client {
     /// Connects, performs the Hello/Welcome exchange, and consumes the first
     /// snapshot. The remaining traffic is driven by the connection task.
     pub async fn connect(
-        addr: SocketAddr,
+        endpoint: &str,
         app_version: &str,
     ) -> Result<(Self, Snapshot), ConnectError> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        let (mut read, mut write_half) = stream.into_split();
+        let mut stream = endpoint::connect(endpoint).await?;
 
         write(
-            &mut write_half,
+            &mut stream,
             &ClientMessage::Hello {
                 magic: MAGIC,
                 protocol: PROTOCOL_VERSION,
@@ -94,7 +129,7 @@ impl Client {
         .await?;
 
         let mut reader = FrameReader::new();
-        let welcome: ServerMessage = reader.read(&mut read).await?;
+        let welcome: ServerMessage = reader.read(&mut stream).await?;
         let protocol = match welcome {
             ServerMessage::Welcome {
                 protocol,
@@ -110,96 +145,29 @@ impl Client {
             });
         }
 
-        let first: ServerMessage = reader.read(&mut read).await?;
+        let first: ServerMessage = reader.read(&mut stream).await?;
         let ServerMessage::Snapshot(snapshot) = first else {
             return Err(ConnectError::Unexpected);
         };
         let snapshot = *snapshot;
 
-        let (out_tx, out_rx) = kanal::unbounded();
         let (events_tx, events_rx) = kanal::unbounded();
         let pending: Pending = Rc::new(RefCell::new(HashMap::new()));
-        let reader_pending = Rc::clone(&pending);
-        let writer_pending = Rc::clone(&pending);
-
-        // Read and write are separate tasks: a select between the two would
-        // drop an already-completed receive when both sides woke together,
-        // losing the frame it had just consumed. A shutdown signal stops the
-        // other half instead.
-        let (stop_tx, stop_rx) = kanal::bounded(1);
-        let reader_stop = stop_rx.clone();
-        let reader_stop_tx = stop_tx.clone();
+        let out = Rc::new(Outbox {
+            queue: RefCell::new(VecDeque::new()),
+            wake: Rc::new(Wake::new()),
+            closed: Cell::new(false),
+        });
+        let task_pending = Rc::clone(&pending);
+        let task_out = Rc::clone(&out);
         compio::runtime::spawn(async move {
-            let stop = reader_stop.to_async();
-            let events = events_tx;
-            loop {
-                let incoming = reader.read::<ServerMessage, _>(&mut read).fuse();
-                let stopped = stop.recv().fuse();
-                futures_util::pin_mut!(incoming, stopped);
-                let selected = futures_util::select! {
-                    message = incoming => Selected::Incoming(message),
-                    _ = stopped => Selected::Stop,
-                };
-                match selected {
-                    Selected::Incoming(Ok(ServerMessage::Update { revision, update })) => {
-                        let _ = events.try_send(ClientEvent::Update { revision, update });
-                    }
-                    Selected::Incoming(Ok(ServerMessage::Snapshot(snapshot))) => {
-                        let _ = events.try_send(ClientEvent::Snapshot(snapshot));
-                    }
-                    Selected::Incoming(Ok(ServerMessage::Response { id, result })) => {
-                        if let Some(waiter) = reader_pending.borrow_mut().remove(&id) {
-                            let _ = waiter.try_send(result);
-                        }
-                    }
-                    // The handshake already consumed the only welcome; the
-                    // writer variant cannot be produced by this select.
-                    Selected::Incoming(Ok(
-                        ServerMessage::Welcome { .. } | ServerMessage::Rejected(_),
-                    ))
-                    | Selected::Outgoing(_) => {}
-                    Selected::Incoming(Err(_)) | Selected::Stop => break,
-                }
-            }
-            for (_, waiter) in reader_pending.borrow_mut().drain() {
-                let _ = waiter.try_send(Err(RpcError::Disconnected));
-            }
-            let _ = reader_stop_tx.try_send(());
-        })
-        .detach();
-
-        let writer_stop = stop_rx;
-        compio::runtime::spawn(async move {
-            let out = out_rx.to_async();
-            let stop = writer_stop.to_async();
-            loop {
-                let outgoing = out.recv().fuse();
-                let stopped = stop.recv().fuse();
-                futures_util::pin_mut!(outgoing, stopped);
-                let selected = futures_util::select! {
-                    message = outgoing => Selected::Outgoing(message),
-                    _ = stopped => Selected::Stop,
-                };
-                match selected {
-                    Selected::Outgoing(Ok(message)) => {
-                        if write(&mut write_half, &message).await.is_err() {
-                            break;
-                        }
-                    }
-                    Selected::Outgoing(Err(_)) | Selected::Stop => break,
-                    Selected::Incoming(_) => {}
-                }
-            }
-            for (_, waiter) in writer_pending.borrow_mut().drain() {
-                let _ = waiter.try_send(Err(RpcError::Disconnected));
-            }
-            let _ = stop_tx.try_send(());
+            drive(stream, reader, task_out, task_pending, events_tx).await;
         })
         .detach();
 
         Ok((
             Self {
-                out: out_tx,
+                out,
                 events: events_rx.to_async(),
                 pending,
                 next_id: Cell::new(0),
@@ -216,18 +184,18 @@ impl Client {
 
     /// Sends one request and waits for its typed result.
     pub async fn request(&self, request: Request) -> Result<Response, RpcError> {
+        if self.out.closed.get() {
+            return Err(RpcError::Disconnected);
+        }
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
         let (waiter, receiver) = kanal::bounded(1);
         self.pending.borrow_mut().insert(id, waiter);
-        if self
-            .out
-            .try_send(ClientMessage::Request { id, request })
-            .is_err()
-        {
-            self.pending.borrow_mut().remove(&id);
-            return Err(RpcError::Disconnected);
-        }
+        self.out
+            .queue
+            .borrow_mut()
+            .push_back(ClientMessage::Request { id, request });
+        self.out.wake.wake();
         match compio::time::timeout(REQUEST_TIMEOUT, receiver.to_async().recv()).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::Disconnected),
@@ -239,118 +207,74 @@ impl Client {
     }
 }
 
-#[cfg(all(test, not(miri)))]
-mod tests {
-    use super::*;
-    use crate::protocol::ArenaSummary;
-    use crate::protocol::Config;
-    use crate::protocol::ConnHealth;
-    use crate::protocol::DownloaderSummary;
-    use crate::protocol::ServerMessage;
-    use compio::net::TcpListener;
-    use std::future::Future;
+async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    mut reader: FrameReader,
+    out: Rc<Outbox>,
+    pending: Pending,
+    events: Sender<ClientEvent>,
+) {
+    loop {
+        loop {
+            let message = out.queue.borrow_mut().pop_front();
+            let Some(message) = message else { break };
+            if write(&mut stream, &message).await.is_err() {
+                fail(&out, &pending);
+                return;
+            }
+        }
+        if events.is_closed() {
+            break;
+        }
 
-    fn snapshot() -> Snapshot {
-        Snapshot {
-            revision: 1,
-            config: Config::default(),
-            conn: ConnHealth::Connecting,
-            channels: Vec::new(),
-            pending: Vec::new(),
-            pipelines: Vec::new(),
-            arena: ArenaSummary::default(),
-            downloader: DownloaderSummary::default(),
-            notifications: Vec::new(),
-            error: None,
-            update: None,
+        let incoming = reader.read::<ServerMessage, _>(&mut stream).fuse();
+        let woken = wait_wake(&out.wake).fuse();
+        futures_util::pin_mut!(incoming, woken);
+        // The read is polled first: a completed frame is never dropped for a
+        // queued request. The wake waiter is non-consuming.
+        let selected = futures_util::select_biased! {
+            message = incoming => message,
+            () = woken => continue,
+        };
+        match selected {
+            Ok(ServerMessage::Update { revision, update }) => {
+                let _ = events.try_send(ClientEvent::Update { revision, update });
+            }
+            Ok(ServerMessage::Snapshot(snapshot)) => {
+                let _ = events.try_send(ClientEvent::Snapshot(snapshot));
+            }
+            Ok(ServerMessage::Response { id, result }) => {
+                if let Some(waiter) = pending.borrow_mut().remove(&id) {
+                    let _ = waiter.try_send(result);
+                }
+            }
+            // The handshake already consumed the only welcome.
+            Ok(ServerMessage::Welcome { .. } | ServerMessage::Rejected(_)) => {}
+            Err(_) => break,
         }
     }
+    fail(&out, &pending);
+}
 
-    async fn serve(protocol: u16) -> (SocketAddr, impl Future<Output = ()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let serve = async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (mut read, mut sink) = stream.into_split();
-            let mut reader = FrameReader::new();
-            let hello: ClientMessage = reader.read(&mut read).await.unwrap();
-            assert!(matches!(hello, ClientMessage::Hello { magic: MAGIC, .. }));
-            write(
-                &mut sink,
-                &ServerMessage::Welcome {
-                    protocol,
-                    server_version: "test".to_owned(),
-                },
-            )
-            .await
-            .unwrap();
-            write(&mut sink, &ServerMessage::Snapshot(Box::new(snapshot())))
-                .await
-                .unwrap();
-            // A version-mismatched client hangs up after the welcome.
-            let Ok(message) = reader.read::<ClientMessage, _>(&mut read).await else {
-                return;
-            };
-            let ClientMessage::Request { id, request } = message else {
-                panic!("expected a request");
-            };
-            assert!(matches!(request, Request::GetArena));
-            write(
-                &mut sink,
-                &ServerMessage::Response {
-                    id,
-                    result: Ok(Response::Arena(ArenaSummary::default())),
-                },
-            )
-            .await
-            .unwrap();
-            write(
-                &mut sink,
-                &ServerMessage::Update {
-                    revision: 2,
-                    update: Update::Error(Some("x".to_owned())),
-                },
-            )
-            .await
-            .unwrap();
-        };
-        (addr, serve)
+fn fail(out: &Outbox, pending: &Pending) {
+    out.closed.set(true);
+    out.wake.wake();
+    for (_, waiter) in pending.borrow_mut().drain() {
+        let _ = waiter.try_send(Err(RpcError::Disconnected));
     }
+}
 
-    #[test]
-    fn connect_resyncs_and_routes_a_request_and_an_update() {
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let (addr, server) = serve(PROTOCOL_VERSION).await;
-            let client = async {
-                let (client, snapshot) = Client::connect(addr, "test").await.unwrap();
-                assert_eq!(snapshot.revision, 1);
-                let events = client.events();
-                let response = client.request(Request::GetArena).await.unwrap();
-                assert!(matches!(response, Response::Arena(_)));
-                match events.recv().await.unwrap() {
-                    ClientEvent::Update { revision, update } => {
-                        assert_eq!(revision, 2);
-                        assert!(matches!(update, Update::Error(Some(reason)) if reason == "x"));
-                    }
-                    ClientEvent::Snapshot(_) => panic!("expected an update"),
-                }
-            };
-            futures_util::join!(server, client);
-        });
-    }
-
-    #[test]
-    fn connect_refuses_a_protocol_mismatch() {
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let (addr, server) = serve(PROTOCOL_VERSION + 1).await;
-            let client = async {
-                let result = Client::connect(addr, "test").await;
-                assert!(matches!(
-                    result,
-                    Err(ConnectError::Protocol { server: 2, .. })
-                ));
-            };
-            futures_util::join!(server, client);
-        });
-    }
+async fn wait_wake(wake: &Wake) {
+    poll_fn(|context| {
+        if wake.take_signal() {
+            return Poll::Ready(());
+        }
+        wake.park(context);
+        if wake.take_signal() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
 }

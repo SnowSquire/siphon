@@ -66,6 +66,15 @@ fn main() {
         return;
     }
 
+    let (tray_tx, tray_rx) = kanal::unbounded();
+    // The primary handle must outlive the app; a second launch sends Show.
+    let primary = app_single_instance::start_primary(APP_ID, {
+        let wake = tray_tx.clone();
+        move || {
+            let _ = wake.try_send(tray::TrayAction::Show);
+        }
+    });
+
     // The tray app owns the service: if the daemon is not listening, start it.
     service::ensure_running();
 
@@ -80,7 +89,6 @@ fn main() {
         })
         .expect("rpc thread");
 
-    let (tray_tx, tray_rx) = kanal::unbounded();
     let tray = match tray::build(tray_tx) {
         Ok(tray) => Some(tray),
         Err(error) => {
@@ -91,6 +99,7 @@ fn main() {
 
     let result = app::run(event_rx, tray_rx, intents);
     drop(tray);
+    drop(primary);
     if let Err(error) = result {
         tracing::error!(target: "app", "{error:#}");
     }

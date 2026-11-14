@@ -9,12 +9,15 @@ authors = ["Ozeniken"]
 publish = false
 
 [dependencies]
-compio = { version = "0.19", features = ["net", "time"] }
+compio = { version = "0.19", features = ["fs", "net", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 kanal = "0.1.1"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.20"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes"] }
 
 [lints]
 workspace = true
