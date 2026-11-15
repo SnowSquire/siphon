@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use libplacebo_sys as pl;
 use windows::Win32::Foundation::HWND;
@@ -35,8 +36,17 @@ use crate::dxgi::BUFFERS;
 use crate::dxgi::D3d12;
 use crate::dxgi::DxgiSwapchain;
 use crate::dxgi::HdrMode;
-use crate::dxgi::canvas_size;
+use crate::dxgi::idle_canvas;
+use crate::dxgi::resize_canvas;
 use crate::placebo::Placebo;
+
+/// How long the window's size has to hold still before the chain shrinks back
+/// to it.
+///
+/// Every resize event moves it, so a drag of any length pays one chain resize
+/// when it starts and one this long after it stops. A pause in the middle of a
+/// drag is indistinguishable from the end of one, and pays the same two.
+const SETTLE: Duration = Duration::from_millis(400);
 
 pub struct UiRenderer {
     inner: WgpuRenderer,
@@ -63,6 +73,8 @@ pub struct UiRenderer {
     /// The extent of the chain's canvas, which is never smaller than the UI.
     chain_width: u32,
     chain_height: u32,
+    /// When the resized chain may shrink back to the window, if it has grown.
+    settle_at: Option<Instant>,
     hwnd: HWND,
 }
 
@@ -130,6 +142,7 @@ impl UiRenderer {
             height,
             chain_width,
             chain_height,
+            settle_at: None,
             hwnd,
         })
     }
@@ -187,7 +200,7 @@ impl UiRenderer {
         height: u32,
         chain: Option<(u32, u32)>,
     ) {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         // Nothing is replaced until its replacement exists: a step below that
         // fails returns with the interface this renderer already had, where
         // destroying it first would leave the frame that follows drawing
@@ -482,19 +495,26 @@ impl UiRenderer {
         outcome
     }
 
-    /// Grows the chain when a configure could not, or left it behind a window
-    /// that has since grown. A frame is composed over the whole interface
-    /// texture, so new backbuffers need nothing drawn into them first.
-    fn ensure_presentation(&mut self) {
-        let (width, height) = canvas_size(self.width, self.height);
-        if self
-            .swapchain
-            .as_ref()
-            .is_some_and(|chain| chain.size() == (width, height))
-        {
+    /// Gives the extra backbuffers back once the window's size has settled.
+    ///
+    /// The interface texture is one picture behind the chain, and every frame
+    /// composes it whole, so a fresh chain needs nothing painted into it before
+    /// the frame that follows presents.
+    fn settle_chain(&mut self) {
+        let Some(at) = self.settle_at else {
+            return;
+        };
+        if Instant::now() < at {
             return;
         }
-        self.resize_chain(width, height);
+        self.settle_at = None;
+        let (width, height) = idle_canvas(self.width, self.height);
+        if self.chain_width == width && self.chain_height == height {
+            return;
+        }
+        if self.resize_chain(width, height) {
+            self.damaged.set(true);
+        }
     }
 }
 
@@ -525,12 +545,13 @@ impl Renderer for UiRenderer {
             self.inner.configure(target);
             return;
         }
-        // The UI follows the window exactly. The chain is a canvas that only
-        // has to be at least as large as the window, so a drag never pays for
-        // a backbuffer reallocation: the window shows the canvas's top-left
-        // corner, cropped by the compositor.
+        // The UI follows the window exactly. The chain follows it at a distance:
+        // it covers the monitor while the size is moving, so the events of a
+        // drag cost a repaint and no backbuffer reallocation, and shrinks back to
+        // the window once the size has held still for `SETTLE`.
+        self.settle_at = Some(Instant::now() + SETTLE);
         let chain = (self.chain_width < width || self.chain_height < height)
-            .then(|| canvas_size(width, height));
+            .then(|| resize_canvas(self.hwnd, width, height));
         self.rebuild(target, width, height, chain);
     }
 
@@ -539,7 +560,7 @@ impl Renderer for UiRenderer {
     }
 
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
-        self.ensure_presentation();
+        self.settle_chain();
         if !self.inner.present_into(0) {
             tracing::warn!(target: "ui", "the UI texture was not supplied");
         }

@@ -369,21 +369,21 @@ on a visible one the same call would turn the next pointer move into faults.
 
 The swapchain is deliberately *not* released on hide, and the reason is a
 measurement that corrected an earlier one. `ResizeBuffers(1, 1)` does give the
-chain's 78 MB back, and every re-import of the three backbuffers on show raises
-the process's own GPU accounting by ~236 MB that never comes down — which looked
-like a leak and was written up as one. It is not: over 40 chain resizes the
-*process* counter went 89 MB -> 1,207 MB while the adapter's dedicated usage
+chain back, and every re-import of the three backbuffers raises the process's own
+GPU accounting by about three times the chain — 9 MB of chain at rest, so ~27 MB;
+a drag's monitor chain is 25-44 MB, so ~75-130 MB — and none of it comes down.
+It looked like a leak and was written up as one. It is not: over 40 chain resizes
+the *process* counter went 89 MB -> 1,207 MB while the adapter's dedicated usage
 stayed flat (7,086 MB -> 7,070 MB), and `VK_EXT_memory_budget` reports each
-import and its free balancing to the byte (3 MiB of image, 9 MiB of chain). What
-grows is per-process attribution for imported resources; after a day in the tray
-Task Manager would show gigabytes this process does not hold. For 78 MB out of
-363, that is a bad trade, so the chain stays and the working set — the number the
-tray is judged on — is handled by the trim instead.
+import and its free balancing to the byte. What grows is per-process attribution
+for imported resources; after a day of dragging, Task Manager would show
+gigabytes this process does not hold. The chain stays, and the working set — the
+number the tray is judged on — is handled by the trim instead.
 
-Worth knowing for `SIPHON_UI_CHAIN=exact`: every window resize there re-imports
-the chain, so the process's GPU accounting climbs ~28 MB per resize while device
-memory does not move. The diagnostic is still fine; do not read its Task Manager
-column as usage.
+Worth knowing: a drag now re-imports the chain twice (monitor at the start, the
+window at the end), so its accounting climbs ~100-160 MB per drag while device
+memory does not move. `SIPHON_UI_CHAIN=exact` re-imports on every resize event
+instead, ~28 MB each.
 
 Tray actions run in the tray's window procedure, not through a channel, for the
 same no-frames reason: an action queued for a frame would wait for the window it
@@ -411,8 +411,8 @@ working set as Task Manager's Memory column reports it):
 | a process that creates only this wgpu Vulkan device | 45 MB | 260 MB | 200 MB |
 | the same window on ZGUI's own wgpu renderer | 133 MB | 466 MB | — |
 | this window, `MemoryHints::Performance` (the default) | 138 MB | 418 MB | 474 MB |
-| this window, `MemoryHints::Manual { 4..8 MiB }` | 134 MB | 228 MB | 363 MB |
-| the same window hidden in the tray | ~1 MB | 228 MB | 363 MB |
+| this window, `MemoryHints::Manual { 4..8 MiB }` | 134 MB | 228 MB | 247 MB |
+| the same window hidden in the tray | ~1 MB | 228 MB | 247 MB |
 
 So the presentation layer (`dxgi.rs`, `placebo.rs`) is about 5 MB of the working
 set, and everything else is what a GPU UI is: the Vulkan instance and device the

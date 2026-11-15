@@ -86,9 +86,9 @@ fn dxgi_renderer(
         .map_err(|_| dxgi_error("the target height is not positive"))?;
 
     let d3d12 = Rc::new(D3d12::new(gpu).map_err(|error| dxgi_error(format!("D3D12: {error:#}")))?);
-    // The chain is a canvas the window is cropped out of; the UI texture is
-    // the window's own extent and is never scaled.
-    let (chain_width, chain_height) = crate::dxgi::canvas_size(width, height);
+    // The chain starts at the window's own extent, which is where it returns
+    // once the size settles; the UI texture is that extent and is never scaled.
+    let (chain_width, chain_height) = crate::dxgi::idle_canvas(width, height);
     let swapchain = DxgiSwapchain::new(&d3d12, gpu, hwnd, chain_width, chain_height, HdrMode::Off)
         .map_err(|error| dxgi_error(format!("{error:#}")))?;
     let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {

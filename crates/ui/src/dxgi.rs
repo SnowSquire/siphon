@@ -84,49 +84,95 @@ pub enum HdrMode {
     Off,
 }
 
-/// The chain extent a window is presented through.
-///
+/// The chain's extent while the window's size is settled.
 ///
 /// The UI is composed for the window's exact extent and presented 1:1 at the
-/// top-left of a chain this large; `DXGI_SCALING_NONE` means the compositor
-/// shows that corner cropped to the window, so nothing is ever scaled. The
-/// canvas covers every monitor the window could be dragged over, and a target
-/// larger than it simply grows it.
+/// top-left of the chain, so at rest the chain only has to be as large as the
+/// window itself. This is the extent it holds whenever nothing is moving.
+#[must_use]
+pub fn idle_canvas(width: u32, height: u32) -> (u32, u32) {
+    match chain_mode() {
+        // `half` exists to expose the compositor's fill outside the back buffer,
+        // so it has to stay smaller than the window even at rest.
+        ChainMode::Half => (width.max(2) / 2, height.max(2) / 2),
+        ChainMode::Exact | ChainMode::Canvas => (width.max(1), height.max(1)),
+    }
+}
+
+/// The chain's extent while a resize is in flight.
 ///
-/// `SIPHON_UI_CHAIN=exact` presents through a chain at the window's own extent
-/// instead, which pays `ResizeBuffers` per resize event and needs no crop from
-/// the compositor. It exists to tell a presentation artifact apart from a
-/// composed one.
-pub fn canvas_size(width: u32, height: u32) -> (u32, u32) {
+/// A chain at the window's own extent pays `ResizeBuffers` — 3 to 6 ms at
+/// 320 Hz — on every event of a drag. A chain covering the monitor the window is
+/// on pays it once when the drag starts, and once more when the size settles;
+/// every event in between is a repaint of the interface texture alone, which is
+/// what makes the content reflow at the display's rate.
+#[must_use]
+pub fn resize_canvas(hwnd: HWND, width: u32, height: u32) -> (u32, u32) {
+    match chain_mode() {
+        ChainMode::Exact | ChainMode::Half => idle_canvas(width, height),
+        ChainMode::Canvas => {
+            let (monitor_width, monitor_height) = monitor_size(hwnd);
+            (
+                monitor_width.max(width.max(1)),
+                monitor_height.max(height.max(1)),
+            )
+        }
+    }
+}
+
+/// The monitor the window is on, or the virtual screen if the desktop will not
+/// say. A window dragged onto another monitor grows the chain to that one.
+fn monitor_size(hwnd: HWND) -> (u32, u32) {
+    use windows::Win32::Graphics::Gdi::GetMonitorInfoW;
+    use windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST;
+    use windows::Win32::Graphics::Gdi::MONITORINFO;
+    use windows::Win32::Graphics::Gdi::MonitorFromWindow;
+
+    // SAFETY: `hwnd` is this process's window and the fallback is a documented
+    // flag; the call takes no pointers out of this frame.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if !monitor.is_invalid() {
+        let mut info = MONITORINFO {
+            cbSize: u32::try_from(size_of::<MONITORINFO>()).unwrap_or(0),
+            ..Default::default()
+        };
+        // SAFETY: `monitor` names a monitor and `info` declares its own size.
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            let rect = info.rcMonitor;
+            let width = u32::try_from(rect.right - rect.left).unwrap_or(0);
+            let height = u32::try_from(rect.bottom - rect.top).unwrap_or(0);
+            if width > 0 && height > 0 {
+                return (width, height);
+            }
+        }
+    }
+    virtual_screen()
+}
+
+/// Every monitor at once, for a window whose monitor the desktop will not name.
+fn virtual_screen() -> (u32, u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics;
     use windows_sys::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN;
     use windows_sys::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN;
 
-    match chain_mode() {
-        ChainMode::Exact => return (width.max(1), height.max(1)),
-        // Diagnostic: a chain smaller than the window is the only way to make the
-        // compositor's fill outside the back buffer visible on demand.
-        ChainMode::Half => return (width.max(2) / 2, height.max(2) / 2),
-        ChainMode::Canvas => {}
-    }
-
     // SAFETY: the metric indices are the two documented ones; GetSystemMetrics
     // takes no pointers and fails by returning 0, which `max(1)` covers.
-    let (screen_width, screen_height) = unsafe {
+    let (width, height) = unsafe {
         (
             GetSystemMetrics(SM_CXVIRTUALSCREEN),
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
     };
-    let screen_width = u32::try_from(screen_width).unwrap_or(1).max(1);
-    let screen_height = u32::try_from(screen_height).unwrap_or(1).max(1);
-    (screen_width.max(width), screen_height.max(height))
+    (
+        u32::try_from(width).unwrap_or(1).max(1),
+        u32::try_from(height).unwrap_or(1).max(1),
+    )
 }
 
 /// How the chain is sized against the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChainMode {
-    /// A chain covering every monitor, cropped to the window by the compositor.
+    /// The window's own extent at rest, the monitor's while it is being sized.
     Canvas,
     /// A chain at the window's own extent; `SIPHON_UI_CHAIN=exact`.
     Exact,
