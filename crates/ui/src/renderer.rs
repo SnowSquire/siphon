@@ -200,7 +200,6 @@ impl UiRenderer {
         height: u32,
         chain: Option<(u32, u32)>,
     ) {
-        let started = Instant::now();
         // Nothing is replaced until its replacement exists: a step below that
         // fails returns with the interface this renderer already had, where
         // destroying it first would leave the frame that follows drawing
@@ -258,13 +257,6 @@ impl UiRenderer {
         self.height = height;
         self.damaged.set(true);
         self.presented.set(false);
-        tracing::debug!(
-            target: "ui",
-            width,
-            height,
-            elapsed = ?started.elapsed(),
-            "rebuilt"
-        );
     }
 
     /// Resizes the chain and re-wraps its backbuffers.

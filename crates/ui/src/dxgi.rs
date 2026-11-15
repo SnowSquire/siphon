@@ -92,12 +92,7 @@ pub enum HdrMode {
 /// window itself. This is the extent it holds whenever nothing is moving.
 #[must_use]
 pub fn idle_canvas(width: u32, height: u32) -> (u32, u32) {
-    match chain_mode() {
-        // `half` exists to expose the compositor's fill outside the back buffer,
-        // so it has to stay smaller than the window even at rest.
-        ChainMode::Half => (width.max(2) / 2, height.max(2) / 2),
-        ChainMode::Exact | ChainMode::Canvas => (width.max(1), height.max(1)),
-    }
+    (width.max(1), height.max(1))
 }
 
 /// The chain's extent while a resize is in flight.
@@ -109,16 +104,11 @@ pub fn idle_canvas(width: u32, height: u32) -> (u32, u32) {
 /// what makes the content reflow at the display's rate.
 #[must_use]
 pub fn resize_canvas(hwnd: HWND, width: u32, height: u32) -> (u32, u32) {
-    match chain_mode() {
-        ChainMode::Exact | ChainMode::Half => idle_canvas(width, height),
-        ChainMode::Canvas => {
-            let (monitor_width, monitor_height) = monitor_size(hwnd);
-            (
-                monitor_width.max(width.max(1)),
-                monitor_height.max(height.max(1)),
-            )
-        }
-    }
+    let (monitor_width, monitor_height) = monitor_size(hwnd);
+    (
+        monitor_width.max(width.max(1)),
+        monitor_height.max(height.max(1)),
+    )
 }
 
 /// The monitor the window is on, or the virtual screen if the desktop will not
@@ -168,31 +158,6 @@ fn virtual_screen() -> (u32, u32) {
         u32::try_from(width).unwrap_or(1).max(1),
         u32::try_from(height).unwrap_or(1).max(1),
     )
-}
-
-/// How the chain is sized against the window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChainMode {
-    /// The window's own extent at rest, the monitor's while it is being sized.
-    Canvas,
-    /// A chain at the window's own extent; `SIPHON_UI_CHAIN=exact`.
-    Exact,
-    /// Half the window; `SIPHON_UI_CHAIN=half`. A diagnostic that makes the
-    /// compositor's fill outside the back buffer, and the colour it uses, visible.
-    Half,
-}
-
-/// Which presentation the chain uses.
-///
-/// Read once: the environment cannot change under a running process, and the
-/// answer is asked for on every resize event.
-fn chain_mode() -> ChainMode {
-    static MODE: std::sync::OnceLock<ChainMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("SIPHON_UI_CHAIN").as_deref() {
-        Ok("exact") => ChainMode::Exact,
-        Ok("half") => ChainMode::Half,
-        _ => ChainMode::Canvas,
-    })
 }
 
 /// The D3D12 device, queue and factory a window's swapchains share.
@@ -331,19 +296,14 @@ impl DxgiSwapchain {
         // the client area a compositor has not taken from the chain yet, say — is
         // filled with the chain's background, and that defaults to opaque black.
         // The page colour is the only thing that may be behind the interface.
-        // `SIPHON_UI_BACKGROUND=black` leaves the default in place, which is the
-        // black this fill was before.
         let page = DXGI_RGBA {
             r: 18.0 / 255.0,
             g: 20.0 / 255.0,
             b: 26.0 / 255.0,
             a: 1.0,
         };
-        let raw_black = std::env::var("SIPHON_UI_BACKGROUND").is_ok_and(|value| value == "black");
-        if !raw_black {
-            // SAFETY: the swapchain is alive and `page` is a valid local.
-            unsafe { swapchain1.SetBackgroundColor(&page) }.context("SetBackgroundColor")?;
-        }
+        // SAFETY: the swapchain is alive and `page` is a valid local.
+        unsafe { swapchain1.SetBackgroundColor(&page) }.context("SetBackgroundColor")?;
         let swapchain: IDXGISwapChain3 = swapchain1.cast().context("swapchain vtable")?;
         let swapchain2: IDXGISwapChain2 = swapchain1.cast().context("swapchain vtable")?;
         // Two frames outstanding at most; the waitable object below is what
@@ -393,7 +353,6 @@ impl DxgiSwapchain {
         anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
         anyhow::ensure!(!self.removed.get(), "the device was removed");
         self.release_buffers();
-        let started = std::time::Instant::now();
         // SAFETY: every reference to the old buffers has been dropped, and the
         // flags are the ones the chain was created with.
         unsafe {
@@ -410,13 +369,6 @@ impl DxgiSwapchain {
         }
         .inspect_err(|error| self.note_removal(error))
         .context("ResizeBuffers")?;
-        tracing::debug!(
-            target: "ui",
-            width,
-            height,
-            elapsed = ?started.elapsed(),
-            "resize buffers"
-        );
         self.attach_backbuffers(d3d12, gpu, width, height)?;
         self.width = width;
         self.height = height;
@@ -554,14 +506,10 @@ impl DxgiSwapchain {
         // SAFETY: the swapchain lives in `self`; the parameters describe the whole frame
         // (no dirty rects), which is what a flip-model present expects.
         let result = unsafe { self.swapchain.Present1(1, DXGI_PRESENT(0), &params) };
-        if let Err(error) = result.ok() {
-            self.note_removal(&error);
-            match self.removal_reason() {
-                Some(reason) => return Err(error).context(format!("Present1 ({reason})")),
-                None => return Err(error).context("Present1"),
-            }
-        }
-        Ok(())
+        result
+            .ok()
+            .inspect_err(|error| self.note_removal(error))
+            .context("Present1")
     }
 
     /// Whether the driver has taken the device away.
@@ -585,20 +533,6 @@ impl DxgiSwapchain {
                 target: "ui",
                 "the D3D12 device was removed ({error}); the window can no longer present"
             );
-        }
-    }
-
-    /// Why the device stopped drawing, if that is what the swapchain says.
-    fn removal_reason(&self) -> Option<String> {
-        // SAFETY: the swapchain is alive; `GetDevice` is what names the device
-        // behind it, and the reason is a plain query on that device.
-        unsafe {
-            let device: ID3D12Device = self.swapchain.GetDevice().ok()?;
-            let reason = device.GetDeviceRemovedReason();
-            Some(match reason {
-                Ok(()) => "the device is fine".to_owned(),
-                Err(error) => format!("device removed: {error:?}"),
-            })
         }
     }
 }

@@ -344,12 +344,10 @@ tracked down to that fill and nothing else in the path can produce pure black:
 a flip-model `Present` is atomic, the canvas is drawn whole before it, and the
 UI texture is rebuilt and fully damaged on the resize frame. `SetBackgroundColor`
 puts the page colour (`#12141a`) in that slot, so whatever the compositor fills
-is the page rather than a black bar. `SIPHON_UI_CHAIN=half` makes the window
-larger than its chain, which is the only way to see and configure that fill on
-demand; `=exact` never grows the chain to the monitor, so it pays
-`ResizeBuffers` (~3-5 ms, one refresh at 320 Hz) per resize event and is a
-diagnostic only, not the presentation. A window-class background brush is set
-to the page colour as well, for `WM_ERASEBKGND` paths.
+is the page rather than a black bar. A window-class background brush is set to
+the page colour as well, for `WM_ERASEBKGND` paths. (The chain-size and
+background knobs that made those two fills visible on demand were removed once
+the causes were known.)
 
 The D3D12 device, command queue and DXGI factory are created once per window by
 `dxgi::D3d12` and shared by every swapchain. Recreating them per resize cost
@@ -399,8 +397,7 @@ number the tray is judged on — is handled by the trim instead.
 
 Worth knowing: a drag re-imports the chain twice (monitor at the start, the
 window at the end), so its accounting climbs ~100-160 MB per drag while device
-memory does not move. `SIPHON_UI_CHAIN=exact` re-imports on every resize event
-instead, ~28 MB each.
+memory does not move.
 
 One `DXGI_ERROR_DEVICE_REMOVED` was seen in a scripted stress of the two-step
 sizing: the settle shrink's `ResizeBuffers` succeeded, the `Present1` after it
@@ -410,8 +407,7 @@ it. The shrink no longer runs while the window holds the mouse capture; and
 `DxgiSwapchain` latches a removed device (`is_removed`), logs one error and stops
 asking, so a removal degrades to a window that stops updating instead of one that
 freezes. It has not been seen again in repeated stress, so the capture guard is a
-precaution rather than a proven fix; `Present1` reports
-`GetDeviceRemovedReason` if it recurs.
+precaution rather than a proven fix.
 
 Tray actions run in the tray's window procedure, not through a channel, for the
 same no-frames reason: an action queued for a frame would wait for the window it
