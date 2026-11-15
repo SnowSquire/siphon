@@ -77,7 +77,13 @@ pub fn create() -> anyhow::Result<(Arc<Gpu>, Option<VideoDecode>)> {
         label: Some("video.device"),
         required_features: wgpu::Features::empty(),
         required_limits: adapter.limits(),
-        memory_hints: wgpu::MemoryHints::default(),
+        // `Performance`, the default, has gpu-allocator carve 128 MiB device
+        // and 64 MiB host blocks for a UI whose resources are megabytes: the
+        // same window commits 418 MB with it and 228 MB with blocks of this
+        // size, and holds 363 MB of VRAM instead of 474 MB.
+        memory_hints: wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: 4 * 1024 * 1024..8 * 1024 * 1024,
+        },
         ..Default::default()
     };
 

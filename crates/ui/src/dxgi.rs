@@ -372,44 +372,6 @@ impl DxgiSwapchain {
         Ok(())
     }
 
-    /// Frees the backbuffers and keeps the chain.
-    ///
-    /// `ResizeBuffers` waits for the compositor to hand every buffer back, which
-    /// is the wait a resize already pays, and is what makes this safe on a live
-    /// chain. The chain object stays: its window association, flip queue and
-    /// latency object are what recreating it would throw away, and its 1x1
-    /// buffers hold nothing.
-    pub fn park(&mut self) -> anyhow::Result<u64> {
-        let bytes = self.bytes();
-        self.release_buffers();
-        // SAFETY: every reference to the old buffers has been dropped, and the
-        // flags are the ones the chain was created with.
-        unsafe {
-            self.swapchain.ResizeBuffers(
-                BUFFERS,
-                1,
-                1,
-                DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG(
-                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0
-                        | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0,
-                ),
-            )
-        }
-        .context("ResizeBuffers (park)")?;
-        self.width = 1;
-        self.height = 1;
-        Ok(bytes)
-    }
-
-    /// The device memory the backbuffers occupy.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        // Four bytes a texel in the 10-bit format, over every buffer the chain
-        // rotates through.
-        u64::from(self.width) * u64::from(self.height) * 4 * u64::from(BUFFERS)
-    }
-
     /// Imports the chain's current backbuffers into Vulkan.
     fn attach_backbuffers(
         &mut self,

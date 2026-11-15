@@ -349,8 +349,8 @@ from a real state and not only from a bug in this file.
 
 Closing the window puts it away in the tray: ZGUI's close request is vetoed and
 the surface hidden, and the tray's Open (or a second launch of the program, which
-posts the same message) shows it again. The park rides on that hide rather than
-on occlusion, for two reasons that are both this platform's:
+posts the same message) shows it again. Two facts about this platform decide how
+the hidden state is handled:
 
 - ZGUI's `occluded` signal never comes true on Windows, because winit's Windows
   backend emits no `Occluded` event.
@@ -359,23 +359,30 @@ on occlusion, for two reasons that are both this platform's:
   Nothing that runs in a frame — the 100 ms interval included — runs while the
   window is in the tray.
 
-So `renderer::park()` is called where the window is hidden: it frees the three
-libplacebo views and resizes the chain's buffers to 1x1 with `ResizeBuffers` —
-77 MB back to the device at 4480x1440. `ResizeBuffers` is the same call a drag
-makes, and the wait it pays is the compositor handing every buffer back, which is
-why this is safe on a live chain; the chain object itself stays, with its window
-association and flip queue. Recreating the chain instead
-(`CreateSwapChainForHwnd` again) was tried first and answered "no usable
-graphics device" — the wgpu device was already marked lost by then — so the
-chain object is kept.
+Hiding therefore ends with `SetProcessWorkingSetSize(-1, -1)`, not with a chain
+park. What a window makes resident is mostly driver code and first-frame work it
+never touches again: the measured private working set goes from 134 MB to about
+1 MB while hidden, and only ~2-5 MB faults back when the tray shows the window.
+From inside, the window never sees the difference; from Task Manager it is the
+difference between a tray app and a browser tab. Only a hidden window asks:
+on a visible one the same call would turn the next pointer move into faults.
 
-The frame that shows the window again grows only the chain, not the renderer.
-Rebuilding the inner renderer there is what a resize does, but a resize rebuilds
-before the frame paints; here the rebuild would happen inside `draw`, after the
-frame had painted into the renderer it replaced, so the new blank texture would
-reach the screen and the window would come back black. Keeping the interface
-texture means that frame composes the last picture whole (every frame overlays
-the entire texture) and the damage it carries refreshes what changed.
+The swapchain is deliberately *not* released. Resizing it to 1x1 with
+`ResizeBuffers` gave 78 MB of VRAM back per hide and then leaked about 236 MB
+per show: every D3D12-to-Vulkan re-import of the three backbuffers costs more
+than it returns on this driver (NVIDIA, 2026-11), measured over six hide/show
+cycles as 363 -> 285 -> 600 -> 521 -> 836 -> 1,072 MB, linear and never
+plateauing. Any chain resize pays it, which is why `SIPHON_UI_CHAIN=exact` grows
+~54 MB per window resize on a 1000x760 chain; the canvas is virtual-screen sized
+so ordinary drags never resize the chain, and the only reachable case is a window
+dragged beyond the virtual screen. VRAM at rest is the device's ~285 MB plus the
+chain's 78 MB; the working set, which is what the tray is judged on, is ~1 MB.
+
+Tray actions run in the tray's window procedure, not through a channel, for the
+same no-frames reason: an action queued for a frame would wait for the window it
+was meant to open. The procedure calls the handler the window installs, so Show,
+Restart and Quit all work while hidden — Quit wakes the loop through ZGUI's own
+command waker.
 
 Tray actions run in the tray's window procedure, not through a channel, for the
 same no-frames reason: an action queued for a frame would wait for the window it
@@ -389,29 +396,29 @@ the desktop asks for). The `.ico` rather than `icon.png` because the window want
 an `HICON` and the file already holds the images Windows asks for; the PNG would
 need a decoder to become the RGBA rows `Surface::set_icon` takes.
 
-What the window costs at rest, measured rather than guessed (debug build,
-private working set as Task Manager's Memory column reports it):
+What the window costs, measured rather than guessed (debug build, private
+working set as Task Manager's Memory column reports it):
 
-| what | bytes |
-| --- | --- |
-| a process that creates only this wgpu Vulkan device | 45 MB |
-| the same window on ZGUI's own wgpu renderer | 133 MB |
-| this window, through D3D12 and libplacebo | 138 MB |
-| textures the window holds (ZGUI composed target 3.1 MB, atlases 5.2 MB, buffers 0.6 MB, interface 3.0 MB) | 12 MB |
-| the canvas chain while it is up | 77 MB of VRAM |
+| what | private working set | commit | VRAM |
+| --- | --- | --- | --- |
+| a process that creates only this wgpu Vulkan device | 45 MB | 260 MB | 200 MB |
+| the same window on ZGUI's own wgpu renderer | 133 MB | 466 MB | — |
+| this window, `MemoryHints::Performance` (the default) | 138 MB | 418 MB | 474 MB |
+| this window, `MemoryHints::Manual { 4..8 MiB }` | 134 MB | 228 MB | 363 MB |
+| the same window hidden in the tray | ~1 MB | 228 MB | 363 MB |
 
-So the presentation layer (`dxgi.rs`, `placebo.rs`) is about 5 MB of that, and
-everything else is what a GPU UI is: the Vulkan instance and device the driver
-sets up for any client, and ZGUI's renderer, text engine and scene. A device
-alone is ~200 MB of VRAM before a single texel is drawn. The daemon has none of
-it: 4 MB, because it is sockets and buffers.
+So the presentation layer (`dxgi.rs`, `placebo.rs`) is about 5 MB of the working
+set, and everything else is what a GPU UI is: the Vulkan instance and device the
+driver sets up for any client, and ZGUI's renderer, text engine and scene, whose
+own textures are 12 MB (composed target 3.1 MB, atlases 5.2 MB, buffers 0.6 MB,
+interface 3.0 MB). The daemon has none of it: 4 MB, because it is sockets and
+buffers.
 
-Parking gives the chain's 77 MB back, but not the device's own footprint, and
-nothing here can: ZGUI owns the renderer for the window's whole life, so the only
-way to go lower in the tray is to close the window while hidden and open a new
-one when the tray's Open asks for it. That trades the resident stack (all of the
-138 MB except the app loop and the RPC worker) for the ~0.3-0.6 s a new window,
-device and first frame take. It has not been built.
+`MemoryHints::Manual` with 4-8 MiB suballocation blocks is the allocator's own
+half of that: `Performance`, the default, has gpu-allocator carve 128 MiB device
+and 64 MiB host blocks, which is where the 190 MB of commit and 111 MB of VRAM
+above came from. wgpu's `MemoryUsage` scores the same here; `Manual` states the
+block size this UI actually wants.
 
 The inner renderer's atlas textures are moved onto the replacement: the atlas*policy* (which tile holds which glyph) lives in the window's content cache,
 above the renderer, and it believes every tile it placed is resident. A fresh

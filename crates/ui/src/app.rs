@@ -124,8 +124,26 @@ fn dxgi_renderer(
         target,
     )
     .map_err(|error| dxgi_error(format!("{error:#}")))?;
-    crate::renderer::install(Rc::clone(renderer.presentation()));
     Ok(Box::new(renderer))
+}
+
+/// Gives back the resident pages a hidden window no longer needs.
+///
+/// What a window makes resident is mostly driver code and work done for the
+/// first frames, which is never touched again while it sits in the tray: the
+/// measured private working set falls from 134 MB to about 1 MB when a hidden
+/// window asks for this, and only a few megabytes fault back when it is shown.
+/// Only a hidden window asks: on a visible one the same call would turn the
+/// next pointer move into page faults.
+fn release_hidden_memory() {
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::Win32::System::Threading::SetProcessWorkingSetSize;
+
+    // SAFETY: the pseudo-handle names this process, and the two sizes ask the
+    // system to remove as many pages from the working set as it can.
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
 }
 
 fn dxgi_error(reason: impl Into<String>) -> AppError {
@@ -185,8 +203,8 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
     let close = on_close_request({
         let window = window.clone();
         move || {
-            crate::renderer::park();
             window.set_visible(false);
+            release_hidden_memory();
             CloseResponse::Veto
         }
     });
