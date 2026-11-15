@@ -259,6 +259,10 @@ impl UiRenderer {
         for mut target in self.targets.drain(..) {
             self.placebo.destroy_texture(&mut target);
         }
+        // The views are gone, but the frames that used them may not be: the
+        // images are freed next, and a driver handed a free while the GPU still
+        // names the image is free to do anything.
+        self.placebo.finish();
 
         // The chain is reused through `ResizeBuffers`; creating a new one would
         // make the window association and the flip queue start over. A chain

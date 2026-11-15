@@ -367,16 +367,23 @@ From inside, the window never sees the difference; from Task Manager it is the
 difference between a tray app and a browser tab. Only a hidden window asks:
 on a visible one the same call would turn the next pointer move into faults.
 
-The swapchain is deliberately *not* released. Resizing it to 1x1 with
-`ResizeBuffers` gave 78 MB of VRAM back per hide and then leaked about 236 MB
-per show: every D3D12-to-Vulkan re-import of the three backbuffers costs more
-than it returns on this driver (NVIDIA, 2026-11), measured over six hide/show
-cycles as 363 -> 285 -> 600 -> 521 -> 836 -> 1,072 MB, linear and never
-plateauing. Any chain resize pays it, which is why `SIPHON_UI_CHAIN=exact` grows
-~54 MB per window resize on a 1000x760 chain; the canvas is virtual-screen sized
-so ordinary drags never resize the chain, and the only reachable case is a window
-dragged beyond the virtual screen. VRAM at rest is the device's ~285 MB plus the
-chain's 78 MB; the working set, which is what the tray is judged on, is ~1 MB.
+The swapchain is deliberately *not* released on hide, and the reason is a
+measurement that corrected an earlier one. `ResizeBuffers(1, 1)` does give the
+chain's 78 MB back, and every re-import of the three backbuffers on show raises
+the process's own GPU accounting by ~236 MB that never comes down — which looked
+like a leak and was written up as one. It is not: over 40 chain resizes the
+*process* counter went 89 MB -> 1,207 MB while the adapter's dedicated usage
+stayed flat (7,086 MB -> 7,070 MB), and `VK_EXT_memory_budget` reports each
+import and its free balancing to the byte (3 MiB of image, 9 MiB of chain). What
+grows is per-process attribution for imported resources; after a day in the tray
+Task Manager would show gigabytes this process does not hold. For 78 MB out of
+363, that is a bad trade, so the chain stays and the working set — the number the
+tray is judged on — is handled by the trim instead.
+
+Worth knowing for `SIPHON_UI_CHAIN=exact`: every window resize there re-imports
+the chain, so the process's GPU accounting climbs ~28 MB per resize while device
+memory does not move. The diagnostic is still fine; do not read its Task Manager
+column as usage.
 
 Tray actions run in the tray's window procedure, not through a channel, for the
 same no-frames reason: an action queued for a frame would wait for the window it
