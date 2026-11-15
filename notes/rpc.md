@@ -389,6 +389,30 @@ the desktop asks for). The `.ico` rather than `icon.png` because the window want
 an `HICON` and the file already holds the images Windows asks for; the PNG would
 need a decoder to become the RGBA rows `Surface::set_icon` takes.
 
+What the window costs at rest, measured rather than guessed (debug build,
+private working set as Task Manager's Memory column reports it):
+
+| what | bytes |
+| --- | --- |
+| a process that creates only this wgpu Vulkan device | 45 MB |
+| the same window on ZGUI's own wgpu renderer | 133 MB |
+| this window, through D3D12 and libplacebo | 138 MB |
+| textures the window holds (ZGUI composed target 3.1 MB, atlases 5.2 MB, buffers 0.6 MB, interface 3.0 MB) | 12 MB |
+| the canvas chain while it is up | 77 MB of VRAM |
+
+So the presentation layer (`dxgi.rs`, `placebo.rs`) is about 5 MB of that, and
+everything else is what a GPU UI is: the Vulkan instance and device the driver
+sets up for any client, and ZGUI's renderer, text engine and scene. A device
+alone is ~200 MB of VRAM before a single texel is drawn. The daemon has none of
+it: 4 MB, because it is sockets and buffers.
+
+Parking gives the chain's 77 MB back, but not the device's own footprint, and
+nothing here can: ZGUI owns the renderer for the window's whole life, so the only
+way to go lower in the tray is to close the window while hidden and open a new
+one when the tray's Open asks for it. That trades the resident stack (all of the
+138 MB except the app loop and the RPC worker) for the ~0.3-0.6 s a new window,
+device and first frame take. It has not been built.
+
 The inner renderer's atlas textures are moved onto the replacement: the atlas*policy* (which tile holds which glyph) lives in the window's content cache,
 above the renderer, and it believes every tile it placed is resident. A fresh
 empty atlas would therefore draw the rectangles and nothing else — the scene
