@@ -269,6 +269,13 @@ impl UiRenderer {
 
     /// Resizes the chain and re-wraps its backbuffers.
     fn resize_chain(&mut self, width: u32, height: u32) -> bool {
+        if self
+            .swapchain
+            .as_ref()
+            .is_some_and(DxgiSwapchain::is_removed)
+        {
+            return false;
+        }
         for mut target in self.targets.drain(..) {
             self.placebo.destroy_texture(&mut target);
         }
@@ -340,6 +347,9 @@ impl UiRenderer {
         let Some(swapchain) = self.swapchain.as_ref() else {
             return outcome;
         };
+        if swapchain.is_removed() {
+            return outcome;
+        }
         let (width, height) = swapchain.size();
         let index = swapchain.current_index();
         let Some(&target_tex) = self.targets.get(usize::try_from(index).unwrap_or(0)) else {
@@ -505,6 +515,14 @@ impl UiRenderer {
             return;
         };
         if Instant::now() < at {
+            return;
+        }
+        // A shrink must not land inside a drag: while the user is sizing the
+        // window the desktop owns its frame, and `ResizeBuffers` there is what
+        // was seen to take the device away. Wait for the drag to end.
+        // SAFETY: `GetCapture` reads the calling thread's capture window.
+        if !unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() }.is_invalid() {
+            self.settle_at = Some(Instant::now() + SETTLE);
             return;
         }
         self.settle_at = None;

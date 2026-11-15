@@ -311,13 +311,30 @@ the presentation is rebuilt on the per-frame path and has to be cheap. The ZGUI
 texture and the inner renderer are rebuilt for the exact window extent every
 time, which is what makes the content reflow at the display's rate. The chain's
 backbuffers are the expensive part (`ResizeBuffers` costs ~3-6 ms), so the chain
-is a canvas the size of the virtual screen (`dxgi::canvas_size`) and the UI is
-presented 1:1 at its top-left. `DXGI_SCALING_NONE` makes DWM show that corner
-cropped to the window, so nothing is scaled during a drag and no resize happens
-per event. The overlay also stretches the UI's edge texels over the rest of the
-canvas, so the area a growing window uncovers is the page background rather
-than black for the frame before the new extent is drawn. The chain only grows
-if a window exceeds the canvas, which a normal drag cannot do.
+is sized in two steps rather than one:
+
+- **At rest** it is the window's own extent (`dxgi::idle_canvas`), presented 1:1
+  at its top-left. 1000x760 costs 9 MB of backbuffers where a virtual-screen
+  canvas cost 77 MB, and nothing is scaled or cropped.
+- **While the size is moving** it covers the monitor the window is on
+  (`dxgi::resize_canvas`, from `MonitorFromWindow`), grown when an event first
+  outgrows it. `ResizeBuffers` is paid once at the start of a drag; every event
+  after that is a repaint of the interface texture alone. `DXGI_SCALING_NONE`
+  makes DWM show the chain's top-left corner cropped to the window, and the
+  overlay stretches the UI's edge texels over the rest, so the area a growing
+  window uncovers is the page background rather than black for the frame before
+  the new extent is drawn.
+- **`SETTLE` (400 ms) after the last event** the chain shrinks back to the window
+  in `UiRenderer::draw`. The interface texture is kept and composed whole, so
+  the new backbuffers need nothing painted into them first; measured, the shrink
+  is ~3 ms. It waits while the desktop has the mouse captured — a live drag or
+  border resize — and re-arms the deadline instead, so it happens once the drag
+  is over. `ResizeBuffers` in the middle of a drag is the one moment this drawing
+  was seen to lose the device (below).
+
+So a drag costs two chain resizes: the monitor one (~5 ms) when it starts and the
+window one (~3 ms) after it stops. A pause in the middle of a drag looks like the
+end of one and pays the same two.
 
 `DXGI_SCALING_NONE` fills whatever part of the client area the chain does not
 cover with the chain's *background colour*, which defaults to opaque black —
@@ -329,7 +346,7 @@ UI texture is rebuilt and fully damaged on the resize frame. `SetBackgroundColor
 puts the page colour (`#12141a`) in that slot, so whatever the compositor fills
 is the page rather than a black bar. `SIPHON_UI_CHAIN=half` makes the window
 larger than its chain, which is the only way to see and configure that fill on
-demand; `=exact` presents through a window-sized chain instead, which costs
+demand; `=exact` never grows the chain to the monitor, so it pays
 `ResizeBuffers` (~3-5 ms, one refresh at 320 Hz) per resize event and is a
 diagnostic only, not the presentation. A window-class background brush is set
 to the page colour as well, for `WM_ERASEBKGND` paths.
@@ -380,10 +397,21 @@ for imported resources; after a day of dragging, Task Manager would show
 gigabytes this process does not hold. The chain stays, and the working set — the
 number the tray is judged on — is handled by the trim instead.
 
-Worth knowing: a drag now re-imports the chain twice (monitor at the start, the
+Worth knowing: a drag re-imports the chain twice (monitor at the start, the
 window at the end), so its accounting climbs ~100-160 MB per drag while device
 memory does not move. `SIPHON_UI_CHAIN=exact` re-imports on every resize event
 instead, ~28 MB each.
+
+One `DXGI_ERROR_DEVICE_REMOVED` was seen in a scripted stress of the two-step
+sizing: the settle shrink's `ResizeBuffers` succeeded, the `Present1` after it
+came back with the device gone, and every frame after that retried the same
+failing `ResizeBuffers` — which reads as a frozen window. Two things came out of
+it. The shrink no longer runs while the window holds the mouse capture; and
+`DxgiSwapchain` latches a removed device (`is_removed`), logs one error and stops
+asking, so a removal degrades to a window that stops updating instead of one that
+freezes. It has not been seen again in repeated stress, so the capture guard is a
+precaution rather than a proven fix; `Present1` reports
+`GetDeviceRemovedReason` if it recurs.
 
 Tray actions run in the tray's window procedure, not through a channel, for the
 same no-frames reason: an action queued for a frame would wait for the window it

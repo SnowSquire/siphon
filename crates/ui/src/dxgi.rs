@@ -6,6 +6,7 @@
 
 // Ported from the video spike: HDR paths stay for later; the UI presents SDR.
 #![allow(dead_code)]
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::size_of;
 
@@ -260,6 +261,10 @@ pub struct DxgiSwapchain {
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
+    /// Whether the driver has taken the device away. Nothing this chain hands
+    /// out is valid after that, and every call that touches it fails the same
+    /// way, so it is asked once and then left alone.
+    removed: Cell<bool>,
     hdr: bool,
     max_luminance: f32,
     sdr_white: f32,
@@ -364,6 +369,7 @@ impl DxgiSwapchain {
             format,
             width,
             height,
+            removed: Cell::new(false),
             hdr,
             max_luminance,
             sdr_white,
@@ -385,6 +391,7 @@ impl DxgiSwapchain {
         height: u32,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
+        anyhow::ensure!(!self.removed.get(), "the device was removed");
         self.release_buffers();
         let started = std::time::Instant::now();
         // SAFETY: every reference to the old buffers has been dropped, and the
@@ -401,6 +408,7 @@ impl DxgiSwapchain {
                 ),
             )
         }
+        .inspect_err(|error| self.note_removal(error))
         .context("ResizeBuffers")?;
         tracing::debug!(
             target: "ui",
@@ -546,7 +554,52 @@ impl DxgiSwapchain {
         // SAFETY: the swapchain lives in `self`; the parameters describe the whole frame
         // (no dirty rects), which is what a flip-model present expects.
         let result = unsafe { self.swapchain.Present1(1, DXGI_PRESENT(0), &params) };
-        result.ok().context("Present1")
+        if let Err(error) = result.ok() {
+            self.note_removal(&error);
+            match self.removal_reason() {
+                Some(reason) => return Err(error).context(format!("Present1 ({reason})")),
+                None => return Err(error).context("Present1"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the driver has taken the device away.
+    #[must_use]
+    pub const fn is_removed(&self) -> bool {
+        self.removed.get()
+    }
+
+    /// Records the one failure that no later call can improve on.
+    fn note_removal(&self, error: &windows::core::Error) {
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_HUNG;
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_RESET;
+
+        let code = error.code();
+        let gone = code == DXGI_ERROR_DEVICE_REMOVED
+            || code == DXGI_ERROR_DEVICE_RESET
+            || code == DXGI_ERROR_DEVICE_HUNG;
+        if gone && !self.removed.replace(true) {
+            tracing::error!(
+                target: "ui",
+                "the D3D12 device was removed ({error}); the window can no longer present"
+            );
+        }
+    }
+
+    /// Why the device stopped drawing, if that is what the swapchain says.
+    fn removal_reason(&self) -> Option<String> {
+        // SAFETY: the swapchain is alive; `GetDevice` is what names the device
+        // behind it, and the reason is a plain query on that device.
+        unsafe {
+            let device: ID3D12Device = self.swapchain.GetDevice().ok()?;
+            let reason = device.GetDeviceRemovedReason();
+            Some(match reason {
+                Ok(()) => "the device is fine".to_owned(),
+                Err(error) => format!("device removed: {error:?}"),
+            })
+        }
     }
 }
 
