@@ -319,21 +319,91 @@ canvas, so the area a growing window uncovers is the page background rather
 than black for the frame before the new extent is drawn. The chain only grows
 if a window exceeds the canvas, which a normal drag cannot do.
 
+`DXGI_SCALING_NONE` fills whatever part of the client area the chain does not
+cover with the chain's *background colour*, which defaults to opaque black —
+not with the window's background brush, and not with the page colour. An
+occasional one-frame black bar across the client area during a live resize was
+tracked down to that fill and nothing else in the path can produce pure black:
+a flip-model `Present` is atomic, the canvas is drawn whole before it, and the
+UI texture is rebuilt and fully damaged on the resize frame. `SetBackgroundColor`
+puts the page colour (`#12141a`) in that slot, so whatever the compositor fills
+is the page rather than a black bar. `SIPHON_UI_CHAIN=half` makes the window
+larger than its chain, which is the only way to see and configure that fill on
+demand; `=exact` presents through a window-sized chain instead, which costs
+`ResizeBuffers` (~3-5 ms, one refresh at 320 Hz) per resize event and is a
+diagnostic only, not the presentation. A window-class background brush is set
+to the page colour as well, for `WM_ERASEBKGND` paths.
+
 The D3D12 device, command queue and DXGI factory are created once per window by
 `dxgi::D3d12` and shared by every swapchain. Recreating them per resize cost
 ~280 ms, almost all of it `D3D12CreateDevice`, which is what made a drag crawl.
 The dev profile optimises the dependencies (ZGUI's layout and paint, wgpu, the
 Win32 bindings) and `siphon-ui`, because a drag is a CPU-bound frame loop.
 
-The inner renderer's atlas textures are moved onto the replacement: the atlas
-*policy* (which tile holds which glyph) lives in the window's content cache,
+A rebuild replaces nothing until its replacement exists. It used to free the
+interface view first; when the renderer for the new extent could not be built,
+the frame that followed composited through the freed texture, and libplacebo
+took the process down with it. `renderer_supplied` asking `SharedGraphics` for
+a device that has been lost is the way that happens, so the failure is reachable
+from a real state and not only from a bug in this file.
+
+Closing the window puts it away in the tray: ZGUI's close request is vetoed and
+the surface hidden, and the tray's Open (or a second launch of the program, which
+posts the same message) shows it again. The park rides on that hide rather than
+on occlusion, for two reasons that are both this platform's:
+
+- ZGUI's `occluded` signal never comes true on Windows, because winit's Windows
+  backend emits no `Occluded` event.
+- A hidden window is handed no frames at all: winit paints visible windows only,
+  and "a window that is hidden later waits for the paint that shows it again".
+  Nothing that runs in a frame — the 100 ms interval included — runs while the
+  window is in the tray.
+
+So `renderer::park()` is called where the window is hidden: it frees the three
+libplacebo views and resizes the chain's buffers to 1x1 with `ResizeBuffers` —
+77 MB back to the device at 4480x1440. `ResizeBuffers` is the same call a drag
+makes, and the wait it pays is the compositor handing every buffer back, which is
+why this is safe on a live chain; the chain object itself stays, with its window
+association and flip queue. Recreating the chain instead
+(`CreateSwapChainForHwnd` again) was tried first and answered "no usable
+graphics device" — the wgpu device was already marked lost by then — so the
+chain object is kept.
+
+The frame that shows the window again grows only the chain, not the renderer.
+Rebuilding the inner renderer there is what a resize does, but a resize rebuilds
+before the frame paints; here the rebuild would happen inside `draw`, after the
+frame had painted into the renderer it replaced, so the new blank texture would
+reach the screen and the window would come back black. Keeping the interface
+texture means that frame composes the last picture whole (every frame overlays
+the entire texture) and the damage it carries refreshes what changed.
+
+Tray actions run in the tray's window procedure, not through a channel, for the
+same no-frames reason: an action queued for a frame would wait for the window it
+was meant to open. The procedure calls the handler the window installs, so Show,
+Restart and Quit all work while hidden — Quit wakes the loop through ZGUI's own
+command waker.
+
+The window icon is set from the bundled `icon.ico` with `WM_SETICON` (a small
+image for the title bar, a large one for Alt-Tab and the taskbar, each the size
+the desktop asks for). The `.ico` rather than `icon.png` because the window wants
+an `HICON` and the file already holds the images Windows asks for; the PNG would
+need a decoder to become the RGBA rows `Surface::set_icon` takes.
+
+The inner renderer's atlas textures are moved onto the replacement: the atlas*policy* (which tile holds which glyph) lives in the window's content cache,
 above the renderer, and it believes every tile it placed is resident. A fresh
 empty atlas would therefore draw the rectangles and nothing else — the scene
 still names glyph tiles no texture backs. The colour space, HDR metadata and SDR
 white point are decisions about the display and survive a resize; only a window
 that moved to another output changes them, which is the next feature's problem.
-There are no external textures to lose: RPC events and tray actions are drained
-by a 100 ms `set_interval` in the view, not by a surface pump. HDR is off for
+There are no external textures to lose: RPC events are drained by a 100 ms
+`set_interval` in the view, not by a surface pump. That interval checks the
+channel before touching the state, so an idle tick costs nothing. The protocol is incremental — an `Update` names one
+entity and carries it whole — so the signals *are* the state: `rpc::UiState`
+holds one per thing the view draws and applies an update to the signal it names.
+A snapshot exists only for the first connect and a reconnect. That is what makes
+ZGUI's reactivity pay: a viewer count touches `channels` alone, and no closure
+clones the login list to read the connection label.
+HDR is off for
 now (`HdrMode::Off`), but the SDR white point still comes from DisplayConfig;
 the video pass and HDR transfer functions are the later work.
 

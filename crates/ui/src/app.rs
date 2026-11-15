@@ -7,7 +7,6 @@ use raw_window_handle::HasWindowHandle as _;
 use siphon_rpc::ChannelView;
 use siphon_rpc::ConnHealth;
 use siphon_rpc::Request;
-use siphon_rpc::Snapshot;
 use zgui::prelude::*;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
@@ -27,25 +26,21 @@ use crate::dxgi::D3d12;
 use crate::dxgi::DxgiSwapchain;
 use crate::dxgi::HdrMode;
 use crate::dxgi::hwnd_from_raw;
+use crate::dxgi::set_window_background;
 use crate::format::format_iso_ms;
 use crate::placebo::Placebo;
 use crate::renderer::UiRenderer;
 use crate::rpc::IntentSender;
 use crate::rpc::UiCommand;
 use crate::rpc::UiEvent;
-use crate::rpc::apply_update;
-use crate::rpc::empty_snapshot;
+use crate::rpc::UiState;
 use crate::tray::TrayAction;
 
-pub fn run(
-    events: kanal::Receiver<UiEvent>,
-    tray: kanal::Receiver<TrayAction>,
-    intents: IntentSender,
-) -> anyhow::Result<()> {
+pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> anyhow::Result<()> {
     let (gpu, _decode) = crate::gpu::create()?;
     let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
     let factory_gpu = Arc::clone(&gpu);
-    let snapshot = RwSignal::new_local(empty_snapshot());
+    let state = UiState::new();
 
     app()
         .with_application_id("com.iken.siphon")
@@ -59,10 +54,9 @@ pub fn run(
         .run(move || {
             view! {
                 App(
-                    snapshot = snapshot,
+                    state = state.clone(),
                     intents = intents.clone(),
                     events = events.clone(),
-                    tray = tray.clone(),
                 )
             }
         })
@@ -82,6 +76,10 @@ fn dxgi_renderer(
         .window_handle()
         .map_err(|error| dxgi_error(format!("window handle: {error}")))?;
     let hwnd = hwnd_from_raw(window.as_raw()).map_err(|error| dxgi_error(format!("{error:#}")))?;
+    set_window_background(hwnd);
+    // The icon helper speaks `windows-sys`, whose `HWND` is the raw handle; `hwnd`
+    // is the `windows` crate's newtype around the same pointer.
+    crate::tray::set_window_icon(hwnd.0);
     let width = u32::try_from(target.size.width)
         .map_err(|_| dxgi_error("the target width is not positive"))?;
     let height = u32::try_from(target.size.height)
@@ -108,8 +106,9 @@ fn dxgi_renderer(
         view_formats: &[],
     });
 
-    let placebo =
-        Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error:#}")))?;
+    let placebo = Rc::new(
+        Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error:#}")))?,
+    );
     let renderer = graphics
         .renderer_supplied(target, vec![ui.clone()])
         .map_err(AppError::from)?;
@@ -125,6 +124,7 @@ fn dxgi_renderer(
         target,
     )
     .map_err(|error| dxgi_error(format!("{error:#}")))?;
+    crate::renderer::install(Rc::clone(renderer.presentation()));
     Ok(Box::new(renderer))
 }
 
@@ -134,46 +134,75 @@ fn dxgi_error(reason: impl Into<String>) -> AppError {
 
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
-fn App(
-    snapshot: RwSignal<Snapshot, LocalStorage>,
-    intents: IntentSender,
-    events: kanal::Receiver<UiEvent>,
-    tray: kanal::Receiver<TrayAction>,
-) -> impl IntoView {
+fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) -> impl IntoView {
     let intents = Rc::new(intents);
+    // One handle per signal the view reads, so a closure depends on that field
+    // alone: ZGUI reruns it when the signals it read change, not when any part of
+    // the snapshot does.
+    let conn_sig = state.conn;
+    let error_sig = state.error;
+    let offer = state.update;
+    let channels_sig = state.channels;
+    let pending_sig = state.pending;
+    let words_sig = state.words;
+    let title_sig = state.title_changes;
+    let sound_sig = state.sound;
 
-    // The RPC worker and the tray feed channels; this interval drains them on
-    // the UI thread and only touches the signal when something changed.
-    let timer = set_interval(std::time::Duration::from_millis(100), move || {
-        let mut state = snapshot.get_untracked();
-        let mut changed = false;
-        while let Ok(Some(event)) = events.try_recv() {
-            match event {
-                UiEvent::Snapshot(update) => state = *update,
-                UiEvent::Update(update) => apply_update(&mut state, update),
+    let window = use_window();
+    let windows = use_windows();
+
+    // Tray clicks run here, on the GUI thread, rather than through the interval:
+    // a window hidden to the tray draws no frames, so a click queued for one
+    // would wait for the very window it was meant to bring back.
+    crate::tray::set_action_handler({
+        let window = window.clone();
+        let windows = windows.clone();
+        move |action| match action {
+            TrayAction::Show => {
+                window.set_visible(true);
+                window.focus();
             }
-            changed = true;
-        }
-        if changed {
-            snapshot.set(state);
-        }
-        while let Ok(Some(action)) = tray.try_recv() {
-            match action {
-                TrayAction::Show => use_window().focus(),
-                TrayAction::Quit => use_windows().quit(),
-                TrayAction::Restart => {
-                    if let Err(error) = std::thread::Builder::new()
-                        .name("service restart".to_owned())
-                        .spawn(crate::service::restart)
-                    {
-                        tracing::error!(
-                            target: "service",
-                            "could not start the restart thread: {error}"
-                        );
-                    }
+            TrayAction::Quit => windows.quit(),
+            TrayAction::Restart => {
+                if let Err(error) = std::thread::Builder::new()
+                    .name("service restart".to_owned())
+                    .spawn(crate::service::restart)
+                {
+                    tracing::error!(
+                        target: "service",
+                        "could not start the restart thread: {error}"
+                    );
                 }
             }
         }
+    });
+
+    // Closing the window puts it away in the tray instead of ending the process:
+    // the way back is the tray's Open (or a double-click), the way out is Quit
+    // there. The backbuffers go back now, because a hidden window is handed no
+    // frame that could do it later, and the frame that shows it again grows the
+    // chain back.
+    let close = on_close_request({
+        let window = window.clone();
+        move || {
+            crate::renderer::park();
+            window.set_visible(false);
+            CloseResponse::Veto
+        }
+    });
+    // The callback lives as long as the window; the component has no teardown
+    // hook that owns the guard.
+    std::mem::forget(close);
+
+    // The RPC worker feeds a channel; this interval drains it on the UI thread
+    // and only touches the signals that changed.
+    let timer = set_interval(std::time::Duration::from_millis(100), move || {
+        // A tick with nothing to drain allocates nothing: the receiver is asked
+        // before anything is cloned or written.
+        if events.is_empty() {
+            return;
+        }
+        state.drain(&events);
     });
     // The interval lives as long as the window; the component has no teardown
     // hook that owns it.
@@ -216,11 +245,11 @@ fn App(
         column(class = "app") {
             row(class = "header") {
                 text(class = "brand") {"Siphon"}
-                text(class = "conn") {{move || conn_label(snapshot.get().conn)}}
+                text(class = "conn") {{move || conn_label(conn_sig.get())}}
                 spacer()
-                if move || snapshot.get().update.is_some() {
+                if move || offer.get().is_some() {
                     row(class = "banner") {
-                        text {{move || snapshot.get().update.map_or_else(String::new, |update| format!("Update to {}", update.version))}}
+                        text {{move || offer.get().map_or_else(String::new, |update| format!("Update to {}", update.version))}}
                         Button(
                             variant = ButtonVariant::Outline,
                             on:click = {
@@ -232,9 +261,9 @@ fn App(
                 }
             }
 
-            if move || snapshot.get().error.is_some() {
+            if move || error_sig.get().is_some() {
                 row(class = "error") {
-                    text(class = "error__text") {{move || snapshot.get().error.clone().unwrap_or_default()}}
+                    text(class = "error__text") {{move || error_sig.get().unwrap_or_default()}}
                     spacer()
                     Button(
                         size = ButtonSize::Sm,
@@ -254,14 +283,14 @@ fn App(
 
             ScrollArea(class = "channels") {
                 column(class = "list") {
-                    for channel in move || snapshot.get().channels, key = |channel: &ChannelView| channel.id {
+                    for channel in move || (*channels_sig.get()).clone(), key = |channel: &ChannelView| channel.id {
                         ChannelRow(
                             channel = channel.clone(),
                             expanded = expanded,
                             intents = Rc::clone(&rows),
                         )
                     }
-                    for login in move || snapshot.get().pending, key = |login: &String| login.clone() {
+                    for login in move || (*pending_sig.get()).clone(), key = |login: &String| login.clone() {
                         row(class = "channel pending") {
                             text(class = "channel__name") {{login.clone()}}
                             text(class = "channel__title") {"resolving…"}
@@ -274,23 +303,23 @@ fn App(
                 Button(
                     variant = ButtonVariant::Outline,
                     on:click = move |_| {
-                        let on = snapshot.get_untracked().config.notify_title_changes;
+                        let on = title_sig.get_untracked();
                         titles.send(UiCommand::Request(Request::SetNotifyTitleChanges(!on)));
                     }
                 ) {
                     text {
-                        {move || if snapshot.get().config.notify_title_changes { "Titles: on" } else { "Titles: off" }}
+                        {move || if title_sig.get() { "Titles: on" } else { "Titles: off" }}
                     }
                 }
                 Button(
                     variant = ButtonVariant::Outline,
                     on:click = move |_| {
-                        let on = snapshot.get_untracked().config.sound;
+                        let on = sound_sig.get_untracked();
                         sound.send(UiCommand::Request(Request::SetSound(!on)));
                     }
                 ) {
                     text {
-                        {move || if snapshot.get().config.sound { "Sound: on" } else { "Sound: off" }}
+                        {move || if sound_sig.get() { "Sound: on" } else { "Sound: off" }}
                     }
                 }
             }
@@ -303,10 +332,7 @@ fn App(
             ScrollArea(class = "words") {
                 column(class = "list") {
                     for word in move || {
-                        snapshot
-                            .get()
-                            .config
-                            .filtered_words
+                        (*words_sig.get())
                             .iter()
                             .enumerate()
                             .map(|(index, word)| WordRow {

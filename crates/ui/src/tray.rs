@@ -3,24 +3,25 @@
 //!
 //! A raw `Shell_NotifyIconW` icon on a hidden message window: the icon,
 //! tooltip, and Open/Quit menu are registered directly with the shell, so
-//! tray clicks arrive as window messages on the GUI thread and forward
-//! into a [`kanal`] channel with sends that never block; the work task and
-//! the GUI pump await tray events instead of polling. The channel sender
-//! rides in the message window's user data, which is how the global window
-//! procedure reaches per-window state. Notifications stay on
-//! WinRT toasts in `notifier`, never on the legacy `NIF_INFO` balloon this
-//! same struct could show.
+//! tray clicks arrive as window messages on the GUI thread. What a click
+//! does is carried out right there rather than queued for a frame, because a
+//! window put away in the tray draws none: a click that brought it back
+//! would otherwise wait for the window it was meant to bring back.
+//! Notifications stay on WinRT toasts in `notifier`, never on the legacy
+//! `NIF_INFO` balloon this same struct could show.
 //! The `Tray` value must stay alive for the icon to remain: dropping it
 //! removes the icon, and `Tray` always owns one — absence of a tray is
 //! `Option<Tray>::None` at the call site, never a flag inside `Tray`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
-use kanal::Sender;
 use windows_sys::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HWND;
@@ -48,29 +49,37 @@ use windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW;
 use windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon;
 use windows_sys::Win32::UI::WindowsAndMessaging::DestroyMenu;
 use windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow;
-use windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA;
 use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
-use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW;
+use windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics;
 use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
 use windows_sys::Win32::UI::WindowsAndMessaging::HMENU;
 use windows_sys::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
+use windows_sys::Win32::UI::WindowsAndMessaging::ICON_BIG;
+use windows_sys::Win32::UI::WindowsAndMessaging::ICON_SMALL;
 use windows_sys::Win32::UI::WindowsAndMessaging::LR_DEFAULTCOLOR;
 use windows_sys::Win32::UI::WindowsAndMessaging::LookupIconIdFromDirectoryEx;
 use windows_sys::Win32::UI::WindowsAndMessaging::MF_STRING;
+use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows_sys::Win32::UI::WindowsAndMessaging::RegisterClassW;
 use windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
+use windows_sys::Win32::UI::WindowsAndMessaging::SM_CXICON;
+use windows_sys::Win32::UI::WindowsAndMessaging::SM_CXSMICON;
+use windows_sys::Win32::UI::WindowsAndMessaging::SM_CYICON;
+use windows_sys::Win32::UI::WindowsAndMessaging::SM_CYSMICON;
+use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
-use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW;
 use windows_sys::Win32::UI::WindowsAndMessaging::TPM_BOTTOMALIGN;
 use windows_sys::Win32::UI::WindowsAndMessaging::TPM_LEFTALIGN;
 use windows_sys::Win32::UI::WindowsAndMessaging::TPM_RETURNCMD;
 use windows_sys::Win32::UI::WindowsAndMessaging::TrackPopupMenuEx;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_APP;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU;
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_GETICON;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_RBUTTONDBLCLK;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP;
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETICON;
 use windows_sys::Win32::UI::WindowsAndMessaging::WNDCLASSW;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,34 +113,25 @@ const TOOLTIP: &str = "Siphon Dev";
 #[cfg(not(debug_assertions))]
 const TOOLTIP: &str = "Siphon";
 
-/// Owns the tray icon, its message window, and the channel sender tray
-/// clicks forward into. Held alive for the app lifetime; dropping removes
-/// the icon from the tray.
+/// Owns the tray icon and its message window. Held alive for the app
+/// lifetime; dropping removes the icon from the tray.
 pub struct Tray {
     hwnd: HWND,
     icon: HICON,
-    /// The sender allocation behind the window's user data pointer. The
-    /// window is destroyed first in `Drop`, so the pointer never outlives
-    /// what it points to.
-    tx: *mut Sender<TrayAction>,
 }
 
-/// Builds the tray icon with clicks forwarding into `tx`. Call on the GUI
-/// thread so the message window that receives the shell callbacks pumps
-/// with the event loop.
-pub fn build(tx: Sender<TrayAction>) -> anyhow::Result<Tray> {
-    let tx = Box::new(tx);
-    let hwnd = ensure_window(&tx)?;
+/// Builds the tray icon. Call on the GUI thread so the message window that
+/// receives the shell callbacks pumps with the event loop.
+pub fn build() -> anyhow::Result<Tray> {
+    let hwnd = ensure_window()?;
     let icon = load_icon()?;
     add_icon(hwnd, icon)?;
     if let Ok(mut guard) = icon_state().lock() {
         *guard = Some(TrayIconState { hwnd, icon });
     }
-    Ok(Tray {
-        hwnd,
-        icon,
-        tx: Box::into_raw(tx),
-    })
+    // Posted to from another thread by `show`, which may not touch a window.
+    TRAY_HWND.store(hwnd as isize, Ordering::Release);
+    Ok(Tray { hwnd, icon })
 }
 
 impl Drop for Tray {
@@ -148,32 +148,52 @@ impl Drop for Tray {
         // SAFETY: icon created by `load_icon` and owned by this value.
         unsafe { DestroyIcon(self.icon) };
         // SAFETY: message window created by `ensure_window` for this value.
-        // Destroying it first retires the window procedure, so nothing can
-        // still read the sender pointer freed below; only this thread ever
-        // touched either.
         unsafe { DestroyWindow(self.hwnd) };
-        // SAFETY: `tx` came from `Box::into_raw` in `build`; the sole
-        // borrower is gone.
-        unsafe { drop(Box::from_raw(self.tx)) };
     }
 }
 
-/// Reads the sender back out of the message window's user data. Set once
-/// by [`build`] for the window's whole life; the owning `Tray` outlives
-/// the window, and only the GUI thread that owns both ever reads it.
-fn sender_for(hwnd: HWND) -> Option<&'static Sender<TrayAction>> {
-    // SAFETY: user data holds a `*const Sender` installed at window
-    // creation; the pointer stays valid until `Drop` destroys the window.
-    unsafe {
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Sender<TrayAction>;
-        ptr.as_ref()
+/// What a tray click does.
+type Handler = Rc<dyn Fn(TrayAction)>;
+
+thread_local! {
+    /// What a tray click does, installed by the window that owns the UI. A
+    /// window put away in the tray runs no frames, so a click has to be
+    /// carried out by the GUI thread that receives it, not queued for one.
+    static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+}
+
+/// Installs what a tray click does. Called from the window's component, the
+/// first place a window handle exists.
+pub fn set_action_handler(handler: impl Fn(TrayAction) + 'static) {
+    HANDLER.with(|slot| *slot.borrow_mut() = Some(Rc::new(handler)));
+}
+
+/// Runs the installed handler, if there is one. Cloned out first, so a handler
+/// that tears anything down cannot pull the closure out from under itself.
+fn dispatch(action: TrayAction) {
+    let handler = HANDLER.with(|slot| slot.borrow().clone());
+    if let Some(handler) = handler {
+        handler(action);
     }
 }
 
-fn send_action(hwnd: HWND, action: TrayAction) {
-    if let Some(tx) = sender_for(hwnd) {
-        let _ = tx.send(action);
+/// The tray window, for posting to it from another thread. Zero until the
+/// tray exists.
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Asks the window to show itself from another thread.
+///
+/// A second launch of the program arrives on a listener thread, and posting a
+/// message is the only way such a thread may reach a window. It raises the
+/// same message a tray click does, so there is one path to being shown.
+pub fn show() {
+    let hwnd = TRAY_HWND.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() {
+        return;
     }
+    // SAFETY: the posted message carries no pointers. The window may already
+    // be gone, in which case the post fails and nothing happens.
+    unsafe { PostMessageW(hwnd, WM_TRAY, 0, NIN_SELECT as LPARAM) };
 }
 
 struct TrayIconState {
@@ -273,6 +293,69 @@ pub fn load_icon() -> anyhow::Result<HICON> {
     Ok(icon)
 }
 
+/// Sets the window's title-bar and taskbar icon from the bundled `.ico`.
+///
+/// The `.ico` rather than the `.png`: the window manager takes an `HICON`, and
+/// the icon file already carries the images Windows asks for at each size,
+/// while the `.png` would need a decoder to become the straight rows
+/// `Surface::set_icon` takes. Renderer setup calls this again on every
+/// swapchain rebuild, so the check for an icon already set is what keeps a
+/// resize from leaking another pair of handles. An icon given to a window this
+/// way lives as long as the window, which is why neither is destroyed here.
+pub fn set_window_icon(hwnd: HWND) {
+    // SAFETY: `hwnd` is this process's window, and the message reads no pointers.
+    if unsafe { SendMessageW(hwnd, WM_GETICON, ICON_BIG as WPARAM, 0) } != 0 {
+        return;
+    }
+    // SAFETY: plain system metric queries.
+    let (big_w, big_h) = unsafe { (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON)) };
+    // SAFETY: plain system metric queries.
+    let (small_w, small_h) =
+        unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+    let big = icon_at(big_w, big_h);
+    if big.is_null() {
+        return;
+    }
+    let small = icon_at(small_w, small_h);
+    let small = if small.is_null() { big } else { small };
+    // SAFETY: both handles were created just above and belong to the window
+    // from here on; it is destroyed with the window.
+    unsafe {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG as WPARAM, big as LPARAM);
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as WPARAM, small as LPARAM);
+    }
+}
+
+/// Creates the bundled `.ico` image closest to `cx` by `cy`.
+fn icon_at(cx: i32, cy: i32) -> HICON {
+    if !valid_ico(ICON_ICO) {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `ICON_ICO` passed validation as a well-formed `.ico` directory,
+    // so the lookup only reads its header.
+    let offset =
+        unsafe { LookupIconIdFromDirectoryEx(ICON_ICO.as_ptr(), 1, cx, cy, LR_DEFAULTCOLOR) };
+    if offset <= 0 {
+        return std::ptr::null_mut();
+    }
+    let Some(rest) = ICON_ICO.get(offset as usize..) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: `rest` starts at the validated image offset and spans to the end
+    // of the bundle, which is exactly the resource slice the call reads.
+    unsafe {
+        CreateIconFromResourceEx(
+            rest.as_ptr(),
+            rest.len() as u32,
+            1,
+            0x0003_0000,
+            cx,
+            cy,
+            LR_DEFAULTCOLOR,
+        )
+    }
+}
+
 fn base_nid(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
     let mut nid: NOTIFYICONDATAW = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -352,20 +435,19 @@ fn show_menu(hwnd: HWND) {
     // SAFETY: destroying the menu created above, exactly once.
     unsafe { DestroyMenu(menu) };
     if picked == MENU_OPEN {
-        send_action(hwnd, TrayAction::Show);
+        dispatch(TrayAction::Show);
     } else if picked == MENU_RESTART {
-        send_action(hwnd, TrayAction::Restart);
+        dispatch(TrayAction::Restart);
     } else if picked == MENU_QUIT {
-        send_action(hwnd, TrayAction::Quit);
+        dispatch(TrayAction::Quit);
     }
 }
 
 static CLASS_READY: AtomicBool = AtomicBool::new(false);
 
 /// Registers the message-window class once and creates the hidden window
-/// the shell posts tray input to. Stashes `tx` in the window's user data
-/// so the window procedure can forward clicks into it.
-fn ensure_window(tx: &Sender<TrayAction>) -> anyhow::Result<HWND> {
+/// the shell posts tray input to.
+fn ensure_window() -> anyhow::Result<HWND> {
     // SAFETY: null name queries the current module handle.
     let instance = unsafe { GetModuleHandleW(core::ptr::null()) };
     if instance.is_null() {
@@ -414,10 +496,6 @@ fn ensure_window(tx: &Sender<TrayAction>) -> anyhow::Result<HWND> {
     if hwnd.is_null() {
         anyhow::bail!("CreateWindowExW failed");
     }
-    // SAFETY: `hwnd` is our own live window; user data is a pointer-sized
-    // slot the procedure reads back in `sender_for`, and the `Tray` owner
-    // outlives the window.
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, core::ptr::from_ref(tx) as isize) };
     Ok(hwnd)
 }
 
@@ -434,7 +512,7 @@ unsafe extern "system" fn wnd_proc(
         // so only the low word names the event.
         match (lparam as u32) & 0xFFFF {
             NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
-                send_action(hwnd, TrayAction::Show);
+                dispatch(TrayAction::Show);
             }
             WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_CONTEXTMENU => show_menu(hwnd),
             _ => {}

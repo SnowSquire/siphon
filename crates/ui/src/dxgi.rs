@@ -42,6 +42,7 @@ use windows::Win32::Graphics::Dxgi::DXGI_HDR_METADATA_TYPE_HDR10;
 use windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS;
+use windows::Win32::Graphics::Dxgi::DXGI_RGBA;
 use windows::Win32::Graphics::Dxgi::DXGI_SCALING_NONE;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1;
@@ -91,10 +92,23 @@ pub enum HdrMode {
 /// shows that corner cropped to the window, so nothing is ever scaled. The
 /// canvas covers every monitor the window could be dragged over, and a target
 /// larger than it simply grows it.
+///
+/// `SIPHON_UI_CHAIN=exact` presents through a chain at the window's own extent
+/// instead, which pays `ResizeBuffers` per resize event and needs no crop from
+/// the compositor. It exists to tell a presentation artifact apart from a
+/// composed one.
 pub fn canvas_size(width: u32, height: u32) -> (u32, u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics;
     use windows_sys::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN;
     use windows_sys::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN;
+
+    match chain_mode() {
+        ChainMode::Exact => return (width.max(1), height.max(1)),
+        // Diagnostic: a chain smaller than the window is the only way to make the
+        // compositor's fill outside the back buffer visible on demand.
+        ChainMode::Half => return (width.max(2) / 2, height.max(2) / 2),
+        ChainMode::Canvas => {}
+    }
 
     // SAFETY: the metric indices are the two documented ones; GetSystemMetrics
     // takes no pointers and fails by returning 0, which `max(1)` covers.
@@ -107,6 +121,31 @@ pub fn canvas_size(width: u32, height: u32) -> (u32, u32) {
     let screen_width = u32::try_from(screen_width).unwrap_or(1).max(1);
     let screen_height = u32::try_from(screen_height).unwrap_or(1).max(1);
     (screen_width.max(width), screen_height.max(height))
+}
+
+/// How the chain is sized against the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChainMode {
+    /// A chain covering every monitor, cropped to the window by the compositor.
+    Canvas,
+    /// A chain at the window's own extent; `SIPHON_UI_CHAIN=exact`.
+    Exact,
+    /// Half the window; `SIPHON_UI_CHAIN=half`. A diagnostic that makes the
+    /// compositor's fill outside the back buffer, and the colour it uses, visible.
+    Half,
+}
+
+/// Which presentation the chain uses.
+///
+/// Read once: the environment cannot change under a running process, and the
+/// answer is asked for on every resize event.
+fn chain_mode() -> ChainMode {
+    static MODE: std::sync::OnceLock<ChainMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SIPHON_UI_CHAIN").as_deref() {
+        Ok("exact") => ChainMode::Exact,
+        Ok("half") => ChainMode::Half,
+        _ => ChainMode::Canvas,
+    })
 }
 
 /// The D3D12 device, queue and factory a window's swapchains share.
@@ -237,6 +276,23 @@ impl DxgiSwapchain {
             factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None::<&IDXGIOutput>)
         }
         .context("CreateSwapChainForHwnd")?;
+        // Whatever `DXGI_SCALING_NONE` leaves outside the back buffer — a band of
+        // the client area a compositor has not taken from the chain yet, say — is
+        // filled with the chain's background, and that defaults to opaque black.
+        // The page colour is the only thing that may be behind the interface.
+        // `SIPHON_UI_BACKGROUND=black` leaves the default in place, which is the
+        // black this fill was before.
+        let page = DXGI_RGBA {
+            r: 18.0 / 255.0,
+            g: 20.0 / 255.0,
+            b: 26.0 / 255.0,
+            a: 1.0,
+        };
+        let raw_black = std::env::var("SIPHON_UI_BACKGROUND").is_ok_and(|value| value == "black");
+        if !raw_black {
+            // SAFETY: the swapchain is alive and `page` is a valid local.
+            unsafe { swapchain1.SetBackgroundColor(&page) }.context("SetBackgroundColor")?;
+        }
         let swapchain: IDXGISwapChain3 = swapchain1.cast().context("swapchain vtable")?;
         let swapchain2: IDXGISwapChain2 = swapchain1.cast().context("swapchain vtable")?;
         // Two frames outstanding at most; the waitable object below is what
@@ -284,6 +340,7 @@ impl DxgiSwapchain {
     ) -> anyhow::Result<()> {
         anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
         self.release_buffers();
+        let started = std::time::Instant::now();
         // SAFETY: every reference to the old buffers has been dropped, and the
         // flags are the ones the chain was created with.
         unsafe {
@@ -299,6 +356,13 @@ impl DxgiSwapchain {
             )
         }
         .context("ResizeBuffers")?;
+        tracing::debug!(
+            target: "ui",
+            width,
+            height,
+            elapsed = ?started.elapsed(),
+            "resize buffers"
+        );
         self.attach_backbuffers(d3d12, gpu, width, height)?;
         self.width = width;
         self.height = height;
@@ -306,6 +370,44 @@ impl DxgiSwapchain {
         // about the display and survive a resize; only a window that moved to
         // another output changes them, which is the next feature's problem.
         Ok(())
+    }
+
+    /// Frees the backbuffers and keeps the chain.
+    ///
+    /// `ResizeBuffers` waits for the compositor to hand every buffer back, which
+    /// is the wait a resize already pays, and is what makes this safe on a live
+    /// chain. The chain object stays: its window association, flip queue and
+    /// latency object are what recreating it would throw away, and its 1x1
+    /// buffers hold nothing.
+    pub fn park(&mut self) -> anyhow::Result<u64> {
+        let bytes = self.bytes();
+        self.release_buffers();
+        // SAFETY: every reference to the old buffers has been dropped, and the
+        // flags are the ones the chain was created with.
+        unsafe {
+            self.swapchain.ResizeBuffers(
+                BUFFERS,
+                1,
+                1,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0
+                        | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0,
+                ),
+            )
+        }
+        .context("ResizeBuffers (park)")?;
+        self.width = 1;
+        self.height = 1;
+        Ok(bytes)
+    }
+
+    /// The device memory the backbuffers occupy.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        // Four bytes a texel in the 10-bit format, over every buffer the chain
+        // rotates through.
+        u64::from(self.width) * u64::from(self.height) * 4 * u64::from(BUFFERS)
     }
 
     /// Imports the chain's current backbuffers into Vulkan.
@@ -667,4 +769,31 @@ pub fn hwnd_from_raw(handle: raw_window_handle::RawWindowHandle) -> anyhow::Resu
         return Err(anyhow!("the surface is not a Win32 window"));
     };
     Ok(HWND(win32.hwnd.get() as *mut c_void))
+}
+
+/// Colours everything behind the interface.
+///
+/// The window class the platform registers has no background brush, so any pixel
+/// the compositor has to fill rather than take from the chain is black: the area
+/// `DXGI_SCALING_NONE` leaves outside the back buffer, whatever DWM exposes while
+/// a window is being resized, and `WM_ERASEBKGND` if it is ever sent. The page's
+/// own colour is the only thing that may be behind the interface, and with it a
+/// frame that exposes that area shows the page instead of a black bar.
+pub fn set_window_background(hwnd: HWND) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::CreateSolidBrush;
+    use windows::Win32::UI::WindowsAndMessaging::GCLP_HBRBACKGROUND;
+    use windows::Win32::UI::WindowsAndMessaging::SetClassLongPtrW;
+
+    // The page background, `#12141a`, as a `0x00BBGGRR` colour reference.
+    const PAGE: COLORREF = COLORREF(0x001a_1412);
+    // SAFETY: a solid brush takes no pointers and fails by returning null, which
+    // `SetClassLongPtrW` accepts as "no brush" — the state it is in already.
+    let brush = unsafe { CreateSolidBrush(PAGE) };
+    // SAFETY: `hwnd` is this window's, the class is alive as long as it is, and
+    // the brush is deliberately never deleted because the class keeps the only
+    // reference to it.
+    unsafe {
+        SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush.0 as isize);
+    }
 }

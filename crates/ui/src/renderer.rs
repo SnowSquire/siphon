@@ -39,12 +39,115 @@ use crate::dxgi::HdrMode;
 use crate::dxgi::canvas_size;
 use crate::placebo::Placebo;
 
+/// The chain and the libplacebo views over its backbuffers.
+///
+/// Shared with the code that hides the window, because a window in the tray
+/// shows none of it: the canvas is the largest thing this process holds (77 MB
+/// of backbuffers at 4480x1440) and there is no reason to keep it on the device
+/// when nobody can look at it. The frame after the window comes back grows the
+/// chain again and composes the interface into it.
+pub struct Presentation {
+    placebo: Rc<Placebo>,
+    swapchain: RefCell<Option<DxgiSwapchain>>,
+    /// One libplacebo texture per backbuffer.
+    targets: RefCell<Vec<pl::pl_tex>>,
+}
+
+impl Presentation {
+    fn new(placebo: Rc<Placebo>, swapchain: DxgiSwapchain) -> Rc<Self> {
+        Rc::new(Self {
+            placebo,
+            swapchain: RefCell::new(Some(swapchain)),
+            targets: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Whether the chain is not at `size`, which a frame that draws puts right.
+    #[must_use]
+    pub fn differs_from(&self, width: u32, height: u32) -> bool {
+        self.swapchain
+            .borrow()
+            .as_ref()
+            .is_none_or(|chain| chain.size() != (width, height))
+    }
+
+    /// Releases the backbuffers of the window nobody can see.
+    ///
+    /// Answers the bytes that went back to the device; a chain already at its
+    /// smallest answers zero, so a second call costs nothing.
+    fn park(&self) -> u64 {
+        let mut chain = self.swapchain.borrow_mut();
+        let Some(chain) = chain.as_mut() else {
+            return 0;
+        };
+        if chain.size() == (1, 1) {
+            return 0;
+        }
+        // The last frame ended with the device idle and nothing has been drawn
+        // since; this only says so before the buffers go away.
+        self.placebo.finish();
+        for mut target in self.targets.borrow_mut().drain(..) {
+            self.placebo.destroy_texture(&mut target);
+        }
+        let freed = match chain.park() {
+            Ok(freed) => freed,
+            Err(error) => {
+                // The chain keeps its full size and the memory with it; the
+                // window is hidden either way.
+                tracing::warn!(target: "ui", "DXGI: park failed: {error:#}");
+                return 0;
+            }
+        };
+        if freed > 0 {
+            tracing::info!(target: "ui", bytes = freed, "presentation parked");
+        }
+        freed
+    }
+}
+
+impl Drop for Presentation {
+    fn drop(&mut self) {
+        // Before the chain: libplacebo's views name its images.
+        for mut target in self.targets.borrow_mut().drain(..) {
+            self.placebo.destroy_texture(&mut target);
+        }
+    }
+}
+
+thread_local! {
+    /// The one window's presentation, for the code that puts it away when the
+    /// window is hidden to the tray.
+    static PRESENTATION: RefCell<Option<Rc<Presentation>>> = const { RefCell::new(None) };
+}
+
+/// Publishes the window's presentation to [`park`].
+pub fn install(presentation: Rc<Presentation>) {
+    PRESENTATION.with(|slot| {
+        *slot.borrow_mut() = Some(presentation);
+    });
+}
+
+/// Releases the backbuffers of the window nobody can see.
+///
+/// Called as the window is hidden to the tray: a hidden window is handed no
+/// frame, so nothing running later could do it. The first frame after the
+/// window is shown again grows the chain back in [`UiRenderer::draw`].
+pub fn park() {
+    PRESENTATION.with(|slot| {
+        if let Some(presentation) = slot.borrow().as_ref() {
+            presentation.park();
+        } else {
+            // The window was closed before its first frame built a chain.
+            tracing::debug!(target: "ui", "park: no presentation installed");
+        }
+    });
+}
+
 pub struct UiRenderer {
     inner: WgpuRenderer,
-    swapchain: RefCell<Option<DxgiSwapchain>>,
-    placebo: Placebo,
-    /// One libplacebo texture per backbuffer.
-    targets: Vec<pl::pl_tex>,
+    /// The chain and the views over its backbuffers, shared with the interval.
+    presentation: Rc<Presentation>,
+    placebo: Rc<Placebo>,
     /// ZGUI's interface, wrapped for the overlay pass.
     ui: pl::pl_tex,
     /// Keeps the image behind `ui` alive; dropped after `ui` in `Drop`.
@@ -71,7 +174,7 @@ impl UiRenderer {
     pub fn new(
         inner: WgpuRenderer,
         swapchain: DxgiSwapchain,
-        placebo: Placebo,
+        placebo: Rc<Placebo>,
         ui_texture: wgpu::Texture,
         graphics: SharedGraphics,
         gpu: Arc<Gpu>,
@@ -86,10 +189,13 @@ impl UiRenderer {
             u32::try_from(target.size.height).unwrap_or(1),
         );
         let (chain_width, chain_height) = swapchain.size();
+        let presentation = Presentation::new(Rc::clone(&placebo), swapchain);
         let mut targets = Vec::with_capacity(BUFFERS as usize);
         for index in 0..BUFFERS {
-            let image = swapchain
-                .image(index)
+            let chain = presentation.swapchain.borrow();
+            let image = chain
+                .as_ref()
+                .and_then(|chain| chain.image(index))
                 .ok_or_else(|| anyhow::anyhow!("the swapchain has no backbuffer {index}"))?;
             let target = placebo.wrap(
                 image,
@@ -104,6 +210,7 @@ impl UiRenderer {
             placebo.release(target, pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
             targets.push(target);
         }
+        *presentation.targets.borrow_mut() = targets;
 
         let handover = placebo.create_semaphore();
         anyhow::ensure!(
@@ -113,9 +220,8 @@ impl UiRenderer {
 
         Ok(Self {
             inner,
-            swapchain: RefCell::new(Some(swapchain)),
+            presentation,
             placebo,
-            targets,
             ui,
             ui_texture,
             sdr_white,
@@ -188,7 +294,10 @@ impl UiRenderer {
         chain: Option<(u32, u32)>,
     ) {
         let started = std::time::Instant::now();
-        self.placebo.destroy_texture(&mut self.ui);
+        // Nothing is replaced until its replacement exists: a step below that
+        // fails returns with the interface this renderer already had, where
+        // destroying it first would leave the frame that follows drawing
+        // through a texture libplacebo has freed.
         if let Some((chain_width, chain_height)) = chain
             && !self.resize_chain(chain_width, chain_height)
         {
@@ -234,6 +343,7 @@ impl UiRenderer {
         // exists. Rects are plain geometry and survive either way.
         std::mem::swap(self.inner.atlas(), inner.atlas());
 
+        self.placebo.destroy_texture(&mut self.ui);
         self.ui = ui;
         self.ui_texture = ui_texture;
         self.inner = inner;
@@ -252,16 +362,15 @@ impl UiRenderer {
 
     /// Resizes the chain and re-wraps its backbuffers.
     fn resize_chain(&mut self, width: u32, height: u32) -> bool {
-        for target in &mut self.targets {
-            self.placebo.destroy_texture(target);
+        for mut target in self.presentation.targets.borrow_mut().drain(..) {
+            self.placebo.destroy_texture(&mut target);
         }
-        self.targets.clear();
 
         // The chain is reused through `ResizeBuffers`; creating a new one would
         // make the window association and the flip queue start over. A chain
         // that cannot be resized is dropped, and the next attempt creates one.
-        let mut chain = self.swapchain.borrow_mut().take();
-        let resized = match &mut chain {
+        let mut chain = self.presentation.swapchain.borrow_mut();
+        let resized = match chain.as_mut() {
             Some(existing) => existing.resize(&self.d3d12, &self.gpu, width, height),
             None => match DxgiSwapchain::new(
                 &self.d3d12,
@@ -272,7 +381,7 @@ impl UiRenderer {
                 HdrMode::Off,
             ) {
                 Ok(fresh) => {
-                    chain = Some(fresh);
+                    *chain = Some(fresh);
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -282,7 +391,7 @@ impl UiRenderer {
             tracing::warn!(target: "ui", "DXGI: resize failed: {error:#}");
             return false;
         }
-        let Some(swapchain) = chain else {
+        let Some(swapchain) = chain.as_ref() else {
             return false;
         };
         let mut targets = Vec::with_capacity(BUFFERS as usize);
@@ -311,21 +420,21 @@ impl UiRenderer {
                 }
             }
         }
-        self.targets = targets;
+        *self.presentation.targets.borrow_mut() = targets;
         self.chain_width = width;
         self.chain_height = height;
-        *self.swapchain.borrow_mut() = Some(swapchain);
         true
     }
 
     fn present(&self, outcome: FrameOutcome) -> FrameOutcome {
-        let swapchain = self.swapchain.borrow();
-        let Some(swapchain) = swapchain.as_ref() else {
+        let chain = self.presentation.swapchain.borrow();
+        let Some(swapchain) = chain.as_ref() else {
             return outcome;
         };
         let (width, height) = swapchain.size();
         let index = swapchain.current_index();
-        let Some(&target_tex) = self.targets.get(usize::try_from(index).unwrap_or(0)) else {
+        let targets = self.presentation.targets.borrow();
+        let Some(&target_tex) = targets.get(usize::try_from(index).unwrap_or(0)) else {
             return outcome;
         };
         let damaged = self.damaged.replace(false);
@@ -477,13 +586,37 @@ impl UiRenderer {
         self.presented.set(true);
         outcome
     }
+
+    /// Puts the chain back at the canvas extent when it is somewhere else.
+    ///
+    /// A window that was parked has a 1x1 chain, and the next frame that draws
+    /// grows it back. Only the chain moves: the interface texture kept the last
+    /// picture the window showed, and it is composed whole into every frame, so
+    /// the frame that shows the window again has something to show even where
+    /// it damaged nothing. Rebuilding the renderer here would replace that
+    /// texture with a blank one *after* the frame had already painted into it.
+    fn ensure_presentation(&mut self) {
+        let (width, height) = canvas_size(self.width, self.height);
+        if !self.presentation.differs_from(width, height) {
+            return;
+        }
+        if self.resize_chain(width, height) {
+            // The new backbuffers hold nothing, and the interface texture is
+            // one picture behind them: compose the whole thing once.
+            self.damaged.set(true);
+        }
+    }
+
+    /// The presentation this renderer draws into, so the interval that watches
+    /// the window can park it.
+    #[must_use]
+    pub const fn presentation(&self) -> &Rc<Presentation> {
+        &self.presentation
+    }
 }
 
 impl Drop for UiRenderer {
     fn drop(&mut self) {
-        for target in &mut self.targets {
-            self.placebo.destroy_texture(target);
-        }
         self.placebo.destroy_texture(&mut self.ui);
         self.placebo.destroy_semaphore(&mut self.handover);
     }
@@ -519,6 +652,7 @@ impl Renderer for UiRenderer {
     }
 
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
+        self.ensure_presentation();
         if !self.inner.present_into(0) {
             tracing::warn!(target: "ui", "the UI texture was not supplied");
         }

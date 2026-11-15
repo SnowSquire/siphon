@@ -17,6 +17,7 @@ use std::task::Waker;
 use std::time::Duration;
 
 use siphon_rpc::ArenaSummary;
+use siphon_rpc::ChannelView;
 use siphon_rpc::Client;
 use siphon_rpc::ClientEvent;
 use siphon_rpc::Config;
@@ -25,6 +26,10 @@ use siphon_rpc::DownloaderSummary;
 use siphon_rpc::Request;
 use siphon_rpc::Snapshot;
 use siphon_rpc::Update;
+use siphon_rpc::UpdateView;
+use zgui::reactive::LocalStorage;
+use zgui::reactive::RwSignal;
+use zgui::reactive::prelude::*;
 
 /// One UI action.
 #[derive(Debug)]
@@ -233,60 +238,132 @@ async fn wait(wake: &Wake, ready: impl Fn() -> bool) {
     .await;
 }
 
-/// Applies one entity update to a snapshot. Idempotent: applying it twice is
-/// harmless.
-pub fn apply_update(state: &mut Snapshot, update: Update) {
-    match update {
-        Update::Config(config) => {
-            state.config = config;
-            state.channels.retain(|view| {
-                state
-                    .config
-                    .channels
-                    .iter()
-                    .any(|channel| channel.id == view.id)
-            });
+/// The window's state, one signal per thing the interface draws.
+///
+/// The protocol is already incremental — an `Update` names one entity and carries
+/// it whole — so the signals *are* the state: an update is applied to the signal
+/// it names and nothing else is touched. A snapshot is the only whole-state
+/// message, and it exists for the first connect and for a reconnect, where every
+/// field may have moved.
+#[derive(Clone)]
+pub struct UiState {
+    pub conn: RwSignal<ConnHealth, LocalStorage>,
+    pub error: RwSignal<Option<String>, LocalStorage>,
+    pub update: RwSignal<Option<UpdateView>, LocalStorage>,
+    pub channels: RwSignal<Rc<Vec<ChannelView>>, LocalStorage>,
+    pub pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
+    pub words: RwSignal<Rc<Vec<String>>, LocalStorage>,
+    pub title_changes: RwSignal<bool, LocalStorage>,
+    pub sound: RwSignal<bool, LocalStorage>,
+}
+
+impl UiState {
+    /// The state a window starts with, before the first snapshot arrives.
+    #[must_use]
+    pub fn new() -> Self {
+        let state = empty_snapshot();
+        Self {
+            conn: RwSignal::new_local(state.conn),
+            error: RwSignal::new_local(state.error),
+            update: RwSignal::new_local(state.update),
+            channels: RwSignal::new_local(Rc::new(state.channels)),
+            pending: RwSignal::new_local(Rc::new(state.pending)),
+            words: RwSignal::new_local(Rc::new(state.config.filtered_words)),
+            title_changes: RwSignal::new_local(state.config.notify_title_changes),
+            sound: RwSignal::new_local(state.config.sound),
         }
-        Update::Conn(conn) => state.conn = conn,
-        Update::ChannelUpsert(view) => {
-            if let Some(existing) = state.channels.iter_mut().find(|row| row.id == view.id) {
-                *existing = view;
-            } else {
-                state.channels.push(view);
+    }
+
+    /// Everything, from a snapshot: the first connect, or a reconnect.
+    fn reset(&self, state: Snapshot) {
+        self.conn.set(state.conn);
+        self.error.set(state.error);
+        self.update.set(state.update);
+        self.channels.set(Rc::new(state.channels));
+        self.pending.set(Rc::new(state.pending));
+        self.words.set(Rc::new(state.config.filtered_words));
+        self.title_changes.set(state.config.notify_title_changes);
+        self.sound.set(state.config.sound);
+    }
+
+    /// One entity update, applied to the signal it names and nowhere else.
+    fn apply(&self, update: Update) {
+        match update {
+            Update::Conn(conn) => {
+                if self.conn.get_untracked() != conn {
+                    self.conn.set(conn);
+                }
             }
-        }
-        Update::ChannelRemove(id) => state.channels.retain(|row| row.id != id),
-        Update::Pending(pending) => state.pending = pending,
-        Update::PipelineUpsert(pipeline) => {
-            if let Some(existing) = state
-                .pipelines
-                .iter_mut()
-                .find(|row| row.key == pipeline.key)
-            {
-                *existing = pipeline;
-            } else {
-                state.pipelines.push(pipeline);
+            // One row of the list, not the list: the clone is what the keyed
+            // list needs to iterate, and it is the only allocation this costs.
+            Update::ChannelUpsert(view) => {
+                let mut channels = (*self.channels.get_untracked()).clone();
+                if let Some(existing) = channels.iter_mut().find(|row| row.id == view.id) {
+                    *existing = view;
+                } else {
+                    channels.push(view);
+                }
+                self.channels.set(Rc::new(channels));
             }
-        }
-        Update::PipelineRemove(key) => state.pipelines.retain(|row| row.key != key),
-        Update::Segment { .. } => {}
-        Update::Arena(arena) => state.arena = arena,
-        Update::Downloader(downloader) => state.downloader = downloader,
-        Update::Notification(notification) => {
-            if let Some(existing) = state
-                .notifications
-                .iter_mut()
-                .find(|row| row.id == notification.id)
-            {
-                *existing = notification;
-            } else {
-                state.notifications.push(notification);
+            Update::ChannelRemove(id) => {
+                let mut channels = (*self.channels.get_untracked()).clone();
+                channels.retain(|row| row.id != id);
+                self.channels.set(Rc::new(channels));
             }
+            Update::Pending(pending) => {
+                if *self.pending.get_untracked() != pending {
+                    self.pending.set(Rc::new(pending));
+                }
+            }
+            // The config names the channels that may exist, so removing one from
+            // it is the only thing that can drop a row here.
+            Update::Config(config) => {
+                if self.title_changes.get_untracked() != config.notify_title_changes {
+                    self.title_changes.set(config.notify_title_changes);
+                }
+                if self.sound.get_untracked() != config.sound {
+                    self.sound.set(config.sound);
+                }
+                if *self.words.get_untracked() != config.filtered_words {
+                    self.words.set(Rc::new(config.filtered_words));
+                }
+                let mut channels = (*self.channels.get_untracked()).clone();
+                let before = channels.len();
+                channels.retain(|row| config.channels.iter().any(|channel| channel.id == row.id));
+                if channels.len() != before {
+                    self.channels.set(Rc::new(channels));
+                }
+            }
+            Update::Error(error) => self.error.set(error),
+            Update::Update(update) => self.update.set(update),
+            // Everything else is stream telemetry the interface does not draw.
+            Update::PipelineUpsert(_)
+            | Update::PipelineRemove(_)
+            | Update::Segment { .. }
+            | Update::Arena(_)
+            | Update::Downloader(_)
+            | Update::Notification(_)
+            | Update::NotificationDismissed(_) => {}
         }
-        Update::NotificationDismissed(id) => {
-            state.notifications.retain(|row| row.id != id);
+    }
+
+    /// Drains the worker's channel. Answers whether anything landed, which is what
+    /// decides whether the frame owes anything at all.
+    pub fn drain(&self, events: &kanal::Receiver<UiEvent>) -> bool {
+        let mut landed = false;
+        while let Ok(Some(event)) = events.try_recv() {
+            match event {
+                UiEvent::Snapshot(state) => self.reset(*state),
+                UiEvent::Update(update) => self.apply(update),
+            }
+            landed = true;
         }
-        Update::Error(error) => state.error = error,
-        Update::Update(update) => state.update = update,
+        landed
+    }
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new()
     }
 }
