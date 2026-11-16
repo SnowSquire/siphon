@@ -10,10 +10,10 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use anyhow::Context as _;
-use anyhow::anyhow;
 use ash::khr;
 use ash::vk;
+use eros::Context as _;
+use eros::IntoUnion as _;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::FALSE;
 use windows::Win32::Foundation::GENERIC_ALL;
@@ -173,7 +173,7 @@ pub struct D3d12 {
 
 impl D3d12 {
     /// Opens the D3D12 device for the adapter `gpu` runs on.
-    pub fn new(gpu: &Gpu) -> anyhow::Result<Self> {
+    pub fn new(gpu: &Gpu) -> eros::Result<Self> {
         // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
         // borrow. The adapter handle is alive for the whole call.
         let hal_adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Vulkan>() }
@@ -248,8 +248,8 @@ impl DxgiSwapchain {
         width: u32,
         height: u32,
         hdr: HdrMode,
-    ) -> anyhow::Result<Self> {
-        anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
+    ) -> eros::Result<Self> {
+        eros::ensure!(width > 0 && height > 0, "zero-sized swapchain");
 
         // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
         // borrow. The device handle is alive for the whole call.
@@ -257,7 +257,7 @@ impl DxgiSwapchain {
             .context("the video device is not Vulkan")?;
 
         let enabled = hal_device.enabled_device_extensions();
-        anyhow::ensure!(
+        eros::ensure!(
             enabled.contains(&khr::external_memory_win32::NAME),
             "the Vulkan device does not have VK_KHR_external_memory_win32"
         );
@@ -349,9 +349,9 @@ impl DxgiSwapchain {
         gpu: &Gpu,
         width: u32,
         height: u32,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(width > 0 && height > 0, "zero-sized swapchain");
-        anyhow::ensure!(!self.removed.get(), "the device was removed");
+    ) -> eros::Result<()> {
+        eros::ensure!(width > 0 && height > 0, "zero-sized swapchain");
+        eros::ensure!(!self.removed.get(), "the device was removed");
         self.release_buffers();
         // SAFETY: every reference to the old buffers has been dropped, and the
         // flags are the ones the chain was created with.
@@ -385,7 +385,7 @@ impl DxgiSwapchain {
         gpu: &Gpu,
         width: u32,
         height: u32,
-    ) -> anyhow::Result<()> {
+    ) -> eros::Result<()> {
         // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
         // borrow. Both wgpu handles are alive for the whole call.
         let hal_adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Vulkan>() }
@@ -501,7 +501,7 @@ impl DxgiSwapchain {
         clippy::borrow_as_ptr,
         reason = "the Windows bindings take a pointer to the present parameters"
     )]
-    pub fn present(&self) -> anyhow::Result<()> {
+    pub fn present(&self) -> eros::Result<()> {
         let params = DXGI_PRESENT_PARAMETERS::default();
         // SAFETY: the swapchain lives in `self`; the parameters describe the whole frame
         // (no dirty rects), which is what a flip-model present expects.
@@ -509,6 +509,7 @@ impl DxgiSwapchain {
         result
             .ok()
             .inspect_err(|error| self.note_removal(error))
+            .union()
             .context("Present1")
     }
 
@@ -551,7 +552,7 @@ impl Drop for DxgiSwapchain {
 }
 
 /// Reads the LUID of the Vulkan physical device so DXGI can find the same adapter.
-fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
+fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> eros::Result<LUID> {
     let instance = adapter.shared_instance().raw_instance();
     let physical = adapter.raw_physical_device();
     let mut id = vk::PhysicalDeviceIDProperties::default();
@@ -561,7 +562,7 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
     unsafe {
         instance.get_physical_device_properties2(physical, &mut properties);
     }
-    anyhow::ensure!(
+    eros::ensure!(
         id.device_luid_valid != vk::FALSE,
         "the Vulkan device has no LUID"
     );
@@ -577,7 +578,7 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
 ///
 /// Also answers where the user put SDR white, which is what the interface and
 /// any SDR video have to be rendered against.
-fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(bool, f32, f32)> {
+fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> eros::Result<(bool, f32, f32)> {
     // SAFETY: the swapchain is alive for the call.
     let output = unsafe { swapchain.GetContainingOutput() }.context("GetContainingOutput")?;
     let output6: IDXGIOutput6 = output.cast().context("IDXGIOutput6")?;
@@ -596,7 +597,7 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(
     let active = match mode {
         HdrMode::Off => false,
         HdrMode::On => {
-            anyhow::ensure!(supported, "the display does not support PQ/Rec.2020");
+            eros::ensure!(supported, "the display does not support PQ/Rec.2020");
             true
         }
         HdrMode::Auto => supported && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
@@ -616,7 +617,7 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(
     let sdr_white = match crate::sdr::white_nits(&desc.DeviceName) {
         Ok(nits) => nits,
         Err(error) => {
-            eprintln!("SDR white: {error:#}; assuming 200 nits");
+            eprintln!("SDR white: {error}; assuming 200 nits");
             200.0
         }
     };
@@ -625,7 +626,7 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(
 }
 
 /// Publishes the mastering metadata for the HDR10 container.
-fn set_hdr_metadata(swapchain: &IDXGISwapChain3) -> anyhow::Result<()> {
+fn set_hdr_metadata(swapchain: &IDXGISwapChain3) -> eros::Result<()> {
     let swapchain4: IDXGISwapChain4 = swapchain.cast().context("IDXGISwapChain4")?;
     let metadata = DXGI_HDR_METADATA_HDR10 {
         // Rec.2020 primaries and D65 white, in 1/50000 units.
@@ -648,6 +649,7 @@ fn set_hdr_metadata(swapchain: &IDXGISwapChain3) -> anyhow::Result<()> {
     };
     // SAFETY: the swapchain is alive and `bytes` outlives the call.
     unsafe { swapchain4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, Some(bytes)) }
+        .union()
         .context("SetHDRMetaData")
 }
 
@@ -665,7 +667,7 @@ unsafe fn import_backbuffer(
     width: u32,
     height: u32,
     vk_format: vk::Format,
-) -> anyhow::Result<(vk::Image, vk::DeviceMemory)> {
+) -> eros::Result<(vk::Image, vk::DeviceMemory)> {
     let raw = device.raw_device();
     let physical = device.raw_physical_device();
     let win32 = khr::external_memory_win32::Device::new(instance, raw);
@@ -716,7 +718,7 @@ unsafe fn import_backbuffer(
     // SAFETY: the physical device belongs to the instance and is still alive.
     let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
     let candidates = handle_properties.memory_type_bits & requirements.memory_type_bits;
-    anyhow::ensure!(
+    eros::ensure!(
         candidates != 0,
         "no Vulkan memory type for the D3D12 resource"
     );
@@ -752,16 +754,16 @@ unsafe fn import_backbuffer(
             raw.destroy_image(image, None);
             raw.free_memory(memory, None);
         }
-        return Err(error).context("vkBindImageMemory");
+        return Err(error).union().context("vkBindImageMemory");
     }
 
     Ok((image, memory))
 }
 
 /// Converts a raw handle into the Windows `HWND` type.
-pub fn hwnd_from_raw(handle: raw_window_handle::RawWindowHandle) -> anyhow::Result<HWND> {
+pub fn hwnd_from_raw(handle: raw_window_handle::RawWindowHandle) -> eros::Result<HWND> {
     let raw_window_handle::RawWindowHandle::Win32(win32) = handle else {
-        return Err(anyhow!("the surface is not a Win32 window"));
+        return Err(eros::error!("the surface is not a Win32 window"));
     };
     Ok(HWND(win32.hwnd.get() as *mut c_void))
 }

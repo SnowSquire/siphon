@@ -81,7 +81,9 @@ fn load_versioned(path: &Path) -> Result<Config, ConfigError> {
         raw.filtered_words = Some(vec![DEFAULT_FILTERED_WORD.to_owned()]);
     }
     // v2 -> v3: `Channel::record` is missing from older files and serde
-    // defaults it to false (notify-only).
+    // defaults it to false (notify-only). v3 -> v4: `Channel::notifyLive` and
+    // `notifyTitles` are missing and `Channel::default` has both on, so an
+    // existing follow keeps the behaviour the global switches gave it.
     let config = Config {
         version: Config::VERSION,
         channels: raw.channels.unwrap_or_default(),
@@ -147,6 +149,8 @@ mod tests {
             );
             assert_eq!(config.filtered_words, ["offline"], "{name}");
             assert!(!config.channels[0].record, "{name}");
+            assert!(config.channels[0].notify_live, "{name}");
+            assert!(config.channels[0].notify_titles, "{name}");
             std::fs::remove_file(&path).ok();
         }
     }
@@ -210,6 +214,7 @@ mod tests {
                 id: 7,
                 display_name: Some("Alice".to_owned()),
                 record: true,
+                ..Channel::default()
             }],
             filtered_words: vec!["spoiler".to_owned()],
             sound: false,

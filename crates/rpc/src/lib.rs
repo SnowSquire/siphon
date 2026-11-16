@@ -30,6 +30,8 @@ pub use protocol::ConnHealth;
 pub use protocol::DiskView;
 pub use protocol::DownloaderSummary;
 pub use protocol::FetchOutcome;
+pub use protocol::LogEntry;
+pub use protocol::LogLevel;
 pub use protocol::MAGIC;
 pub use protocol::MAX_FRAME;
 pub use protocol::NotificationView;

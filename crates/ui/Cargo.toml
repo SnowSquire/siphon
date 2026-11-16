@@ -2,9 +2,9 @@
 
 [package]
 name = "siphon-ui"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
-description = "Siphon UI: a ZGUI window presented through DXGI, fed by the daemon RPC"
+description = "Siphon UI: a ZGUI window fed by the daemon RPC, presented through DXGI on Windows"
 authors = ["Ozeniken"]
 publish = false
 
@@ -12,19 +12,29 @@ publish = false
 name = "siphon"
 path = "src/main.rs"
 
-[target.'cfg(windows)'.dependencies]
-anyhow = "1"
-app-single-instance = "0.1"
-ash = "0.38"
+[dependencies]
 compio = { version = "0.19", features = ["net", "time", "runtime"] }
 dirs = "6"
+eros = { version = "=0.9.0-rc.0", default-features = false, features = [
+  "alloc",
+  "context",
+] }
 kanal = "0.1.1"
-pollster = "0.4"
-libplacebo-sys = { path = "../libplacebo-sys" }
-raw-window-handle = "0.6"
 siphon-rpc = { path = "../rpc" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zgui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
+zgui-ui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
+zgui-ui-tokens = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
+
+# The DXGI flip chain, libplacebo and the Win32 shell. Linux presents through
+# the framework's own wgpu renderer for now, so none of it is needed there.
+[target.'cfg(windows)'.dependencies]
+app-single-instance = "0.1"
+ash = "0.38"
+libplacebo-sys = { path = "../libplacebo-sys" }
+pollster = "0.4"
+raw-window-handle = "0.6"
 windows = { version = "0.62.2", features = [
   "Win32_Devices_Display",
   "Win32_Foundation",
@@ -44,9 +54,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
-zgui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
 zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
-zgui-ui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
 
 [lints]
 workspace = true

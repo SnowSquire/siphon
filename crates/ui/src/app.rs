@@ -1,68 +1,132 @@
-//! The ZGUI view: header, channels, filters, and the DXGI renderer setup.
+//! The ZGUI view: header, tabs, channels, filters, recordings, logs, and the
+//! DXGI renderer setup.
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
+#[cfg(windows)]
 use std::sync::Arc;
 
+#[cfg(windows)]
 use raw_window_handle::HasWindowHandle as _;
+use siphon_rpc::ArenaSummary;
 use siphon_rpc::ChannelView;
 use siphon_rpc::ConnHealth;
+use siphon_rpc::DownloaderSummary;
+use siphon_rpc::LogEntry;
+use siphon_rpc::LogLevel;
+use siphon_rpc::NotificationView;
+use siphon_rpc::PipelineState;
+use siphon_rpc::PipelineView;
 use siphon_rpc::Request;
 use zgui::prelude::*;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
+use zgui::reactive::Signal;
+use zgui::reactive::UnsyncCallback;
+#[cfg(windows)]
 use zgui::render::GpuUnavailable;
+#[cfg(windows)]
 use zgui::render::RenderTarget;
+#[cfg(windows)]
 use zgui::render::Renderer;
+#[cfg(windows)]
 use zgui::runtime::AppError;
+#[cfg(windows)]
 use zgui::runtime::use_window;
+#[cfg(windows)]
 use zgui::runtime::use_windows;
+#[cfg(windows)]
 use zgui::surface::wgpu;
 use zgui::view::set_interval;
+#[cfg(windows)]
 use zgui_render_wgpu::Gpu;
+#[cfg(windows)]
 use zgui_render_wgpu::SharedGraphics;
 use zgui_ui::prelude::*;
+use zgui_ui_tokens::prelude::*;
 
+#[cfg(windows)]
 use crate::dxgi::D3d12;
+#[cfg(windows)]
 use crate::dxgi::DxgiSwapchain;
+#[cfg(windows)]
 use crate::dxgi::HdrMode;
+#[cfg(windows)]
 use crate::dxgi::hwnd_from_raw;
+#[cfg(windows)]
 use crate::dxgi::set_window_background;
+use crate::format::format_bytes;
+use crate::format::format_count;
+use crate::format::format_duration_ms;
 use crate::format::format_iso_ms;
+use crate::format::format_time_ms;
+#[cfg(windows)]
 use crate::placebo::Placebo;
+#[cfg(windows)]
 use crate::renderer::UiRenderer;
 use crate::rpc::IntentSender;
 use crate::rpc::UiCommand;
 use crate::rpc::UiEvent;
 use crate::rpc::UiState;
+#[cfg(windows)]
 use crate::tray::TrayAction;
 
-pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> anyhow::Result<()> {
-    let (gpu, _decode) = crate::gpu::create()?;
-    let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
-    let factory_gpu = Arc::clone(&gpu);
-    let state = UiState::new();
+/// Which tab the window shows. `Watch` is deliberately absent: the video
+/// surface is not implemented, and its tab is drawn but never selected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Channels,
+    Filter,
+    Recordings,
+    Logs,
+}
 
-    app()
+pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Result<()> {
+    let state = UiState::new();
+    // The preset dark scheme is close, but the window has its own ink. The
+    // token block is what makes every zgui-ui control (switches, inputs,
+    // tooltips, buttons) use the same palette as the hand-written classes.
+    let dark = Signal::stored_local(Theme::dark().with_css(THEME_CSS));
+
+    let window = app()
         .with_application_id("com.iken.siphon")
         .with_title("Siphon")
         .with_size(1000.0, 760.0)
+        .with_min_size(840.0, 560.0)
         .with_resizable(true)
-        .with_stylesheet(SHEET)
-        .with_renderer(Box::new(move |surface, target| {
+        .with_stylesheet(SHEET);
+
+    // Windows composes the interface into a texture of its own and presents it
+    // through the DXGI chain. Linux has no chain of its own yet, so the
+    // framework opens the surface and presents it directly.
+    #[cfg(windows)]
+    let window = {
+        let (gpu, _decode) = crate::gpu::create()?;
+        let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
+        let factory_gpu = Arc::clone(&gpu);
+        window.with_renderer(Box::new(move |surface, target| {
             dxgi_renderer(&graphics, &factory_gpu, surface, target)
         }))
+    };
+
+    window
         .run(move || {
+            // Fresh handles per build: the run closure is `FnMut`, so it must
+            // not move its captures into the first view it makes.
+            let state = state.clone();
+            let intents = intents.clone();
+            let events = events.clone();
+            let dark = dark;
             view! {
-                App(
-                    state = state.clone(),
-                    intents = intents.clone(),
-                    events = events.clone(),
-                )
+                ThemeProvider(scheme = ColorScheme::Dark, dark = dark) {
+                    App(state = state, intents = intents, events = events)
+                }
             }
         })
-        .map_err(|error| anyhow::anyhow!("zgui: {error}"))
+        .map_err(|error| eros::error!("zgui: {error}"))
 }
 
+#[cfg(windows)]
 fn dxgi_renderer(
     graphics: &SharedGraphics,
     gpu: &Arc<Gpu>,
@@ -75,7 +139,7 @@ fn dxgi_renderer(
     let window = gpu_surface
         .window_handle()
         .map_err(|error| dxgi_error(format!("window handle: {error}")))?;
-    let hwnd = hwnd_from_raw(window.as_raw()).map_err(|error| dxgi_error(format!("{error:#}")))?;
+    let hwnd = hwnd_from_raw(window.as_raw()).map_err(|error| dxgi_error(format!("{error}")))?;
     set_window_background(hwnd);
     // The icon helper speaks `windows-sys`, whose `HWND` is the raw handle; `hwnd`
     // is the `windows` crate's newtype around the same pointer.
@@ -85,12 +149,12 @@ fn dxgi_renderer(
     let height = u32::try_from(target.size.height)
         .map_err(|_| dxgi_error("the target height is not positive"))?;
 
-    let d3d12 = Rc::new(D3d12::new(gpu).map_err(|error| dxgi_error(format!("D3D12: {error:#}")))?);
+    let d3d12 = Rc::new(D3d12::new(gpu).map_err(|error| dxgi_error(format!("D3D12: {error}")))?);
     // The chain starts at the window's own extent, which is where it returns
     // once the size settles; the UI texture is that extent and is never scaled.
     let (chain_width, chain_height) = crate::dxgi::idle_canvas(width, height);
     let swapchain = DxgiSwapchain::new(&d3d12, gpu, hwnd, chain_width, chain_height, HdrMode::Off)
-        .map_err(|error| dxgi_error(format!("{error:#}")))?;
+        .map_err(|error| dxgi_error(format!("{error}")))?;
     let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("siphon.ui"),
         size: wgpu::Extent3d {
@@ -106,9 +170,8 @@ fn dxgi_renderer(
         view_formats: &[],
     });
 
-    let placebo = Rc::new(
-        Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error:#}")))?,
-    );
+    let placebo =
+        Rc::new(Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error}")))?);
     let renderer = graphics
         .renderer_supplied(target, vec![ui.clone()])
         .map_err(AppError::from)?;
@@ -123,7 +186,7 @@ fn dxgi_renderer(
         hwnd,
         target,
     )
-    .map_err(|error| dxgi_error(format!("{error:#}")))?;
+    .map_err(|error| dxgi_error(format!("{error}")))?;
     Ok(Box::new(renderer))
 }
 
@@ -135,6 +198,7 @@ fn dxgi_renderer(
 /// window asks for this, and only a few megabytes fault back when it is shown.
 /// Only a hidden window asks: on a visible one the same call would turn the
 /// next pointer move into page faults.
+#[cfg(windows)]
 fn release_hidden_memory() {
     use windows::Win32::System::Threading::GetCurrentProcess;
     use windows::Win32::System::Threading::SetProcessWorkingSetSize;
@@ -146,6 +210,7 @@ fn release_hidden_memory() {
     }
 }
 
+#[cfg(windows)]
 fn dxgi_error(reason: impl Into<String>) -> AppError {
     AppError::GpuUnavailable(GpuUnavailable::new().rejected("DXGI", reason))
 }
@@ -162,55 +227,66 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
     let offer = state.update;
     let channels_sig = state.channels;
     let pending_sig = state.pending;
+    let pipelines_sig = state.pipelines;
+    let arena_sig = state.arena;
+    let downloader_sig = state.downloader;
+    let notifications_sig = state.notifications;
+    let logs_sig = state.logs;
     let words_sig = state.words;
     let title_sig = state.title_changes;
     let sound_sig = state.sound;
 
-    let window = use_window();
-    let windows = use_windows();
+    // The tray owns the window's lifetime on Windows: closing it puts it away,
+    // and a tray click is what brings it back. Linux has neither, so the close
+    // is the framework's default and the process ends with the window.
+    #[cfg(windows)]
+    {
+        let window = use_window();
+        let windows = use_windows();
 
-    // Tray clicks run here, on the GUI thread, rather than through the interval:
-    // a window hidden to the tray draws no frames, so a click queued for one
-    // would wait for the very window it was meant to bring back.
-    crate::tray::set_action_handler({
-        let window = window.clone();
-        let windows = windows.clone();
-        move |action| match action {
-            TrayAction::Show => {
-                window.set_visible(true);
-                window.focus();
-            }
-            TrayAction::Quit => windows.quit(),
-            TrayAction::Restart => {
-                if let Err(error) = std::thread::Builder::new()
-                    .name("service restart".to_owned())
-                    .spawn(crate::service::restart)
-                {
-                    tracing::error!(
-                        target: "service",
-                        "could not start the restart thread: {error}"
-                    );
+        // Tray clicks run here, on the GUI thread, rather than through the interval:
+        // a window hidden to the tray draws no frames, so a click queued for one
+        // would wait for the very window it was meant to bring back.
+        crate::tray::set_action_handler({
+            let window = window.clone();
+            let windows = windows.clone();
+            move |action| match action {
+                TrayAction::Show => {
+                    window.set_visible(true);
+                    window.focus();
+                }
+                TrayAction::Quit => windows.quit(),
+                TrayAction::Restart => {
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("service restart".to_owned())
+                        .spawn(crate::service::restart)
+                    {
+                        tracing::error!(
+                            target: "service",
+                            "could not start the restart thread: {error}"
+                        );
+                    }
                 }
             }
-        }
-    });
+        });
 
-    // Closing the window puts it away in the tray instead of ending the process:
-    // the way back is the tray's Open (or a double-click), the way out is Quit
-    // there. The backbuffers go back now, because a hidden window is handed no
-    // frame that could do it later, and the frame that shows it again grows the
-    // chain back.
-    let close = on_close_request({
-        let window = window.clone();
-        move || {
-            window.set_visible(false);
-            release_hidden_memory();
-            CloseResponse::Veto
-        }
-    });
-    // The callback lives as long as the window; the component has no teardown
-    // hook that owns the guard.
-    std::mem::forget(close);
+        // Closing the window puts it away in the tray instead of ending the process:
+        // the way back is the tray's Open (or a double-click), the way out is Quit
+        // there. The backbuffers go back now, because a hidden window is handed no
+        // frame that could do it later, and the frame that shows it again grows the
+        // chain back.
+        let close = on_close_request({
+            let window = window.clone();
+            move || {
+                window.set_visible(false);
+                release_hidden_memory();
+                CloseResponse::Veto
+            }
+        });
+        // The callback lives as long as the window; the component has no teardown
+        // hook that owns the guard.
+        std::mem::forget(close);
+    }
 
     // The RPC worker feeds a channel; this interval drains it on the UI thread
     // and only touches the signals that changed.
@@ -225,45 +301,29 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
     // The interval lives as long as the window; the component has no teardown
     // hook that owns it.
     std::mem::forget(timer);
+
+    let tab = RwSignal::new_local(Tab::Channels);
+    let expanded = RwSignal::new_local(BTreeSet::<u64>::new());
     let draft = RwSignal::new_local(String::new());
     let word_draft = RwSignal::new_local(String::new());
-    let expanded = RwSignal::new_local(None::<u64>);
-
-    let add_login = {
-        let intents = Rc::clone(&intents);
-        move || {
-            let login = draft.get_untracked().trim().to_owned();
-            if login.is_empty() {
-                return;
-            }
-            intents.send(UiCommand::Request(Request::AddLogin(login)));
-            draft.set(String::new());
-        }
-    };
-    let add_word = {
-        let intents = Rc::clone(&intents);
-        move || {
-            let word = word_draft.get_untracked().trim().to_owned();
-            if word.is_empty() {
-                return;
-            }
-            intents.send(UiCommand::Request(Request::AddFilteredWord(word)));
-            word_draft.set(String::new());
-        }
-    };
+    let once_login = RwSignal::new_local(String::new());
+    let once_quality = RwSignal::new_local(String::new());
 
     let update = Rc::clone(&intents);
     let dismiss = Rc::clone(&intents);
-    let titles = Rc::clone(&intents);
-    let sound = Rc::clone(&intents);
-    let rows = Rc::clone(&intents);
-    let words = Rc::clone(&intents);
+    let channels_intents = Rc::clone(&intents);
+    let filter_intents = Rc::clone(&intents);
+    let recordings_intents = Rc::clone(&intents);
 
     view! {
         column(class = "app") {
             row(class = "header") {
-                text(class = "brand") {"Siphon"}
-                text(class = "conn") {{move || conn_label(conn_sig.get())}}
+                column(class = "brand-block") {
+                    text(class = "brand") {"Siphon"}
+                    text(class = "conn") {
+                        {move || conn_summary(conn_sig.get(), &channels_sig.get())}
+                    }
+                }
                 spacer()
                 if move || offer.get().is_some() {
                     row(class = "banner") {
@@ -294,63 +354,442 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 }
             }
 
-            row(class = "add") {
-                Input(value = draft, placeholder = "twitch login")
-                Button(on:click = move |_| add_login()) {"Add"}
+            row(class = "tabs") {
+                box(
+                    class = "tab",
+                    class:on = move || tab.get() == Tab::Channels,
+                    on:click = move |_| tab.set(Tab::Channels)
+                ) {
+                    text {"Channels"}
+                }
+                box(
+                    class = "tab",
+                    class:on = move || tab.get() == Tab::Filter,
+                    on:click = move |_| tab.set(Tab::Filter)
+                ) {
+                    text {"Filter"}
+                }
+                box(
+                    class = "tab",
+                    class:on = move || tab.get() == Tab::Recordings,
+                    on:click = move |_| tab.set(Tab::Recordings)
+                ) {
+                    text {"Recordings"}
+                }
+                box(
+                    class = "tab",
+                    class:on = move || tab.get() == Tab::Logs,
+                    on:click = move |_| tab.set(Tab::Logs)
+                ) {
+                    text {"Logs"}
+                }
+                // The video surface is the next milestone. A tab that changes
+                // nothing is worse than a tab that says it cannot be used yet,
+                // so it is drawn and never selected.
+                box(class = "tab tab--off", attr:aria-disabled = "true") {
+                    text {"Watch"}
+                }
             }
 
+            if move || tab.get() == Tab::Channels {
+                ChannelsTab(
+                    channels = channels_sig,
+                    pending = pending_sig,
+                    expanded = expanded,
+                    draft = draft,
+                    intents = Rc::clone(&channels_intents),
+                )
+            }
+            if move || tab.get() == Tab::Filter {
+                FilterTab(
+                    words = words_sig,
+                    title_changes = title_sig,
+                    sound = sound_sig,
+                    draft = word_draft,
+                    intents = Rc::clone(&filter_intents),
+                )
+            }
+            if move || tab.get() == Tab::Recordings {
+                RecordingsTab(
+                    pipelines = pipelines_sig,
+                    draft = once_login,
+                    quality = once_quality,
+                    intents = Rc::clone(&recordings_intents),
+                )
+            }
+            if move || tab.get() == Tab::Logs {
+                LogsTab(
+                    conn = conn_sig,
+                    channels = channels_sig,
+                    arena = arena_sig,
+                    downloader = downloader_sig,
+                    notifications = notifications_sig,
+                    logs = logs_sig,
+                    pipelines = pipelines_sig,
+                )
+            }
+        }
+    }
+}
+
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn ChannelsTab(
+    channels: RwSignal<Rc<Vec<ChannelView>>, LocalStorage>,
+    pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
+    expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
+    draft: RwSignal<String, LocalStorage>,
+    intents: Rc<IntentSender>,
+) -> impl IntoView {
+    let add_login = {
+        let intents = Rc::clone(&intents);
+        move || {
+            let login = draft.get_untracked().trim().to_owned();
+            if login.is_empty() {
+                return;
+            }
+            intents.send(UiCommand::Request(Request::AddLogin(login)));
+            draft.set(String::new());
+        }
+    };
+    let rows = Rc::clone(&intents);
+    // Twitch logins top out at 25 characters; stop the field there rather than
+    // letting a longer string reach GQL and come back as "not found".
+    let clamp_login = UnsyncCallback::new(move |value: String| {
+        if value.chars().count() > 25 {
+            draft.set(value.chars().take(25).collect());
+        }
+    });
+
+    view! {
+        column(class = "tabbody") {
+            row(class = "tablehead") {
+                text(class = "cell cell--chevron") {""}
+                text(class = "cell cell--dot") {""}
+                text(class = "cell cell--channel") {"Channel"}
+                text(class = "cell cell--title") {"Title"}
+                text(class = "cell cell--notify") {"Notify"}
+                text(class = "cell cell--record") {"Record"}
+                text(class = "cell cell--viewers") {"Viewers"}
+                text(class = "cell cell--action") {""}
+            }
             ScrollArea(class = "channels") {
                 column(class = "list") {
-                    for channel in move || (*channels_sig.get()).clone(), key = |channel: &ChannelView| channel.id {
+                    for channel in move || (*channels.get()).clone(), key = |channel: &ChannelView| channel.id {
                         ChannelRow(
                             channel = channel.clone(),
                             expanded = expanded,
                             intents = Rc::clone(&rows),
                         )
                     }
-                    for login in move || (*pending_sig.get()).clone(), key = |login: &String| login.clone() {
-                        row(class = "channel pending") {
-                            text(class = "channel__name") {{login.clone()}}
-                            text(class = "channel__title") {"resolving…"}
+                    for login in move || (*pending.get()).clone(), key = |login: &String| login.clone() {
+                        row(class = "channel-row pending") {
+                            text(class = "cell cell--chevron") {""}
+                            text(class = "live-dot") {"●"}
+                            text(class = "cell cell--channel") {{login.clone()}}
+                            text(class = "cell cell--title") {"resolving…"}
+                            spacer()
                         }
                     }
                 }
             }
+            row(class = "add") {
+                Input(
+                    value = draft,
+                    placeholder = "Add a new streamer",
+                    on_change = clamp_login,
+                    class = "add__input",
+                )
+                Button(on:click = move |_| add_login()) {"Add"}
+            }
+        }
+    }
+}
 
-            row(class = "options") {
-                Button(
-                    variant = ButtonVariant::Outline,
-                    on:click = move |_| {
-                        let on = title_sig.get_untracked();
-                        titles.send(UiCommand::Request(Request::SetNotifyTitleChanges(!on)));
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn ChannelRow(
+    channel: ChannelView,
+    expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
+    intents: Rc<IntentSender>,
+) -> impl IntoView {
+    let id = channel.id;
+    let open = Signal::derive_local(move || expanded.get().contains(&id));
+    let display_name = channel.display_name.clone();
+    let initials = initials(&display_name);
+    let avatar_path = channel.avatar_path.clone();
+    let title = channel
+        .title
+        .clone()
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "—".to_owned());
+    let viewers = viewers(&channel);
+    let live = channel.live;
+    let notify_live = RwSignal::new_local(channel.notify_live);
+    let notify_titles = RwSignal::new_local(channel.notify_titles);
+    let record = RwSignal::new_local(channel.record);
+    let detail = channel.clone();
+
+    let live_intents = Rc::clone(&intents);
+    let title_intents = Rc::clone(&intents);
+    let record_intents = Rc::clone(&intents);
+    let remove_intents = Rc::clone(&intents);
+
+    view! {
+        column(class = "channel") {
+            row(
+                class = "channel-row",
+                class:open = open,
+                on:click = move |_| {
+                    expanded.update(|expanded| {
+                        if !expanded.remove(&id) {
+                            expanded.insert(id);
+                        }
+                    });
+                }
+            ) {
+                text(class = "chevron", class:open = open) {"›"}
+                text(class = "live-dot", class:live = live) {"●"}
+                Tooltip {
+                    TooltipTrigger(class = "cell cell--channel") {
+                        row(class = "identity") {
+                            Avatar(
+                                size = AvatarSize::Sm,
+                                src = Signal::stored_local(avatar_path.clone()),
+                                label = display_name.clone()
+                            ) {
+                                text {{initials.clone()}}
+                            }
+                            text(class = "channel-name") {{display_name.clone()}}
+                        }
                     }
-                ) {
-                    text {
-                        {move || if title_sig.get() { "Titles: on" } else { "Titles: off" }}
+                    TooltipContent {{format!("Channel ID {id}")}}
+                }
+                Tooltip {
+                    TooltipTrigger(class = "cell cell--title") {
+                        text(class = "channel-title") {{title.clone()}}
+                    }
+                    TooltipContent {{stream_tooltip(&channel)}}
+                }
+                box(class = "cell cell--notify", on:click:stop = |_| {}) {
+                    Tooltip {
+                        TooltipTrigger {
+                            column(class = "mini") {
+                                Switch(
+                                    size = SwitchSize::Sm,
+                                    checked = notify_live,
+                                    on_change = UnsyncCallback::new(move |on| {
+                                        live_intents.send(UiCommand::Request(Request::SetNotifyLive {
+                                            channel: id,
+                                            notify: on,
+                                        }));
+                                    })
+                                )
+                                text(class = "mini__label") {"live"}
+                            }
+                        }
+                        TooltipContent {"Notify when this channel goes live"}
+                    }
+                    Tooltip {
+                        TooltipTrigger {
+                            column(class = "mini") {
+                                Switch(
+                                    size = SwitchSize::Sm,
+                                    checked = notify_titles,
+                                    on_change = UnsyncCallback::new(move |on| {
+                                        title_intents.send(UiCommand::Request(Request::SetNotifyTitles {
+                                            channel: id,
+                                            notify: on,
+                                        }));
+                                    })
+                                )
+                                text(class = "mini__label") {"title"}
+                            }
+                        }
+                        TooltipContent {"Notify when the title or game changes"}
                     }
                 }
+                box(class = "cell cell--record", on:click:stop = |_| {}) {
+                    Switch(
+                        size = SwitchSize::Sm,
+                        checked = record,
+                        on_change = UnsyncCallback::new(move |on| {
+                            record_intents.send(UiCommand::Request(Request::SetRecord {
+                                channel: id,
+                                record: on,
+                            }));
+                        })
+                    )
+                }
+                text(class = "cell cell--viewers") {{viewers.clone()}}
                 Button(
-                    variant = ButtonVariant::Outline,
-                    on:click = move |_| {
-                        let on = sound_sig.get_untracked();
-                        sound.send(UiCommand::Request(Request::SetSound(!on)));
+                    size = ButtonSize::IconSm,
+                    variant = ButtonVariant::Ghost,
+                    class = "remove",
+                    on:click:stop = move |_| {
+                        remove_intents.send(UiCommand::Request(Request::RemoveChannel(id)));
                     }
+                ) {"×"}
+            }
+            if move || open.get() {
+                {channel_detail_view(&detail)}
+            }
+        }
+    }
+}
+
+fn channel_detail_view(channel: &ChannelView) -> impl IntoView {
+    let display_name = channel.display_name.clone();
+    let initials = initials(&display_name);
+    let login = channel.login.clone();
+    let stream_id = if channel.stream_id == 0 {
+        "—".to_owned()
+    } else {
+        channel.stream_id.to_string()
+    };
+    let game_id = channel
+        .game_id
+        .map_or_else(|| "—".to_owned(), |id| id.to_string());
+    let game = channel
+        .game
+        .clone()
+        .filter(|game| !game.is_empty())
+        .unwrap_or_else(|| "no game".to_owned());
+    let game_tip = channel.game_id.map_or_else(
+        || "No game id resolved".to_owned(),
+        |id| format!("Game ID {id}"),
+    );
+    let collab = channel
+        .collaboration_viewers
+        .map_or_else(|| "—".to_owned(), format_count);
+    let started = channel
+        .stream_start_ms
+        .map_or_else(|| "—".to_owned(), format_iso_ms);
+    let created_at = channel
+        .stream_created_at
+        .clone()
+        .unwrap_or_else(|| "—".to_owned());
+    let viewers = channel.viewers.map_or_else(|| "—".to_owned(), format_count);
+    let status = if channel.live { "LIVE" } else { "OFFLINE" };
+
+    view! {
+        column(class = "detail") {
+            row(class = "detail-head") {
+                Avatar(
+                    size = AvatarSize::Sm,
+                    src = Signal::stored_local(channel.avatar_path.clone()),
+                    label = display_name.clone()
                 ) {
-                    text {
-                        {move || if sound_sig.get() { "Sound: on" } else { "Sound: off" }}
-                    }
+                    text {{initials}}
+                }
+                column(class = "detail-id") {
+                    text(class = "detail-name") {{display_name}}
+                    text(class = "detail-login") {{format!("@{login}")}}
+                }
+                spacer()
+                text(class = "badge", class:live = channel.live) {{status}}
+            }
+            row(class = "detail-grid") {
+                column(class = "detail-col") {
+                    {detail_item("Channel ID", channel.id.to_string())}
+                    {detail_item("Stream ID", stream_id)}
+                    {detail_item("Game ID", game_id)}
+                    {detail_item_tip("Game", game, game_tip)}
+                }
+                column(class = "detail-col") {
+                    {detail_item("Viewers", viewers)}
+                    {detail_item("Collab", collab)}
+                    {detail_item("Started", started)}
+                    {detail_item("createdAt", created_at)}
                 }
             }
+        }
+    }
+}
 
+fn detail_item(key: &'static str, value: String) -> impl IntoView {
+    view! {
+        row(class = "detail-item") {
+            text(class = "detail-key") {{key}}
+            text(class = "detail-value") {{value}}
+        }
+    }
+}
+
+fn detail_item_tip(key: &'static str, value: String, tip: String) -> impl IntoView {
+    view! {
+        row(class = "detail-item") {
+            text(class = "detail-key") {{key}}
+            Tooltip {
+                TooltipTrigger(class = "detail-value") {
+                    text(class = "detail-value__text") {{value}}
+                }
+                TooltipContent {{tip.clone()}}
+            }
+        }
+    }
+}
+
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn FilterTab(
+    words: RwSignal<Rc<Vec<String>>, LocalStorage>,
+    title_changes: RwSignal<bool, LocalStorage>,
+    sound: RwSignal<bool, LocalStorage>,
+    draft: RwSignal<String, LocalStorage>,
+    intents: Rc<IntentSender>,
+) -> impl IntoView {
+    let add_word = {
+        let intents = Rc::clone(&intents);
+        move || {
+            let word = draft.get_untracked().trim().to_owned();
+            if word.is_empty() {
+                return;
+            }
+            intents.send(UiCommand::Request(Request::AddFilteredWord(word)));
+            draft.set(String::new());
+        }
+    };
+    let titles = Rc::clone(&intents);
+    let sound_switch = Rc::clone(&intents);
+    let word_rows = Rc::clone(&intents);
+
+    view! {
+        column(class = "tabbody") {
+            column(class = "settings") {
+                row(class = "switch-row") {
+                    column(class = "switch-copy") {
+                        text(class = "switch-title") {"Title and game changes"}
+                        text(class = "switch-hint") {"Notify when a followed channel changes its title or game."}
+                    }
+                    spacer()
+                    Switch(checked = Binding::controlled(
+                        Signal::derive_local(move || title_changes.get()),
+                        move |on| titles.send(UiCommand::Request(Request::SetNotifyTitleChanges(on))),
+                    ))
+                }
+                row(class = "switch-row") {
+                    column(class = "switch-copy") {
+                        text(class = "switch-title") {"Notification sound"}
+                        text(class = "switch-hint") {"Play a sound with every toast and webhook."}
+                    }
+                    spacer()
+                    Switch(checked = Binding::controlled(
+                        Signal::derive_local(move || sound.get()),
+                        move |on| sound_switch.send(UiCommand::Request(Request::SetSound(on))),
+                    ))
+                }
+            }
+            text(class = "section-title") {"Filtered words"}
+            text(class = "section-hint") {"A notification whose title contains one of these is dropped."}
             row(class = "add") {
-                Input(value = word_draft, placeholder = "filtered word")
+                Input(value = draft, placeholder = "Add a filtered word", class = "add__input")
                 Button(on:click = move |_| add_word()) {"Add"}
             }
-
             ScrollArea(class = "words") {
                 column(class = "list") {
                     for word in move || {
-                        (*words_sig.get())
+                        (*words.get())
                             .iter()
                             .enumerate()
                             .map(|(index, word)| WordRow {
@@ -359,11 +798,10 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                             })
                             .collect::<Vec<_>>()
                     }, key = |word: &WordRow| word.index {
-                        WordRowView(word = word.clone(), intents = Rc::clone(&words))
+                        WordRowView(word = word.clone(), intents = Rc::clone(&word_rows))
                     }
                 }
             }
-
         }
     }
 }
@@ -376,51 +814,11 @@ struct WordRow {
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
-fn ChannelRow(
-    channel: ChannelView,
-    expanded: RwSignal<Option<u64>, LocalStorage>,
-    intents: Rc<IntentSender>,
-) -> impl IntoView {
-    let id = channel.id;
-    let live = channel.live;
-    view! {
-        column(class = "channel") {
-            row(
-                class = "channel__line",
-                on:click = move |_| {
-                    expanded.update(|expanded| {
-                        *expanded = if *expanded == Some(id) { None } else { Some(id) };
-                    });
-                }
-            ) {
-                text(class = if live { "dot dot--live" } else { "dot" }) {"●"}
-                text(class = "channel__name") {{channel.display_name.clone()}}
-                text(class = "channel__title") {{channel.title.clone().unwrap_or_default()}}
-                spacer()
-                text(class = "channel__viewers") {{viewers(&channel)}}
-                Button(
-                    size = ButtonSize::IconSm,
-                    variant = ButtonVariant::Ghost,
-                    on:click:stop = {
-                        let intents = Rc::clone(&intents);
-                        move |_| intents.send(UiCommand::Request(Request::RemoveChannel(id)))
-                    }
-                ) {"×"}
-            }
-            if move || expanded.get() == Some(id) {
-                text(class = "channel__detail") {{detail(&channel)}}
-            }
-        }
-    }
-}
-
-#[component]
-#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn WordRowView(word: WordRow, intents: Rc<IntentSender>) -> impl IntoView {
     let index = word.index;
     view! {
         row(class = "word") {
-            text {{word.text.clone()}}
+            text(class = "word__text") {{word.text}}
             spacer()
             Button(
                 size = ButtonSize::IconSm,
@@ -434,6 +832,226 @@ fn WordRowView(word: WordRow, intents: Rc<IntentSender>) -> impl IntoView {
     }
 }
 
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn RecordingsTab(
+    pipelines: RwSignal<Rc<Vec<PipelineView>>, LocalStorage>,
+    draft: RwSignal<String, LocalStorage>,
+    quality: RwSignal<String, LocalStorage>,
+    intents: Rc<IntentSender>,
+) -> impl IntoView {
+    let record_once = {
+        let intents = Rc::clone(&intents);
+        move || {
+            let login = draft.get_untracked().trim().to_lowercase();
+            if login.is_empty() {
+                return;
+            }
+            let quality = quality.get_untracked().trim().to_owned();
+            intents.send(UiCommand::Request(Request::RecordOnce {
+                login,
+                quality: (!quality.is_empty()).then_some(quality),
+            }));
+            draft.set(String::new());
+        }
+    };
+    let rows = Rc::clone(&intents);
+
+    view! {
+        column(class = "tabbody") {
+            row(class = "tablehead") {
+                text(class = "cell cell--channel") {"Channel"}
+                text(class = "cell cell--quality") {"Quality"}
+                text(class = "cell cell--state") {"State"}
+                text(class = "cell cell--position") {"Position"}
+                text(class = "cell cell--segments") {"Segments"}
+                text(class = "cell cell--size") {"Size"}
+                text(class = "cell cell--runs") {"Runs"}
+                text(class = "cell cell--action") {""}
+            }
+            ScrollArea(class = "recordings") {
+                column(class = "list") {
+                    for pipeline in move || recordings(&pipelines.get()), key = |pipeline: &PipelineView| (pipeline.key.login.clone(), pipeline.key.quality.clone()) {
+                        RecordingRow(pipeline = pipeline.clone(), intents = Rc::clone(&rows))
+                    }
+                    if move || recordings(&pipelines.get()).is_empty() {
+                        text(class = "empty") {"No recording is running. Pick a channel above and press Record once, or turn Record on in Channels."}
+                    }
+                }
+            }
+            row(class = "add") {
+                Input(value = draft, placeholder = "Add a channel to record once", class = "add__input")
+                Input(value = quality, placeholder = "quality (optional)", class = "add__quality")
+                Button(on:click = move |_| record_once()) {"Record once"}
+            }
+        }
+    }
+}
+
+fn recordings(pipelines: &[PipelineView]) -> Vec<PipelineView> {
+    pipelines
+        .iter()
+        .filter(|pipeline| pipeline.recording || pipeline.disk.is_some())
+        .cloned()
+        .collect()
+}
+
+#[component]
+#[allow(clippy::needless_pass_by_value)]
+fn RecordingRow(pipeline: PipelineView, intents: Rc<IntentSender>) -> impl IntoView {
+    let key = pipeline.key.clone();
+    let login = key.login.clone();
+    let quality = key.quality.clone().unwrap_or_else(|| "best".to_owned());
+    let state = state_label(pipeline.state);
+    let position = pipeline
+        .disk
+        .as_ref()
+        .map_or_else(String::new, |disk| format_duration_ms(disk.position_ms));
+    let segments = pipeline
+        .disk
+        .as_ref()
+        .map_or_else(String::new, |disk| disk.segments.to_string());
+    let size = pipeline
+        .disk
+        .as_ref()
+        .map_or_else(String::new, |disk| format_bytes(disk.bytes));
+    let runs = pipeline
+        .disk
+        .as_ref()
+        .map_or_else(String::new, |disk| disk.runs.to_string());
+    let error = pipeline
+        .disk
+        .as_ref()
+        .and_then(|disk| disk.last_error.clone())
+        .or_else(|| pipeline.last_error.clone())
+        .unwrap_or_default();
+    let has_error = !error.is_empty();
+    let recording = pipeline.recording;
+
+    view! {
+        column(class = "recording") {
+            row(class = "recording-row") {
+                text(class = "cell cell--channel") {{login}}
+                text(class = "cell cell--quality") {{quality}}
+                text(class = "cell cell--state") {{state}}
+                text(class = "cell cell--position") {{position}}
+                text(class = "cell cell--segments") {{segments}}
+                text(class = "cell cell--size") {{size}}
+                text(class = "cell cell--runs") {{runs}}
+                if move || recording {
+                    Button(
+                        size = ButtonSize::Sm,
+                        variant = ButtonVariant::Ghost,
+                        on:click = {
+                            let intents = Rc::clone(&intents);
+                            let key = key.clone();
+                            move |_| intents.send(UiCommand::Request(Request::PipelineStop {
+                                key: key.clone(),
+                                force: false,
+                            }))
+                        }
+                    ) {"Stop"}
+                }
+            }
+            if move || has_error {
+                text(class = "recording__error") {{error.clone()}}
+            }
+        }
+    }
+}
+
+#[component]
+#[allow(clippy::needless_pass_by_value)]
+fn LogsTab(
+    conn: RwSignal<ConnHealth, LocalStorage>,
+    channels: RwSignal<Rc<Vec<ChannelView>>, LocalStorage>,
+    arena: RwSignal<ArenaSummary, LocalStorage>,
+    downloader: RwSignal<DownloaderSummary, LocalStorage>,
+    notifications: RwSignal<Rc<Vec<NotificationView>>, LocalStorage>,
+    logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
+    pipelines: RwSignal<Rc<Vec<PipelineView>>, LocalStorage>,
+) -> impl IntoView {
+    view! {
+        column(class = "tabbody") {
+            row(class = "stats") {
+                column(class = "stat") {
+                    text(class = "stat__label") {"Connection"}
+                    text(class = "stat__value") {{move || conn_summary(conn.get(), &channels.get())}}
+                }
+                column(class = "stat") {
+                    text(class = "stat__label") {"Pipelines"}
+                    text(class = "stat__value") {{move || pipelines.get().len().to_string()}}
+                }
+                column(class = "stat") {
+                    text(class = "stat__label") {"Arena slots"}
+                    text(class = "stat__value") {{move || format!("{} / {}", arena.get().live_slots, arena.get().high_water)}}
+                }
+                column(class = "stat") {
+                    text(class = "stat__label") {"Downloader"}
+                    text(class = "stat__value") {{move || format!("{} / {}", downloader.get().in_flight, downloader.get().capacity)}}
+                }
+            }
+            ScrollArea(class = "logs") {
+                column(class = "loglist") {
+                    if move || !(*notifications.get()).is_empty() {
+                        text(class = "section-title") {"Notifications"}
+                        for note in move || (*notifications.get()).clone().into_iter().rev().collect::<Vec<_>>(), key = |note: &NotificationView| note.id {
+                            row(class = "notification") {
+                                text(class = "log__time") {{format_time_ms(note.at_ms)}}
+                                column(class = "notification__body") {
+                                    text(class = "notification__summary") {{note.summary}}
+                                    text(class = "notification__text") {{note.body}}
+                                }
+                            }
+                        }
+                    }
+                    text(class = "section-title") {"Pipelines"}
+                    if move || pipelines.get().is_empty() {
+                        text(class = "empty") {"No pipeline is running."}
+                    }
+                    for pipeline in move || (*pipelines.get()).clone(), key = |pipeline: &PipelineView| (pipeline.key.login.clone(), pipeline.key.quality.clone()) {
+                        row(class = "pipeline") {
+                            text(class = "pipeline__name") {{format!("{}{}", pipeline.key.login, pipeline.key.quality.as_ref().map_or_else(String::new, |quality| format!(" · {quality}")))}}
+                            text(class = "pipeline__state") {{state_label(pipeline.state)}}
+                            text(class = "pipeline__meta") {{format!("{} · {} viewers", format_duration_ms(pipeline.position_ms), pipeline.sessions)}}
+                            text(class = "pipeline__rec", class:on = pipeline.recording) {"REC"}
+                        }
+                    }
+                    text(class = "section-title") {"Events"}
+                    for entry in move || (*logs.get()).clone().into_iter().rev().collect::<Vec<_>>(), key = |entry: &LogEntry| entry.seq {
+                        {log_row(entry)}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn log_row(entry: LogEntry) -> impl IntoView {
+    let bad = entry.level == LogLevel::Error;
+    let meta = [
+        entry.login.as_ref().map(|login| format!("@{login}")),
+        entry.stream_id.map(|id| format!("stream {id}")),
+        entry
+            .created_at
+            .as_ref()
+            .map(|created| format!("created {created}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+
+    view! {
+        row(class = "log", class:bad = bad) {
+            text(class = "log__time") {{format_time_ms(entry.at_ms)}}
+            text(class = "log__target") {{entry.target}}
+            text(class = "log__message") {{entry.message}}
+            text(class = "log__meta") {{meta}}
+        }
+    }
+}
+
 const fn conn_label(conn: ConnHealth) -> &'static str {
     match conn {
         ConnHealth::Connected => "connected",
@@ -442,43 +1060,95 @@ const fn conn_label(conn: ConnHealth) -> &'static str {
     }
 }
 
+fn conn_summary(conn: ConnHealth, channels: &[ChannelView]) -> String {
+    let live = channels.iter().filter(|channel| channel.live).count();
+    if live == 0 {
+        conn_label(conn).to_owned()
+    } else {
+        format!("{} · {live} live", conn_label(conn))
+    }
+}
+
+const fn state_label(state: PipelineState) -> &'static str {
+    match state {
+        PipelineState::Starting => "starting",
+        PipelineState::Live => "live",
+        PipelineState::Offline => "offline",
+        PipelineState::Stopped => "stopped",
+        PipelineState::Failed => "failed",
+    }
+}
+
 fn viewers(channel: &ChannelView) -> String {
     if !channel.live {
         return "offline".to_owned();
     }
-    channel
-        .viewers
-        .map_or_else(|| "—".to_owned(), |viewers| viewers.to_string())
+    channel.viewers.map_or_else(|| "—".to_owned(), format_count)
 }
 
-fn detail(channel: &ChannelView) -> String {
-    let game = channel.game.as_deref().unwrap_or("no game");
-    let start = channel
-        .stream_start_ms
-        .map_or_else(|| "—".to_owned(), format_iso_ms);
-    let count =
-        |value: Option<u32>| value.map_or_else(|| "—".to_owned(), |value| value.to_string());
-    format!(
-        "{} • {} • {} • {}/{}",
-        channel.login,
-        game,
-        start,
-        count(channel.viewers),
-        count(channel.collaboration_viewers)
+fn stream_tooltip(channel: &ChannelView) -> String {
+    if channel.stream_id == 0 {
+        return "No stream id resolved yet".to_owned();
+    }
+    channel.stream_created_at.as_deref().map_or_else(
+        || format!("Stream ID {}", channel.stream_id),
+        |created| format!("Stream ID {} · created {created}", channel.stream_id),
     )
 }
 
+fn initials(display_name: &str) -> String {
+    let mut initials = display_name
+        .split_whitespace()
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .collect::<String>();
+    if initials.is_empty() {
+        initials = display_name.chars().take(2).collect();
+    }
+    initials.to_uppercase()
+}
+
+/// The token block the zgui-ui controls read. It is laid over the dark preset
+/// rather than written as a second style sheet so the provider owns the cascade
+/// and every control is themed by one palette.
+const THEME_CSS: &str = "
+    --zui-color-background: #0d0f14;
+    --zui-color-foreground: #e9edf5;
+    --zui-color-card: #12151c;
+    --zui-color-card-foreground: #e9edf5;
+    --zui-color-popover: #171b24;
+    --zui-color-popover-foreground: #e9edf5;
+    --zui-color-primary: #9146ff;
+    --zui-color-primary-foreground: #ffffff;
+    --zui-color-secondary: #1c2130;
+    --zui-color-secondary-foreground: #e9edf5;
+    --zui-color-muted: #1b2030;
+    --zui-color-muted-foreground: #97a1b4;
+    --zui-color-accent: #222838;
+    --zui-color-accent-foreground: #ffffff;
+    --zui-color-destructive: #e5484d;
+    --zui-color-destructive-foreground: #ffffff;
+    --zui-color-border: #232936;
+    --zui-color-input: #232936;
+    --zui-color-ring: #9146ff;
+    --zui-color-tooltip: #1b2130;
+    --zui-color-tooltip-foreground: #e9edf5;
+    --zui-color-tooltip-border: #2c3444;
+    --zui-radius-base: 6px;
+";
+
 const SHEET: &str = css!(
     ":root {
-        background-color: #12141a;
-        color: #e8ecf4;
+        background-color: #0d0f14;
+        color: #e9edf5;
         font-family: sans-serif;
     }
 
     .app {
-        padding: 16px 18px;
-        gap: 10px;
-        flex-grow: 1;
+        width: 100%;
+        height: 100%;
+        padding: 18px 22px;
+        gap: 12px;
     }
 
     .header {
@@ -486,9 +1156,12 @@ const SHEET: &str = css!(
         gap: 12px;
     }
 
+    .brand-block { gap: 1px; }
+
     .brand {
-        font-size: 22px;
+        font-size: 24px;
         font-weight: 700;
+        letter-spacing: 0.4px;
     }
 
     .conn {
@@ -518,81 +1191,475 @@ const SHEET: &str = css!(
 
     .error__text { flex-grow: 1; }
 
-    .add {
-        gap: 8px;
-        align-items: center;
+    .tabs {
+        gap: 2px;
+        align-items: flex-end;
+        padding: 0 2px;
     }
 
-    .channels {
-        height: 360px;
-        border-radius: 10px;
-        border: 1px solid #262b36;
+    .tab {
+        padding: 8px 18px;
+        border-radius: 10px 10px 0 0;
+        border: 1px solid transparent;
+        border-bottom: 0;
+        color: #97a1b4;
+        font-size: 14px;
+        cursor: pointer;
+    }
+
+    .tab:hover {
+        color: #e9edf5;
         background-color: #171b24;
     }
 
-    .words {
-        height: 110px;
-        border-radius: 10px;
-        border: 1px solid #262b36;
-        background-color: #171b24;
+    .tab.on {
+        color: #ffffff;
+        background-color: #1b2030;
+        border-color: #232936;
     }
 
-    .list { gap: 2px; padding: 6px; }
-
-    .channel { padding: 2px 4px; }
-
-    .channel__line {
-        align-items: center;
-        gap: 8px;
-        padding: 6px 8px;
-        border-radius: 7px;
+    .tab--off {
+        color: #4b5263;
+        cursor: not-allowed;
     }
 
-    .channel__line:hover { background-color: #1e2430; }
-
-    .dot {
-        color: #555b68;
-        font-size: 11px;
+    .tab--off:hover {
+        color: #4b5263;
+        background-color: transparent;
     }
 
-    .dot--live { color: #2ea043; }
-
-    .channel__name {
-        width: 140px;
-        font-size: 15px;
-    }
-
-    .channel__title {
+    .tabbody {
         flex-grow: 1;
-        font-size: 13px;
-        color: #9aa4b6;
+        gap: 10px;
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid #232936;
+        background-color: #12151c;
     }
 
-    .channel__viewers {
-        font-size: 13px;
-        color: #9aa4b6;
+    .tablehead {
+        gap: 10px;
+        align-items: center;
+        padding: 0 10px 8px;
+        border-bottom: 1px solid #232936;
     }
 
-    .channel__detail {
-        padding-left: 30px;
-        padding-bottom: 4px;
+    .tablehead .cell {
+        color: #7d879b;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.6px;
+        white-space: nowrap;
+    }
+
+    .cell {
+        font-size: 13px;
+        color: #d7dce8;
+    }
+
+    .cell--chevron { width: 14px; }
+    .cell--dot { width: 10px; }
+    /* A Twitch login is at most 25 characters; the avatar and the gap take
+       the rest of this column, and the name truncates rather than widening
+       the row. */
+    .cell--channel {
+        width: 230px;
+        flex-shrink: 0;
+        min-width: 0;
+    }
+
+    /* Base zero, grow to the gap left by the fixed columns: a long title
+       truncates inside its own cell instead of pushing Notify to the right. */
+    .cell--title {
+        width: 0;
+        flex-grow: 1;
+        flex-basis: 0;
+        min-width: 0;
+        overflow: hidden;
+    }
+    .cell--notify { width: 124px; }
+    .cell--record { width: 62px; }
+    .cell--viewers { width: 82px; text-align: right; }
+    .cell--action { width: 34px; }
+    .cell--quality { width: 90px; }
+    .cell--state { width: 82px; }
+    .cell--position { width: 90px; }
+    .cell--segments { width: 88px; }
+    .cell--size { width: 90px; }
+    .cell--runs { width: 56px; }
+
+    .list {
+        gap: 2px;
+        padding: 6px 2px;
+    }
+
+    .channels, .recordings, .words, .logs {
+        flex-grow: 1;
+        min-height: 0;
+    }
+
+    .channel { padding: 0; }
+
+    .channel-row {
+        align-items: center;
+        gap: 10px;
+        padding: 7px 10px;
+        border-radius: 9px;
+    }
+
+    .channel-row:hover { background-color: #181d27; }
+    .channel-row.open { background-color: #171c26; }
+    .channel-row.pending { opacity: 0.65; }
+
+    .chevron {
+        width: 14px;
+        color: #5c6577;
+        font-size: 14px;
+    }
+
+    .chevron.open {
+        color: #a970ff;
+        transform: rotate(90deg);
+    }
+
+    .live-dot {
+        width: 10px;
+        color: #3a3f4c;
+        font-size: 10px;
+    }
+
+    .live-dot.live { color: #f43f5e; }
+
+    .identity {
+        align-items: center;
+        gap: 8px;
+        flex-grow: 1;
+        min-width: 0;
+    }
+
+    .channel-name {
+        flex-grow: 1;
+        min-width: 0;
+        font-size: 14px;
+        font-weight: 600;
+        color: #e9edf5;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .channel-title {
+        width: 100%;
+        font-size: 13px;
+        color: #97a1b4;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .cell--notify {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .cell--record {
+        display: flex;
+        align-items: center;
+    }
+
+    .mini {
+        align-items: center;
+        gap: 3px;
+    }
+
+    .mini__label {
+        font-size: 9px;
+        color: #7d879b;
+        letter-spacing: 0.3px;
+    }
+
+    .remove {
+        width: 28px;
+        height: 28px;
+        color: #6c7587;
+    }
+
+    .detail {
+        margin: 2px 6px 8px 40px;
+        padding: 14px 16px;
+        gap: 12px;
+        border-radius: 10px;
+        border: 1px solid #232936;
+        background-color: #0f1219;
+    }
+
+    .detail-head {
+        align-items: center;
+        gap: 12px;
+    }
+
+    .detail-id { gap: 1px; }
+
+    .detail-name {
+        font-size: 15px;
+        font-weight: 600;
+    }
+
+    .detail-login {
         font-size: 12px;
         color: #7d879b;
     }
 
-    .pending .channel__title { color: #7d879b; }
+    .badge {
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.6px;
+        background-color: #1b2130;
+        color: #7d879b;
+    }
 
-    .options { gap: 8px; }
+    .badge.live {
+        background-color: #3a1420;
+        color: #ff6b81;
+    }
+
+    .detail-grid {
+        gap: 24px;
+        padding-top: 4px;
+    }
+
+    .detail-col {
+        flex-grow: 1;
+        flex-basis: 0;
+        gap: 5px;
+    }
+
+    .detail-item {
+        gap: 10px;
+        align-items: baseline;
+    }
+
+    .detail-key {
+        width: 96px;
+        font-size: 12px;
+        color: #7d879b;
+    }
+
+    .detail-value {
+        flex-grow: 1;
+        font-size: 12px;
+        color: #d7dce8;
+    }
+
+    .detail-value__text {
+        font-size: 12px;
+        color: #d7dce8;
+    }
+
+    .settings { gap: 8px; }
+
+    .switch-row {
+        align-items: center;
+        gap: 12px;
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid #232936;
+        background-color: #0f1219;
+    }
+
+    .switch-copy { gap: 2px; }
+
+    .switch-title {
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+    .switch-hint {
+        font-size: 12px;
+        color: #7d879b;
+    }
+
+    .section-title {
+        padding-top: 6px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.7px;
+        color: #97a1b4;
+    }
+
+    .section-hint {
+        font-size: 12px;
+        color: #6c7587;
+    }
+
+    .add {
+        gap: 8px;
+        align-items: center;
+        padding-top: 2px;
+    }
+
+    .add__input { flex-grow: 1; }
+    .add__quality { width: 170px; }
 
     .word {
         align-items: center;
         gap: 8px;
-        padding: 4px 8px;
-        font-size: 13px;
+        padding: 6px 10px;
+        border-radius: 8px;
     }
 
-    .pump {
-        width: 1px;
-        height: 1px;
+    .word:hover { background-color: #181d27; }
+
+    .word__text {
+        font-size: 13px;
+        color: #d7dce8;
+    }
+
+    .recording { padding: 0; }
+
+    .recording-row {
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border-radius: 9px;
+    }
+
+    .recording-row:hover { background-color: #181d27; }
+
+    .recording__error {
+        padding: 0 10px 6px 10px;
+        font-size: 11px;
+        color: #ff9aa8;
+    }
+
+    .empty {
+        padding: 22px 12px;
+        font-size: 13px;
+        color: #7d879b;
+    }
+
+    .stats { gap: 8px; }
+
+    .stat {
+        flex-grow: 1;
+        flex-basis: 0;
+        gap: 2px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #232936;
+        background-color: #0f1219;
+    }
+
+    .stat__label {
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.6px;
+        color: #7d879b;
+    }
+
+    .stat__value {
+        font-size: 15px;
+        font-weight: 600;
+        color: #e9edf5;
+    }
+
+    .loglist { gap: 1px; }
+
+    .notification {
+        align-items: flex-start;
+        gap: 10px;
+        padding: 6px 10px;
+        border-radius: 8px;
+    }
+
+    .notification:hover { background-color: #181d27; }
+
+    .notification__body { gap: 1px; flex-grow: 1; }
+
+    .notification__summary {
+        font-size: 13px;
+        font-weight: 600;
+        color: #e9edf5;
+    }
+
+    .notification__text {
+        font-size: 12px;
+        color: #97a1b4;
+    }
+
+    .pipeline {
+        align-items: center;
+        gap: 10px;
+        padding: 6px 10px;
+        border-radius: 8px;
+    }
+
+    .pipeline:hover { background-color: #181d27; }
+
+    .pipeline__name {
+        width: 220px;
+        font-size: 13px;
+        font-weight: 600;
+    }
+
+    .pipeline__state {
+        width: 74px;
+        font-size: 12px;
+        color: #97a1b4;
+    }
+
+    .pipeline__meta {
+        font-size: 12px;
+        color: #7d879b;
+    }
+
+    .pipeline__rec {
+        display: none;
+        padding: 1px 8px;
+        border-radius: 999px;
+        background-color: #3a1420;
+        color: #ff6b81;
+        font-size: 10px;
+        font-weight: 700;
+    }
+
+    .pipeline__rec.on { display: inline-flex; }
+
+    .log {
+        align-items: baseline;
+        gap: 10px;
+        padding: 5px 10px;
+        border-radius: 7px;
+    }
+
+    .log:hover { background-color: #181d27; }
+
+    .log__time {
+        width: 58px;
+        font-size: 11px;
+        color: #6c7587;
+    }
+
+    .log__target {
+        width: 74px;
+        font-size: 11px;
+        color: #a970ff;
+    }
+
+    .log__message {
+        flex-grow: 1;
+        font-size: 12px;
+        color: #d7dce8;
+    }
+
+    .log.bad .log__message { color: #ff9aa8; }
+
+    .log__meta {
+        font-size: 11px;
+        color: #7d879b;
     }"
 );

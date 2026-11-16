@@ -2,7 +2,7 @@
 
 [package]
 name = "daemon"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Siphon backend: Twitch HLS pipelines over RTSP, with monitors and RPC"
 authors = ["Ozeniken"]

@@ -31,24 +31,24 @@ const SDR_REFERENCE_NITS: f32 = 80.0;
 ///
 /// `device_name` is `DXGI_OUTPUT_DESC::DeviceName` (`\\.\DISPLAY1`), padded with
 /// zeroes to 32 wide characters.
-pub fn white_nits(device_name: &[u16; 32]) -> anyhow::Result<f32> {
+pub fn white_nits(device_name: &[u16; 32]) -> eros::Result<f32> {
     for path in active_paths()? {
         if source_name(&path) != *device_name {
             continue;
         }
         return white_level(path.targetInfo.adapterId, path.targetInfo.id);
     }
-    anyhow::bail!("no active display path for this output")
+    eros::bail!("no active display path for this output")
 }
 
 /// Every active display path, source and target together.
-fn active_paths() -> anyhow::Result<Vec<DISPLAYCONFIG_PATH_INFO>> {
+fn active_paths() -> eros::Result<Vec<DISPLAYCONFIG_PATH_INFO>> {
     let mut paths = 0;
     let mut modes = 0;
     // SAFETY: both out-pointers name live locals.
     let status =
         unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) };
-    anyhow::ensure!(
+    eros::ensure!(
         status == ERROR_SUCCESS,
         "GetDisplayConfigBufferSizes failed: {}",
         status.0
@@ -68,7 +68,7 @@ fn active_paths() -> anyhow::Result<Vec<DISPLAYCONFIG_PATH_INFO>> {
             None,
         )
     };
-    anyhow::ensure!(
+    eros::ensure!(
         status == ERROR_SUCCESS,
         "QueryDisplayConfig failed: {}",
         status.0
@@ -95,7 +95,7 @@ fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> [u16; 32] {
 }
 
 /// The SDR white level of one target, in nits.
-fn white_level(adapter: LUID, id: u32) -> anyhow::Result<f32> {
+fn white_level(adapter: LUID, id: u32) -> eros::Result<f32> {
     let mut level = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
     level.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
     level.header.size = u32::try_from(size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>()).unwrap_or(0);
@@ -103,7 +103,7 @@ fn white_level(adapter: LUID, id: u32) -> anyhow::Result<f32> {
     level.header.id = id;
     // SAFETY: as above; this request names a target of the same path.
     let status = unsafe { DisplayConfigGetDeviceInfo(&raw mut level.header) };
-    anyhow::ensure!(
+    eros::ensure!(
         status == ERROR_SUCCESS.0 as i32,
         "DisplayConfigGetDeviceInfo(SDR_WHITE_LEVEL) failed: {status}"
     );
@@ -112,7 +112,7 @@ fn white_level(adapter: LUID, id: u32) -> anyhow::Result<f32> {
         reason = "the level is a small integer, far inside f32's exact range"
     )]
     let nits = level.SDRWhiteLevel as f32 / 1000.0 * SDR_REFERENCE_NITS;
-    anyhow::ensure!(
+    eros::ensure!(
         nits > 1.0,
         "the display reports an unusable SDR white level"
     );

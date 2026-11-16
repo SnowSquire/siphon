@@ -57,7 +57,12 @@ pub enum ConnectError {
 #[derive(Debug)]
 pub enum ClientEvent {
     Snapshot(Box<Snapshot>),
-    Update { revision: u64, update: Update },
+    Update {
+        revision: u64,
+        /// Boxed: one update is much larger than a snapshot handle, and the
+        /// worker keeps a queue of them.
+        update: Box<Update>,
+    },
 }
 
 type Pending = Rc<RefCell<HashMap<u64, Sender<Result<Response, RpcError>>>>>;
@@ -238,7 +243,10 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
         };
         match selected {
             Ok(ServerMessage::Update { revision, update }) => {
-                let _ = events.try_send(ClientEvent::Update { revision, update });
+                let _ = events.try_send(ClientEvent::Update {
+                    revision,
+                    update: Box::new(update),
+                });
             }
             Ok(ServerMessage::Snapshot(snapshot)) => {
                 let _ = events.try_send(ClientEvent::Snapshot(snapshot));

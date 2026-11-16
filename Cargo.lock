@@ -1262,7 +1262,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "daemon"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "compio",
@@ -4346,7 +4346,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "siphon-rpc"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "compio",
  "futures-util",
@@ -4359,13 +4359,13 @@ dependencies = [
 
 [[package]]
 name = "siphon-ui"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
- "anyhow",
  "app-single-instance",
  "ash",
  "compio",
  "dirs",
+ "eros",
  "kanal",
  "libplacebo-sys",
  "pollster",
@@ -4378,6 +4378,7 @@ dependencies = [
  "zgui",
  "zgui-render-wgpu",
  "zgui-ui",
+ "zgui-ui-tokens",
 ]
 
 [[package]]

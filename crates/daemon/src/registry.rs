@@ -21,6 +21,7 @@ use kanal::AsyncSender;
 use siphon_rpc::ArenaSummary;
 use siphon_rpc::DiskView;
 use siphon_rpc::DownloaderSummary;
+use siphon_rpc::LogLevel;
 use siphon_rpc::PipelineState;
 use siphon_rpc::PipelineView;
 use siphon_rpc::SegmentRecord;
@@ -472,6 +473,17 @@ impl Registry {
             quality = runtime.key.quality.as_deref().unwrap_or("<first>"),
             "daemon: recording started"
         );
+        self.bus.log_channel(
+            LogLevel::Info,
+            "recording",
+            format!(
+                "recording started ({})",
+                runtime.key.quality.as_deref().unwrap_or("best")
+            ),
+            Some(runtime.key.login.clone()),
+            Some(runtime.broadcast_id),
+            None,
+        );
         self.publish_pipeline(runtime);
     }
 
@@ -482,6 +494,14 @@ impl Registry {
         if let Some(disk) = runtime.disk.borrow_mut().take() {
             disk.stop();
         }
+        self.bus.log_channel(
+            LogLevel::Info,
+            "recording",
+            "recording stopped",
+            Some(runtime.key.login.clone()),
+            Some(runtime.broadcast_id),
+            None,
+        );
         self.publish_pipeline(runtime);
     }
 
@@ -752,6 +772,18 @@ impl Registry {
             polls: metrics.polls.get(),
             poll_failures: metrics.poll_failures.get(),
             last_error,
+            disk: runtime
+                .disk_metrics
+                .borrow()
+                .as_ref()
+                .map(|metrics| DiskView {
+                    active: metrics.active.get(),
+                    runs: metrics.runs.get(),
+                    segments: metrics.segments.get(),
+                    bytes: metrics.bytes.get(),
+                    position_ms: metrics.position_ms.get(),
+                    last_error: metrics.last_error.borrow().clone(),
+                }),
         }
     }
 

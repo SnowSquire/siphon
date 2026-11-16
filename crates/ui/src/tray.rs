@@ -21,7 +21,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
 
-use anyhow::Context as _;
+use eros::Context as _;
 use windows_sys::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HWND;
@@ -122,7 +122,7 @@ pub struct Tray {
 
 /// Builds the tray icon. Call on the GUI thread so the message window that
 /// receives the shell callbacks pumps with the event loop.
-pub fn build() -> anyhow::Result<Tray> {
+pub fn build() -> eros::Result<Tray> {
     let hwnd = ensure_window()?;
     let icon = load_icon()?;
     add_icon(hwnd, icon)?;
@@ -260,16 +260,16 @@ fn valid_ico(data: &[u8]) -> bool {
 }
 
 /// Picks the shell-preferred image out of the bundled `.ico`.
-pub fn load_icon() -> anyhow::Result<HICON> {
+pub fn load_icon() -> eros::Result<HICON> {
     if !valid_ico(ICON_ICO) {
-        anyhow::bail!("bundled icon.ico failed validation");
+        eros::bail!("bundled icon.ico failed validation");
     }
     // SAFETY: `ICON_ICO` passed validation as a well-formed `.ico`
     // directory, so the lookup only reads its header.
     let offset =
         unsafe { LookupIconIdFromDirectoryEx(ICON_ICO.as_ptr(), 1, 0, 0, LR_DEFAULTCOLOR) };
     if offset <= 0 {
-        anyhow::bail!("bundled icon.ico lookup failed");
+        eros::bail!("bundled icon.ico lookup failed");
     }
     let rest = ICON_ICO
         .get(offset as usize..)
@@ -288,7 +288,7 @@ pub fn load_icon() -> anyhow::Result<HICON> {
         )
     };
     if icon.is_null() {
-        anyhow::bail!("CreateIconFromResourceEx failed");
+        eros::bail!("CreateIconFromResourceEx failed");
     }
     Ok(icon)
 }
@@ -371,13 +371,13 @@ fn base_nid(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
 }
 
 /// Adds the icon and opts into version 4 event behavior.
-fn add_icon(hwnd: HWND, icon: HICON) -> anyhow::Result<()> {
+fn add_icon(hwnd: HWND, icon: HICON) -> eros::Result<()> {
     let nid = base_nid(hwnd, icon);
     // SAFETY: `nid` is fully populated with our live window, icon, tooltip,
     // and callback message; the shell only reads it for this call.
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
     if added == 0 {
-        anyhow::bail!("Shell_NotifyIconW NIM_ADD failed");
+        eros::bail!("Shell_NotifyIconW NIM_ADD failed");
     }
     let mut versioned = nid;
     versioned.Anonymous.uVersion = NOTIFYICON_VERSION_4;
@@ -447,11 +447,11 @@ static CLASS_READY: AtomicBool = AtomicBool::new(false);
 
 /// Registers the message-window class once and creates the hidden window
 /// the shell posts tray input to.
-fn ensure_window() -> anyhow::Result<HWND> {
+fn ensure_window() -> eros::Result<HWND> {
     // SAFETY: null name queries the current module handle.
     let instance = unsafe { GetModuleHandleW(core::ptr::null()) };
     if instance.is_null() {
-        anyhow::bail!("GetModuleHandleW failed");
+        eros::bail!("GetModuleHandleW failed");
     }
     if !CLASS_READY.load(Ordering::Acquire) {
         let class = wide("SiphonTray");
@@ -469,7 +469,7 @@ fn ensure_window() -> anyhow::Result<HWND> {
             // registration.
             let error = unsafe { GetLastError() };
             if error != ERROR_CLASS_ALREADY_EXISTS {
-                anyhow::bail!("RegisterClassW failed ({error})");
+                eros::bail!("RegisterClassW failed ({error})");
             }
         }
         CLASS_READY.store(true, Ordering::Release);
@@ -494,7 +494,7 @@ fn ensure_window() -> anyhow::Result<HWND> {
         )
     };
     if hwnd.is_null() {
-        anyhow::bail!("CreateWindowExW failed");
+        eros::bail!("CreateWindowExW failed");
     }
     Ok(hwnd)
 }

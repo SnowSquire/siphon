@@ -4,6 +4,8 @@ mod app;
 #[allow(dead_code, clippy::future_not_send)]
 mod arena;
 #[allow(clippy::future_not_send)]
+mod avatar;
+#[allow(clippy::future_not_send)]
 mod balesh;
 #[allow(dead_code, clippy::future_not_send)]
 mod bus;

@@ -184,8 +184,9 @@ impl Key {
             Update::NotificationDismissed(id) => Some(Self::Notification(*id)),
             Update::Error(_) => Some(Self::Error),
             Update::Update(_) => Some(Self::Update),
-            // The segment ring is append-only; coalescing would lose entries.
-            Update::Segment { .. } => None,
+            // The segment ring and the event log are append-only; coalescing
+            // would lose entries.
+            Update::Segment { .. } | Update::Log(_) => None,
         }
     }
 }
@@ -281,10 +282,8 @@ mod tests {
                 .await
                 .ok()
                 .and_then(Result::ok);
-            if let Some(ClientEvent::Update {
-                update: Update::Config(_),
-                ..
-            }) = event
+            if let Some(ClientEvent::Update { update, .. }) = event
+                && matches!(*update, Update::Config(_))
             {
                 return;
             }
@@ -304,7 +303,7 @@ mod tests {
             let ClientEvent::Update { update, .. } = event else {
                 continue;
             };
-            match update {
+            match *update {
                 Update::PipelineUpsert(view) if !removed && view.key.login == login => return,
                 Update::PipelineRemove(key) if removed && key.login == login => return,
                 _ => {}
@@ -354,6 +353,7 @@ mod tests {
                         id: 7,
                         display_name: Some("Sunnys".to_owned()),
                         record: false,
+                        ..Channel::default()
                     }],
                     ..Config::default()
                 },

@@ -10,14 +10,23 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::rc::Weak;
 
+use siphon_rpc::LogEntry;
+use siphon_rpc::LogLevel;
 use siphon_rpc::ServerMessage;
 use siphon_rpc::Update;
 
 /// How many frames a connection may fall behind before it is disconnected.
 const BACKLOG: usize = 64;
+
+/// How many event-log lines a snapshot carries.
+///
+/// The ring is bounded because the daemon outlives any UI: a full history is a
+/// leak that only looks like a feature.
+pub const LOG_CAP: usize = 512;
 
 /// One published change with the revision it belongs to.
 #[derive(Debug, Clone)]
@@ -60,6 +69,8 @@ impl Subscriber {
 pub struct Bus {
     revision: Cell<u64>,
     subscribers: RefCell<Vec<Weak<Subscriber>>>,
+    logs: RefCell<VecDeque<LogEntry>>,
+    next_log: Cell<u64>,
 }
 
 impl Bus {
@@ -68,6 +79,8 @@ impl Bus {
         Rc::new(Self {
             revision: Cell::new(0),
             subscribers: RefCell::new(Vec::new()),
+            logs: RefCell::new(VecDeque::with_capacity(LOG_CAP)),
+            next_log: Cell::new(1),
         })
     }
 
@@ -75,6 +88,52 @@ impl Bus {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision.get()
+    }
+
+    /// Appends one event with no stream identity.
+    pub fn log(&self, level: LogLevel, target: &str, message: impl Into<String>) {
+        self.log_channel(level, target, message, None, None, None);
+    }
+
+    /// Appends one event and sends it to every connected UI.
+    ///
+    /// The ring is updated before the publish, so a UI that reconnects between
+    /// the two sees the line exactly once.
+    pub fn log_channel(
+        &self,
+        level: LogLevel,
+        target: &str,
+        message: impl Into<String>,
+        login: Option<String>,
+        stream_id: Option<u64>,
+        created_at: Option<String>,
+    ) {
+        let seq = self.next_log.get();
+        self.next_log.set(seq.wrapping_add(1));
+        let entry = LogEntry {
+            seq,
+            at_ms: crate::time::now_ms(),
+            level,
+            target: target.to_owned(),
+            message: message.into(),
+            login,
+            stream_id,
+            created_at,
+        };
+        {
+            let mut logs = self.logs.borrow_mut();
+            if logs.len() == LOG_CAP {
+                logs.pop_front();
+            }
+            logs.push_back(entry.clone());
+        }
+        self.publish(Update::Log(entry));
+    }
+
+    /// The event ring, oldest first.
+    #[must_use]
+    pub fn logs(&self) -> Vec<LogEntry> {
+        self.logs.borrow().iter().cloned().collect()
     }
 
     /// Registers one connection. The caller keeps the `Subscriber` alive for

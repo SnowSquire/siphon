@@ -8,9 +8,9 @@
 use std::ffi::c_char;
 use std::ptr;
 
-use anyhow::Context as _;
 use ash::vk;
 use ash::vk::Handle as _;
+use eros::Context as _;
 use libplacebo_sys as pl;
 use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
@@ -25,7 +25,7 @@ pub struct Placebo {
 }
 
 impl Placebo {
-    pub fn import(gpu: &Gpu) -> anyhow::Result<Self> {
+    pub fn import(gpu: &Gpu) -> eros::Result<Self> {
         // SAFETY: `as_hal` only asks that the resource behind the guard is not
         // destroyed while borrowed. Both wgpu handles live for the call.
         let hal_adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Vulkan>() }
@@ -43,7 +43,7 @@ impl Placebo {
         // owned log or null.
         let log =
             unsafe { pl::pl_log_create_372(pl::PL_API_VER as std::os::raw::c_int, &log_params) };
-        anyhow::ensure!(!log.is_null(), "libplacebo refused to create a log");
+        eros::ensure!(!log.is_null(), "libplacebo refused to create a log");
 
         let instance = hal_adapter.shared_instance().raw_instance();
         // SAFETY: loading the system Vulkan loader; `Placebo` owns the entry for
@@ -102,7 +102,7 @@ impl Placebo {
         if vulkan.is_null() {
             // SAFETY: the log was created just above and is destroyed once.
             unsafe { pl::pl_log_destroy(&raw const log as *mut _) };
-            anyhow::bail!("libplacebo refused to import the Vulkan device");
+            eros::bail!("libplacebo refused to import the Vulkan device");
         }
 
         // SAFETY: a successfully imported `pl_vulkan` owns a `pl_gpu`.
@@ -116,7 +116,7 @@ impl Placebo {
                 pl::pl_vulkan_destroy(&raw const vulkan as *mut _);
                 pl::pl_log_destroy(&raw const log as *mut _);
             }
-            anyhow::bail!("libplacebo refused to create a renderer");
+            eros::bail!("libplacebo refused to create a renderer");
         }
 
         Ok(Self {
@@ -147,7 +147,7 @@ impl Placebo {
         height: u32,
         format: vk::Format,
         usage: vk::ImageUsageFlags,
-    ) -> anyhow::Result<pl::pl_tex> {
+    ) -> eros::Result<pl::pl_tex> {
         let params = pl::pl_vulkan_wrap_params {
             image: image.as_raw() as usize as *mut pl::VkImage_T,
             aspect: vk::ImageAspectFlags::COLOR.as_raw(),
@@ -161,7 +161,7 @@ impl Placebo {
         };
         // SAFETY: the image lives on this GPU's device and matches the description.
         let texture = unsafe { pl::pl_vulkan_wrap(self.gpu, &params) };
-        anyhow::ensure!(!texture.is_null(), "libplacebo refused to wrap the image");
+        eros::ensure!(!texture.is_null(), "libplacebo refused to wrap the image");
         Ok(texture)
     }
 
@@ -225,8 +225,8 @@ impl Placebo {
 
     /// Wraps a wgpu texture that was created `Bgra8Unorm` with
     /// `RENDER_ATTACHMENT | TEXTURE_BINDING`, which is what ZGUI draws into.
-    pub fn wrap_wgpu(&self, texture: &wgpu::Texture) -> anyhow::Result<pl::pl_tex> {
-        anyhow::ensure!(
+    pub fn wrap_wgpu(&self, texture: &wgpu::Texture) -> eros::Result<pl::pl_tex> {
+        eros::ensure!(
             texture.format() == wgpu::TextureFormat::Bgra8Unorm,
             "the interface texture is not Bgra8Unorm"
         );

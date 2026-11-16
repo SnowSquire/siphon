@@ -46,6 +46,8 @@ pub struct ChannelDetail {
     pub login: String,
     pub display_name: String,
     pub profile_image_url: String,
+    /// Local avatar file, once the app has cached the remote picture.
+    pub avatar_path: Option<String>,
     /// Twitch's `BROADCAST-ID` from the last broadcast; 0 when absent.
     pub stream_id: u64,
     pub stream_title: Option<String>,
@@ -71,19 +73,30 @@ pub struct StreamGame {
 
 impl ChannelDetail {
     /// The UI entity for this channel.
+    ///
+    /// `channel` is the persisted follow entry, when there is one: it carries
+    /// the three switches the row draws. A resolve with no entry is a pending
+    /// add, which the row does not show yet.
     #[must_use]
-    pub fn view(&self) -> ChannelView {
+    pub fn view(&self, channel: Option<&siphon_rpc::Channel>) -> ChannelView {
         ChannelView {
             id: self.id,
             login: self.login.clone(),
             display_name: self.display_name.clone(),
             profile_image_url: self.profile_image_url.clone(),
+            avatar_path: self.avatar_path.clone(),
             live: self.live,
             title: self.stream_title.clone(),
             game: self.game.as_ref().map(|game| game.display_name.clone()),
+            game_id: self.game.as_ref().map(|game| game.id),
             viewers: self.viewers,
             collaboration_viewers: self.collaboration_viewers,
             stream_start_ms: self.stream_start,
+            stream_created_at: self.stream_created_at.clone(),
+            stream_id: self.stream_id,
+            notify_live: channel.is_none_or(|channel| channel.notify_live),
+            notify_titles: channel.is_none_or(|channel| channel.notify_titles),
+            record: channel.is_some_and(|channel| channel.record),
         }
     }
 }
@@ -210,6 +223,7 @@ impl GqlUser {
             login: self.login.filter(|login| !login.is_empty())?,
             display_name: self.display_name.filter(|name| !name.is_empty())?,
             profile_image_url: self.profile_image_url.filter(|url| !url.is_empty())?,
+            avatar_path: None,
             stream_id: broadcast.id?,
             stream_title: broadcast.title.filter(|title| !title.is_empty()),
             stream_start: self

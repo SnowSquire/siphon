@@ -185,6 +185,14 @@ fn terminate_pid(pid: u32) -> bool {
 
 #[cfg(not(windows))]
 fn terminate_pid(pid: u32) -> bool {
+    // A stale PID may have been reused: only stop the daemon image. `/proc`
+    // names the executable the pid is actually running, symlink and all.
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"));
+    let is_daemon =
+        exe.is_ok_and(|path| path.file_name().is_some_and(|name| name == "siphon-daemon"));
+    if !is_daemon {
+        return false;
+    }
     Command::new("kill")
         .arg(pid.to_string())
         .status()
@@ -206,8 +214,10 @@ fn kill_by_name() {
     }
     #[cfg(not(windows))]
     {
+        // `-x` matches the process name exactly, so nothing else named with
+        // "daemon" in it is a candidate; this is the force path, hence `-9`.
         let _ = Command::new("pkill")
-            .args(["-f", "daemon"])
+            .args(["-9", "-x", "siphon-daemon"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -222,7 +232,7 @@ fn daemon_path() -> PathBuf {
     let name = if cfg!(windows) {
         "siphon-daemon.exe"
     } else {
-        "daemon"
+        "siphon-daemon"
     };
     std::env::current_exe()
         .ok()

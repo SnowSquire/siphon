@@ -6,6 +6,7 @@
 //! `.await`.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::future::poll_fn;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use siphon_rpc::ChannelView;
 use siphon_rpc::Config;
 use siphon_rpc::ConnHealth;
 use siphon_rpc::DownloaderSummary;
+use siphon_rpc::LogLevel;
 use siphon_rpc::NotificationView;
 use siphon_rpc::PipelineView;
 use siphon_rpc::Request;
@@ -170,7 +172,7 @@ pub struct AppInit {
 
 /// One finished background job.
 pub enum JobDone {
-    AddResolved(String, Result<Option<ChannelDetail>, GqlError>),
+    AddResolved(String, Box<Result<Option<ChannelDetail>, GqlError>>),
     LiveRefreshed(u64, Result<Vec<ChannelDetail>, GqlError>),
     SaveFinished(Result<(), ConfigError>),
     ToastShown,
@@ -178,6 +180,7 @@ pub enum JobDone {
     UpdateDownloadFinished(Result<PathBuf, update::UpdateError>),
     SubscribeCheckDue(Topic, NanoId, u64),
     ConnectFinished(Box<ConnectOutcome>),
+    AvatarReady(u64, Option<String>),
 }
 
 /// One in-flight job. `!Send` is fine: everything stays on the reactor thread.
@@ -195,6 +198,8 @@ pub struct App {
     pub(crate) debug: bool,
 
     pub(crate) channels: HashMap<u64, ChannelDetail>,
+    /// Avatar downloads in flight, so a refresh does not start a second one.
+    pub(crate) avatars_pending: HashSet<u64>,
     pub(crate) pending: Vec<String>,
     pub(crate) conn: ConnHealth,
     pub(crate) error: Option<String>,
@@ -264,6 +269,7 @@ impl App {
             client_id,
             debug,
             channels: HashMap::new(),
+            avatars_pending: HashSet::new(),
             pending: Vec::new(),
             conn,
             error: None,
@@ -381,7 +387,7 @@ impl App {
     async fn handle_job(&mut self, done: JobDone) {
         match done {
             JobDone::AddResolved(login, result) => {
-                self.complete_add_login(login, result).await;
+                self.complete_add_login(login, *result).await;
             }
             JobDone::LiveRefreshed(id, result) => {
                 self.complete_live_refresh(id, result);
@@ -439,6 +445,23 @@ impl App {
             JobDone::ConnectFinished(outcome) => {
                 self.complete_connect(*outcome).await;
             }
+            JobDone::AvatarReady(id, path) => {
+                self.avatars_pending.remove(&id);
+                let Some(path) = path else {
+                    return;
+                };
+                let flags = self
+                    .config
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                    .cloned();
+                if let Some(user) = self.channels.get_mut(&id) {
+                    user.avatar_path = Some(path);
+                    let view = user.view(flags.as_ref());
+                    self.bus.publish(Update::ChannelUpsert(view));
+                }
+            }
         }
     }
 
@@ -466,6 +489,12 @@ impl App {
                 self.apply_remove_filtered_word(usize::try_from(index).unwrap_or(usize::MAX))
             }
             Request::SetRecord { channel, record } => self.apply_set_record(channel, record),
+            Request::SetNotifyLive { channel, notify } => {
+                self.apply_set_notify_live(channel, notify)
+            }
+            Request::SetNotifyTitles { channel, notify } => {
+                self.apply_set_notify_titles(channel, notify)
+            }
             Request::ClearError => {
                 self.clear_error();
                 Ok(Response::Ack)
@@ -493,7 +522,7 @@ impl App {
                 .registry
                 .detail(&key, 256)
                 .map_or(Err(RpcError::NotFound), |detail| {
-                    Ok(Response::StreamDetail(detail))
+                    Ok(Response::StreamDetail(Box::new(detail)))
                 }),
             Request::ListSegments { key, limit } => self
                 .registry
@@ -525,14 +554,21 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| channel.login.clone()),
                     profile_image_url: String::new(),
+                    avatar_path: None,
                     live: false,
                     title: None,
                     game: None,
+                    game_id: None,
                     viewers: None,
                     collaboration_viewers: None,
                     stream_start_ms: None,
+                    stream_created_at: None,
+                    stream_id: 0,
+                    notify_live: channel.notify_live,
+                    notify_titles: channel.notify_titles,
+                    record: channel.record,
                 },
-                ChannelDetail::view,
+                |detail| detail.view(Some(channel)),
             );
             channels.push(view);
         }
@@ -546,6 +582,7 @@ impl App {
             arena: self.registry.arena_summary(),
             downloader: self.registry.downloader_summary(),
             notifications: self.notifications.clone(),
+            logs: self.bus.logs(),
             error: self.error.clone(),
             update: self.update.as_ref().map(update_view),
         }
@@ -562,6 +599,7 @@ impl App {
     pub fn set_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         tracing::info!(target: "app", "{message}");
+        self.bus.log(LogLevel::Error, "app", message.clone());
         self.error = Some(message.clone());
         self.bus.publish(Update::Error(Some(message)));
     }
@@ -663,6 +701,18 @@ impl App {
             let oldest = self.notifications.remove(0);
             self.bus.publish(Update::NotificationDismissed(oldest.id));
         }
+        self.bus.log_channel(
+            LogLevel::Info,
+            "notify",
+            if body.is_empty() {
+                summary.clone()
+            } else {
+                format!("{summary}: {body}")
+            },
+            login.clone(),
+            None,
+            None,
+        );
         self.bus.publish(Update::Notification(notification));
 
         let client = Rc::clone(&self.client);
@@ -696,6 +746,10 @@ impl App {
     /// in-flight resolves and empty input are ignored without touching disk.
     pub fn request_add_login(&mut self, login: &str) -> Option<String> {
         let login = login.trim().to_lowercase();
+        if login.chars().count() > 25 {
+            self.set_error("a Twitch login is at most 25 characters");
+            return None;
+        }
         if login.is_empty()
             || self
                 .config
@@ -717,7 +771,7 @@ impl App {
         let job_login = login.clone();
         self.spawn_job(async move {
             let result = gql::fetch_channel(&client, client_id.as_deref(), &job_login).await;
-            JobDone::AddResolved(job_login, result)
+            JobDone::AddResolved(job_login, Box::new(result))
         });
         Some(login)
     }
@@ -755,11 +809,18 @@ impl App {
                     return;
                 }
                 let id = user.id;
+                self.bus.log(
+                    LogLevel::Info,
+                    "channel",
+                    format!("added {} ({})", user.login, id),
+                );
                 self.config.channels.push(siphon_rpc::Channel {
                     login: user.login.clone(),
                     id,
                     display_name: Some(user.display_name.clone()),
                     record: false,
+                    notify_live: true,
+                    notify_titles: true,
                 });
                 self.publish_config();
                 self.track_channel(user);
@@ -794,6 +855,11 @@ impl App {
         };
         let removed = self.config.channels.remove(index);
         self.registry.monitor_clear(&removed.login);
+        self.bus.log(
+            LogLevel::Info,
+            "channel",
+            format!("removed {} ({})", removed.login, removed.id),
+        );
         let removed = self.drop_channel(channel);
         self.pending_unsubscribes.extend(removed);
         self.publish_config();
@@ -898,9 +964,19 @@ impl App {
             return Err(RpcError::NotFound);
         };
         entry.record = record;
-        let login = entry.login.clone();
+        let flags = entry.clone();
+        let login = flags.login.clone();
         self.publish_config();
+        self.publish_channel_flags(&flags);
         self.queue_save();
+        self.bus.log(
+            LogLevel::Info,
+            "channel",
+            format!(
+                "recording {} for {login}",
+                if record { "enabled" } else { "disabled" }
+            ),
+        );
         if record {
             if self.registry.can_record() {
                 self.registry.monitor_set(&login);
@@ -911,6 +987,53 @@ impl App {
             self.registry.monitor_clear(&login);
         }
         Ok(Response::Ack)
+    }
+
+    fn apply_set_notify_live(&mut self, channel: u64, notify: bool) -> Result<Response, RpcError> {
+        let Some(entry) = self
+            .config
+            .channels
+            .iter_mut()
+            .find(|candidate| candidate.id == channel)
+        else {
+            return Err(RpcError::NotFound);
+        };
+        entry.notify_live = notify;
+        let flags = entry.clone();
+        self.publish_config();
+        self.publish_channel_flags(&flags);
+        self.queue_save();
+        Ok(Response::Ack)
+    }
+
+    fn apply_set_notify_titles(
+        &mut self,
+        channel: u64,
+        notify: bool,
+    ) -> Result<Response, RpcError> {
+        let Some(entry) = self
+            .config
+            .channels
+            .iter_mut()
+            .find(|candidate| candidate.id == channel)
+        else {
+            return Err(RpcError::NotFound);
+        };
+        entry.notify_titles = notify;
+        let flags = entry.clone();
+        self.publish_config();
+        self.publish_channel_flags(&flags);
+        self.queue_save();
+        Ok(Response::Ack)
+    }
+
+    /// Re-sends one channel row after a switch moved, so a controlled toggle
+    /// in the UI follows the backend rather than snapping back.
+    fn publish_channel_flags(&self, flags: &siphon_rpc::Channel) {
+        if let Some(detail) = self.channels.get(&flags.id) {
+            self.bus
+                .publish(Update::ChannelUpsert(detail.view(Some(flags))));
+        }
     }
 
     fn handle_apply_update(&mut self) {

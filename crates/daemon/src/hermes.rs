@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 use std::time::Instant;
 
+use siphon_rpc::LogLevel;
 use siphon_rpc::Update;
 use sonic_rs::JsonValueTrait as _;
 use sonic_rs::Value;
@@ -259,9 +260,41 @@ impl App {
         }
     }
 
+    /// The persisted follow entry for one channel, if there is one.
+    ///
+    /// Cloned because callers hold a mutable borrow of `channels` when they
+    /// build the view, and a view needs both sides.
+    fn channel_config(&self, id: u64) -> Option<siphon_rpc::Channel> {
+        self.config
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .cloned()
+    }
+
+    /// Starts one avatar download, if this channel does not have one.
+    fn ensure_avatar(&mut self, id: u64, url: &str) {
+        if url.is_empty() || !self.avatars_pending.insert(id) {
+            return;
+        }
+        let client = std::rc::Rc::clone(&self.client);
+        let url = url.to_owned();
+        self.spawn_job(async move {
+            JobDone::AvatarReady(id, crate::avatar::ensure(&client, &url).await)
+        });
+    }
+
     /// Tracks a fresh resolve, logging stream identity when it moved.
-    pub fn track_channel(&mut self, user: ChannelDetail) {
+    pub fn track_channel(&mut self, mut user: ChannelDetail) {
         let id = user.id;
+        // A refresh replaces the whole detail; the cached picture is still the
+        // same person, so do not make the row fall back to initials for it.
+        if user.avatar_path.is_none() {
+            user.avatar_path = self
+                .channels
+                .get(&id)
+                .and_then(|old| old.avatar_path.clone());
+        }
         if should_log_stream(self.channels.get(&id), &user) {
             tracing::info!(
                 target: "hermes",
@@ -271,9 +304,31 @@ impl App {
                 user.stream_id,
                 user.stream_created_at.as_deref().unwrap_or("none"),
             );
+            self.bus.log_channel(
+                LogLevel::Info,
+                "hermes",
+                format!(
+                    "{} stream {} started at {}",
+                    user.login,
+                    user.stream_id,
+                    user.stream_created_at
+                        .as_deref()
+                        .unwrap_or("an unknown time"),
+                ),
+                Some(user.login.clone()),
+                Some(user.stream_id),
+                user.stream_created_at.clone(),
+            );
         }
-        self.bus.publish(Update::ChannelUpsert(user.view()));
+        let config = self.channel_config(id);
+        let avatar_url = user.profile_image_url.clone();
+        let needs_avatar = user.avatar_path.is_none();
+        self.bus
+            .publish(Update::ChannelUpsert(user.view(config.as_ref())));
         self.channels.insert(id, user);
+        if needs_avatar {
+            self.ensure_avatar(id, &avatar_url);
+        }
     }
 
     /// Registers a channel's two topics if not registered already.
@@ -311,6 +366,11 @@ impl App {
     pub(crate) async fn on_disconnect(&mut self) {
         self.close_socket().await;
         self.welcomed = false;
+        self.bus.log(
+            LogLevel::Error,
+            "hermes",
+            "disconnected from Twitch, reconnecting",
+        );
         self.publish_conn_health();
         self.schedule_reconnect();
     }
@@ -333,6 +393,9 @@ impl App {
     /// Fires once a second: enforces the welcome timeout and drops the
     /// connection after missed keepalives.
     pub(crate) async fn on_tick(&mut self) {
+        // Once a second, and before the socket check: a UI watching recordings
+        // must keep getting fresh counters even while Hermes is reconnecting.
+        self.publish_telemetry();
         if self.socket.is_none() {
             return;
         }
@@ -572,13 +635,15 @@ impl App {
         let old_game = pubsub["old_game"].as_str().unwrap_or_default();
         let title_filtered = self.matcher.is_match(&status);
         let notify_titles = self.config.notify_title_changes;
+        let channel = self.channel_config(id);
+        let channel_notifies = channel.as_ref().is_none_or(|channel| channel.notify_titles);
         let quiet = self.quiet(id);
         let Some(user) = self.channels.get_mut(&id) else {
             return;
         };
         let title_changed = user.stream_title.as_deref() != Some(status.as_str());
         let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
-        let can_notify = notify_titles && !user.live && !quiet;
+        let can_notify = notify_titles && channel_notifies && !user.live && !quiet;
         let filtered = title_changed && title_filtered;
         let toast = if can_notify && (title_changed || game_changed) && !filtered {
             let mut lines = Vec::new();
@@ -605,6 +670,16 @@ impl App {
         } else {
             None
         };
+        let mut changes = Vec::new();
+        if title_changed {
+            changes.push(format!("title → {status}"));
+        }
+        if game_changed {
+            changes.push(format!("game → {}", game.as_deref().unwrap_or("none")));
+        }
+        let login = user.login.clone();
+        let stream_id = user.stream_id;
+        let created_at = user.stream_created_at.clone();
         user.stream_title = Some(status).filter(|title| !title.is_empty());
         let game_display_name = user.game.as_ref().map(|game| game.display_name.clone());
         user.game = game
@@ -614,8 +689,18 @@ impl App {
                 name,
                 display_name: game_display_name.unwrap_or_default(),
             });
-        let view = user.view();
+        let view = user.view(channel.as_ref());
         self.bus.publish(Update::ChannelUpsert(view));
+        if !changes.is_empty() {
+            self.bus.log_channel(
+                LogLevel::Info,
+                "hermes",
+                changes.join(", "),
+                Some(login),
+                Some(stream_id),
+                created_at,
+            );
+        }
         if let Some((summary, body, avatar, login)) = toast {
             self.queue_notification(
                 summary,
@@ -630,6 +715,7 @@ impl App {
     fn on_video_playback(&mut self, id: u64, pubsub: &Value) {
         match pubsub["type"].as_str() {
             Some("viewcount") => {
+                let channel = self.channel_config(id);
                 let Some(user) = self.channels.get_mut(&id) else {
                     return;
                 };
@@ -642,11 +728,12 @@ impl App {
                         .as_u64()
                         .and_then(|count| u32::try_from(count).ok());
                 }
-                let view = user.view();
+                let view = user.view(channel.as_ref());
                 self.bus.publish(Update::ChannelUpsert(view));
             }
             Some("stream-up") => {
                 let quiet = self.quiet(id);
+                let channel = self.channel_config(id);
                 let Some(user) = self.channels.get(&id) else {
                     return;
                 };
@@ -655,19 +742,29 @@ impl App {
                 let game = user.game.clone();
                 let title = user.stream_title.clone();
                 let avatar = user.profile_image_url.clone();
+                let stream_id = user.stream_id;
+                let created_at = user.stream_created_at.clone();
                 let Some(user) = self.channels.get_mut(&id) else {
                     return;
                 };
                 user.live = true;
-                let view = user.view();
+                let view = user.view(channel.as_ref());
                 self.bus.publish(Update::ChannelUpsert(view));
                 self.publish_conn_health();
+                self.bus.log_channel(
+                    LogLevel::Info,
+                    "hermes",
+                    "is live",
+                    Some(login.clone()),
+                    Some(stream_id),
+                    created_at,
+                );
                 if quiet {
                     tracing::info!(
                         target: "hermes",
                         "stream-up for {id} inside offline window, staying silent"
                     );
-                } else {
+                } else if channel.as_ref().is_none_or(|channel| channel.notify_live) {
                     self.notify_live(
                         &display_name,
                         game.as_ref(),
@@ -675,13 +772,10 @@ impl App {
                         &avatar,
                         Some(&login),
                     );
+                } else {
+                    tracing::info!(target: "hermes", "stream-up for {id} muted by channel");
                 }
-                let record = self
-                    .config
-                    .channels
-                    .iter()
-                    .any(|channel| channel.id == id && channel.record);
-                if record {
+                if channel.as_ref().is_some_and(|channel| channel.record) {
                     self.registry.monitor_set(&login);
                 }
                 let client = std::rc::Rc::clone(&self.client);
@@ -692,18 +786,29 @@ impl App {
                 });
             }
             Some("stream-down") => {
+                let channel = self.channel_config(id);
                 let Some(user) = self.channels.get(&id) else {
                     return;
                 };
                 let login = user.login.clone();
+                let stream_id = user.stream_id;
+                let created_at = user.stream_created_at.clone();
                 self.quiet_until.insert(id, Instant::now() + OFFLINE_QUIET);
                 if let Some(user) = self.channels.get_mut(&id) {
                     user.live = false;
                     user.collaboration_viewers = None;
                     user.viewers = None;
-                    let view = user.view();
+                    let view = user.view(channel.as_ref());
                     self.bus.publish(Update::ChannelUpsert(view));
                 }
+                self.bus.log_channel(
+                    LogLevel::Info,
+                    "hermes",
+                    "went offline",
+                    Some(login.clone()),
+                    Some(stream_id),
+                    created_at,
+                );
                 self.registry.stream_down(&login);
             }
             _ => {}
@@ -725,7 +830,10 @@ impl App {
                 };
                 user.live = true;
                 let known = self.channels.contains_key(&id);
-                if !known && !self.quiet(id) {
+                let notifies = self
+                    .channel_config(id)
+                    .is_none_or(|channel| channel.notify_live);
+                if !known && !self.quiet(id) && notifies {
                     let display_name = user.display_name.clone();
                     let game = user.game.clone();
                     let title = user.stream_title.clone();

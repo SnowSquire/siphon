@@ -23,6 +23,9 @@ use siphon_rpc::ClientEvent;
 use siphon_rpc::Config;
 use siphon_rpc::ConnHealth;
 use siphon_rpc::DownloaderSummary;
+use siphon_rpc::LogEntry;
+use siphon_rpc::NotificationView;
+use siphon_rpc::PipelineView;
 use siphon_rpc::Request;
 use siphon_rpc::Snapshot;
 use siphon_rpc::Update;
@@ -41,7 +44,7 @@ pub enum UiCommand {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Snapshot(Box<Snapshot>),
-    Update(Update),
+    Update(Box<Update>),
 }
 
 /// A single-waiter wake, shared between the UI thread (intent sender) and the
@@ -108,6 +111,10 @@ pub fn intent_channel() -> (IntentSender, kanal::Receiver<UiCommand>, Arc<Wake>)
     )
 }
 
+/// How many notifications and log lines the window keeps.
+const NOTIFICATION_CAP: usize = 64;
+const LOG_CAP: usize = 512;
+
 /// A fresh snapshot for the first frame.
 #[must_use]
 pub fn empty_snapshot() -> Snapshot {
@@ -121,6 +128,7 @@ pub fn empty_snapshot() -> Snapshot {
         arena: ArenaSummary::default(),
         downloader: DownloaderSummary::default(),
         notifications: Vec::new(),
+        logs: Vec::new(),
         error: None,
         update: None,
     }
@@ -143,16 +151,16 @@ pub async fn run(
                 serve_connection(client, &intents, &wake, &events).await
             }
             Err(error) => {
-                let _ = events.try_send(UiEvent::Update(Update::Error(Some(format!(
+                let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(format!(
                     "backend: {error}"
-                )))));
+                ))))));
                 false
             }
         };
         if !connected {
-            let _ = events.try_send(UiEvent::Update(Update::Error(Some(
+            let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(
                 "backend disconnected".to_owned(),
-            ))));
+            )))));
         }
         compio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(2));
@@ -197,7 +205,9 @@ async fn serve_connection(
         while let Ok(Some(command)) = intents.try_recv() {
             let UiCommand::Request(request) = command;
             if let Err(error) = client.request(request).await {
-                let _ = events.try_send(UiEvent::Update(Update::Error(Some(error.to_string()))));
+                let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(
+                    error.to_string(),
+                )))));
             }
         }
 
@@ -252,6 +262,11 @@ pub struct UiState {
     pub update: RwSignal<Option<UpdateView>, LocalStorage>,
     pub channels: RwSignal<Rc<Vec<ChannelView>>, LocalStorage>,
     pub pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
+    pub pipelines: RwSignal<Rc<Vec<PipelineView>>, LocalStorage>,
+    pub arena: RwSignal<ArenaSummary, LocalStorage>,
+    pub downloader: RwSignal<DownloaderSummary, LocalStorage>,
+    pub notifications: RwSignal<Rc<Vec<NotificationView>>, LocalStorage>,
+    pub logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
     pub words: RwSignal<Rc<Vec<String>>, LocalStorage>,
     pub title_changes: RwSignal<bool, LocalStorage>,
     pub sound: RwSignal<bool, LocalStorage>,
@@ -268,6 +283,11 @@ impl UiState {
             update: RwSignal::new_local(state.update),
             channels: RwSignal::new_local(Rc::new(state.channels)),
             pending: RwSignal::new_local(Rc::new(state.pending)),
+            pipelines: RwSignal::new_local(Rc::new(state.pipelines)),
+            arena: RwSignal::new_local(state.arena),
+            downloader: RwSignal::new_local(state.downloader),
+            notifications: RwSignal::new_local(Rc::new(state.notifications)),
+            logs: RwSignal::new_local(Rc::new(state.logs)),
             words: RwSignal::new_local(Rc::new(state.config.filtered_words)),
             title_changes: RwSignal::new_local(state.config.notify_title_changes),
             sound: RwSignal::new_local(state.config.sound),
@@ -281,6 +301,11 @@ impl UiState {
         self.update.set(state.update);
         self.channels.set(Rc::new(state.channels));
         self.pending.set(Rc::new(state.pending));
+        self.pipelines.set(Rc::new(state.pipelines));
+        self.arena.set(state.arena);
+        self.downloader.set(state.downloader);
+        self.notifications.set(Rc::new(state.notifications));
+        self.logs.set(Rc::new(state.logs));
         self.words.set(Rc::new(state.config.filtered_words));
         self.title_changes.set(state.config.notify_title_changes);
         self.sound.set(state.config.sound);
@@ -334,16 +359,70 @@ impl UiState {
                     self.channels.set(Rc::new(channels));
                 }
             }
+            Update::PipelineUpsert(view) => {
+                let mut pipelines = (*self.pipelines.get_untracked()).clone();
+                if let Some(existing) = pipelines.iter_mut().find(|row| row.key == view.key) {
+                    *existing = view;
+                } else {
+                    pipelines.push(view);
+                }
+                self.pipelines.set(Rc::new(pipelines));
+            }
+            Update::PipelineRemove(key) => {
+                let mut pipelines = (*self.pipelines.get_untracked()).clone();
+                pipelines.retain(|row| row.key != key);
+                self.pipelines.set(Rc::new(pipelines));
+            }
+            Update::Arena(arena) => {
+                if self.arena.get_untracked() != arena {
+                    self.arena.set(arena);
+                }
+            }
+            Update::Downloader(downloader) => {
+                if self.downloader.get_untracked() != downloader {
+                    self.downloader.set(downloader);
+                }
+            }
+            Update::Notification(notification) => {
+                let mut notifications = (*self.notifications.get_untracked()).clone();
+                if !notifications
+                    .iter()
+                    .any(|existing| existing.id == notification.id)
+                {
+                    notifications.push(notification);
+                    if notifications.len() > NOTIFICATION_CAP {
+                        let drop = notifications.len() - NOTIFICATION_CAP;
+                        notifications.drain(..drop);
+                    }
+                    self.notifications.set(Rc::new(notifications));
+                }
+            }
+            Update::NotificationDismissed(id) => {
+                let mut notifications = (*self.notifications.get_untracked()).clone();
+                let before = notifications.len();
+                notifications.retain(|notification| notification.id != id);
+                if notifications.len() != before {
+                    self.notifications.set(Rc::new(notifications));
+                }
+            }
+            Update::Log(entry) => {
+                let mut logs = (*self.logs.get_untracked()).clone();
+                // A reconnect replays the snapshot and then the updates that
+                // raced it, so the same seq can arrive twice.
+                if logs.last().is_some_and(|last| last.seq >= entry.seq) {
+                    return;
+                }
+                logs.push(entry);
+                if logs.len() > LOG_CAP {
+                    let drop = logs.len() - LOG_CAP;
+                    logs.drain(..drop);
+                }
+                self.logs.set(Rc::new(logs));
+            }
             Update::Error(error) => self.error.set(error),
             Update::Update(update) => self.update.set(update),
-            // Everything else is stream telemetry the interface does not draw.
-            Update::PipelineUpsert(_)
-            | Update::PipelineRemove(_)
-            | Update::Segment { .. }
-            | Update::Arena(_)
-            | Update::Downloader(_)
-            | Update::Notification(_)
-            | Update::NotificationDismissed(_) => {}
+            // The segment ring is queried on demand by the detail view.
+            Update::Segment { .. } => {}
         }
     }
 
@@ -354,7 +433,7 @@ impl UiState {
         while let Ok(Some(event)) = events.try_recv() {
             match event {
                 UiEvent::Snapshot(state) => self.reset(*state),
-                UiEvent::Update(update) => self.apply(update),
+                UiEvent::Update(update) => self.apply(*update),
             }
             landed = true;
         }

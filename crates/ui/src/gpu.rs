@@ -16,8 +16,8 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
-use anyhow::Context as _;
 use ash::vk;
+use eros::Context as _;
 use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
 
@@ -62,7 +62,7 @@ pub struct VideoDecode {
 
 /// The device plus the video-decode queue FFmpeg must submit on, if the driver
 /// has Vulkan video decode at all.
-pub fn create() -> anyhow::Result<(Arc<Gpu>, Option<VideoDecode>)> {
+pub fn create() -> eros::Result<(Arc<Gpu>, Option<VideoDecode>)> {
     let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     instance_descriptor.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(instance_descriptor);

@@ -10,7 +10,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -40,15 +40,36 @@ impl StreamKey {
     }
 }
 
-/// One followed channel. `record` is the per-channel monitor: false means
-/// notify-only, true starts a recording pipeline on `stream-up`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// One followed channel, with the three switches the Channels tab draws.
+///
+/// `record` is the per-channel monitor: true starts a recording pipeline on
+/// `stream-up`. The two notify switches are narrower than the global ones: a
+/// channel can stay followed and still be silent for just one kind of event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Channel {
     pub login: String,
     pub id: u64,
     pub display_name: Option<String>,
     pub record: bool,
+    pub notify_live: bool,
+    pub notify_titles: bool,
+}
+
+impl Default for Channel {
+    /// A channel that predates the per-channel switches is a channel the user
+    /// followed to hear about: both start on, which is what the global settings
+    /// did for it before.
+    fn default() -> Self {
+        Self {
+            login: String::new(),
+            id: 0,
+            display_name: None,
+            record: false,
+            notify_live: true,
+            notify_titles: true,
+        }
+    }
 }
 
 /// The persisted app configuration.
@@ -64,8 +85,9 @@ pub struct Config {
 
 impl Config {
     /// Current on-disk schema. `2` is Siphon's last release; `3` adds
-    /// `channels[].record`.
-    pub const VERSION: u64 = 3;
+    /// `channels[].record`; `4` adds `channels[].notifyLive` and
+    /// `channels[].notifyTitles`.
+    pub const VERSION: u64 = 4;
 }
 
 impl Default for Config {
@@ -94,18 +116,33 @@ pub enum ConnHealth {
 /// One channel row, as the UI renders it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "live plus three independent per-channel switches"
+)]
 pub struct ChannelView {
     pub id: u64,
     pub login: String,
     pub display_name: String,
     pub profile_image_url: String,
+    /// A local file the daemon cached for the avatar; `None` until it exists.
+    pub avatar_path: Option<String>,
     pub live: bool,
     pub title: Option<String>,
     pub game: Option<String>,
+    /// Twitch's game id; `None` when no game was ever resolved.
+    pub game_id: Option<u64>,
     pub viewers: Option<u32>,
     pub collaboration_viewers: Option<u32>,
     /// Milliseconds since the unix epoch; `None` while offline.
     pub stream_start_ms: Option<i64>,
+    /// The raw `createdAt` Twitch sent with the stream; `None` while offline.
+    pub stream_created_at: Option<String>,
+    /// Twitch's `BROADCAST-ID` for the current or last broadcast; 0 when absent.
+    pub stream_id: u64,
+    pub notify_live: bool,
+    pub notify_titles: bool,
+    pub record: bool,
 }
 
 /// Lifecycle of a pipeline's scheduler.
@@ -139,6 +176,8 @@ pub struct PipelineView {
     pub polls: u64,
     pub poll_failures: u64,
     pub last_error: Option<String>,
+    /// The recorder behind this pipeline, when one is attached.
+    pub disk: Option<DiskView>,
 }
 
 /// Terminal outcome of one segment fetch.
@@ -186,7 +225,7 @@ pub struct DownloaderSummary {
 }
 
 /// Live counters from the recorder behind one pipeline.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskView {
     pub active: bool,
@@ -209,6 +248,37 @@ pub struct NotificationView {
     pub login: Option<String>,
     pub image: Option<String>,
     pub sound: bool,
+}
+
+/// Severity of one event in the daemon's log ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LogLevel {
+    Info,
+    Error,
+}
+
+/// One line of the daemon's event log.
+///
+/// The stream identity is carried beside the message rather than folded into
+/// it, so the Logs tab can show and filter it: a stream event without the
+/// broadcast id and Twitch's `createdAt` is a line nobody can correlate with
+/// the recording on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    /// Monotonic within one daemon process; the UI drops anything it has seen.
+    pub seq: u64,
+    /// Milliseconds since the unix epoch.
+    pub at_ms: i64,
+    pub level: LogLevel,
+    /// Subsystem that produced the line (`hermes`, `recording`, `notify`, ...).
+    pub target: String,
+    pub message: String,
+    pub login: Option<String>,
+    pub stream_id: Option<u64>,
+    /// The raw `createdAt` Twitch sent with the stream.
+    pub created_at: Option<String>,
 }
 
 /// An update offer rendered by the UI.
@@ -235,6 +305,7 @@ pub struct Snapshot {
     pub arena: ArenaSummary,
     pub downloader: DownloaderSummary,
     pub notifications: Vec<NotificationView>,
+    pub logs: Vec<LogEntry>,
     pub error: Option<String>,
     pub update: Option<UpdateView>,
 }
@@ -259,6 +330,7 @@ pub enum Update {
     Downloader(DownloaderSummary),
     Notification(NotificationView),
     NotificationDismissed(u64),
+    Log(LogEntry),
     Error(Option<String>),
     Update(Option<UpdateView>),
 }
@@ -286,6 +358,16 @@ pub enum Request {
     SetRecord {
         channel: u64,
         record: bool,
+    },
+    /// Notify when this channel goes live.
+    SetNotifyLive {
+        channel: u64,
+        notify: bool,
+    },
+    /// Notify when this channel's title or game changes.
+    SetNotifyTitles {
+        channel: u64,
+        notify: bool,
     },
     ClearError,
     DismissNotification(u64),
@@ -322,7 +404,7 @@ pub enum Request {
 pub enum Response {
     Ack,
     Snapshot(Box<Snapshot>),
-    StreamDetail(StreamDetail),
+    StreamDetail(Box<StreamDetail>),
     Segments(Vec<SegmentRecord>),
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
@@ -407,11 +489,14 @@ mod tests {
     #[test]
     fn config_defaults_to_the_current_version() {
         assert_eq!(Config::default().version, Config::VERSION);
-        assert_eq!(Config::VERSION, 3);
+        assert_eq!(Config::VERSION, 4);
     }
 
     #[test]
     fn a_channel_defaults_to_notify_only() {
-        assert!(!Channel::default().record);
+        let channel = Channel::default();
+        assert!(!channel.record);
+        assert!(channel.notify_live);
+        assert!(channel.notify_titles);
     }
 }

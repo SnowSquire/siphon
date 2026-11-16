@@ -90,7 +90,7 @@ impl UiRenderer {
         d3d12: Rc<D3d12>,
         hwnd: HWND,
         target: RenderTarget,
-    ) -> anyhow::Result<Self> {
+    ) -> eros::Result<Self> {
         let ui = placebo.wrap_wgpu(&ui_texture)?;
         let sdr_white = swapchain.sdr_white();
         let (width, height) = (
@@ -102,7 +102,7 @@ impl UiRenderer {
         for index in 0..BUFFERS {
             let image = swapchain
                 .image(index)
-                .ok_or_else(|| anyhow::anyhow!("the swapchain has no backbuffer {index}"))?;
+                .ok_or_else(|| eros::error!("the swapchain has no backbuffer {index}"))?;
             let target = placebo.wrap(
                 image,
                 chain_width,
@@ -118,7 +118,7 @@ impl UiRenderer {
         }
 
         let handover = placebo.create_semaphore();
-        anyhow::ensure!(
+        eros::ensure!(
             !handover.is_null(),
             "libplacebo refused to create the handover semaphore"
         );
@@ -227,7 +227,7 @@ impl UiRenderer {
         let ui = match self.placebo.wrap_wgpu(&ui_texture) {
             Ok(ui) => ui,
             Err(error) => {
-                tracing::warn!(target: "ui", "libplacebo: resized interface wrap failed: {error:#}");
+                tracing::warn!(target: "ui", "libplacebo: resized interface wrap failed: {error:?}");
                 return;
             }
         };
@@ -297,7 +297,7 @@ impl UiRenderer {
             },
         };
         if let Err(error) = resized {
-            tracing::warn!(target: "ui", "DXGI: resize failed: {error:#}");
+            tracing::warn!(target: "ui", "DXGI: resize failed: {error:?}");
             return false;
         }
         let Some(swapchain) = self.swapchain.as_ref() else {
@@ -324,7 +324,7 @@ impl UiRenderer {
                     targets.push(texture);
                 }
                 Err(error) => {
-                    tracing::warn!(target: "ui", "libplacebo: resize wrap failed: {error:#}");
+                    tracing::warn!(target: "ui", "libplacebo: resize wrap failed: {error:?}");
                     return false;
                 }
             }
@@ -491,7 +491,7 @@ impl UiRenderer {
         }
 
         if let Err(error) = swapchain.present() {
-            tracing::warn!(target: "ui", "DXGI present failed: {error:#}");
+            tracing::warn!(target: "ui", "DXGI present failed: {error:?}");
         }
         self.presented.set(true);
         outcome

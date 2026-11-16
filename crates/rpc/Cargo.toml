@@ -2,7 +2,7 @@
 
 [package]
 name = "siphon-rpc"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Typed RPC protocol shared by the Siphon backend and its UI"
 authors = ["Ozeniken"]
