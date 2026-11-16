@@ -37,7 +37,6 @@ use zgui::runtime::use_window;
 use zgui::runtime::use_windows;
 #[cfg(windows)]
 use zgui::surface::wgpu;
-use zgui::view::set_interval;
 #[cfg(windows)]
 use zgui_render_wgpu::Gpu;
 #[cfg(windows)]
@@ -288,19 +287,26 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
         std::mem::forget(close);
     }
 
-    // The RPC worker feeds a channel; this interval drains it on the UI thread
-    // and only touches the signals that changed.
-    let timer = set_interval(std::time::Duration::from_millis(100), move || {
-        // A tick with nothing to drain allocates nothing: the receiver is asked
-        // before anything is cloned or written.
-        if events.is_empty() {
-            return;
+    // The RPC worker publishes into this channel, and that send is what wakes the
+    // UI thread: the receive below is where the frame comes from, so nothing is
+    // polled. Whatever arrived alongside the event is drained in the same frame,
+    // which is why a burst costs one repaint rather than one per event.
+    zgui::reactive::spawn_detached({
+        let state = state.clone();
+        async move {
+            loop {
+                let Ok(event) = events.as_async().recv().await else {
+                    break;
+                };
+                state.apply_event(event);
+                // Whatever arrived alongside it lands in the same frame: a burst
+                // costs one repaint rather than one per event.
+                while let Ok(Some(event)) = events.try_recv() {
+                    state.apply_event(event);
+                }
+            }
         }
-        state.drain(&events);
     });
-    // The interval lives as long as the window; the component has no teardown
-    // hook that owns it.
-    std::mem::forget(timer);
 
     let tab = RwSignal::new_local(Tab::Channels);
     let expanded = RwSignal::new_local(BTreeSet::<u64>::new());

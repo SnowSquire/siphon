@@ -426,18 +426,12 @@ impl UiState {
         }
     }
 
-    /// Drains the worker's channel. Answers whether anything landed, which is what
-    /// decides whether the frame owes anything at all.
-    pub fn drain(&self, events: &kanal::Receiver<UiEvent>) -> bool {
-        let mut landed = false;
-        while let Ok(Some(event)) = events.try_recv() {
-            match event {
-                UiEvent::Snapshot(state) => self.reset(*state),
-                UiEvent::Update(update) => self.apply(*update),
-            }
-            landed = true;
+    /// Applies one event to the signals the view reads.
+    pub fn apply_event(&self, event: UiEvent) {
+        match event {
+            UiEvent::Snapshot(state) => self.reset(*state),
+            UiEvent::Update(update) => self.apply(*update),
         }
-        landed
     }
 }
 
