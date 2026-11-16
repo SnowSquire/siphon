@@ -234,7 +234,7 @@ like `StreamKey`; changing quality is remove + add.
 - `crates/ui` (`siphon-ui`, binary `siphon`): the ZGUI window presented through
   the DXGI/libplacebo renderer, the native tray and the RPC worker. It owns the daemon lifecycle (`service.rs`): auto-start on launch and
   a process-level restart (`daemon.pid` in the app data dir, image-name check,
-  `taskkill` fallback). `crates/tray` is obsolete.
+  `taskkill` fallback).
 - `play` keeps its current pipeline and needs no protocol types.
 
 ## Phases

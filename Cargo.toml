@@ -1,7 +1,4 @@
 [workspace]
-# `crates/tray` is the old Tauri app; it lives on in its own repository and is
-# replaced by the Siphon UI. Leaving it in the workspace pins `windows` 0.61,
-# which makes wgpu-hal 29 (windows 0.62) fail to compile against gpu-allocator.
 members = ["crates/daemon", "crates/libplacebo-sys", "crates/rpc", "crates/ui", "crates/video"]
 resolver = "2"
 
@@ -44,7 +41,7 @@ opt-level = 3
 codegen-units = 1
 lto = true
 panic = "abort"
-strip = true # moved here from crates/tray (profiles are ignored in member manifests)
+strip = true # profiles in member manifests are ignored; keep them here
 
 [profile.dev]
 panic = "abort"
