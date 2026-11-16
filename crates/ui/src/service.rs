@@ -99,6 +99,14 @@ pub fn start() {
 
         command.creation_flags(CREATE_NO_WINDOW);
     }
+    // Its own process group, so a Ctrl-C on the UI — or the terminal that started
+    // it being closed — is not also a signal to the daemon this UI started.
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        command.process_group(0);
+    }
     match command.spawn() {
         Ok(child) => tracing::info!(
             target: "service",
