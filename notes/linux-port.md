@@ -112,32 +112,36 @@ on the box.
 
 ## Video
 
-Deferred, and currently blocked. `crates/video` is a spike kept as a reference for
-what ZGUI can do — it is not maintained, and it is deleted once the UI plays video.
+Deferred in the UI, but the backend question is settled: **VA-API on Linux,
+D3D11VA on Windows**, with libplacebo importing the decoded frames without a
+copy. The full plan, measurements and the driver trap are in
+`notes/video-decode.md`. `crates/video` is a spike kept as a reference for what
+ZGUI can do — it is not maintained, and it is deleted once the UI plays video.
 
 - Frame path: FFmpeg's `AVVulkanDeviceContext` is filled by hand from the wgpu-hal
   device (`crates/video/src/hw.rs`), decoded frames are mapped with
   `pl_map_avframe_ex`, and the same `pl_render_image` that draws the UI overlay
-  draws the video planes. Most of that is portable as-is.
-- The spike selects a decode queue that supports **HEVC only**
-  (`crates/video/src/gpu.rs:185-199`). The UI must accept whatever decode codec the
-  driver advertises and prefer H.264, which is what Twitch serves.
-- **This box cannot decode.** Mesa 26.2.5 on the N97 (ADL-N) advertises no
-  `VK_KHR_video_*` extension at all, and `MESA_VK_ENABLE_VIDEO_DECODE=1` changes
-  nothing. Software decode is refused on licensing grounds. So video cannot run on
-  `shivering` until the driver exposes Vulkan video decode; do not design around it
-  being available.
+  draws the video planes. Most of that is portable as-is; only the decode backend
+  changes.
+- The spike's Vulkan decode queue selection (`crates/video/src/gpu.rs:185-199`,
+  HEVC only) goes with it: Mesa 26.2.6 on the N97 (ADL-N) advertises no Vulkan
+  video codec extension at all, so there is nothing to select.
+- **This box does decode — Fedora's driver build does not.** Fedora ships the
+  free `libva-intel-media-driver`, whose H.264/HEVC/AV1 decoders are compiled out;
+  `intel-media-driver` from RPM Fusion restores them. Software decode stays
+  refused on licensing grounds, so a missing hardware profile means no video.
 - Transport is not settled and RTSP is probably not it: its semantics do not suit
   live monitoring. Expect a purpose-built protocol from the daemon instead. Nothing
   to build yet.
 
 ## Environment measured on `shivering`
 
-Fedora 44, kernel 7.2.13, Intel N97 (Alder Lake-N, Mesa 26.2.5, `llvmpipe` also
+Fedora 44, kernel 7.2.13, Intel N97 (Alder Lake-N, Mesa 26.2.6, `llvmpipe` also
 present), cargo 1.100, jj installed, repo at `~/code/siphon` (jj + git colocated,
 `origin` = the GitHub private repo). `libplacebo` 7.360.1 and `libavcodec` are
-packaged but their `-devel` packages are not installed; bindgen also wants
-`clang`/`libclang`.
+installed with their `-devel` packages, and `intel-media-driver` (RPM Fusion) is
+installed next to Fedora's free `libva-intel-media-driver` — see
+`notes/video-decode.md` for why both are listed.
 
 Building works over plain ssh; running the window does not. The GUI needs the
 desktop session's environment (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR=/run/user/$(id -u)`)
@@ -159,7 +163,9 @@ variables.
 4. **Wayland chain**: surface from the raw handles, `pl_swapchain` with the probe
    and the depth above, the canvas policy, the visibility gate. Verify with
    `cargo run -p siphon-ui` in the desktop session and a live channel.
-5. **Video**, when the hardware or the driver allows it.
+5. **Video**: VA-API decode behind the `decode` seam, per
+   `notes/video-decode.md`. The driver does allow it; only the renderer chain
+   (steps 2-4) is in front of it.
 
 Steps 2 and 4 are separable on purpose: the extraction has to leave Windows
 provably unchanged, and the Linux chain is then one new file behind the same seam.
