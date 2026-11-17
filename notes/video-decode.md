@@ -5,7 +5,8 @@ copy. The renderer does not change: `pl_render_image` still draws one `pl_frame`
 per video frame into the swapchain (`notes/video-player.md` for the Windows
 prototype, `notes/linux-port.md` for the Wayland chain).
 
-**Decision: VA-API on Linux, D3D11VA on Windows. Vulkan Video is not used.**
+**Decision: VA-API on Linux, D3D12 Video on Windows (D3D11VA only as a
+probe-selected fallback). Vulkan Video is not used.**
 
 ## Vulkan Video is out
 
@@ -72,28 +73,45 @@ modifiers, and `pl_fmt_has_modifier` must accept them for NV12; a rejected
 modifier fails the map, which the decoder must treat as "this backend cannot feed
 the renderer", not as a broken frame.
 
-## Windows: D3D11VA, imported by hand
+## Windows: D3D12 Video, D3D11VA as the fallback
 
-`AV_PIX_FMT_D3D11` appears nowhere in libplacebo's libav glue, and libplacebo's
-D3D11 support is a whole alternative backend, not interop into Vulkan. So:
+D3D11VA was the first draft of this section and it was the wrong instinct: it
+would make the Windows path *four* APIs (D3D11 decode, D3D12 swapchain, Vulkan
+render, DXGI present) with two different interop flavours.
 
-- `av_hwdevice_ctx_create(AV_HWDEVICE_TYPE_D3D11VA)` on the adapter with the same
-  LUID as the Vulkan device (`dxgi.rs` already does the LUID match).
-- Decode textures must be shareable: `D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
-  D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, set through
-  `AVD3D11VAFramesContext` when initialising the frames context.
-- Per plane, `IDXGIResource1::CreateSharedHandle` and
-  `pl_tex_create(.import_handle = PL_HANDLE_WIN32, .shared_mem = { .handle,
-  .stride_w, .offset })`. libplacebo's Vulkan backend supports
-  `PL_HANDLE_WIN32` import (`src/vulkan/gpu.c:678`), and the device needs
-  `VK_KHR_external_memory_win32` — the same extension `dxgi.rs` already requires
-  for the backbuffers.
-- Synchronisation is the keyed mutex around the GPU use, exactly as the swapchain
-  import synchronises today; NV12/P010 are two planes, each its own texture.
-- D3D12 Video is the alternative (decode straight into the D3D12 resources the
-  swapchain already imports) but FFmpeg's `d3d12va` path and driver coverage are
-  younger than `d3d11va`. Revisit only if the D3D11 import costs something
-  measurable.
+D3D12 Video is the coherent one, because `dxgi.rs` already owns everything it
+needs:
+
+- The D3D12 device is already created on the LUID-matched adapter
+  (`D3D12CreateDevice` after `vulkan_luid`), and D3D12 resources are already
+  imported into Vulkan by NT handle for the backbuffers
+  (`ID3D12Resource::CreateSharedHandle` → `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT`).
+  Decoding into D3D12 means decode, present and import are one API above Vulkan.
+- FFmpeg is built for exactly this: `AVD3D12VADeviceContext.device` accepts *our*
+  `ID3D12Device` (no second device), and `heap_flags`/`resource_flags` on the
+  device and frames context let the pool allocate with `D3D12_HEAP_FLAG_SHARED`,
+  which is the one thing an exported texture must have.
+- Frames arrive as `AVD3D12VAFrame { texture, subresource_index, sync_ctx }`,
+  and `AVD3D12VASyncContext` is an `ID3D12Fence` + event + value — a real
+  synchronisation primitive, importable into Vulkan as a semaphore
+  (`VK_KHR_external_semaphore_win32`, `D3D12_FENCE`), rather than the keyed mutex
+  a shared D3D11 texture forces.
+- Import per plane is the same call as the dmabuf path: NV12/P010 is two planes,
+  two NT handles, `pl_tex_create(.import_handle = PL_HANDLE_WIN32, .shared_mem = {
+  .handle, .stride_w, .offset })`.
+
+**Why a fallback still exists.** D3D12 Video decode has the narrowest driver
+coverage of the three APIs — older GPUs and some IGP drivers expose VA/D3D11
+decode and no `ID3D12VideoDevice`. So the probe asks the D3D12 video device for
+H.264 8-bit decoder support first, and only falls back to `d3d11va` (same adapter,
+matched by LUID, keyed mutex around the shared texture) when that fails. Both sit
+behind the same seam, so the fallback is one more file, not another architecture.
+
+Binding caveat: check whether `ffmpeg-the-third` exposes
+`AV_HWDEVICE_TYPE_D3D12VA` / `AVD3D12VADeviceContext`. If it does not, hand-roll
+the structs the way `hw.rs` already does for `AVVulkanDeviceContext` — the fields
+above are the whole contract, and `heap_flags` in particular is newer than some
+bindings.
 
 ## Software decode stays refused
 
@@ -109,9 +127,9 @@ video (`notes/linux-port.md`). It lands in `crates/ui` as `decode/`, picked by
 
 | item | linux | windows |
 |---|---|---|
-| `HwDevice::open()` | VA-API on the render node | D3D11VA on the LUID-matched adapter |
+| `HwDevice::open()` | VA-API on the render node | D3D12 Video on the swapchain's device; D3D11VA only if unsupported |
 | `frame → pl_frame` | `pl_map_avframe_ex` (+ libplacebo's DRM derivation) | NT handle per plane → `pl_tex_create` |
-| `release()` | `pl_unmap_avframe` | release the keyed mutex, unmap AVFrame |
+| `release()` | `pl_unmap_avframe` | signal/wait the D3D12 fence, unmap AVFrame |
 
 Above the seam: demuxer, decoder, the stream clock from `player.rs`, and the
 container-colour fix-up (`player.rs` — HEVC overwrites `avctx->color_*` from a VUI
@@ -127,8 +145,9 @@ that says nothing while the container says BT.2020/PQ). Audio stays out of scope
    `PL_HANDLE_DMA_BUF` import cap, with the RPM Fusion hint on failure.
 3. Linux zero-copy path end to end: a captured TS file first, then a live channel
    once the transport question (`notes/architecture.md`) is settled.
-4. Windows D3D11VA behind the same seam, verified on the desktop against the
-   Vulkan Video path it replaces.
+4. Windows D3D12 Video on the existing device and import path, `d3d11va` as the
+   probe-selected fallback, verified on the desktop against the Vulkan Video path
+   it replaces.
 5. Delete `crates/video`.
 
 ## Open
