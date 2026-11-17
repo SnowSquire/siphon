@@ -5,8 +5,8 @@ copy. The renderer does not change: `pl_render_image` still draws one `pl_frame`
 per video frame into the swapchain (`notes/video-player.md` for the Windows
 prototype, `notes/linux-port.md` for the Wayland chain).
 
-**Decision: VA-API on Linux, D3D12 Video on Windows (D3D11VA only as a
-probe-selected fallback). Vulkan Video is not used.**
+**Decision: VA-API on Linux, D3D12 Video on Windows. Vulkan Video and D3D11VA
+are not used.**
 
 ## Vulkan Video is out
 
@@ -73,7 +73,7 @@ modifiers, and `pl_fmt_has_modifier` must accept them for NV12; a rejected
 modifier fails the map, which the decoder must treat as "this backend cannot feed
 the renderer", not as a broken frame.
 
-## Windows: D3D12 Video, D3D11VA as the fallback
+## Windows: D3D12 Video
 
 D3D11VA was the first draft of this section and it was the wrong instinct: it
 would make the Windows path *four* APIs (D3D11 decode, D3D12 swapchain, Vulkan
@@ -100,12 +100,11 @@ needs:
   two NT handles, `pl_tex_create(.import_handle = PL_HANDLE_WIN32, .shared_mem = {
   .handle, .stride_w, .offset })`.
 
-**Why a fallback still exists.** D3D12 Video decode has the narrowest driver
-coverage of the three APIs — older GPUs and some IGP drivers expose VA/D3D11
-decode and no `ID3D12VideoDevice`. So the probe asks the D3D12 video device for
-H.264 8-bit decoder support first, and only falls back to `d3d11va` (same adapter,
-matched by LUID, keyed mutex around the shared texture) when that fails. Both sit
-behind the same seam, so the fallback is one more file, not another architecture.
+**No fallback.** D3D12 Video decode has narrower driver coverage than D3D11VA —
+old GPUs and some IGP drivers expose VA/D3D11 decode with no usable
+`ID3D12VideoDevice`. That is reported at open time, not worked around: a second
+backend is only written when a machine we actually run on needs it, and it would
+be D3D12-only until then.
 
 Binding caveat: check whether `ffmpeg-the-third` exposes
 `AV_HWDEVICE_TYPE_D3D12VA` / `AVD3D12VADeviceContext`. If it does not, hand-roll
@@ -127,7 +126,7 @@ video (`notes/linux-port.md`). It lands in `crates/ui` as `decode/`, picked by
 
 | item | linux | windows |
 |---|---|---|
-| `HwDevice::open()` | VA-API on the render node | D3D12 Video on the swapchain's device; D3D11VA only if unsupported |
+| `HwDevice::open()` | VA-API on the render node | D3D12 Video on the swapchain's device |
 | `frame → pl_frame` | `pl_map_avframe_ex` (+ libplacebo's DRM derivation) | NT handle per plane → `pl_tex_create` |
 | `release()` | `pl_unmap_avframe` | signal/wait the D3D12 fence, unmap AVFrame |
 
@@ -145,9 +144,8 @@ that says nothing while the container says BT.2020/PQ). Audio stays out of scope
    `PL_HANDLE_DMA_BUF` import cap, with the RPM Fusion hint on failure.
 3. Linux zero-copy path end to end: a captured TS file first, then a live channel
    once the transport question (`notes/architecture.md`) is settled.
-4. Windows D3D12 Video on the existing device and import path, `d3d11va` as the
-   probe-selected fallback, verified on the desktop against the Vulkan Video path
-   it replaces.
+4. Windows D3D12 Video on the existing device and import path, verified on the
+   desktop against the Vulkan Video path it replaces.
 5. Delete `crates/video`.
 
 ## Open
