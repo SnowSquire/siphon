@@ -73,30 +73,31 @@ modifiers, and `pl_fmt_has_modifier` must accept them for NV12; a rejected
 modifier fails the map, which the decoder must treat as "this backend cannot feed
 the renderer", not as a broken frame.
 
-## libav: yes, dynamically linked, LGPL only
+## libav: yes, dynamically linked, LGPL accepted
 
-The UI decodes through FFmpeg, behind `libplacebo-sys`'s `libav` feature so that
-a UI-only build links no FFmpeg at all.
+The UI decodes through FFmpeg, behind `libplacebo-sys`'s `libav` feature, so a
+UI-only build links no FFmpeg at all.
 
-Two different legal questions get conflated here, and only one is about FFmpeg:
+Two separate decisions were in play, and only one of them changes:
 
-- **Copyright (LGPL-2.1+).** Satisfied by dynamic linking plus the usual
-  distribution hygiene: ship the FFmpeg DLLs unmodified, include the licence text,
-  and point at the corresponding source. Static linking is the painful case
-  (you must ship objects so the user can relink); there is no reason to do it.
-  Use an LGPL shared build — BtbN's `lgpl-shared` Windows archives are exactly
-  this — and never a "full" build, which links x264/x265 and makes the whole
-  thing GPL.
-- **Patents (H.264/HEVC pools).** Not avoided by avoiding FFmpeg. With hardware
-  decode the codec implementation runs in the GPU driver, which the vendor
-  licenses; libavcodec still parses the bitstream, and a home-grown parser would
-  be just as exposed. That is the configuration every practical player ships
-  (mpv, VLC, Firefox), and it is why the licence policy here is "no *software*
-  decode", which stays true.
+- **Patents — unchanged.** Hardware decode keeps the codec implementation in the
+  GPU driver, which the vendor licenses. libavcodec still parses the bitstream,
+  but a hand-written parser would be just as exposed, so nothing about the patent
+  position moves either way.
+- **LGPL — now accepted, because it is cheap to discharge.** The earlier plan
+  avoided FFmpeg only to keep the licence obligation off the Windows
+  distribution. Keeping it is a one-time packaging cost: dynamic linking only
+  (ship the FFmpeg DLLs unmodified beside the exe), the licence text, and a
+  pointer to the corresponding source. Static linking is the case that would
+  force shipping object files for relinking — not doing that. Use an **LGPL
+  shared** build (BtbN's `lgpl-shared`), never a "full" one: those link
+  x264/x265 and make the whole distribution GPL.
 
-The alternative — driving VA-API and D3D12 Video ourselves with our own H.264
-parser, DPB and reference-list management — is weeks of work to arrive at the
-same legal position.
+What tipped it was effort, not law. Driving VA-API and D3D12 Video by hand still
+means owning an H.264 parser, DPB and reference-list management — weeks of work
+that buys nothing, since the licensing answer is the same either way. libavcodec
+is the orchestration every player uses, and the `libav` feature keeps it out of
+the binaries that do not play video.
 
 ## Windows: D3D12 Video
 
