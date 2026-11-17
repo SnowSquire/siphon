@@ -31,8 +31,9 @@ libav = []
 [build-dependencies]
 bindgen = "0.73.2"
 cc = "1.11.1"
-
-[target.'cfg(not(windows))'.build-dependencies]
+# The build script dispatches on the *target* OS, not the host's `cfg`, so the
+# Linux branch must compile into the script even when it runs on Windows (or
+# cross-compiles from Linux to Windows).
 pkg-config = "0.3"
 
 [lints]

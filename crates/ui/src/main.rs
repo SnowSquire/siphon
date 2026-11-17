@@ -17,25 +17,22 @@
 
 //! Siphon UI: a ZGUI window fed by the daemon RPC.
 //!
-//! Windows presents through the DXGI flip chain, with libplacebo drawing the
-//! composed interface into the backbuffers. Linux presents through the
-//! framework's own wgpu renderer, over the same Vulkan device it would use for
-//! that pass; the libplacebo path is Windows-only until the Linux present path
-//! is ported, and nothing above the renderer knows the difference.
+//! Both platforms compose the interface into a wgpu texture and let libplacebo
+//! draw it into the frame a chain acquired: a D3D12 flip chain imported into
+//! Vulkan on Windows, a `VkSwapchainKHR` on ZGUI's Wayland surface on Linux.
+//! Nothing above the renderer knows which chain is linked.
 
 mod app;
+mod chain;
 mod format;
+mod gpu;
+mod placebo;
+mod renderer;
 mod rpc;
 mod service;
 
 #[cfg(windows)]
 mod dxgi;
-#[cfg(windows)]
-mod gpu;
-#[cfg(windows)]
-mod placebo;
-#[cfg(windows)]
-mod renderer;
 #[cfg(windows)]
 mod sdr;
 #[cfg(windows)]

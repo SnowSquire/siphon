@@ -5,9 +5,10 @@ view, same daemon, same RPC. Nothing here changes what Windows does — the DXGI
 path stays the reference implementation and every commit must leave it running
 identically.
 
-The port is in progress. What is in the tree today is step 1 (below): the crate
-builds and runs on Linux, but presents through ZGUI's own wgpu renderer, with the
-DXGI/libplacebo/tray modules compiled out.
+The port is done except video: `cargo run -p siphon` opens the same ZGUI view on
+Wayland, presenting through libplacebo's own `VkSwapchainKHR` on ZGUI's surface.
+The Windows DXGI chain was extracted behind the same seam and behaves as before.
+Only the tray, single-instance handover and Win32 shell remain Windows-only.
 
 ## Decisions
 
@@ -43,7 +44,10 @@ same thing with the swapchain Vulkan already has:
   `RawWindowHandle::Wayland` (`wl_display`, `wl_surface`). **Not** a wgpu surface:
   libplacebo drawing straight into the presented image is one copy fewer, and the
   chain is ours to shape.
-- `present_mode = VK_PRESENT_MODE_MAILBOX_KHR`, `swapchain_depth = 2`.
+- `present_mode = VK_PRESENT_MODE_MAILBOX_KHR`, `swapchain_depth = 2`. wgpu
+  enables `VK_KHR_wayland_surface` on its instance and requires
+  `VK_KHR_swapchain` on its device, so the surface and libplacebo's chain can
+  both be created on the handles wgpu already owns.
   `swapchain_depth` counts frames in flight, not buffers — libplacebo asks for
   `depth + 1` images (`src/vulkan/swapchain.c:409`), so two in flight is three
   images: one displayed, one in the mailbox, one being drawn. With three, acquire
@@ -58,65 +62,72 @@ same thing with the swapchain Vulkan already has:
   `vkAcquireNextImageKHR(…, UINT64_MAX, …)` (`swapchain.c:893`), so it can never
   produce `FrameOutcome::Skipped(SkipReason::Timeout)` — and that outcome is the
   only thing that arms zgui's starvation latch (pinned zgui rev,
-  `zgui-runtime/src/window/frame.rs:221`), which is what handles a window the
-  compositor stops drawing. So `begin()` is gated on `present_now()` and on the
-  surface being visible; a hidden window parks instead of entering the driver.
-  If that proves insufficient, the fix is our own `VkSwapchainKHR` with a finite
-  acquire timeout — not a copy back into a wgpu surface.
-- **The canvas keeps the DXGI policy** (do not "simplify" it away on Linux): the
-  chain grows to the requested size immediately and only shrinks once the size
-  has settled (`SETTLE`, 400 ms, no shrink while a drag is in progress). Resizing
-  a swapchain reallocates its images, so following every configure of a drag would
-  reallocate several times a second. The shared `present()` edge-extends the
-  interface's outermost texels into the extra canvas area, which is what makes
-  that invisible.
+  `zgui-runtime/src/window/frame.rs:221`). The Wayland chain therefore gates every
+  acquire on `Surface::present_now()`: when the compositor has not delivered a
+  frame callback, the frame is dropped and the damage flag is kept. That also
+  keeps libplacebo's `wl_surface_commit` in step with zgui's frame pacer. If a
+  hidden window still parks inside the driver, the fix is our own
+  `VkSwapchainKHR` with a finite acquire timeout — not a copy back into a wgpu
+  surface.
+- **The canvas policy is Windows-only.** Windows grows to the requested size
+  immediately and shrinks once it settles (`SETTLE`, 400 ms, no shrink during a
+  drag), with the shared `present()` edge-extending the interface's outermost
+  texels into the extra area. Wayland follows the surface extent exactly: Mesa's
+  WSI scales an image that differs from the surface instead of cropping it, so a
+  larger canvas would scale the whole interface down rather than show its
+  top-left corner 1:1. `pl_swapchain_resize` writes back the extent it actually
+  created, which is the one used for the overlay parts.
 
 The seam is one concrete `Chain` type per platform, selected by `#[cfg]` rather
 than a trait object (only one backend is ever linked, so `dyn` would buy nothing):
 
 | method | win32 | wayland |
 |---|---|---|
-| `begin(ui_extent) -> Option<pl_frame>` | acquire + cached `pl_tex` + build the frame | `pl_swapchain_start_frame` |
+| `configure(ui)` | monitor-sized growth on overflow + settle timer | `pl_swapchain_resize` to `ui` |
+| `settle(ui)` | shrink after `SETTLE` when `GetCapture() == null` | no-op |
+| `wait_for_frame(ms)` | frame-latency waitable object | `Surface::present_now()` |
+| `begin(ui) -> Option<Acquired>` | current backbuffer + cached `pl_tex` + build `pl_frame` | `pl_swapchain_start_frame` + `pl_frame_from_swapchain` |
 | `end() -> bool` | `Present1` | `submit_frame` + `swap_buffers` |
-| `resize(w, h) -> (w, h)` | `ResizeBuffers` + re-wrap | `pl_swapchain_resize` |
-| `extent()` | the grown canvas | the same, via the resize answer |
-| `can_shrink_now()` | `GetCapture() == null` | always |
 
 Everything above it — the overlay parts, `pl_render_image`, the handover
-semaphore, damage/presented gating — is shared and unchanged.
+semaphore, damage/presented gating — is shared and unchanged. The chain owns its
+per-buffer textures and destroys them before its swapchain.
 
 ## Build
 
-`libplacebo-sys` has no Linux story yet. It needs a `cfg(not(windows))` branch in
-`build.rs`: `pkg-config` for libplacebo and the Vulkan headers, plain `cc` for the
-libav glue instead of `clang-cl`, no MSVC splat and no DLL copy. `LIBPLACEBO_PREFIX`
-stays as the override for a locally built prefix, on both platforms.
+`libplacebo-sys` builds on both platforms. Windows keeps its prefix knobs;
+Linux uses `pkg-config` for libplacebo and the Vulkan headers, plain `cc` for the
+C glue, and no DLL copy. `LIBPLACEBO_PREFIX` wins when set. Fedora's libclang
+derives its resource dir from `libclang.so.22.1` and misses `clang/22`, so the
+build script asks `clang -print-resource-dir` for `stdbool.h`'s directory.
 
-**The system libplacebo is too old for the hardcoded symbol.** Fedora 44 ships
-7.360.1; `placebo.rs` calls `pl_log_create_372` because bindgen cannot translate
-libplacebo's versioned macro and the local prefix is 7.372. Two ways out, and the
-shim is the better one: add a two-line C file (`PL_LIBAV_IMPLEMENTATION` style)
-that calls `pl_log_create(PL_API_VER, …)` from the installed headers and exposes
-a stable symbol, so the crate builds against whatever version is present. Nothing
-else the UI calls is newer than 7.360. Check that before raising the floor.
+The version problem is solved by `src/shim.c`: libplacebo's `pl_log_create` is a
+macro expanding to `pl_log_create_<PL_API_VER>`, so callers used to hardcode
+`_372` and could not link Fedora's 7.360. The shim expands the macro against the
+headers it compiles with and exports one `siphon_pl_log_create`. Fields added
+after 7.360 (for example `pl_vulkan_queue.flags`) are handled with
+`..Default::default()` in struct literals so one source builds against both.
+The header-only libav glue sits behind the `libav` feature, which only the video
+path enables; the UI build needs no FFmpeg headers.
 
-The libav glue (`pl_map_avframe_ex`, which is header-only) goes behind a `libav`
-cargo feature that the video path enables, so a UI-only build needs no FFmpeg
-headers.
-
-No Linux cross-check is possible from the Windows machine: `smithay-client-toolkit`'s
-build script wants `xkbcommon` for the target and `pkg-config` is not configured
-for cross-compilation. A green `cargo check --target x86_64-unknown-linux-gnu` only
-means the crate graph *without* native dependencies type-checks; the real build is
-on the box.
+No Linux cross-check is possible from the Windows machine (its build scripts want
+`xkbcommon` for the target). The other direction works with one caveat: installing
+`x86_64-pc-windows-gnu` and running `cargo check --target x86_64-pc-windows-gnu
+-p siphon-ui` type-checks the Windows-only chain without linking, but
+`libplacebo-sys` then wants the Windows prefixes (`C:/Users/alex/...`) that do
+not exist here. Point `paths` at a tiny stub crate named `libplacebo-sys`
+containing the already-generated Linux `bindings.rs` plus the shim declaration
+to get past that. This is a type-check, not a runtime verification — the Windows
+UI still has to be run on the Windows machine.
 
 ## Video
 
 Deferred in the UI, but the backend question is settled: **VA-API on Linux,
-D3D11VA on Windows**, with libplacebo importing the decoded frames without a
-copy. The full plan, measurements and the driver trap are in
-`notes/video-decode.md`. `crates/video` is a spike kept as a reference for what
-ZGUI can do — it is not maintained, and it is deleted once the UI plays video.
+D3D12 Video on Windows**, with libplacebo importing the decoded frames without a
+copy. The full plan, measurements, the driver trap and why the UI links libav
+dynamically are in `notes/video-decode.md`. `crates/video` is a spike kept as a
+reference for what ZGUI can do — it is not maintained, and it is deleted once
+the UI plays video.
 
 - Frame path: FFmpeg's `AVVulkanDeviceContext` is filled by hand from the wgpu-hal
   device (`crates/video/src/hw.rs`), decoded frames are mapped with
@@ -130,9 +141,8 @@ ZGUI can do — it is not maintained, and it is deleted once the UI plays video.
   free `libva-intel-media-driver`, whose H.264/HEVC/AV1 decoders are compiled out;
   `intel-media-driver` from RPM Fusion restores them. Software decode stays
   refused on licensing grounds, so a missing hardware profile means no video.
-- Transport is not settled and RTSP is probably not it: its semantics do not suit
-  live monitoring. Expect a purpose-built protocol from the daemon instead. Nothing
-  to build yet.
+- Transport is a purpose-built elementary-stream channel on the admin RPC, not
+  RTSP; the design is in `notes/media-transport.md`. Nothing is built yet.
 
 ## Environment measured on `shivering`
 
@@ -143,10 +153,11 @@ installed with their `-devel` packages, and `intel-media-driver` (RPM Fusion) is
 installed next to Fedora's free `libva-intel-media-driver` — see
 `notes/video-decode.md` for why both are listed.
 
-Building works over plain ssh; running the window does not. The GUI needs the
-desktop session's environment (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR=/run/user/$(id -u)`)
-— start the session from a terminal inside the desktop, or import those two
-variables.
+Building works over plain ssh; running the window needs the desktop session's
+environment: `WAYLAND_DISPLAY=wayland-1`, `XDG_RUNTIME_DIR=/run/user/$(id -u)`
+and `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`. With those set,
+`./target/debug/siphon` opens the window and spawns `siphon-daemon` next to the
+binary if the admin port is idle.
 
 ## Work order
 
@@ -154,18 +165,16 @@ variables.
    with no tray or single instance, `service` fixed for Linux, eros throughout,
    close quits, the RPC pump wake-driven instead of a 100 ms interval, the daemon
    spawned in its own process group.
-2. **Extract the chain** inside `crates/ui`, Windows behaviour byte-identical:
-   `D3d12`, the `HWND`, `HdrMode`, `idle_canvas`/`resize_canvas`, the per-buffer
-   `pl_tex` cache and `GetCapture` all move behind the type; `renderer.rs` and
-   `app.rs` lose their `windows::` imports. Verify by running the Windows UI.
-3. **libplacebo-sys Linux branch** plus the version shim; `cargo build -p siphon-ui`
-   on the box.
-4. **Wayland chain**: surface from the raw handles, `pl_swapchain` with the probe
-   and the depth above, the canvas policy, the visibility gate. Verify with
-   `cargo run -p siphon-ui` in the desktop session and a live channel.
-5. **Video**: VA-API decode behind the `decode` seam, per
-   `notes/video-decode.md`. The driver does allow it; only the renderer chain
-   (steps 2-4) is in front of it.
-
-Steps 2 and 4 are separable on purpose: the extraction has to leave Windows
-provably unchanged, and the Linux chain is then one new file behind the same seam.
+2. **Extract the chain** (done): `crates/ui/src/chain/{windows,wayland}.rs`. The
+   Windows chain owns `D3d12`, the `HWND`, `HdrMode`, the monitor canvas, the
+   per-buffer `pl_tex` cache and `GetCapture`; `renderer.rs` and `app.rs` have no
+   `windows::` imports. The Windows cross-target check type-checks it; running
+   the Windows UI is still the final verification.
+3. **libplacebo-sys Linux branch** (done): pkg-config, the `pl_log_create` shim,
+   the `libav` feature. `cargo build -p siphon-ui` is green on the box.
+4. **Wayland chain** (done): surface from ZGUI's raw handles, present-mode probe,
+   depth 2, `present_now()` gate. Verified in the live session: the window draws
+   its full interface through libplacebo and survives resizes without artefacts.
+5. **Video** (deferred): VA-API decode behind the `decode` seam, per
+   `notes/video-decode.md`. The renderer chain is now in place; video is the only
+   thing left.

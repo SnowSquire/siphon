@@ -1,13 +1,10 @@
 //! The ZGUI view: header, tabs, channels, filters, recordings, logs, and the
-//! DXGI renderer setup.
+//! renderer setup.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
-#[cfg(windows)]
 use std::sync::Arc;
 
-#[cfg(windows)]
-use raw_window_handle::HasWindowHandle as _;
 use siphon_rpc::ArenaSummary;
 use siphon_rpc::ChannelView;
 use siphon_rpc::ConnHealth;
@@ -24,45 +21,17 @@ use zgui::reactive::RwSignal;
 use zgui::reactive::Signal;
 use zgui::reactive::UnsyncCallback;
 #[cfg(windows)]
-use zgui::render::GpuUnavailable;
-#[cfg(windows)]
-use zgui::render::RenderTarget;
-#[cfg(windows)]
-use zgui::render::Renderer;
-#[cfg(windows)]
-use zgui::runtime::AppError;
-#[cfg(windows)]
 use zgui::runtime::use_window;
 #[cfg(windows)]
 use zgui::runtime::use_windows;
-#[cfg(windows)]
-use zgui::surface::wgpu;
-#[cfg(windows)]
-use zgui_render_wgpu::Gpu;
-#[cfg(windows)]
-use zgui_render_wgpu::SharedGraphics;
 use zgui_ui::prelude::*;
 use zgui_ui_tokens::prelude::*;
 
-#[cfg(windows)]
-use crate::dxgi::D3d12;
-#[cfg(windows)]
-use crate::dxgi::DxgiSwapchain;
-#[cfg(windows)]
-use crate::dxgi::HdrMode;
-#[cfg(windows)]
-use crate::dxgi::hwnd_from_raw;
-#[cfg(windows)]
-use crate::dxgi::set_window_background;
 use crate::format::format_bytes;
 use crate::format::format_count;
 use crate::format::format_duration_ms;
 use crate::format::format_iso_ms;
 use crate::format::format_time_ms;
-#[cfg(windows)]
-use crate::placebo::Placebo;
-#[cfg(windows)]
-use crate::renderer::UiRenderer;
 use crate::rpc::IntentSender;
 use crate::rpc::UiCommand;
 use crate::rpc::UiEvent;
@@ -95,16 +64,15 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
         .with_resizable(true)
         .with_stylesheet(SHEET);
 
-    // Windows composes the interface into a texture of its own and presents it
-    // through the DXGI chain. Linux has no chain of its own yet, so the
-    // framework opens the surface and presents it directly.
-    #[cfg(windows)]
+    // Both platforms compose the interface into a texture and present it
+    // through a chain: DXGI on Windows, a Vulkan swapchain on Wayland. Only the
+    // chain differs, and it is chosen inside the renderer factory.
     let window = {
         let (gpu, _decode) = crate::gpu::create()?;
-        let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
+        let graphics = zgui_render_wgpu::SharedGraphics::with_gpu(Arc::clone(&gpu));
         let factory_gpu = Arc::clone(&gpu);
         window.with_renderer(Box::new(move |surface, target| {
-            dxgi_renderer(&graphics, &factory_gpu, surface, target)
+            crate::chain::renderer(&graphics, &factory_gpu, surface, target)
         }))
     };
 
@@ -125,70 +93,6 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
         .map_err(|error| eros::error!("zgui: {error}"))
 }
 
-#[cfg(windows)]
-fn dxgi_renderer(
-    graphics: &SharedGraphics,
-    gpu: &Arc<Gpu>,
-    surface: &Arc<dyn zgui::platform::Surface>,
-    target: RenderTarget,
-) -> Result<Box<dyn Renderer>, AppError> {
-    let gpu_surface = Arc::clone(surface)
-        .gpu_shared()
-        .ok_or_else(|| dxgi_error("the surface has no native window handle"))?;
-    let window = gpu_surface
-        .window_handle()
-        .map_err(|error| dxgi_error(format!("window handle: {error}")))?;
-    let hwnd = hwnd_from_raw(window.as_raw()).map_err(|error| dxgi_error(format!("{error}")))?;
-    set_window_background(hwnd);
-    // The icon helper speaks `windows-sys`, whose `HWND` is the raw handle; `hwnd`
-    // is the `windows` crate's newtype around the same pointer.
-    crate::tray::set_window_icon(hwnd.0);
-    let width = u32::try_from(target.size.width)
-        .map_err(|_| dxgi_error("the target width is not positive"))?;
-    let height = u32::try_from(target.size.height)
-        .map_err(|_| dxgi_error("the target height is not positive"))?;
-
-    let d3d12 = Rc::new(D3d12::new(gpu).map_err(|error| dxgi_error(format!("D3D12: {error}")))?);
-    // The chain starts at the window's own extent, which is where it returns
-    // once the size settles; the UI texture is that extent and is never scaled.
-    let (chain_width, chain_height) = crate::dxgi::idle_canvas(width, height);
-    let swapchain = DxgiSwapchain::new(&d3d12, gpu, hwnd, chain_width, chain_height, HdrMode::Off)
-        .map_err(|error| dxgi_error(format!("{error}")))?;
-    let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {
-        label: Some("siphon.ui"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-
-    let placebo =
-        Rc::new(Placebo::import(gpu).map_err(|error| dxgi_error(format!("libplacebo: {error}")))?);
-    let renderer = graphics
-        .renderer_supplied(target, vec![ui.clone()])
-        .map_err(AppError::from)?;
-    let renderer = UiRenderer::new(
-        renderer,
-        swapchain,
-        placebo,
-        ui,
-        graphics.clone(),
-        Arc::clone(gpu),
-        d3d12,
-        hwnd,
-        target,
-    )
-    .map_err(|error| dxgi_error(format!("{error}")))?;
-    Ok(Box::new(renderer))
-}
-
 /// Gives back the resident pages a hidden window no longer needs.
 ///
 /// What a window makes resident is mostly driver code and work done for the
@@ -207,11 +111,6 @@ fn release_hidden_memory() {
     unsafe {
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
-}
-
-#[cfg(windows)]
-fn dxgi_error(reason: impl Into<String>) -> AppError {
-    AppError::GpuUnavailable(GpuUnavailable::new().rejected("DXGI", reason))
 }
 
 #[component]

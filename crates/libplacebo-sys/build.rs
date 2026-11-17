@@ -18,35 +18,35 @@
 //! the Twitch crate's Linux builds.
 
 use std::env;
-#[cfg(windows)]
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
 /// `meson install`'s prefix for the libplacebo this repo builds.
-#[cfg(windows)]
 const DEFAULT_PLACEBO: &str = "C:/Users/alex/.local/libplacebo-shared";
 /// The scoop `FFmpeg` package.
-#[cfg(windows)]
 const DEFAULT_FFMPEG: &str = "C:/Users/alex/scoop/apps/ffmpeg-shared/current";
 /// The Vulkan SDK, for `vulkan/vulkan.h`.
-#[cfg(windows)]
 const DEFAULT_VULKAN: &str = "C:/Users/alex/scoop/apps/vulkan/current";
 /// The xwin splat holding the MSVC CRT and Windows SDK.
-#[cfg(windows)]
 const DEFAULT_SPLAT: &str = "C:/Users/alex/Projects/Code/Libs/Windows/splat";
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=src/shim.c");
     println!("cargo:rerun-if-changed=src/libav.c");
-    platform();
+    // Build scripts run on the host but serve the *target*: `cfg(windows)` here
+    // would describe the host, so cross-compiling needs Cargo's target variable.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        windows();
+    } else {
+        linux();
+    }
 }
 
 // ---------------------------------------------------------------- Windows
 
-#[cfg(windows)]
-fn platform() {
+fn windows() {
     for knob in [
         "LIBPLACEBO_PREFIX",
         "FFMPEG_DIR",
@@ -84,7 +84,6 @@ fn platform() {
 }
 
 /// Every include directory the bindings and the native shims need, in one place.
-#[cfg(windows)]
 struct Includes {
     placebo: PathBuf,
     ffmpeg: PathBuf,
@@ -95,7 +94,6 @@ struct Includes {
     shared: PathBuf,
 }
 
-#[cfg(windows)]
 impl Includes {
     /// Everything `cc` needs to compile C for this ABI.
     fn all(&self) -> [PathBuf; 7] {
@@ -113,8 +111,7 @@ impl Includes {
 
 // ------------------------------------------------------------------ Linux
 
-#[cfg(not(windows))]
-fn platform() {
+fn linux() {
     println!("cargo:rerun-if-env-changed=LIBPLACEBO_PREFIX");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
 
@@ -166,7 +163,6 @@ fn platform() {
 }
 
 /// A pkg-config lookup whose failure says what to install.
-#[cfg(not(windows))]
 fn probe(package: &str) -> pkg_config::Library {
     pkg_config::Config::new().probe(package).unwrap_or_else(|error| {
         panic!("pkg-config could not find {package}: {error}; install its -devel package")
@@ -174,7 +170,6 @@ fn probe(package: &str) -> pkg_config::Library {
 }
 
 /// clang's own include directory, the one holding `stdbool.h` and friends.
-#[cfg(not(windows))]
 fn clang_include_dirs() -> Vec<PathBuf> {
     let Ok(output) = std::process::Command::new("clang")
         .arg("-print-resource-dir")
@@ -241,7 +236,6 @@ fn glue(includes: &[PathBuf], compiler: &str) {
 }
 
 /// Points the linker at the import library and puts the DLL beside the binary.
-#[cfg(windows)]
 fn link(placebo: &Path) {
     let lib = placebo.join("lib");
     println!("cargo:rustc-link-search=native={}", lib.display());
@@ -255,7 +249,6 @@ fn link(placebo: &Path) {
 /// Windows resolves it when the process starts, before `main`, and `cargo run`
 /// gives the process the environment it already had, so the executable's own
 /// directory is the only place the loader will look.
-#[cfg(windows)]
 fn copy_dll(placebo: &Path) {
     let Some(profile) = profile_dir() else {
         println!("cargo:warning=cannot work out the profile directory from OUT_DIR");
@@ -304,7 +297,6 @@ fn copy_dll(placebo: &Path) {
 ///
 /// Cargo has used both `build/<crate>-<hash>/out` and `build/<crate>/<hash>/out`,
 /// so this walks to `build` instead of counting levels.
-#[cfg(windows)]
 fn profile_dir() -> Option<PathBuf> {
     let out = out_dir();
     let build = out
@@ -324,7 +316,6 @@ fn feature(name: &str) -> bool {
 }
 
 /// A path from `knob`, or `default` when it is not set.
-#[cfg(windows)]
 fn prefix(knob: &str, default: &str) -> PathBuf {
     let value = env::var_os(knob).map_or_else(|| PathBuf::from(default), PathBuf::from);
     assert!(
@@ -336,14 +327,12 @@ fn prefix(knob: &str, default: &str) -> PathBuf {
 }
 
 /// `Windows Kits/10/Include/<version>/<part>`.
-#[cfg(windows)]
 fn sdk_include(splat: &Path, part: &str) -> PathBuf {
     let include = splat.join("Windows Kits/10/Include");
     include.join(latest(&include)).join(part)
 }
 
 /// The newest subdirectory of `dir`, which is how the splat versions itself.
-#[cfg(windows)]
 fn latest(dir: &Path) -> String {
     let versions: Vec<String> = fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("cannot list {}: {error}", dir.display()))

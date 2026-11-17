@@ -41,8 +41,7 @@ impl Placebo {
         };
         // SAFETY: the parameters are a live local and libplacebo returns an
         // owned log or null.
-        let log =
-            unsafe { pl::pl_log_create_372(pl::PL_API_VER as std::os::raw::c_int, &log_params) };
+        let log = unsafe { pl::siphon_pl_log_create(&log_params) };
         eros::ensure!(!log.is_null(), "libplacebo refused to create a log");
 
         let instance = hal_adapter.shared_instance().raw_instance();
@@ -78,10 +77,12 @@ impl Placebo {
             device: hal_device.raw_device().handle().as_raw() as usize as *mut pl::VkDevice_T,
             extensions: extensions.as_ptr(),
             num_extensions: std::os::raw::c_int::try_from(extensions.len()).unwrap_or(0),
+            // `pl_vulkan_queue` gained `flags` after 7.360, which is what
+            // Fedora ships; the default fills it in where it exists.
             queue_graphics: pl::pl_vulkan_queue {
                 index: hal_device.queue_family_index(),
                 count: 1,
-                flags: 0,
+                ..Default::default()
             },
             // No dedicated compute or transfer queues: libplacebo falls back to
             // the graphics queue.
@@ -130,6 +131,11 @@ impl Placebo {
 
     pub const fn gpu(&self) -> pl::pl_gpu {
         self.gpu
+    }
+
+    /// The imported Vulkan context, used to create a swapchain on this device.
+    pub const fn vulkan(&self) -> pl::pl_vulkan {
+        self.vulkan
     }
 
     pub const fn renderer(&self) -> pl::pl_renderer {
