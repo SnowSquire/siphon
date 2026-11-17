@@ -170,6 +170,7 @@ pub async fn download_msi(
 
 /// Builds the waiter script: installs the MSI, then reopens the daemon.
 /// Single quotes cover spaces in both paths; embedded quotes are doubled.
+#[cfg(any(windows, test))]
 fn relaunch_script(msi: &Path, exe: &Path) -> String {
     let quote = |path: &Path| path.display().to_string().replace('\'', "''");
     format!(
