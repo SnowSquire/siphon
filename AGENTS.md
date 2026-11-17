@@ -23,6 +23,8 @@ only sink; disk output is disabled and being rebuilt from
 - `hls-transport-probe.md` — measurements of how Twitch actually delivers.
 - `disk-complete-recording.md` — the disk-recording design.
 - `rpc.md` — the daemon RPC, Siphon backend/UI split, state updates and monitor lifecycle.
+- `linux-port.md` — the UI on Linux: present path, buffer counts, build constraints,
+  and what the hardware on the dev box can and cannot do.
 
 ## Commands
 
