@@ -1,31 +1,52 @@
-//! Builds the bindings, the libav glue, the link directives and the DLL copy
-//! for the libplacebo this repository compiles.
+//! Builds the bindings, the libav glue, the `pl_log_create` shim, the link
+//! directives and the DLL copy for the libplacebo this repository links.
 //!
-//! Nothing here reads pkg-config: libplacebo is one prefix on this machine, and
-//! `FFmpeg` and the Vulkan SDK are two more, so each path is a knob with an
-//! environment override and a sensible default. That is what makes
-//! `cargo run --bin video` work without exporting anything first.
+//! Two platforms, two ways of finding the library:
 //!
-//! `ffcine-libplacebo-sys` does the same job through pkg-config, which needs
-//! `PKG_CONFIG_PATH`, `CC` and `INCLUDE` in the environment — and Cargo can only
-//! set those for the whole workspace, where they would break the Linux builds of
-//! the Twitch crate.
+//! * **Windows** uses explicit prefixes (libplacebo, FFmpeg, the Vulkan SDK and
+//!   the xwin splat), because the scoop packages ship no pkg-config files and
+//!   `clang-cl` needs the MSVC CRT and Windows SDK on its include path. Every
+//!   path is a knob with an environment override and a default, which is what
+//!   makes `cargo run --bin video` work without exporting anything first.
+//! * **Linux** uses pkg-config, because there the library is a distribution
+//!   package (or a prefix from `scripts/build-libplacebo.sh`). `LIBPLACEBO_PREFIX`
+//!   still wins when it is set.
+//!
+//! `ffcine-libplacebo-sys` does the same job through pkg-config alone, which needs
+//! `PKG_CONFIG_PATH`, `CC` and `INCLUDE` in the environment for every platform —
+//! and Cargo can only set those for the whole workspace, where they would break
+//! the Twitch crate's Linux builds.
 
 use std::env;
+#[cfg(windows)]
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
 /// `meson install`'s prefix for the libplacebo this repo builds.
+#[cfg(windows)]
 const DEFAULT_PLACEBO: &str = "C:/Users/alex/.local/libplacebo-shared";
 /// The scoop `FFmpeg` package.
+#[cfg(windows)]
 const DEFAULT_FFMPEG: &str = "C:/Users/alex/scoop/apps/ffmpeg-shared/current";
 /// The Vulkan SDK, for `vulkan/vulkan.h`.
+#[cfg(windows)]
 const DEFAULT_VULKAN: &str = "C:/Users/alex/scoop/apps/vulkan/current";
 /// The xwin splat holding the MSVC CRT and Windows SDK.
+#[cfg(windows)]
 const DEFAULT_SPLAT: &str = "C:/Users/alex/Projects/Code/Libs/Windows/splat";
 
 fn main() {
+    println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=src/shim.c");
+    println!("cargo:rerun-if-changed=src/libav.c");
+    platform();
+}
+
+// ---------------------------------------------------------------- Windows
+
+#[cfg(windows)]
+fn platform() {
     for knob in [
         "LIBPLACEBO_PREFIX",
         "FFMPEG_DIR",
@@ -35,8 +56,6 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={knob}");
     }
-    println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-changed=src/libav.c");
 
     let placebo = prefix("LIBPLACEBO_PREFIX", DEFAULT_PLACEBO);
     let ffmpeg = prefix("FFMPEG_DIR", DEFAULT_FFMPEG);
@@ -47,18 +66,25 @@ fn main() {
         placebo: placebo.join("include"),
         ffmpeg: ffmpeg.join("include"),
         vulkan: vulkan.join("Include"),
-        crt: splat.join("VC/Tools/MSVC").join(latest(&splat.join("VC/Tools/MSVC"))).join("include"),
+        crt: splat
+            .join("VC/Tools/MSVC")
+            .join(latest(&splat.join("VC/Tools/MSVC")))
+            .join("include"),
         ucrt: sdk_include(&splat, "ucrt"),
         um: sdk_include(&splat, "um"),
         shared: sdk_include(&splat, "shared"),
     };
 
-    bindings(&includes);
-    glue(&includes);
+    bindings(&includes.all());
+    shim(&includes.all());
+    if feature("libav") {
+        glue(&includes.all(), "clang-cl");
+    }
     link(&placebo);
 }
 
-/// Every include directory the bindings and the glue need, in one place.
+/// Every include directory the bindings and the native shims need, in one place.
+#[cfg(windows)]
 struct Includes {
     placebo: PathBuf,
     ffmpeg: PathBuf,
@@ -69,29 +95,106 @@ struct Includes {
     shared: PathBuf,
 }
 
+#[cfg(windows)]
 impl Includes {
-    /// The two the public headers need: libplacebo itself and Vulkan.
-    fn public(&self) -> [&Path; 2] {
-        [&self.placebo, &self.vulkan]
-    }
-
     /// Everything `cc` needs to compile C for this ABI.
-    fn all(&self) -> [&Path; 7] {
+    fn all(&self) -> [PathBuf; 7] {
         [
-            &self.placebo,
-            &self.ffmpeg,
-            &self.vulkan,
-            &self.crt,
-            &self.ucrt,
-            &self.um,
-            &self.shared,
+            self.placebo.clone(),
+            self.ffmpeg.clone(),
+            self.vulkan.clone(),
+            self.crt.clone(),
+            self.ucrt.clone(),
+            self.um.clone(),
+            self.shared.clone(),
         ]
     }
 }
 
+// ------------------------------------------------------------------ Linux
+
+#[cfg(not(windows))]
+fn platform() {
+    println!("cargo:rerun-if-env-changed=LIBPLACEBO_PREFIX");
+    println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
+
+    let mut includes = match env::var_os("LIBPLACEBO_PREFIX") {
+        Some(prefix) => {
+            let prefix = PathBuf::from(prefix);
+            assert!(
+                prefix.is_dir(),
+                "LIBPLACEBO_PREFIX points at {}, which is not a directory",
+                prefix.display()
+            );
+            let lib = prefix.join("lib");
+            // The prefix may sit in `lib` or `lib64`.
+            for dir in [lib.clone(), prefix.join("lib64")] {
+                if dir.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", dir.display());
+                }
+            }
+            println!("cargo:rustc-link-lib=libplacebo");
+            vec![prefix.join("include")]
+        }
+        None => probe("libplacebo").include_paths,
+    };
+
+    // The public headers include `vulkan/vulkan.h`; pkg-config knows where the
+    // distribution keeps it, and clang usually finds it anyway.
+    if let Ok(vulkan) = pkg_config::Config::new().probe("vulkan") {
+        includes.extend(vulkan.include_paths);
+    }
+
+    // libclang finds its own builtin headers (`stdbool.h`, `stdint.h`) from a
+    // resource directory derived from the library's path, and on Fedora that
+    // derivation misses: libclang.so.22.1 looks for `clang/22.1.8` while the
+    // package installs `clang/22`. Ask the driver instead of guessing.
+    includes.extend(clang_include_dirs());
+
+    bindings(&includes);
+    shim(&includes);
+    if feature("libav") {
+        // libplacebo's libav glue includes the FFmpeg headers, which the caller
+        // is responsible for having (libavcodec-devel or an FFMPEG_DIR-style
+        // prefix). Probe rather than guess: a missing one is a clear error here
+        // instead of 200 lines of clang diagnostics.
+        for package in ["libavutil", "libavcodec", "libavformat"] {
+            includes.extend(probe(package).include_paths);
+        }
+        glue(&includes, "cc");
+    }
+}
+
+/// A pkg-config lookup whose failure says what to install.
+#[cfg(not(windows))]
+fn probe(package: &str) -> pkg_config::Library {
+    pkg_config::Config::new().probe(package).unwrap_or_else(|error| {
+        panic!("pkg-config could not find {package}: {error}; install its -devel package")
+    })
+}
+
+/// clang's own include directory, the one holding `stdbool.h` and friends.
+#[cfg(not(windows))]
+fn clang_include_dirs() -> Vec<PathBuf> {
+    let Ok(output) = std::process::Command::new("clang")
+        .arg("-print-resource-dir")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let include = dir.join("include");
+    if include.is_dir() { vec![include] } else { Vec::new() }
+}
+
+// ------------------------------------------------------------------ shared
+
 /// Generates the bindings from the installed headers.
-fn bindings(includes: &Includes) {
-    for dir in includes.public() {
+fn bindings(includes: &[PathBuf]) {
+    for dir in includes {
         rerun_on_dir(dir);
     }
     let mut builder = bindgen::Builder::default()
@@ -105,7 +208,7 @@ fn bindings(includes: &Includes) {
         .derive_default(true)
         .layout_tests(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
-    for dir in includes.all() {
+    for dir in includes {
         builder = builder.clang_arg(format!("-I{}", dir.display()));
     }
     builder
@@ -115,21 +218,30 @@ fn bindings(includes: &Includes) {
         .expect("could not write bindings.rs");
 }
 
+/// Compiles `shim.c`, which turns the versioned `pl_log_create` macro into one
+/// symbol that works against any installed libplacebo.
+fn shim(includes: &[PathBuf]) {
+    let mut build = cc::Build::new();
+    build.file("src/shim.c").warnings(false);
+    for dir in includes {
+        build.include(dir);
+    }
+    build.compile("placebo_shim");
+}
+
 /// Compiles `libav.c`, which is the only part of libplacebo's libav support that
 /// is not `static inline`.
-///
-/// The compiler is named rather than taken from `CC`: `cc` would otherwise look
-/// for `cl.exe`, which this machine does not have.
-fn glue(includes: &Includes) {
+fn glue(includes: &[PathBuf], compiler: &str) {
     let mut build = cc::Build::new();
-    build.compiler("clang-cl").file("src/libav.c").warnings(false);
-    for dir in includes.all() {
+    build.compiler(compiler).file("src/libav.c").warnings(false);
+    for dir in includes {
         build.include(dir);
     }
     build.compile("placebo_libav");
 }
 
 /// Points the linker at the import library and puts the DLL beside the binary.
+#[cfg(windows)]
 fn link(placebo: &Path) {
     let lib = placebo.join("lib");
     println!("cargo:rustc-link-search=native={}", lib.display());
@@ -143,6 +255,7 @@ fn link(placebo: &Path) {
 /// Windows resolves it when the process starts, before `main`, and `cargo run`
 /// gives the process the environment it already had, so the executable's own
 /// directory is the only place the loader will look.
+#[cfg(windows)]
 fn copy_dll(placebo: &Path) {
     let Some(profile) = profile_dir() else {
         println!("cargo:warning=cannot work out the profile directory from OUT_DIR");
@@ -191,6 +304,7 @@ fn copy_dll(placebo: &Path) {
 ///
 /// Cargo has used both `build/<crate>-<hash>/out` and `build/<crate>/<hash>/out`,
 /// so this walks to `build` instead of counting levels.
+#[cfg(windows)]
 fn profile_dir() -> Option<PathBuf> {
     let out = out_dir();
     let build = out
@@ -203,7 +317,14 @@ fn out_dir() -> PathBuf {
     PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts"))
 }
 
+/// Whether a cargo feature is on, as the build script sees it.
+fn feature(name: &str) -> bool {
+    let key = format!("CARGO_FEATURE_{}", name.to_uppercase().replace('-', "_"));
+    env::var_os(key).is_some()
+}
+
 /// A path from `knob`, or `default` when it is not set.
+#[cfg(windows)]
 fn prefix(knob: &str, default: &str) -> PathBuf {
     let value = env::var_os(knob).map_or_else(|| PathBuf::from(default), PathBuf::from);
     assert!(
@@ -215,12 +336,14 @@ fn prefix(knob: &str, default: &str) -> PathBuf {
 }
 
 /// `Windows Kits/10/Include/<version>/<part>`.
+#[cfg(windows)]
 fn sdk_include(splat: &Path, part: &str) -> PathBuf {
     let include = splat.join("Windows Kits/10/Include");
     include.join(latest(&include)).join(part)
 }
 
 /// The newest subdirectory of `dir`, which is how the splat versions itself.
+#[cfg(windows)]
 fn latest(dir: &Path) -> String {
     let versions: Vec<String> = fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("cannot list {}: {error}", dir.display()))

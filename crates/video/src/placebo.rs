@@ -39,9 +39,7 @@ impl Placebo {
         };
         // SAFETY: the parameters are a live local and libplacebo returns an
         // owned log or null.
-        let log = unsafe {
-            pl::pl_log_create_372(pl::PL_API_VER as std::os::raw::c_int, &log_params)
-        };
+        let log = unsafe { pl::siphon_pl_log_create(&log_params) };
         anyhow::ensure!(!log.is_null(), "libplacebo refused to create a log");
 
         let instance = hal_adapter.shared_instance().raw_instance();

@@ -31,6 +31,16 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+unsafe extern "C" {
+    /// `pl_log_create`, behind a stable name.
+    ///
+    /// The C API's `pl_log_create` is a macro that expands to
+    /// `pl_log_create_<PL_API_VER>`, so the symbol carries the installed
+    /// library's version. `src/shim.c` expands the macro against the headers it
+    /// was compiled with, and this is the one symbol callers link against.
+    pub fn siphon_pl_log_create(params: *const pl_log_params) -> pl_log;
+}
+
 /// `libplacebo/utils/libav.h`: map libav `AVFrame`s (including `AV_PIX_FMT_VULKAN`
 /// hw frames, with their `AVVkFrame` semaphores) to `pl_frame`s.
 ///
