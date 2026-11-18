@@ -24,8 +24,9 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   should be distinct and meaningful (red live dot, amber record, etc.). OKLCH
   is supported by ZGUI, so palette work should be done in L/C/H values, not
   guessed hex.
-- Texture and patterns are wanted, but only on large surfaces (headers, empty
-  table area). Never on controls or text. Exact pattern is still open.
+- Texture and patterns are wanted, but only on large surfaces. The first
+  scanline pass on the channel list was rejected: the empty area under the rows
+  must stay solid dark. Exact pattern/placement is still open.
 
 ## Density and spacing
 

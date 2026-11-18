@@ -1621,13 +1621,7 @@ const SHEET: &str = css!(r####"
 .tablehead .cell { font-size: 10px; }
 .cell { font-size: 12px; }
 .channels {
-    background-image: repeating-linear-gradient(
-        0deg,
-        transparent,
-        transparent 3px,
-        rgba(255, 255, 255, 0.14) 3px,
-        rgba(255, 255, 255, 0.14) 4px
-    );
+    background-color: #0b0d12;
 }
 .list { gap: 0; padding: 0; }
 .channel { padding: 0; }
@@ -1636,15 +1630,17 @@ const SHEET: &str = css!(r####"
     padding: 2px 10px;
     border-radius: 0;
 }
-.channel:nth-child(even) .channel-row { background-color: #151922; }
-.channel-row:hover { background-color: #1d2330; }
-.channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: #202736; }
+.channel:nth-child(even) .channel-row { background-color: #10131a; }
+.channel-row:hover { background-color: #171b24; }
+.channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: #161b25; }
 .channel-name { font-size: 13px; }
 .channel-title { font-size: 12px; }
 .detail {
-    margin: 0 6px 4px 24px;
+    margin: 2px 6px 6px 6px;
     padding: 10px 12px;
+    border: 1px solid #2a3140;
     border-radius: 0;
+    background-color: #0b0d12;
 }
 .log { border-radius: 0; }
 .banner, .error { border-radius: 0; }
