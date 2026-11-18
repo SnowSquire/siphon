@@ -1,6 +1,8 @@
 //! The ZGUI view: header, tabs, channels, filters, recordings, logs, and the
 //! renderer setup.
 
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -283,7 +285,16 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
     let ticker = Signal::derive_local(move || {
         ticker_text(channels_sig.get(), notifications_sig.get())
     });
+    let tab_weight = RwSignal::new_local(1.0f32);
+    let tab_generation = Rc::new(Cell::new(0u64));
     let tab = RwSignal::new_local(Tab::Channels);
+    let tab_click = move |target: Tab| {
+        let generation = Rc::clone(&tab_generation);
+        move |_: &mut EventCx<'_, events::Click>| {
+            tab.set(target);
+            animate_tab_weight(tab_weight, Rc::clone(&generation));
+        }
+    };
     let expanded = RwSignal::new_local(BTreeSet::<u64>::new());
     let draft = RwSignal::new_local(String::new());
     let word_draft = RwSignal::new_local(String::new());
@@ -341,28 +352,32 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Channels,
-                    on:click = move |_| tab.set(Tab::Channels)
+                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Channels),
+                    on:click = tab_click(Tab::Channels)
                 ) {
                     text {"Channels"}
                 }
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Filter,
-                    on:click = move |_| tab.set(Tab::Filter)
+                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Filter),
+                    on:click = tab_click(Tab::Filter)
                 ) {
                     text {"Filter"}
                 }
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Recordings,
-                    on:click = move |_| tab.set(Tab::Recordings)
+                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Recordings),
+                    on:click = tab_click(Tab::Recordings)
                 ) {
                     text {"Recordings"}
                 }
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Logs,
-                    on:click = move |_| tab.set(Tab::Logs)
+                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Logs),
+                    on:click = tab_click(Tab::Logs)
                 ) {
                     text {"Logs"}
                 }
@@ -518,6 +533,30 @@ fn ChannelRow(
     let record = RwSignal::new_local(channel.record);
     let detail = channel.clone();
 
+    // Only titles that cannot fit their cell scroll. Three copies keep the
+    // cell filled; the offset is a signal so leaving the row can rewind it.
+    let long_title = title.chars().count() > 55;
+    let title_run = if long_title {
+        format!("{title}     │     ").repeat(3)
+    } else {
+        title.clone()
+    };
+    let title_shift = RwSignal::new_local(0.0f32);
+    let title_gen = Rc::new(Cell::new(0u64));
+    let title_limit = if long_title {
+        title.chars().count() as f32 * 6.4
+    } else {
+        0.0
+    };
+    let enter = {
+        let token = Rc::clone(&title_gen);
+        move |_: &mut EventCx<'_, events::PointerEnter>| scroll_title(title_shift, title_limit, Rc::clone(&token), false)
+    };
+    let leave = {
+        let token = Rc::clone(&title_gen);
+        move |_: &mut EventCx<'_, events::PointerLeave>| scroll_title(title_shift, title_limit, Rc::clone(&token), true)
+    };
+
     let live_intents = Rc::clone(&intents);
     let title_intents = Rc::clone(&intents);
     let record_intents = Rc::clone(&intents);
@@ -529,6 +568,8 @@ fn ChannelRow(
                 class = "channel-row",
                 class:open = open,
                 var:--channel-color = color,
+                on:pointer_enter = enter,
+                on:pointer_leave = leave,
                 on:click = move |_| {
                     expanded.update(|expanded| {
                         if !expanded.remove(&id) {
@@ -558,7 +599,13 @@ fn ChannelRow(
                 }
                 Tooltip {
                     TooltipTrigger(class = "cell cell--title") {
-                        text(class = "channel-title") {{title.clone()}}
+                        box(class = "channel-title") {
+                            text(
+                                class = "channel-title__run",
+                                class:active = long_title,
+                                var:--title-shift = move || Some(format!("-{:.1}px", title_shift.get())),
+                            ) {{title_run}}
+                        }
                     }
                     TooltipContent {{stream_tooltip(&channel)}}
                 }
@@ -1083,6 +1130,83 @@ fn ticker_duration(text: &str) -> String {
     let per_copy = text.chars().count() / 8;
     let seconds = (per_copy as f32 * 0.22).clamp(18.0, 180.0);
     format!("{seconds:.0}s")
+}
+
+/// The weight axis for one tab during a switch: the incoming tab goes 600→800
+/// while the outgoing one goes 800→600.
+fn tab_weight_value(
+    tab: RwSignal<Tab, LocalStorage>,
+    weight: RwSignal<f32, LocalStorage>,
+    mine: Tab,
+) -> impl Fn() -> Option<String> {
+    move || {
+        let progress = if tab.get() == mine {
+            weight.get()
+        } else {
+            1.0 - weight.get()
+        };
+        Some(format!("{:.0}", 600.0 + 200.0 * progress))
+    }
+}
+
+/// Keeps a per-frame callback alive until `step` says it is done. The slot
+/// holds the current frame handle; replacing it drops the one that just fired.
+fn next_frame(
+    generation: Rc<Cell<u64>>,
+    token: u64,
+    slot: Rc<RefCell<Option<zgui::view::FrameHandle>>>,
+    mut step: impl FnMut() -> bool + 'static,
+) {
+    let inner = Rc::clone(&slot);
+    let handle = request_frame(move |_| {
+        if token != generation.get() {
+            return;
+        }
+        if !step() {
+            next_frame(Rc::clone(&generation), token, Rc::clone(&inner), step);
+        }
+    });
+    *slot.borrow_mut() = Some(handle);
+}
+
+/// Eases the variable weight from the old tab to the new one over 180ms. A
+/// generation counter makes a quick series of tab clicks restart the tween
+/// instead of letting older frames fight over the signal.
+fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u64>>) {
+    weight.set(0.0);
+    let token = generation.get() + 1;
+    generation.set(token);
+    let started = std::time::Instant::now();
+    let slot = Rc::new(RefCell::new(None));
+    next_frame(generation, token, slot, move || {
+        let t = (started.elapsed().as_secs_f32() / 0.18).min(1.0);
+        weight.set(t * t * (3.0 - 2.0 * t));
+        t == 1.0
+    });
+}
+
+/// Drives a channel title's horizontal offset while its row is hovered, then
+/// rewinds it to the start. Keeping the offset in a signal (rather than a CSS
+/// animation) means leaving mid-scroll can smoothly return to zero.
+fn scroll_title(
+    shift: RwSignal<f32, LocalStorage>,
+    limit: f32,
+    generation: Rc<Cell<u64>>,
+    rewind: bool,
+) {
+    let token = generation.get() + 1;
+    generation.set(token);
+    let slot = Rc::new(RefCell::new(None));
+    next_frame(generation, token, slot, move || {
+        let now = shift.get_untracked();
+        let next = if rewind {
+            (now - (now / 8.0 + 3.0)).max(0.0)
+        } else {
+            (now + 0.9).min(limit)
+        };
+        shift.set(next);
+        (next - now).abs() < 0.01
+    });
 }
 
 const fn state_label(state: PipelineState) -> &'static str {
@@ -1714,8 +1838,9 @@ const SHEET: &str = css!(r####"
 .tab {
     padding: 5px 14px;
     border-radius: 10px 10px 0 0;
+    font-family: BrandFont, Chillax, sans-serif;
     font-size: 13px;
-    font-variation-settings: "wght" 600, "wdth" 92;
+    font-variation-settings: "wght" var(--tab-wght, 600), "wdth" 92;
 }
 .tabbody {
     gap: 0;
@@ -1755,7 +1880,22 @@ const SHEET: &str = css!(r####"
     font-size: 14px;
     font-variation-settings: "wght" 600, "wdth" 100;
 }
-.channel-title { font-size: 12px; }
+.channel-title {
+    width: 100%;
+    height: 18px;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.channel-title__run {
+    display: inline-block;
+    white-space: nowrap;
+    line-height: 18px;
+    font-size: 12px;
+    color: oklch(0.70 0.018 240);
+}
+.channel-title__run.active {
+    transform: translateX(var(--title-shift, 0px));
+}
 .detail {
     margin: 2px 6px 6px 6px;
     padding: 10px 12px;

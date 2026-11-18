@@ -38,16 +38,20 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   is 8px, the viewport uses `overflow: scroll` so the gutter is always reserved
   (`scrollbar-gutter` is unsupported in ZGUI), and the list keeps 6px of right
   padding. Expanding a row cannot pull the columns sideways.
-- Motion is back for two controls: the switch track/thumb transition over
-  160ms, and a live dot pulses while the channel is live. The switch gets its
+- Motion is back for four controls: the switch track/thumb transition over
+  160ms, a live dot pulse, the two marquees, and the tab weight. Tab names use
+  Chillax; the selected tab's `wght` axis eases 600→800 over 180ms on a switch
+  while the outgoing tab eases back, driven by `font-variation-settings` and a
+  per-frame signal. The switch gets its
   motion from `--zui-motion-duration-normal`: zgui-ui's switch declares its own
   `transition-property` and reads that token, and the Terminal preset sets it
   to `0ms`, so the token is overridden in `THEME_CSS` rather than redeclaring
   transitions in the app sheet. The live dot is a drawn box, not a glyph: at
   the pinned zgui revision a translated glyph animates and paints fine, but a
   `scale()` transform drops the glyph except at its rest keyframe (verified on
-  the live Wayland window with kwin-mcp). Only translation is animated in the
-  app. The thumb keeps a 2px inset at both ends of its travel. Hover
+  the live Wayland window with kwin-mcp). Text motion is translation only;
+  the tab weight moves a font axis, not a transform. The thumb keeps a 2px
+  inset at both ends of its travel. Hover
   tooltips wait 400ms so dragging the pointer across a row does not flash a
   label.
 - Avoid the default "sloth look": no purple `#9146ff` primary, no soft cards on
@@ -126,8 +130,13 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   below the last row.
 - Keep the row's avatar/display name and the live dot; those are the primary
   identity and state. Display names use Chillax (see Typography).
-- Row titles stay single-line and truncated. The full text is in the top
-  marquee and the expanded detail panel.
+- Row titles are single-line and truncated to one cell height; the full text
+  is also in the top marquee and the expanded detail panel. Titles over 55
+  characters scroll horizontally while the row is hovered and **rewind to the
+  start** on pointer-leave. The offset is driven per frame through zgui's
+  `request_frame` (not compio's timer, which panics outside its runtime), so
+  leaving mid-scroll can return smoothly; a generation counter cancels an
+  older tween when the pointer moves again.
 - Row hover/open/pending states should be subtle background changes, not
   rounded cards.
 
