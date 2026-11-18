@@ -73,16 +73,26 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 
 ## Typography
 
-- **Archivo** variable font for all UI text. Downloaded to
-  `/tmp/opencode/fonts/Archivo.ttf`; axes `wght` 100–900 and `wdth` 62–125.
-  ZGUI supports variable fonts through `font-variation-settings`; `font-weight`
+- **Archivo** variable font for all UI text. The TTF ships in
+  `crates/ui/fonts/` (OFL 1.1); axes `wght` 100–900 and `wdth` 62–125. ZGUI
+  supports variable fonts through `font-variation-settings`; `font-weight`
   alone does not drive the axes. The narrow `wdth` axis is useful for dense
   table rows.
-- **Chillax** was downloaded for the old top "Siphon" wordmark from Fontshare to
-  `/tmp/opencode/fonts/chillax-extract/.../Chillax-Variable.ttf`. It is under
-  the ITF Free Font License: embedding in a desktop app is allowed, but the
-  font files may not be modified/subset or redistributed through a repository.
-  The wordmark is gone; keep the font out of git unless a use for it returns.
+- **Chillax** (Fontshare, ITF Free Font License 2.0) is used for channel names
+  via the `BrandFont` family; download the unmodified variable TTF from
+  `https://api.fontshare.com/v2/fonts/download/chillax` to
+  `/tmp/opencode/fonts/Chillax-Variable.ttf` and pass it as `SIPHON_FONT_BRAND`.
+  The licence allows embedding in the app but explicitly forbids distributing
+  the font file through a repository, so it is **not** in git; release builds
+  need a build-time fetch or a separately licensed asset. `font-family:
+  BrandFont, Chillax, sans-serif` degrades to the system font when the dev
+  override is absent.
+- **Noto Color Emoji** (CBDT build, OFL 1.1) ships in `crates/ui/fonts/` and is
+  registered as `SiphonEmoji`. It is both the last entry in the root
+  `font-family` stack and bound to fontique's `Emoji` generic. The CBDT build
+  matters: the system COLRv1 font decodes as a monochrome outline in zgui's
+  swash 0.2.10. Verified with kwin-mcp that 😀/🎉/✅ render in colour. `★` and
+  `✧` are not Unicode-emoji, so they stay monochrome by design.
 
 ## Header / activity ticker
 
@@ -91,8 +101,9 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   stream: newest first, each item `summary — body`, separated by `│`.
 - The run repeats four times and slides by `-25%` (one copy) on a linear loop
   whose duration scales with the text length. Four copies keep the window full
-  even when there is only one short notification. Connection health is pinned
-  at the left; the update banner still sits at the right when present.
+  even when there is only one short notification. Connection health lives at
+  the right end of the **tab row**, not in the ticker; the update banner still
+  sits at the right of the ticker row when present.
 - Keep the 14px top padding and the 6px gap below the 30px strip. Deleting the
   space entirely makes the tabs look clipped against the title bar; filling
   it with live activity is what makes the gap read as deliberate.
@@ -111,7 +122,10 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   transparent they inherit the table background and the banding disappears
   below the last row.
 - Keep the row's avatar/display name and the live dot; those are the primary
-  identity and state.
+  identity and state. Display names use Chillax (see Typography).
+- Titles longer than 55 characters repeat three times and scroll by `-33.333%`
+  **on row hover only** (`animation-play-state: paused` until hover), so a
+  dense list does not have every row moving at once.
 - Row hover/open/pending states should be subtle background changes, not
   rounded cards.
 

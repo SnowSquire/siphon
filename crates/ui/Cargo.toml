@@ -20,6 +20,9 @@ eros = { version = "=0.9.0-rc.0", default-features = false, features = [
   "alloc",
   "context",
 ] }
+# Must match the version parley (inside zgui) resolves, so the emoji generic
+# is bound in the same font collection the shaper reads.
+fontique = "0.11.1"
 kanal = "0.1.1"
 libplacebo-sys = { path = "../libplacebo-sys" }
 pollster = "0.4"

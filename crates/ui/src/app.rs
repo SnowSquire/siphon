@@ -77,7 +77,7 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
     // Shipped fonts are registered by path in dev so typography can be tried
     // without a rebuild: SIPHON_FONT_UI, SIPHON_FONT_BRAND. Release builds
     // keep ZGUI's system fonts until the licensing/asset path is settled.
-    let fonts = dev_fonts()?;
+    let fonts = fonts()?;
     let window = window.with_fonts(fonts);
 
     // Both platforms compose the interface into a texture and present it
@@ -119,10 +119,36 @@ fn dev_text(path_var: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
-/// Registers fonts named by env vars as UIFont/BrandFont, on top of system
-/// fonts. In release, where no overrides are set, this is just the system set.
-fn dev_fonts() -> eros::Result<Fonts> {
+/// Registers the shipped fonts, then any dev overrides. Archivo and a CBDT
+/// Noto Color Emoji are embedded so every platform renders the same text and
+/// real colour emoji: the system emoji font can be COLRv1, which zgui's
+/// rasterizer decodes as a monochrome outline.
+fn fonts() -> eros::Result<Fonts> {
     let fonts = Fonts::system();
+    fonts
+        .register(
+            Arc::new(include_bytes!("../fonts/Archivo-Variable.ttf").to_vec()),
+            Some("UIFont"),
+        )
+        .map_err(|error| eros::error!("shipped UIFont: {error}"))?;
+    fonts
+        .register(
+            Arc::new(include_bytes!("../fonts/NotoColorEmoji-CBDT.ttf").to_vec()),
+            Some("SiphonEmoji"),
+        )
+        .map_err(|error| eros::error!("shipped emoji font: {error}"))?;
+
+    // parley appends the Emoji generic to every emoji cluster's font query.
+    // Binding it to the shipped family puts that face ahead of the platform
+    // font; the collection is shared with the shaper and rasterizer.
+    let mut context = fonts.shaper().fonts().font_context();
+    if let Some(id) = context.collection.family_id("SiphonEmoji") {
+        context.collection.set_generic_families(
+            fontique::GenericFamily::Emoji,
+            std::iter::once(id),
+        );
+    }
+
     for (var, family) in [
         ("SIPHON_FONT_UI", "UIFont"),
         ("SIPHON_FONT_BRAND", "BrandFont"),
@@ -271,9 +297,6 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
     view! {
         column(class = "app") {
             row(class = "header") {
-                text(class = "conn") {
-                    {move || conn_summary(conn_sig.get(), &channels_sig.get())}
-                }
                 box(class = "ticker") {
                     text(
                         class = "ticker__run",
@@ -346,6 +369,10 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 // so it is drawn and never selected.
                 box(class = "tab tab--off", attr:aria-disabled = "true") {
                     text {"Watch"}
+                }
+                spacer()
+                text(class = "conn") {
+                    {move || conn_summary(conn_sig.get(), &channels_sig.get())}
                 }
             }
 
@@ -482,6 +509,19 @@ fn ChannelRow(
         .clone()
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| "—".to_owned());
+    // A title that cannot fit its cell scrolls on hover. Three copies sliding
+    // by one copy keep the cell filled for the whole loop; shorter titles are
+    // left alone.
+    let long_title = title.chars().count() > 55;
+    let title_run = if long_title {
+        format!("{title}     │     ").repeat(3)
+    } else {
+        title.clone()
+    };
+    let title_duration = format!(
+        "{}s",
+        (title.chars().count() as f32 * 0.22).clamp(10.0, 60.0) as u32
+    );
     let viewers = viewers(&channel);
     let live = channel.live;
     let notify_live = RwSignal::new_local(channel.notify_live);
@@ -529,7 +569,13 @@ fn ChannelRow(
                 }
                 Tooltip {
                     TooltipTrigger(class = "cell cell--title") {
-                        text(class = "channel-title") {{title.clone()}}
+                        box(class = "channel-title") {
+                            text(
+                                class = "channel-title__run",
+                                class:active = long_title,
+                                var:--title-duration = Some(title_duration),
+                            ) {{title_run}}
+                        }
                     }
                     TooltipContent {{stream_tooltip(&channel)}}
                 }
@@ -1656,7 +1702,7 @@ const SHEET: &str = css!(r####"
 
 /* ---- first pass: dense desktop tool -------------------------------- */
 :root {
-    font-family: UIFont, Archivo, sans-serif;
+    font-family: UIFont, Archivo, SiphonEmoji, sans-serif;
     font-variation-settings: "wght" 400, "wdth" 92;
 }
 
@@ -1712,8 +1758,32 @@ const SHEET: &str = css!(r####"
 .channel:nth-child(even) .channel-row { background-color: oklch(0.21 0.014 240); }
 .channel-row:hover { background-color: oklch(0.25 0.016 240); }
 .channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: oklch(0.25 0.016 240); }
-.channel-name { font-size: 13px; }
-.channel-title { font-size: 12px; }
+/* Channel names are the one place with a display face: the old wordmark's
+   Chillax, registered as BrandFont (or its Chillax fallback in dev). */
+.channel-name {
+    font-family: BrandFont, Chillax, sans-serif;
+    font-size: 14px;
+    font-variation-settings: "wght" 600, "wdth" 100;
+}
+.channel-title {
+    width: 100%;
+    overflow: hidden;
+}
+.channel-title__run {
+    display: inline-block;
+    white-space: nowrap;
+    font-size: 12px;
+    color: oklch(0.70 0.018 240);
+}
+.channel-title__run.active {
+    animation: title-scroll var(--title-duration, 20s) linear infinite;
+    animation-play-state: paused;
+}
+.channel-row:hover .channel-title__run.active { animation-play-state: running; }
+@keyframes title-scroll {
+    from { transform: translateX(0); }
+    to { transform: translateX(-33.333%); }
+}
 .detail {
     margin: 2px 6px 6px 6px;
     padding: 10px 12px;
@@ -1820,8 +1890,12 @@ const SHEET: &str = css!(r####"
     border-bottom: 1px solid oklch(0.32 0.020 240);
     overflow: hidden;
 }
-.header .conn {
+.tabs {
+    align-items: center;
+}
+.tabs .conn {
     flex: 0 0 auto;
+    padding: 0 6px;
     color: oklch(0.80 0.012 240);
     font-size: 12px;
 }
