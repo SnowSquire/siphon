@@ -6,6 +6,9 @@ can be opened directly instead of through the ephemeral kwin-mcp temp dir.
 - `01-channels.png`, `02-detail.png`, `03-logs.png` — the stable "before fix"
   set, showing the amber palette that read far too close to Pornhub and the
   chunky filled toggles.
+- `04-channels-collapsed.png`, `05-channels-expanded.png`, `06-logs.png` —
+  fresh captures of the current shipped build after the dark-row / detached
+  detail pass.
 - `raw/` — every capture from the later tab-switching session, including the
   intermediate `frame_*.png` files. Tab clicks lagged by a frame on this
   desktop, so some raw filenames do not match the tab visible in the image.
