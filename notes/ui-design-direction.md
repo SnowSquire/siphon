@@ -70,12 +70,11 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   handle (`@login`) in the detail header.
 - Remove the duplicate LIVE badge from the detail header; the row already has
   the red live dot.
-- Remove the `createdAt` row. `stream_start_ms` and `stream_created_at` are
-  both derived from the same GQL field `stream.createdAt` (see
-  `crates/daemon/src/gql.rs:230-238`): `started` is that timestamp parsed to
-  milliseconds and formatted; `createdAt` is the raw string. They are the same
-  instant and do not need two rows in the UI. Keep the raw string in the daemon
-  for log/record correlation, but drop it from the detail view.
+- No `createdAt` anywhere in the happy path. It was the same GQL
+  `stream.createdAt` already parsed into `stream_start_ms`; keeping both was
+  redundant. The UI shows only `Started`, and the daemon drops the raw string
+  too — if Twitch ever sends a timestamp it cannot parse, that is an error-path
+  warning with the raw value, not state carried through the system.
 - Keep Channel ID, Stream ID, Game ID/Game, Viewers and Collab in the detail
   grid. The grid itself should be denser and flatter than today.
 
@@ -87,6 +86,15 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   not as a literal pixel-art recreation.
 - Reject mobile/web-first design systems (Material, Carbon, Spectrum) as the
   basis; they are not the target feel.
+
+## Iteration loop
+
+Visual changes do not need a rebuild. `app::run` reads three env vars at
+startup: `SIPHON_SHEET` and `SIPHON_THEME_CSS` replace the compiled-in CSS text,
+and `SIPHON_FONT_UI` / `SIPHON_FONT_BRAND` register local font files under the
+families `UIFont` and `BrandFont`. A checkpoint is therefore: edit the dev CSS,
+restart the binary, screenshot. Only view-structure or data-model changes need
+a compile.
 
 ## Open
 

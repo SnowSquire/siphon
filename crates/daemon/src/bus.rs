@@ -92,7 +92,7 @@ impl Bus {
 
     /// Appends one event with no stream identity.
     pub fn log(&self, level: LogLevel, target: &str, message: impl Into<String>) {
-        self.log_channel(level, target, message, None, None, None);
+        self.log_channel(level, target, message, None, None);
     }
 
     /// Appends one event and sends it to every connected UI.
@@ -106,7 +106,6 @@ impl Bus {
         message: impl Into<String>,
         login: Option<String>,
         stream_id: Option<u64>,
-        created_at: Option<String>,
     ) {
         let seq = self.next_log.get();
         self.next_log.set(seq.wrapping_add(1));
@@ -118,7 +117,6 @@ impl Bus {
             message: message.into(),
             login,
             stream_id,
-            created_at,
         };
         {
             let mut logs = self.logs.borrow_mut();

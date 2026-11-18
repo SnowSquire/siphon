@@ -109,8 +109,8 @@ enum Update {
 
 `ChannelView` carries what the UI renders: id, login, display name, the remote
 avatar URL and the local `avatarPath` the daemon cached, live, title, game, the
-game id, viewers, stream start, the raw `createdAt`, Twitch's `BROADCAST-ID`,
-and the per-channel `notifyLive` / `notifyTitles` / `record` switches. ZGUI's
+game id, viewers, stream start as milliseconds, Twitch's `BROADCAST-ID`, and
+the per-channel `notifyLive` / `notifyTitles` / `record` switches. ZGUI's
 image element reads files, not URLs, so `avatar::ensure` downloads each picture
 once into the app data directory and the row is re-published when the path
 exists. The workspace version (`0.5.0`) is shared by `daemon`, `siphon-rpc` and
@@ -122,8 +122,7 @@ is only scalars; the segment ring is queryable and updates append to it.
 
 `LogEntry` is the daemon's bounded event ring (`LOG_CAP`, 512): `seq`, `at_ms`,
 level, subsystem target, message, and the stream identity beside it (`login`,
-`stream_id`, raw `createdAt`) so the Logs tab can correlate a line with the
-recording on disk. `Update::Log` is append-only and never coalesced. The ring
+`stream_id`) so the Logs tab can correlate a line with the recording on disk. `Update::Log` is append-only and never coalesced. The ring
 lives on the bus, not the app, so the registry can log a recording start/stop
 and the snapshot still carries the whole history.
 
@@ -325,8 +324,8 @@ downloader counters, pipeline state, notifications and the event ring), and
 **Watch**, which is drawn with a `not-allowed` cursor until the video surface
 exists. zgui-ui controls are themed through one `ThemeProvider` token block in
 `THEME_CSS`, so switches, inputs and tooltips share the hand-written palette.
-Hovering a row's name, title or game shows its channel id, broadcast id (with
-`createdAt`) and game id; the expanded panel shows all of them as fields.
+Hovering a row's name, title or game shows its channel id, broadcast id and
+game id; the expanded panel shows those and the stream's start time as fields.
 
 The UI is ZGUI (fine-grained `reactive_graph` signals); `Snapshot`/`Update` map
 onto the reactive state, and the protocol stays free of ZGUI types. The renderer

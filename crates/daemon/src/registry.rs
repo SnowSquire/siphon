@@ -482,7 +482,6 @@ impl Registry {
             ),
             Some(runtime.key.login.clone()),
             Some(runtime.broadcast_id),
-            None,
         );
         self.publish_pipeline(runtime);
     }
@@ -500,7 +499,6 @@ impl Registry {
             "recording stopped",
             Some(runtime.key.login.clone()),
             Some(runtime.broadcast_id),
-            None,
         );
         self.publish_pipeline(runtime);
     }

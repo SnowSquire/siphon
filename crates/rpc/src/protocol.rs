@@ -136,8 +136,6 @@ pub struct ChannelView {
     pub collaboration_viewers: Option<u32>,
     /// Milliseconds since the unix epoch; `None` while offline.
     pub stream_start_ms: Option<i64>,
-    /// The raw `createdAt` Twitch sent with the stream; `None` while offline.
-    pub stream_created_at: Option<String>,
     /// Twitch's `BROADCAST-ID` for the current or last broadcast; 0 when absent.
     pub stream_id: u64,
     pub notify_live: bool,
@@ -277,8 +275,6 @@ pub struct LogEntry {
     pub message: String,
     pub login: Option<String>,
     pub stream_id: Option<u64>,
-    /// The raw `createdAt` Twitch sent with the stream.
-    pub created_at: Option<String>,
 }
 
 /// An update offer rendered by the UI.

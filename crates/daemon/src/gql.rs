@@ -53,8 +53,6 @@ pub struct ChannelDetail {
     pub stream_title: Option<String>,
     /// Milliseconds since the unix epoch; `None` when offline.
     pub stream_start: Option<i64>,
-    /// Raw `createdAt` from the stream, kept for logging; `None` offline.
-    pub stream_created_at: Option<String>,
     pub viewers: Option<u32>,
     pub collaboration_viewers: Option<u32>,
     pub game: Option<StreamGame>,
@@ -92,7 +90,6 @@ impl ChannelDetail {
             viewers: self.viewers,
             collaboration_viewers: self.collaboration_viewers,
             stream_start_ms: self.stream_start,
-            stream_created_at: self.stream_created_at.clone(),
             stream_id: self.stream_id,
             notify_live: channel.is_none_or(|channel| channel.notify_live),
             notify_titles: channel.is_none_or(|channel| channel.notify_titles),
@@ -218,6 +215,22 @@ where
 impl GqlUser {
     fn into_channel(self) -> Option<ChannelDetail> {
         let broadcast = self.broadcast?;
+        // `createdAt` is only useful as a parsed instant. If Twitch ever sends
+        // a string we cannot parse, say so in the error path rather than
+        // carrying the raw value through the happy path as redundant state.
+        let created_at = self
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.created_at.as_deref());
+        let stream_start = created_at.and_then(parse_iso_ms);
+        if created_at.is_some() && stream_start.is_none() {
+            tracing::warn!(
+                target: "gql",
+                login = %self.login.as_deref().unwrap_or(""),
+                created_at = %created_at.unwrap_or(""),
+                "could not parse Twitch stream createdAt"
+            );
+        }
         Some(ChannelDetail {
             id: self.id?,
             login: self.login.filter(|login| !login.is_empty())?,
@@ -226,15 +239,7 @@ impl GqlUser {
             avatar_path: None,
             stream_id: broadcast.id?,
             stream_title: broadcast.title.filter(|title| !title.is_empty()),
-            stream_start: self
-                .stream
-                .as_ref()
-                .and_then(|stream| stream.created_at.as_deref())
-                .and_then(parse_iso_ms),
-            stream_created_at: self
-                .stream
-                .as_ref()
-                .and_then(|stream| stream.created_at.clone()),
+            stream_start,
             game: broadcast.game.and_then(|game| {
                 Some(StreamGame {
                     id: game.id?,

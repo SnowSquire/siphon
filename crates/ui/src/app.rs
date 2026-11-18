@@ -54,7 +54,11 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
     // The preset dark scheme is close, but the window has its own ink. The
     // token block is what makes every zgui-ui control (switches, inputs,
     // tooltips, buttons) use the same palette as the hand-written classes.
-    let dark = Signal::stored_local(Theme::dark().with_css(THEME_CSS));
+    // Dev loop: both token and sheet text can be overridden from files, so a
+    // visual change needs a process restart, not a recompile.
+    let theme_css = dev_text("SIPHON_THEME_CSS", THEME_CSS);
+    let dark = Signal::stored_local(Theme::dark().with_css(&theme_css));
+    let sheet = dev_text("SIPHON_SHEET", SHEET);
 
     let window = app()
         .with_application_id("com.iken.siphon")
@@ -62,7 +66,13 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
         .with_size(1000.0, 760.0)
         .with_min_size(840.0, 560.0)
         .with_resizable(true)
-        .with_stylesheet(SHEET);
+        .with_stylesheet(sheet);
+
+    // Shipped fonts are registered by path in dev so typography can be tried
+    // without a rebuild: SIPHON_FONT_UI, SIPHON_FONT_BRAND. Release builds
+    // keep ZGUI's system fonts until the licensing/asset path is settled.
+    let fonts = dev_fonts()?;
+    let window = window.with_fonts(fonts);
 
     // Both platforms compose the interface into a texture and present it
     // through a chain: DXGI on Windows, a Vulkan swapchain on Wayland. Only the
@@ -91,6 +101,35 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
             }
         })
         .map_err(|error| eros::error!("zgui: {error}"))
+}
+
+/// Reads a dev override for a stylesheet from `path_var`, or the compiled-in
+/// text when the variable is unset or the file cannot be read.
+fn dev_text(path_var: &str, fallback: &str) -> String {
+    std::env::var_os(path_var)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+/// Registers fonts named by env vars as UIFont/BrandFont, on top of system
+/// fonts. In release, where no overrides are set, this is just the system set.
+fn dev_fonts() -> eros::Result<Fonts> {
+    let fonts = Fonts::system();
+    for (var, family) in [
+        ("SIPHON_FONT_UI", "UIFont"),
+        ("SIPHON_FONT_BRAND", "BrandFont"),
+    ] {
+        let Some(path) = std::env::var_os(var) else {
+            continue;
+        };
+        let bytes = std::fs::read(&path)
+            .map_err(|error| eros::error!("{var} ({path:?}): {error}"))?;
+        let data: zgui::text::FontData = Arc::new(bytes);
+        fonts
+            .register(data, Some(family))
+            .map_err(|error| eros::error!("{var} ({family}): {error}"))?;
+    }
+    Ok(fonts)
 }
 
 /// Gives back the resident pages a hidden window no longer needs.
@@ -544,8 +583,6 @@ fn ChannelRow(
 }
 
 fn channel_detail_view(channel: &ChannelView) -> impl IntoView {
-    let display_name = channel.display_name.clone();
-    let initials = initials(&display_name);
     let login = channel.login.clone();
     let stream_id = if channel.stream_id == 0 {
         "—".to_owned()
@@ -570,29 +607,12 @@ fn channel_detail_view(channel: &ChannelView) -> impl IntoView {
     let started = channel
         .stream_start_ms
         .map_or_else(|| "—".to_owned(), format_iso_ms);
-    let created_at = channel
-        .stream_created_at
-        .clone()
-        .unwrap_or_else(|| "—".to_owned());
     let viewers = channel.viewers.map_or_else(|| "—".to_owned(), format_count);
-    let status = if channel.live { "LIVE" } else { "OFFLINE" };
 
     view! {
         column(class = "detail") {
             row(class = "detail-head") {
-                Avatar(
-                    size = AvatarSize::Sm,
-                    src = Signal::stored_local(channel.avatar_path.clone()),
-                    label = display_name.clone()
-                ) {
-                    text {{initials}}
-                }
-                column(class = "detail-id") {
-                    text(class = "detail-name") {{display_name}}
-                    text(class = "detail-login") {{format!("@{login}")}}
-                }
-                spacer()
-                text(class = "badge", class:live = channel.live) {{status}}
+                text(class = "detail-login") {{format!("@{login}")}}
             }
             row(class = "detail-grid") {
                 column(class = "detail-col") {
@@ -605,7 +625,6 @@ fn channel_detail_view(channel: &ChannelView) -> impl IntoView {
                     {detail_item("Viewers", viewers)}
                     {detail_item("Collab", collab)}
                     {detail_item("Started", started)}
-                    {detail_item("createdAt", created_at)}
                 }
             }
         }
@@ -937,10 +956,6 @@ fn log_row(entry: LogEntry) -> impl IntoView {
     let meta = [
         entry.login.as_ref().map(|login| format!("@{login}")),
         entry.stream_id.map(|id| format!("stream {id}")),
-        entry
-            .created_at
-            .as_ref()
-            .map(|created| format!("created {created}")),
     ]
     .into_iter()
     .flatten()
@@ -995,10 +1010,7 @@ fn stream_tooltip(channel: &ChannelView) -> String {
     if channel.stream_id == 0 {
         return "No stream id resolved yet".to_owned();
     }
-    channel.stream_created_at.as_deref().map_or_else(
-        || format!("Stream ID {}", channel.stream_id),
-        |created| format!("Stream ID {} · created {created}", channel.stream_id),
-    )
+    format!("Stream ID {}", channel.stream_id)
 }
 
 fn initials(display_name: &str) -> String {
@@ -1016,34 +1028,34 @@ fn initials(display_name: &str) -> String {
 /// The token block the zgui-ui controls read. It is laid over the dark preset
 /// rather than written as a second style sheet so the provider owns the cascade
 /// and every control is themed by one palette.
-const THEME_CSS: &str = "
-    --zui-color-background: #0d0f14;
-    --zui-color-foreground: #e9edf5;
-    --zui-color-card: #12151c;
-    --zui-color-card-foreground: #e9edf5;
-    --zui-color-popover: #171b24;
-    --zui-color-popover-foreground: #e9edf5;
-    --zui-color-primary: #9146ff;
-    --zui-color-primary-foreground: #ffffff;
-    --zui-color-secondary: #1c2130;
-    --zui-color-secondary-foreground: #e9edf5;
-    --zui-color-muted: #1b2030;
-    --zui-color-muted-foreground: #97a1b4;
-    --zui-color-accent: #222838;
-    --zui-color-accent-foreground: #ffffff;
-    --zui-color-destructive: #e5484d;
+const THEME_CSS: &str = r####"
+    --zui-color-background: #0b0d12;
+    --zui-color-foreground: #e8ecf4;
+    --zui-color-card: #11141b;
+    --zui-color-card-foreground: #e8ecf4;
+    --zui-color-popover: #151922;
+    --zui-color-popover-foreground: #e8ecf4;
+    --zui-color-primary: #f59e0b;
+    --zui-color-primary-foreground: #1a1204;
+    --zui-color-secondary: #1b202b;
+    --zui-color-secondary-foreground: #e8ecf4;
+    --zui-color-muted: #1a1f29;
+    --zui-color-muted-foreground: #8b95a7;
+    --zui-color-accent: #202634;
+    --zui-color-accent-foreground: #e8ecf4;
+    --zui-color-destructive: #f43f5e;
     --zui-color-destructive-foreground: #ffffff;
-    --zui-color-border: #232936;
-    --zui-color-input: #232936;
-    --zui-color-ring: #9146ff;
-    --zui-color-tooltip: #1b2130;
-    --zui-color-tooltip-foreground: #e9edf5;
-    --zui-color-tooltip-border: #2c3444;
-    --zui-radius-base: 6px;
-";
+    --zui-color-border: #2a3140;
+    --zui-color-input: #2a3140;
+    --zui-color-ring: #f59e0b;
+    --zui-color-tooltip: #1a1f29;
+    --zui-color-tooltip-foreground: #e8ecf4;
+    --zui-color-tooltip-border: #2a3140;
+    --zui-radius-base: 0px;
+"####;
 
-const SHEET: &str = css!(
-    ":root {
+const SHEET: &str = css!(r####"
+:root {
         background-color: #0d0f14;
         color: #e9edf5;
         font-family: sans-serif;
@@ -1223,7 +1235,7 @@ const SHEET: &str = css!(
     }
 
     .chevron.open {
-        color: #a970ff;
+        color: #f59e0b;
         transform: rotate(90deg);
     }
 
@@ -1552,7 +1564,7 @@ const SHEET: &str = css!(
     .log__target {
         width: 74px;
         font-size: 11px;
-        color: #a970ff;
+        color: #f59e0b;
     }
 
     .log__message {
@@ -1566,5 +1578,74 @@ const SHEET: &str = css!(
     .log__meta {
         font-size: 11px;
         color: #7d879b;
-    }"
-);
+    }
+
+/* ---- first pass: dense desktop tool -------------------------------- */
+:root {
+    font-family: UIFont, Archivo, sans-serif;
+    font-variation-settings: "wght" 400, "wdth" 92;
+}
+
+.app { padding: 10px 12px; gap: 4px; }
+.brand-block { gap: 0; }
+.brand {
+    font-family: BrandFont, Chillax, sans-serif;
+    font-size: 24px;
+    font-weight: 700;
+    font-variation-settings: "wght" 700, "wdth" 100;
+    letter-spacing: 0.2px;
+}
+
+.tabs {
+    gap: 0;
+    padding: 0 2px;
+    border-bottom: 1px solid #2a3140;
+}
+.tab {
+    padding: 5px 14px;
+    border-radius: 10px 10px 0 0;
+    font-size: 13px;
+    font-variation-settings: "wght" 600, "wdth" 92;
+}
+.tabbody {
+    gap: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background-color: transparent;
+}
+.tablehead {
+    padding: 6px 10px;
+    border-bottom: 1px solid #2a3140;
+}
+.tablehead .cell { font-size: 10px; }
+.cell { font-size: 12px; }
+.channels {
+    background-image: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 3px,
+        rgba(255, 255, 255, 0.14) 3px,
+        rgba(255, 255, 255, 0.14) 4px
+    );
+}
+.list { gap: 0; padding: 0; }
+.channel { padding: 0; }
+.channel-row {
+    min-height: 28px;
+    padding: 2px 10px;
+    border-radius: 0;
+}
+.channel:nth-child(even) .channel-row { background-color: #151922; }
+.channel-row:hover { background-color: #1d2330; }
+.channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: #202736; }
+.channel-name { font-size: 13px; }
+.channel-title { font-size: 12px; }
+.detail {
+    margin: 0 6px 4px 24px;
+    padding: 10px 12px;
+    border-radius: 0;
+}
+.log { border-radius: 0; }
+.banner, .error { border-radius: 0; }
+"####);

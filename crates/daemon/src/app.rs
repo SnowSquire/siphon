@@ -562,7 +562,6 @@ impl App {
                     viewers: None,
                     collaboration_viewers: None,
                     stream_start_ms: None,
-                    stream_created_at: None,
                     stream_id: 0,
                     notify_live: channel.notify_live,
                     notify_titles: channel.notify_titles,
@@ -710,7 +709,6 @@ impl App {
                 format!("{summary}: {body}")
             },
             login.clone(),
-            None,
             None,
         );
         self.bus.publish(Update::Notification(notification));

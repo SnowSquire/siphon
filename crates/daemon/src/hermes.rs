@@ -200,11 +200,13 @@ impl App {
             if should_log_stream(old, channel) {
                 tracing::info!(
                     target: "hermes",
-                    "stream {}({}): stream_id={} createdAt={}",
+                    "stream {}({}): stream_id={} started={}",
                     channel.login,
                     channel.id,
                     channel.stream_id,
-                    channel.stream_created_at.as_deref().unwrap_or("none"),
+                    channel
+                        .stream_start
+                        .map_or("unknown".to_owned(), crate::time::format_iso_ms),
                 );
             }
         }
@@ -296,28 +298,22 @@ impl App {
                 .and_then(|old| old.avatar_path.clone());
         }
         if should_log_stream(self.channels.get(&id), &user) {
+            let started = user
+                .stream_start
+                .map_or("an unknown time".to_owned(), crate::time::format_iso_ms);
             tracing::info!(
                 target: "hermes",
-                "stream {}({}): stream_id={} createdAt={}",
+                "stream {}({}): stream_id={} started={started}",
                 user.login,
                 user.id,
                 user.stream_id,
-                user.stream_created_at.as_deref().unwrap_or("none"),
             );
             self.bus.log_channel(
                 LogLevel::Info,
                 "hermes",
-                format!(
-                    "{} stream {} started at {}",
-                    user.login,
-                    user.stream_id,
-                    user.stream_created_at
-                        .as_deref()
-                        .unwrap_or("an unknown time"),
-                ),
+                format!("{} stream {} started at {started}", user.login, user.stream_id),
                 Some(user.login.clone()),
                 Some(user.stream_id),
-                user.stream_created_at.clone(),
             );
         }
         let config = self.channel_config(id);
@@ -679,7 +675,6 @@ impl App {
         }
         let login = user.login.clone();
         let stream_id = user.stream_id;
-        let created_at = user.stream_created_at.clone();
         user.stream_title = Some(status).filter(|title| !title.is_empty());
         let game_display_name = user.game.as_ref().map(|game| game.display_name.clone());
         user.game = game
@@ -698,7 +693,6 @@ impl App {
                 changes.join(", "),
                 Some(login),
                 Some(stream_id),
-                created_at,
             );
         }
         if let Some((summary, body, avatar, login)) = toast {
@@ -743,7 +737,6 @@ impl App {
                 let title = user.stream_title.clone();
                 let avatar = user.profile_image_url.clone();
                 let stream_id = user.stream_id;
-                let created_at = user.stream_created_at.clone();
                 let Some(user) = self.channels.get_mut(&id) else {
                     return;
                 };
@@ -757,7 +750,6 @@ impl App {
                     "is live",
                     Some(login.clone()),
                     Some(stream_id),
-                    created_at,
                 );
                 if quiet {
                     tracing::info!(
@@ -792,7 +784,6 @@ impl App {
                 };
                 let login = user.login.clone();
                 let stream_id = user.stream_id;
-                let created_at = user.stream_created_at.clone();
                 self.quiet_until.insert(id, Instant::now() + OFFLINE_QUIET);
                 if let Some(user) = self.channels.get_mut(&id) {
                     user.live = false;
@@ -807,7 +798,6 @@ impl App {
                     "went offline",
                     Some(login.clone()),
                     Some(stream_id),
-                    created_at,
                 );
                 self.registry.stream_down(&login);
             }
@@ -883,7 +873,7 @@ impl App {
 /// identity moved.
 fn should_log_stream(old: Option<&ChannelDetail>, new: &ChannelDetail) -> bool {
     old.map_or_else(
-        || new.stream_created_at.is_some(),
-        |prev| prev.stream_id != new.stream_id || prev.stream_created_at != new.stream_created_at,
+        || new.stream_start.is_some(),
+        |prev| prev.stream_id != new.stream_id || prev.stream_start != new.stream_start,
     )
 }
