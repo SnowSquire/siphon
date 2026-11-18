@@ -5,12 +5,14 @@
 //! files, GQL, Hermes, pipelines) stays in the daemon; this crate only owns
 //! the shape and the frame codec.
 
+use std::num::NonZeroU64;
+
 use serde::Deserialize;
 use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -124,6 +126,9 @@ pub struct ChannelView {
     pub id: u64,
     pub login: String,
     pub display_name: String,
+    /// Twitch's chat colour for the channel's switches, with a generated
+    /// fallback when Twitch reports none.
+    pub chat_color: String,
     pub profile_image_url: String,
     /// A local file the daemon cached for the avatar; `None` until it exists.
     pub avatar_path: Option<String>,
@@ -136,8 +141,8 @@ pub struct ChannelView {
     pub collaboration_viewers: Option<u32>,
     /// Milliseconds since the unix epoch; `None` while offline.
     pub stream_start_ms: Option<i64>,
-    /// Twitch's `BROADCAST-ID` for the current or last broadcast; 0 when absent.
-    pub stream_id: u64,
+    /// Twitch's `BROADCAST-ID` for the active stream; `None` while offline.
+    pub stream_id: Option<NonZeroU64>,
     pub notify_live: bool,
     pub notify_titles: bool,
     pub record: bool,
@@ -274,7 +279,7 @@ pub struct LogEntry {
     pub target: String,
     pub message: String,
     pub login: Option<String>,
-    pub stream_id: Option<u64>,
+    pub stream_id: Option<NonZeroU64>,
 }
 
 /// An update offer rendered by the UI.

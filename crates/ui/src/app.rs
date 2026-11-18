@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use siphon_rpc::ArenaSummary;
 use siphon_rpc::ChannelView;
@@ -66,6 +67,11 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
         .with_size(1000.0, 760.0)
         .with_min_size(840.0, 560.0)
         .with_resizable(true)
+        // The libplacebo chain owns presentation pacing. ZGUI must keep
+        // composing at the animation cadence instead of waiting for a surface
+        // callback that the swapchain's own `wl_surface.frame()` request makes
+        // arrive one serial late; see `chain::wayland::wait_for_frame`.
+        .with_compose_ahead(ComposeAhead::Always)
         .with_stylesheet(sheet);
 
     // Shipped fonts are registered by path in dev so typography can be tried
@@ -95,8 +101,10 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
             let events = events.clone();
             let dark = dark;
             view! {
-                ThemeProvider(scheme = ColorScheme::Dark, dark = dark) {
-                    App(state = state, intents = intents, events = events)
+                TooltipProvider(delay = Duration::from_millis(400)) {
+                    ThemeProvider(scheme = ColorScheme::Dark, dark = dark) {
+                        App(state = state, intents = intents, events = events)
+                    }
                 }
             }
         })
@@ -408,8 +416,8 @@ fn ChannelsTab(
     view! {
         column(class = "tabbody") {
             row(class = "tablehead") {
-                text(class = "cell cell--chevron") {""}
                 text(class = "cell cell--dot") {""}
+                text(class = "cell cell--chevron") {""}
                 text(class = "cell cell--channel") {"Channel"}
                 text(class = "cell cell--title") {"Title"}
                 text(class = "cell cell--notify") {"Notify"}
@@ -428,8 +436,8 @@ fn ChannelsTab(
                     }
                     for login in move || (*pending.get()).clone(), key = |login: &String| login.clone() {
                         row(class = "channel-row pending") {
-                            text(class = "cell cell--chevron") {""}
-                            text(class = "live-dot") {"●"}
+                            text(class = "cell cell--dot") {""}
+                            box(class = "live-dot") {box(class = "live-dot__lamp")}
                             text(class = "cell cell--channel") {{login.clone()}}
                             text(class = "cell cell--title") {"resolving…"}
                             spacer()
@@ -461,6 +469,7 @@ fn ChannelRow(
     let open = Signal::derive_local(move || expanded.get().contains(&id));
     let display_name = channel.display_name.clone();
     let initials = initials(&display_name);
+    let color = channel.chat_color.clone();
     let avatar_path = channel.avatar_path.clone();
     let title = channel
         .title
@@ -484,6 +493,7 @@ fn ChannelRow(
             row(
                 class = "channel-row",
                 class:open = open,
+                var:--channel-color = color,
                 on:click = move |_| {
                     expanded.update(|expanded| {
                         if !expanded.remove(&id) {
@@ -492,8 +502,10 @@ fn ChannelRow(
                     });
                 }
             ) {
-                text(class = "chevron", class:open = open) {"›"}
-                text(class = "live-dot", class:live = live) {"●"}
+                box(class = "live-dot", class:live = live) {box(class = "live-dot__lamp")}
+                box(class = "chevron", class:open = open) {
+                    box(class = "chevron__tip")
+                }
                 Tooltip {
                     TooltipTrigger(class = "cell cell--channel") {
                         row(class = "identity") {
@@ -584,11 +596,14 @@ fn ChannelRow(
 
 fn channel_detail_view(channel: &ChannelView) -> impl IntoView {
     let login = channel.login.clone();
-    let stream_id = if channel.stream_id == 0 {
-        "—".to_owned()
-    } else {
-        channel.stream_id.to_string()
-    };
+    let title = channel
+        .title
+        .clone()
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "No title".to_owned());
+    let stream_id = channel
+        .stream_id
+        .map_or_else(|| "—".to_owned(), |id| id.to_string());
     let game_id = channel
         .game_id
         .map_or_else(|| "—".to_owned(), |id| id.to_string());
@@ -614,6 +629,7 @@ fn channel_detail_view(channel: &ChannelView) -> impl IntoView {
             row(class = "detail-head") {
                 text(class = "detail-login") {{format!("@{login}")}}
             }
+            text(class = "detail-title") {{title}}
             row(class = "detail-grid") {
                 column(class = "detail-col") {
                     {detail_item("Channel ID", channel.id.to_string())}
@@ -687,10 +703,12 @@ fn FilterTab(
                         text(class = "switch-hint") {"Notify when a followed channel changes its title or game."}
                     }
                     spacer()
-                    Switch(checked = Binding::controlled(
-                        Signal::derive_local(move || title_changes.get()),
-                        move |on| titles.send(UiCommand::Request(Request::SetNotifyTitleChanges(on))),
-                    ))
+                    Switch(
+                        checked = Binding::controlled(
+                            Signal::derive_local(move || title_changes.get()),
+                            move |on| titles.send(UiCommand::Request(Request::SetNotifyTitleChanges(on))),
+                        )
+                    )
                 }
                 row(class = "switch-row") {
                     column(class = "switch-copy") {
@@ -698,10 +716,12 @@ fn FilterTab(
                         text(class = "switch-hint") {"Play a sound with every toast and webhook."}
                     }
                     spacer()
-                    Switch(checked = Binding::controlled(
-                        Signal::derive_local(move || sound.get()),
-                        move |on| sound_switch.send(UiCommand::Request(Request::SetSound(on))),
-                    ))
+                    Switch(
+                        checked = Binding::controlled(
+                            Signal::derive_local(move || sound.get()),
+                            move |on| sound_switch.send(UiCommand::Request(Request::SetSound(on))),
+                        )
+                    )
                 }
             }
             text(class = "section-title") {"Filtered words"}
@@ -1007,10 +1027,10 @@ fn viewers(channel: &ChannelView) -> String {
 }
 
 fn stream_tooltip(channel: &ChannelView) -> String {
-    if channel.stream_id == 0 {
-        return "No stream id resolved yet".to_owned();
-    }
-    format!("Stream ID {}", channel.stream_id)
+    channel.stream_id.map_or_else(
+        || "No stream id resolved yet".to_owned(),
+        |id| format!("Stream ID {id}"),
+    )
 }
 
 fn initials(display_name: &str) -> String {
@@ -1029,35 +1049,43 @@ fn initials(display_name: &str) -> String {
 /// rather than written as a second style sheet so the provider owns the cascade
 /// and every control is themed by one palette.
 const THEME_CSS: &str = r####"
-    --zui-color-background: #0b0d12;
-    --zui-color-foreground: #e8ecf4;
-    --zui-color-card: #11141b;
-    --zui-color-card-foreground: #e8ecf4;
-    --zui-color-popover: #151922;
-    --zui-color-popover-foreground: #e8ecf4;
-    --zui-color-primary: #f59e0b;
-    --zui-color-primary-foreground: #1a1204;
-    --zui-color-secondary: #1b202b;
-    --zui-color-secondary-foreground: #e8ecf4;
-    --zui-color-muted: #1a1f29;
-    --zui-color-muted-foreground: #8b95a7;
-    --zui-color-accent: #202634;
-    --zui-color-accent-foreground: #e8ecf4;
+    --zui-color-background: oklch(0.16 0.012 240);
+    --zui-color-foreground: oklch(0.94 0.008 240);
+    --zui-color-card: oklch(0.21 0.015 240);
+    --zui-color-card-foreground: oklch(0.94 0.008 240);
+    --zui-color-popover: oklch(0.23 0.015 240);
+    --zui-color-popover-foreground: oklch(0.94 0.008 240);
+    --zui-color-primary: oklch(0.75 0.13 230);
+    --zui-color-primary-foreground: oklch(0.28 0.05 230);
+    --zui-color-secondary: oklch(0.24 0.016 240);
+    --zui-color-secondary-foreground: oklch(0.94 0.008 240);
+    --zui-color-muted: oklch(0.23 0.016 240);
+    --zui-color-muted-foreground: oklch(0.68 0.018 240);
+    --zui-color-accent: oklch(0.26 0.018 240);
+    --zui-color-accent-foreground: oklch(0.94 0.008 240);
     --zui-color-destructive: #f43f5e;
     --zui-color-destructive-foreground: #ffffff;
-    --zui-color-border: #2a3140;
-    --zui-color-input: #2a3140;
-    --zui-color-ring: #f59e0b;
-    --zui-color-tooltip: #1a1f29;
-    --zui-color-tooltip-foreground: #e8ecf4;
-    --zui-color-tooltip-border: #2a3140;
+    --zui-color-border: oklch(0.32 0.020 240);
+    --zui-color-input: oklch(0.32 0.020 240);
+    --zui-color-ring: oklch(0.75 0.13 230);
+    --zui-color-tooltip: oklch(0.23 0.016 240);
+    --zui-color-tooltip-foreground: oklch(0.94 0.008 240);
+    --zui-color-tooltip-border: oklch(0.32 0.020 240);
     --zui-radius-base: 0px;
+    /* The switch/checkbox components declare their own transition-property and
+       read this token; Terminal sets it to 0ms. Overriding the token is what
+       actually makes the stock transitions run. */
+    --zui-motion-duration-normal: 160ms;
+    --zui-motion-ease-standard: ease;
+    /* A slim bar in a permanently reserved right strip: the engine cannot do
+       `scrollbar-gutter`, so the channels viewport asks for a gutter always. */
+    --zui-scrollbar-width: 8px;
 "####;
 
 const SHEET: &str = css!(r####"
 :root {
-        background-color: #0d0f14;
-        color: #e9edf5;
+        background-color: oklch(0.16 0.012 240);
+        color: oklch(0.95 0.008 240);
         font-family: sans-serif;
     }
 
@@ -1082,7 +1110,7 @@ const SHEET: &str = css!(r####"
     }
 
     .conn {
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
         font-size: 12px;
     }
 
@@ -1119,29 +1147,29 @@ const SHEET: &str = css!(r####"
         border-radius: 10px 10px 0 0;
         border: 1px solid transparent;
         border-bottom: 0;
-        color: #97a1b4;
+        color: oklch(0.70 0.018 240);
         font-size: 14px;
         cursor: pointer;
     }
 
     .tab:hover {
-        color: #e9edf5;
-        background-color: #171b24;
+        color: oklch(0.95 0.008 240);
+        background-color: oklch(0.25 0.016 240);
     }
 
     .tab.on {
         color: #ffffff;
-        background-color: #1b2030;
-        border-color: #232936;
+        background-color: oklch(0.24 0.016 240);
+        border-color: oklch(0.30 0.018 240);
     }
 
     .tab--off {
-        color: #4b5263;
+        color: oklch(0.45 0.020 240);
         cursor: not-allowed;
     }
 
     .tab--off:hover {
-        color: #4b5263;
+        color: oklch(0.45 0.020 240);
         background-color: transparent;
     }
 
@@ -1150,19 +1178,19 @@ const SHEET: &str = css!(r####"
         gap: 10px;
         padding: 12px;
         border-radius: 12px;
-        border: 1px solid #232936;
-        background-color: #12151c;
+        border: 1px solid oklch(0.30 0.018 240);
+        background-color: oklch(0.19 0.012 240);
     }
 
     .tablehead {
         gap: 10px;
         align-items: center;
         padding: 0 10px 8px;
-        border-bottom: 1px solid #232936;
+        border-bottom: 1px solid oklch(0.30 0.018 240);
     }
 
     .tablehead .cell {
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
         font-size: 11px;
         font-weight: 600;
         letter-spacing: 0.6px;
@@ -1171,7 +1199,7 @@ const SHEET: &str = css!(r####"
 
     .cell {
         font-size: 13px;
-        color: #d7dce8;
+        color: oklch(0.88 0.010 240);
     }
 
     .cell--chevron { width: 14px; }
@@ -1224,28 +1252,34 @@ const SHEET: &str = css!(r####"
         border-radius: 9px;
     }
 
-    .channel-row:hover { background-color: #181d27; }
-    .channel-row.open { background-color: #171c26; }
+    .channel-row:hover { background-color: oklch(0.26 0.017 240); }
+    .channel-row.open { background-color: oklch(0.25 0.016 240); }
     .channel-row.pending { opacity: 0.65; }
 
-    .chevron {
-        width: 14px;
-        color: #5c6577;
-        font-size: 14px;
-    }
-
-    .chevron.open {
-        color: #f59e0b;
-        transform: rotate(90deg);
-    }
-
     .live-dot {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         width: 10px;
-        color: #3a3f4c;
-        font-size: 10px;
     }
 
-    .live-dot.live { color: #f43f5e; }
+    /* A drawn box, not a text glyph: zgui does not paint text inside a
+       transformed element, which made a pulsing "●" disappear entirely. */
+    .live-dot__lamp {
+        width: 6px;
+        height: 6px;
+        background-color: oklch(0.40 0.015 240);
+    }
+
+    .live-dot.live .live-dot__lamp {
+        background-color: #f43f5e;
+        animation: live-pulse 1500ms ease-in-out infinite;
+    }
+
+    @keyframes live-pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.55; transform: scale(0.8); }
+    }
 
     .identity {
         align-items: center;
@@ -1259,7 +1293,7 @@ const SHEET: &str = css!(r####"
         min-width: 0;
         font-size: 14px;
         font-weight: 600;
-        color: #e9edf5;
+        color: oklch(0.95 0.008 240);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1268,7 +1302,7 @@ const SHEET: &str = css!(r####"
     .channel-title {
         width: 100%;
         font-size: 13px;
-        color: #97a1b4;
+        color: oklch(0.70 0.018 240);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1293,14 +1327,14 @@ const SHEET: &str = css!(r####"
 
     .mini__label {
         font-size: 9px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
         letter-spacing: 0.3px;
     }
 
     .remove {
         width: 28px;
         height: 28px;
-        color: #6c7587;
+        color: oklch(0.56 0.020 240);
     }
 
     .detail {
@@ -1308,8 +1342,8 @@ const SHEET: &str = css!(r####"
         padding: 14px 16px;
         gap: 12px;
         border-radius: 10px;
-        border: 1px solid #232936;
-        background-color: #0f1219;
+        border: 1px solid oklch(0.30 0.018 240);
+        background-color: oklch(0.20 0.013 240);
     }
 
     .detail-head {
@@ -1326,7 +1360,7 @@ const SHEET: &str = css!(r####"
 
     .detail-login {
         font-size: 12px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
     }
 
     .badge {
@@ -1335,8 +1369,8 @@ const SHEET: &str = css!(r####"
         font-size: 10px;
         font-weight: 700;
         letter-spacing: 0.6px;
-        background-color: #1b2130;
-        color: #7d879b;
+        background-color: oklch(0.24 0.016 240);
+        color: oklch(0.62 0.020 240);
     }
 
     .badge.live {
@@ -1363,18 +1397,18 @@ const SHEET: &str = css!(r####"
     .detail-key {
         width: 96px;
         font-size: 12px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
     }
 
     .detail-value {
         flex-grow: 1;
         font-size: 12px;
-        color: #d7dce8;
+        color: oklch(0.88 0.010 240);
     }
 
     .detail-value__text {
         font-size: 12px;
-        color: #d7dce8;
+        color: oklch(0.88 0.010 240);
     }
 
     .settings { gap: 8px; }
@@ -1384,8 +1418,8 @@ const SHEET: &str = css!(r####"
         gap: 12px;
         padding: 12px 14px;
         border-radius: 10px;
-        border: 1px solid #232936;
-        background-color: #0f1219;
+        border: 1px solid oklch(0.30 0.018 240);
+        background-color: oklch(0.20 0.013 240);
     }
 
     .switch-copy { gap: 2px; }
@@ -1397,7 +1431,7 @@ const SHEET: &str = css!(r####"
 
     .switch-hint {
         font-size: 12px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
     }
 
     .section-title {
@@ -1405,12 +1439,12 @@ const SHEET: &str = css!(r####"
         font-size: 11px;
         font-weight: 700;
         letter-spacing: 0.7px;
-        color: #97a1b4;
+        color: oklch(0.70 0.018 240);
     }
 
     .section-hint {
         font-size: 12px;
-        color: #6c7587;
+        color: oklch(0.56 0.020 240);
     }
 
     .add {
@@ -1429,11 +1463,11 @@ const SHEET: &str = css!(r####"
         border-radius: 8px;
     }
 
-    .word:hover { background-color: #181d27; }
+    .word:hover { background-color: oklch(0.26 0.017 240); }
 
     .word__text {
         font-size: 13px;
-        color: #d7dce8;
+        color: oklch(0.88 0.010 240);
     }
 
     .recording { padding: 0; }
@@ -1445,7 +1479,7 @@ const SHEET: &str = css!(r####"
         border-radius: 9px;
     }
 
-    .recording-row:hover { background-color: #181d27; }
+    .recording-row:hover { background-color: oklch(0.26 0.017 240); }
 
     .recording__error {
         padding: 0 10px 6px 10px;
@@ -1456,7 +1490,7 @@ const SHEET: &str = css!(r####"
     .empty {
         padding: 22px 12px;
         font-size: 13px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
     }
 
     .stats { gap: 8px; }
@@ -1467,21 +1501,21 @@ const SHEET: &str = css!(r####"
         gap: 2px;
         padding: 10px 12px;
         border-radius: 10px;
-        border: 1px solid #232936;
-        background-color: #0f1219;
+        border: 1px solid oklch(0.30 0.018 240);
+        background-color: oklch(0.20 0.013 240);
     }
 
     .stat__label {
         font-size: 10px;
         font-weight: 600;
         letter-spacing: 0.6px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
     }
 
     .stat__value {
         font-size: 15px;
         font-weight: 600;
-        color: #e9edf5;
+        color: oklch(0.95 0.008 240);
     }
 
     .loglist { gap: 1px; }
@@ -1493,19 +1527,19 @@ const SHEET: &str = css!(r####"
         border-radius: 8px;
     }
 
-    .notification:hover { background-color: #181d27; }
+    .notification:hover { background-color: oklch(0.26 0.017 240); }
 
     .notification__body { gap: 1px; flex-grow: 1; }
 
     .notification__summary {
         font-size: 13px;
         font-weight: 600;
-        color: #e9edf5;
+        color: oklch(0.95 0.008 240);
     }
 
     .notification__text {
         font-size: 12px;
-        color: #97a1b4;
+        color: oklch(0.70 0.018 240);
     }
 
     .pipeline {
@@ -1515,7 +1549,7 @@ const SHEET: &str = css!(r####"
         border-radius: 8px;
     }
 
-    .pipeline:hover { background-color: #181d27; }
+    .pipeline:hover { background-color: oklch(0.26 0.017 240); }
 
     .pipeline__name {
         width: 220px;
@@ -1526,12 +1560,12 @@ const SHEET: &str = css!(r####"
     .pipeline__state {
         width: 74px;
         font-size: 12px;
-        color: #97a1b4;
+        color: oklch(0.70 0.018 240);
     }
 
     .pipeline__meta {
         font-size: 12px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
     }
 
     .pipeline__rec {
@@ -1553,31 +1587,31 @@ const SHEET: &str = css!(r####"
         border-radius: 7px;
     }
 
-    .log:hover { background-color: #181d27; }
+    .log:hover { background-color: oklch(0.26 0.017 240); }
 
     .log__time {
         width: 58px;
         font-size: 11px;
-        color: #6c7587;
+        color: oklch(0.56 0.020 240);
     }
 
     .log__target {
         width: 74px;
         font-size: 11px;
-        color: #f59e0b;
+        color: var(--zui-color-primary);
     }
 
     .log__message {
         flex-grow: 1;
         font-size: 12px;
-        color: #d7dce8;
+        color: oklch(0.88 0.010 240);
     }
 
     .log.bad .log__message { color: #ff9aa8; }
 
     .log__meta {
         font-size: 11px;
-        color: #7d879b;
+        color: oklch(0.62 0.020 240);
     }
 
 /* ---- first pass: dense desktop tool -------------------------------- */
@@ -1599,7 +1633,7 @@ const SHEET: &str = css!(r####"
 .tabs {
     gap: 0;
     padding: 0 2px;
-    border-bottom: 1px solid #2a3140;
+    border-bottom: 1px solid oklch(0.32 0.020 240);
 }
 .tab {
     padding: 5px 14px;
@@ -1616,31 +1650,118 @@ const SHEET: &str = css!(r####"
 }
 .tablehead {
     padding: 6px 10px;
-    border-bottom: 1px solid #2a3140;
+    border-bottom: 1px solid oklch(0.32 0.020 240);
 }
 .tablehead .cell { font-size: 10px; }
 .cell { font-size: 12px; }
 .channels {
-    background-color: #0b0d12;
+    background-color: oklch(0.11 0.010 240);
 }
-.list { gap: 0; padding: 0; }
+/* The bar lives in a permanent right strip. `scrollbar-gutter` is unsupported
+   here, so `overflow: scroll` keeps the gutter reserved whether or not the
+   rows overflow; expanding a row can no longer pull the columns sideways. */
+.channels .zui-scroll-area__viewport { overflow: scroll; }
+.list { gap: 0; padding: 0 6px 0 0; }
 .channel { padding: 0; }
 .channel-row {
     min-height: 28px;
     padding: 2px 10px;
     border-radius: 0;
+    background-color: oklch(0.18 0.012 240);
 }
-.channel:nth-child(even) .channel-row { background-color: #10131a; }
-.channel-row:hover { background-color: #171b24; }
-.channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: #161b25; }
+.channel:nth-child(even) .channel-row { background-color: oklch(0.21 0.014 240); }
+.channel-row:hover { background-color: oklch(0.25 0.016 240); }
+.channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: oklch(0.25 0.016 240); }
 .channel-name { font-size: 13px; }
 .channel-title { font-size: 12px; }
 .detail {
     margin: 2px 6px 6px 6px;
     padding: 10px 12px;
-    border: 1px solid #2a3140;
+    border: 1px solid oklch(0.32 0.020 240);
     border-radius: 0;
-    background-color: #0b0d12;
+    background-color: oklch(0.18 0.012 240);
+}
+
+/* The row truncates the title to keep Notify aligned; the expanded panel is
+   where the whole thing goes, wrapped rather than clipped. */
+.detail-title {
+    width: 100%;
+    font-size: 13px;
+    line-height: 1.4;
+    color: oklch(0.95 0.008 240);
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+/* A bordered box instead of a text glyph: zgui does not paint text inside a
+   transformed element, but it does transform boxes. The tip is a bottom-right
+   corner, so -45deg points right and +45deg points down when the row is open.
+   The outer box stretches to the row and centres the tip vertically. */
+.chevron {
+    display: inline-flex;
+    align-self: stretch;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+}
+.chevron__tip {
+    width: 6px;
+    height: 6px;
+    border-right: 1px solid oklch(0.50 0.020 240);
+    border-bottom: 1px solid oklch(0.50 0.020 240);
+    transform: rotate(-45deg);
+}
+.chevron.open .chevron__tip {
+    border-color: var(--channel-color, var(--zui-color-primary));
+    transform: rotate(45deg);
+}
+
+/* The stock switch is a rounded pill, which is the wrong shape and too small
+   for a dense desktop tool. Rebuild it as a hard-edged track with a square
+   thumb on the same 4px grid. The checked colour comes from --channel-color
+   (the channel's Twitch chat colour, with a generated fallback); the global
+   settings have no channel, so they fall through to the app's primary. The
+   extra class in each selector outranks the component's own scoped sheet. */
+.app .zui-switch,
+.app .zui-switch[data-size="sm"] {
+    width: 40px;
+    height: 22px;
+    border: 1px solid var(--zui-color-border);
+    border-radius: 0;
+    background-color: var(--zui-color-control-switch-off);
+    box-shadow: none;
+}
+.app .zui-switch[data-size="sm"] {
+    width: 34px;
+    height: 18px;
+}
+.app .zui-switch:checked {
+    background-color: var(--channel-color, var(--zui-color-primary));
+    border-color: var(--channel-color, var(--zui-color-primary));
+}
+.app .zui-switch > .zui-switch__thumb,
+.app .zui-switch[data-size="sm"] > .zui-switch__thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 0;
+    margin-left: 2px;
+    margin-right: 2px;
+    background-color: var(--zui-color-control-switch-thumb);
+    transform: translateX(0);
+    transition-property: transform;
+    transition-duration: var(--zui-motion-duration-normal);
+    transition-timing-function: var(--zui-motion-ease-standard);
+}
+.app .zui-switch[data-size="sm"] > .zui-switch__thumb {
+    width: 14px;
+    height: 14px;
+}
+.app .zui-switch:checked > .zui-switch__thumb {
+    background-color: var(--zui-color-control-switch-thumb-on);
+    transform: translateX(16px);
+}
+.app .zui-switch[data-size="sm"]:checked > .zui-switch__thumb {
+    transform: translateX(14px);
 }
 .log { border-radius: 0; }
 .banner, .error { border-radius: 0; }

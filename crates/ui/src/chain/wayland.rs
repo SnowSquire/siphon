@@ -21,6 +21,8 @@ use raw_window_handle::HasWindowHandle as _;
 use raw_window_handle::RawDisplayHandle;
 use raw_window_handle::RawWindowHandle;
 use tracing::warn;
+use zgui::geom::Device;
+use zgui::geom::Size;
 use zgui::platform::GpuSurface;
 use zgui::platform::Surface;
 use zgui::surface::wgpu;
@@ -138,19 +140,50 @@ impl Chain {
         200.0
     }
 
-    /// The Wayland surface paces commits against its frame callbacks. When it
-    /// says no, the acquired image must not be committed or the pacer loses
-    /// track of the callback the next frame waits on.
+    /// Presentation is paced by libplacebo's Vulkan mailbox, not by ZGUI's
+    /// surface callbacks. Every frame this renderer composes is submitted to
+    /// the swapchain immediately; the compositor shows the newest one.
+    ///
+    /// `Surface::present_now()` must not be called here. Besides answering
+    /// whether a callback is owed, it *marks* the frame as held in ZGUI's
+    /// surface pacer — state only a renderer that finishes held frames through
+    /// `present_held()` can release. This renderer presents at once, so a held
+    /// mark leaves ZGUI refusing every later redraw until its 200 ms watchdog
+    /// expires. By then the callback it waited for is one serial behind the one
+    /// the watchdog probe just asked for, so it is ignored, the pacer stays
+    /// owed, and the window is locked to a 200 ms cadence with half its frames
+    /// dropped. `ComposeAhead::Always` on the window keeps ZGUI composing at
+    /// the animation cadence while the mailbox decides what reaches the screen.
     pub fn wait_for_frame(&self, _timeout_ms: u32) -> bool {
-        self.surface.present_now()
+        true
     }
 
     /// The chain is the window: every configure changes its extent, and there
     /// is no larger canvas to settle back from.
-    pub fn configure(&mut self, ui: (u32, u32)) {
+    /// Declares a window extent before the swapchain has followed it.
+    ///
+    /// KWin decides where a maximized frame goes from the geometry declared at
+    /// the start of the animation. Calling this on configure, with the extent
+    /// the compositor just granted, keeps that geometry in step with the new
+    /// surface; declaring the old swapchain extent centres the old window in
+    /// the new one and leaves the frame offset by half the difference.
+    pub fn declare(&self, width: u32, height: u32, scale: f32) {
+        self.surface.pre_present_frame(
+            Size::<i32, Device>::new(width as i32, height as i32),
+            f64::from(scale),
+        );
+    }
+
+    /// Resizes to the requested extent and reports the extent it actually got.
+    /// A maximize configure can arrive before the surface itself grows, in
+    /// which case libplacebo caps the swapchain at the old extent; the UI must
+    /// be rebuilt for what was granted, not for what was asked for, or it is
+    /// drawn large and scaled down into the smaller surface.
+    pub fn configure(&mut self, ui: (u32, u32)) -> (u32, u32) {
         if (self.width, self.height) != ui {
             self.resize(ui.0, ui.1);
         }
+        (self.width, self.height)
     }
 
     pub fn settle(&mut self, _ui: (u32, u32)) {}
@@ -194,7 +227,13 @@ impl Chain {
     }
 
     /// Submits the render commands and commits the image to the surface.
-    pub fn end(&self) -> bool {
+    ///
+    /// The extent passed in is the one the swapchain actually presented, which
+    /// can lead the surface's own configure during a maximize. Declaring that
+    /// extent here keeps `set_window_geometry` in step with the buffer; using
+    /// the surface's stale size makes KWin centre an old-size window inside
+    /// the new one and place the frame off-screen.
+    pub fn end(&self, width: u32, height: u32, scale: f64) -> bool {
         if !self.presentable() {
             return false;
         }
@@ -203,7 +242,10 @@ impl Chain {
             warn!(target: "ui", "Wayland: swapchain submit failed");
             return false;
         }
-        self.surface.pre_present_notify();
+        self.surface.pre_present_frame(
+            Size::<i32, Device>::new(width as i32, height as i32),
+            scale,
+        );
         // SAFETY: the submitted image is the one acquired by `begin`.
         unsafe { pl::pl_swapchain_swap_buffers(self.swapchain) };
         true

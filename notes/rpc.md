@@ -107,7 +107,8 @@ enum Update {
 }
 ```
 
-`ChannelView` carries what the UI renders: id, login, display name, the remote
+`ChannelView` carries what the UI renders: id, login, display name, the resolved
+switch colour (`chatColor`, or a generated `oklch(...)` fallback), the remote
 avatar URL and the local `avatarPath` the daemon cached, live, title, game, the
 game id, viewers, stream start as milliseconds, Twitch's `BROADCAST-ID`, and
 the per-channel `notifyLive` / `notifyTitles` / `record` switches. ZGUI's

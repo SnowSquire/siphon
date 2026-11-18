@@ -3,6 +3,7 @@
 //! notifications.
 
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -203,7 +204,7 @@ impl App {
                     "stream {}({}): stream_id={} started={}",
                     channel.login,
                     channel.id,
-                    channel.stream_id,
+                    stream_id_label(channel.stream_id),
                     channel
                         .stream_start
                         .map_or("unknown".to_owned(), crate::time::format_iso_ms),
@@ -306,14 +307,18 @@ impl App {
                 "stream {}({}): stream_id={} started={started}",
                 user.login,
                 user.id,
-                user.stream_id,
+                stream_id_label(user.stream_id),
             );
             self.bus.log_channel(
                 LogLevel::Info,
                 "hermes",
-                format!("{} stream {} started at {started}", user.login, user.stream_id),
+                format!(
+                    "{} stream {} started at {started}",
+                    user.login,
+                    stream_id_label(user.stream_id)
+                ),
                 Some(user.login.clone()),
-                Some(user.stream_id),
+                user.stream_id,
             );
         }
         let config = self.channel_config(id);
@@ -692,7 +697,7 @@ impl App {
                 "hermes",
                 changes.join(", "),
                 Some(login),
-                Some(stream_id),
+                stream_id,
             );
         }
         if let Some((summary, body, avatar, login)) = toast {
@@ -749,7 +754,7 @@ impl App {
                     "hermes",
                     "is live",
                     Some(login.clone()),
-                    Some(stream_id),
+                    stream_id,
                 );
                 if quiet {
                     tracing::info!(
@@ -797,7 +802,7 @@ impl App {
                     "hermes",
                     "went offline",
                     Some(login.clone()),
-                    Some(stream_id),
+                    stream_id,
                 );
                 self.registry.stream_down(&login);
             }
@@ -876,4 +881,9 @@ fn should_log_stream(old: Option<&ChannelDetail>, new: &ChannelDetail) -> bool {
         || new.stream_start.is_some(),
         |prev| prev.stream_id != new.stream_id || prev.stream_start != new.stream_start,
     )
+}
+
+/// Renders a broadcast id for a log line; an offline channel has none.
+fn stream_id_label(stream_id: Option<NonZeroU64>) -> String {
+    stream_id.map_or_else(|| "none".to_owned(), |id| id.to_string())
 }

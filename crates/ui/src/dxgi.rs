@@ -782,8 +782,8 @@ pub fn set_window_background(hwnd: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::GCLP_HBRBACKGROUND;
     use windows::Win32::UI::WindowsAndMessaging::SetClassLongPtrW;
 
-    // The page background, `#12141a`, as a `0x00BBGGRR` colour reference.
-    const PAGE: COLORREF = COLORREF(0x001a_1412);
+    // The page background, `#080a10`, as a `0x00BBGGRR` colour reference.
+    const PAGE: COLORREF = COLORREF(0x0010_0a08);
     // SAFETY: a solid brush takes no pointers and fails by returning null, which
     // `SetClassLongPtrW` accepts as "no brush" — the state it is in already.
     let brush = unsafe { CreateSolidBrush(PAGE) };

@@ -44,8 +44,6 @@ pub struct UiRenderer {
     ui_texture: wgpu::Texture,
     handover: pl::VkSemaphore,
     handover_value: Cell<u64>,
-    damaged: Cell<bool>,
-    presented: Cell<bool>,
     graphics: SharedGraphics,
     gpu: Arc<Gpu>,
     /// The extent the UI texture and inner renderer are built for.
@@ -84,8 +82,6 @@ impl UiRenderer {
             ui_texture,
             handover,
             handover_value: Cell::new(0),
-            damaged: Cell::new(true),
-            presented: Cell::new(false),
             graphics,
             gpu,
             width,
@@ -172,8 +168,20 @@ impl UiRenderer {
         self.inner = inner;
         self.width = width;
         self.height = height;
-        self.damaged.set(true);
-        self.presented.set(false);
+    }
+
+    /// Applies a deferred configure: resize the chain, then rebuild the UI for
+    /// the extent the chain actually granted.
+    fn apply_configure(&mut self, target: RenderTarget) {
+        let requested = (
+            u32::try_from(target.size.width).unwrap_or(1),
+            u32::try_from(target.size.height).unwrap_or(1),
+        );
+        let (width, height) = self
+            .chain
+            .as_mut()
+            .map_or(requested, |chain| chain.configure(requested));
+        self.rebuild(target, width, height);
     }
 
     fn present(&mut self, outcome: FrameOutcome) -> FrameOutcome {
@@ -183,18 +191,10 @@ impl UiRenderer {
         if !chain.presentable() {
             return outcome;
         }
-        let damaged = self.damaged.replace(false);
-        if !damaged && self.presented.get() {
-            return outcome;
-        }
         if !chain.wait_for_frame(100) {
-            // Occluded, or the compositor has not offered a frame yet: drop it
-            // instead of blocking or committing out of turn.
-            self.damaged.set(true);
             return outcome;
         }
         let Some(acquired) = chain.begin((self.width, self.height)) else {
-            self.damaged.set(true);
             return outcome;
         };
         let (width, height) = (acquired.width, acquired.height);
@@ -310,10 +310,14 @@ impl UiRenderer {
             tracing::warn!(target: "ui", "libplacebo: failed to take the interface texture back");
         }
 
-        if !chain.end() {
+        // Declare the frame's own extent, not the surface's possibly stale one.
+        let scale = self
+            .inner
+            .target()
+            .map_or(1.0, |target| f64::from(target.scale.get()));
+        if !chain.end(width, height, scale) {
             chain.present_failed();
         }
-        self.presented.set(true);
         outcome
     }
 }
@@ -341,13 +345,14 @@ impl Renderer for UiRenderer {
             self.inner.configure(target);
             return;
         }
-        // The UI follows the window exactly. The chain has its own resize
-        // policy: Windows grows to the monitor during a drag and shrinks back
-        // once the size settles; Wayland follows the surface every time.
-        if let Some(chain) = self.chain.as_mut() {
-            chain.configure((width, height));
+        // KWin computes the final frame position from the geometry declared at
+        // the start of a maximize. Declare the new extent now, before the
+        // swapchain is rebuilt, so the window lands at the origin instead of
+        // centred on its old size.
+        if let Some(chain) = self.chain.as_ref() {
+            chain.declare(width, height, target.scale.get());
         }
-        self.rebuild(target, width, height);
+        self.apply_configure(target);
     }
 
     fn target(&self) -> Option<RenderTarget> {
@@ -361,7 +366,6 @@ impl Renderer for UiRenderer {
         if !self.inner.present_into(0) {
             tracing::warn!(target: "ui", "the UI texture was not supplied");
         }
-        self.damaged.set(self.damaged.get() || !damage.is_empty());
         let outcome = self.inner.draw(scene, damage);
         self.present(outcome)
     }

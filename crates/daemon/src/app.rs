@@ -553,6 +553,7 @@ impl App {
                         .display_name
                         .clone()
                         .unwrap_or_else(|| channel.login.clone()),
+                    chat_color: gql::fallback_color(channel.id),
                     profile_image_url: String::new(),
                     avatar_path: None,
                     live: false,
@@ -562,7 +563,7 @@ impl App {
                     viewers: None,
                     collaboration_viewers: None,
                     stream_start_ms: None,
-                    stream_id: 0,
+                    stream_id: None,
                     notify_live: channel.notify_live,
                     notify_titles: channel.notify_titles,
                     record: channel.record,

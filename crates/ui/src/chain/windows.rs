@@ -170,7 +170,9 @@ impl Chain {
     /// Called when the window's extent changes. The UI follows it exactly; the
     /// chain grows to the monitor only while the window outgrows its canvas,
     /// and shrinks back in [`Chain::settle`].
-    pub fn configure(&mut self, ui: (u32, u32)) {
+    pub fn declare(&self, _width: u32, _height: u32, _scale: f32) {}
+
+    pub fn configure(&mut self, ui: (u32, u32)) -> (u32, u32) {
         self.canvas.configured();
         if !self.canvas.covers(ui) {
             let (width, height) = resize_canvas(self.hwnd, ui.0, ui.1);
@@ -178,6 +180,9 @@ impl Chain {
                 warn!(target: "ui", "DXGI: could not grow the chain: {error:?}");
             }
         }
+        // The UI texture always follows the window; only the chain's canvas
+        // grows past it during a resize.
+        ui
     }
 
     /// Gives the extra backbuffers back once the window's size has settled.
@@ -242,7 +247,7 @@ impl Chain {
     }
 
     /// Hands the backbuffer to the compositor.
-    pub fn end(&self) -> bool {
+    pub fn end(&self, _width: u32, _height: u32, _scale: f64) -> bool {
         let Some(swapchain) = self.swapchain.as_ref() else {
             return false;
         };

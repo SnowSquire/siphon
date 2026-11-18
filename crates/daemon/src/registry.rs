@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::poll_fn;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::task::Poll;
@@ -481,7 +482,7 @@ impl Registry {
                 runtime.key.quality.as_deref().unwrap_or("best")
             ),
             Some(runtime.key.login.clone()),
-            Some(runtime.broadcast_id),
+            NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
     }
@@ -498,7 +499,7 @@ impl Registry {
             "recording",
             "recording stopped",
             Some(runtime.key.login.clone()),
-            Some(runtime.broadcast_id),
+            NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
     }

@@ -3,6 +3,7 @@
 //! This is Siphon's typed decoder, moved onto the daemon's own HTTP client and
 //! `sonic_rs`, so the backend keeps one TLS/connection stack.
 
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,8 +23,8 @@ use crate::time::parse_iso_ms;
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 
-const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
-const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
+const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login chatColor displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
+const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login chatColor displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
 
 #[derive(Debug, Error)]
 pub enum GqlError {
@@ -45,11 +46,14 @@ pub struct ChannelDetail {
     pub id: u64,
     pub login: String,
     pub display_name: String,
+    /// CSS colour for this channel's switches: Twitch's chat colour, or a
+    /// stable generated one when the user has not picked a chat colour.
+    pub chat_color: String,
     pub profile_image_url: String,
     /// Local avatar file, once the app has cached the remote picture.
     pub avatar_path: Option<String>,
-    /// Twitch's `BROADCAST-ID` from the active stream; 0 when offline.
-    pub stream_id: u64,
+    /// Twitch's `BROADCAST-ID` from the active stream; `None` when offline.
+    pub stream_id: Option<NonZeroU64>,
     pub stream_title: Option<String>,
     /// Milliseconds since the unix epoch; `None` when offline.
     pub stream_start: Option<i64>,
@@ -81,6 +85,7 @@ impl ChannelDetail {
             id: self.id,
             login: self.login.clone(),
             display_name: self.display_name.clone(),
+            chat_color: self.chat_color.clone(),
             profile_image_url: self.profile_image_url.clone(),
             avatar_path: self.avatar_path.clone(),
             live: self.live,
@@ -128,6 +133,9 @@ struct GqlUser {
     #[serde(default, deserialize_with = "de_opt_u64")]
     id: Option<u64>,
     login: Option<String>,
+    /// Null until the user picks a chat colour in Twitch's settings.
+    #[serde(rename = "chatColor")]
+    chat_color: Option<String>,
     #[serde(rename = "displayName")]
     display_name: Option<String>,
     #[serde(rename = "profileImageURL")]
@@ -212,9 +220,26 @@ where
     deserializer.deserialize_option(IdVisitor)
 }
 
+/// A stable stand-in for users with no `chatColor` (Twitch leaves it null until
+/// they pick one). The channel id walked by the golden angle spreads hues
+/// across the wheel while keeping each channel's colour the same across
+/// refreshes and restarts, rather than flickering on every snapshot.
+pub(crate) fn fallback_color(id: u64) -> String {
+    const GOLDEN_ANGLE: f64 = 137.507_764_050_918;
+    let hue = (id as f64 * GOLDEN_ANGLE) % 360.0;
+    let lightness = 0.70 + f64::from((id % 2) as u8) * 0.03;
+    let chroma = 0.13 + f64::from((id % 3) as u8) * 0.01;
+    format!("oklch({lightness:.2} {chroma:.2} {hue:.0})")
+}
+
 impl GqlUser {
     fn into_channel(self) -> Option<ChannelDetail> {
         let settings = self.broadcast_settings?;
+        let id = self.id?;
+        let chat_color = self
+            .chat_color
+            .filter(|color| !color.is_empty())
+            .unwrap_or_else(|| fallback_color(id));
         // `stream` is the single source of truth for liveness and the broadcast
         // identity: it is non-null only while the channel is live, and its `id`
         // is the `BROADCAST-ID` the rest of the pipeline keys off. `title` and
@@ -223,7 +248,7 @@ impl GqlUser {
             .stream
             .as_ref()
             .and_then(|stream| stream.id)
-            .unwrap_or(0);
+            .and_then(NonZeroU64::new);
         let viewers = self.stream.as_ref().and_then(|stream| stream.viewers_count);
         let collaboration_viewers = self
             .stream
@@ -247,7 +272,8 @@ impl GqlUser {
             );
         }
         Some(ChannelDetail {
-            id: self.id?,
+            id,
+            chat_color,
             login: self.login.filter(|login| !login.is_empty())?,
             display_name: self.display_name.filter(|name| !name.is_empty())?,
             profile_image_url: self.profile_image_url.filter(|url| !url.is_empty())?,
@@ -427,7 +453,7 @@ mod tests {
         assert_eq!(user.login, "alice");
         assert_eq!(user.display_name, "Alice");
         assert_eq!(user.profile_image_url, "http://x/y.png");
-        assert_eq!(user.stream_id, 42);
+        assert_eq!(user.stream_id, NonZeroU64::new(42));
         assert_eq!(user.stream_title.as_deref(), Some("hi"));
         assert_eq!(user.stream_start, parse_iso_ms("2026-09-10T18:35:06Z"));
         let game = user.game.as_ref().expect("game should decode");
@@ -454,7 +480,7 @@ mod tests {
         assert_eq!(user.id, 456);
         // Offline: `stream` is null, so no broadcast identity — but the title
         // and game still come through from `broadcastSettings`.
-        assert_eq!(user.stream_id, 0);
+        assert!(user.stream_id.is_none());
         assert_eq!(user.stream_title.as_deref(), Some("last night"));
         assert_eq!(
             user.game.as_ref().map(|game| game.display_name.as_str()),
@@ -484,7 +510,7 @@ mod tests {
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         assert_eq!(users[0].id, 123);
-        assert_eq!(users[0].stream_id, 1);
+        assert_eq!(users[0].stream_id, NonZeroU64::new(1));
     }
 
     #[test]
@@ -492,6 +518,27 @@ mod tests {
         assert!(decode_users(br#"{"data": null}"#).is_empty());
         assert!(decode_users(br#"{"data": {}}"#).is_empty());
         assert!(decode_users(br#"{"data": {"users": null}}"#).is_empty());
+    }
+
+    #[test]
+    fn chat_color_is_used_when_present_and_generated_when_null() {
+        let with = br##"{"data": {"users": [
+            {"id": "123", "login": "alice", "chatColor": "#FF0000", "displayName": "Alice",
+             "profileImageURL": "http://x/y.png",
+             "broadcastSettings": {"title": "hi", "game": null}, "stream": null}
+        ]}}"##;
+        assert_eq!(decode_users(with)[0].chat_color, "#FF0000");
+
+        let without = br##"{"data": {"users": [
+            {"id": "123", "login": "alice", "chatColor": null, "displayName": "Alice",
+             "profileImageURL": "http://x/y.png",
+             "broadcastSettings": {"title": "hi", "game": null}, "stream": null}
+        ]}}"##;
+        let user = &decode_users(without)[0];
+        assert!(user.chat_color.starts_with("oklch("), "{user:?}");
+        assert_eq!(user.chat_color, fallback_color(123));
+        assert_eq!(fallback_color(123), fallback_color(123));
+        assert_ne!(fallback_color(123), fallback_color(456));
     }
 
     #[test]

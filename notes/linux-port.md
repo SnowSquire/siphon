@@ -76,7 +76,47 @@ same thing with the swapchain Vulkan already has:
   WSI scales an image that differs from the surface instead of cropping it, so a
   larger canvas would scale the whole interface down rather than show its
   top-left corner 1:1. `pl_swapchain_resize` writes back the extent it actually
-  created, which is the one used for the overlay parts.
+  created, which is the one used for the overlay parts. `Chain::configure`
+  returns that granted extent and the renderer rebuilds the UI for it: during a
+  maximize the configure can arrive before the surface grows, and rebuilding
+  for the requested extent instead made a large interface render into the old
+  small surface (the window looked shrunken and the content tiny until a later
+  configure arrived). A second half of the bug was window placement: KWin
+  decides a maximize's final frame position from the window geometry declared
+  when its animation starts, and a stale 1000-wide declaration made it place
+  the 1920-wide frame at x=-460 (half the size change off-screen). The renderer
+  now calls `Chain::declare` on configure, with the extent the compositor just
+  granted, before the swapchain is rebuilt, and `end` declares the frame's
+  actual extent rather than the surface's possibly stale one. Maximize lands at
+  the origin and restore returns to the old geometry.
+
+## Why the switch did not slide
+
+The switch's `:checked` transition is fine: ZGUI's harness interpolates it
+frame by frame with the app's exact selector structure (state on the parent,
+`transform` overridden by a second sheet), and instrumenting the runtime showed
+the thumb's matrix moving 14→12→…→0 in even steps. The fault was the present
+path starving the animation of frames.
+
+`Chain::wait_for_frame` called `Surface::present_now()`. Besides answering
+whether a frame callback is owed, that call **marks a frame as held in ZGUI's
+surface pacer** — state only a renderer that finishes held frames through
+`Renderer::present_held()` can release. This renderer presents immediately and
+never completes a held frame. Worse, libplacebo's swapchain uses Vulkan WSI,
+which issues its own `wl_surface.frame()` request alongside ZGUI's; the
+callback ZGUI waited for therefore arrived one serial behind the one its
+200 ms watchdog probe had already asked for, was discarded, and left the pacer
+permanently owed. Measured: 60 redraw requests but 30 frames in 97 s, presents
+exactly 205 ms apart (the watchdog floor), every other frame dropped. A 160 ms
+transition completed between two presents and only its endpoints were visible.
+
+The fix has two halves: `Chain::wait_for_frame` no longer calls `present_now()`
+on Wayland (the mailbox swapchain paces itself), and the window is opened with
+`ComposeAhead::Always` so ZGUI keeps composing at the animation cadence instead
+of waiting on a callback the swapchain will not let it accept. Measured after:
+1534 frames in 26 s (58 fps), 16.7 ms apart, all presented. The renderer's
+local `damaged`/`presented` gate was also removed — it could drop an
+animation-only frame with no layout damage — but that alone was not the cause.
 
 The seam is one concrete `Chain` type per platform, selected by `#[cfg]` rather
 than a trait object (only one backend is ever linked, so `dyn` would buy nothing):
@@ -85,13 +125,13 @@ than a trait object (only one backend is ever linked, so `dyn` would buy nothing
 |---|---|---|
 | `configure(ui)` | monitor-sized growth on overflow + settle timer | `pl_swapchain_resize` to `ui` |
 | `settle(ui)` | shrink after `SETTLE` when `GetCapture() == null` | no-op |
-| `wait_for_frame(ms)` | frame-latency waitable object | `Surface::present_now()` |
+| `wait_for_frame(ms)` | frame-latency waitable object | no-op (mailbox swapchain paces itself) |
 | `begin(ui) -> Option<Acquired>` | current backbuffer + cached `pl_tex` + build `pl_frame` | `pl_swapchain_start_frame` + `pl_frame_from_swapchain` |
 | `end() -> bool` | `Present1` | `submit_frame` + `swap_buffers` |
 
 Everything above it — the overlay parts, `pl_render_image`, the handover
-semaphore, damage/presented gating — is shared and unchanged. The chain owns its
-per-buffer textures and destroys them before its swapchain.
+semaphore — is shared and unchanged. The chain owns its per-buffer textures and
+destroys them before its swapchain.
 
 ## Build
 

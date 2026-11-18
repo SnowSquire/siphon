@@ -11,6 +11,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::rc::Weak;
 
@@ -105,7 +106,7 @@ impl Bus {
         target: &str,
         message: impl Into<String>,
         login: Option<String>,
-        stream_id: Option<u64>,
+        stream_id: Option<NonZeroU64>,
     ) {
         let seq = self.next_log.get();
         self.next_log.set(seq.wrapping_add(1));
