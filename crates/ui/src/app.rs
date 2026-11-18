@@ -254,6 +254,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
         }
     });
 
+    let ticker = Signal::derive_local(move || ticker_text(notifications_sig.get()));
     let tab = RwSignal::new_local(Tab::Channels);
     let expanded = RwSignal::new_local(BTreeSet::<u64>::new());
     let draft = RwSignal::new_local(String::new());
@@ -270,10 +271,15 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
     view! {
         column(class = "app") {
             row(class = "header") {
-                column(class = "brand-block") {
-                    text(class = "brand") {"Siphon"}
-                    text(class = "conn") {
-                        {move || conn_summary(conn_sig.get(), &channels_sig.get())}
+                text(class = "conn") {
+                    {move || conn_summary(conn_sig.get(), &channels_sig.get())}
+                }
+                box(class = "ticker") {
+                    text(
+                        class = "ticker__run",
+                        var:--ticker-duration = move || Some(ticker_duration(&ticker.get())),
+                    ) {
+                        {move || ticker.get()}
                     }
                 }
                 spacer()
@@ -1007,6 +1013,40 @@ fn conn_summary(conn: ConnHealth, channels: &[ChannelView]) -> String {
     } else {
         format!("{} · {live} live", conn_label(conn))
     }
+}
+
+/// One loop of the activity ticker, newest first. The run repeats four times
+/// so a short notification list still fills the window, and the -25% keyframe
+/// lands on an identical string with no seam.
+fn ticker_text(notifications: Rc<Vec<NotificationView>>) -> String {
+    let items = notifications
+        .iter()
+        .rev()
+        .take(8)
+        .map(|note| {
+            if note.body.is_empty() {
+                format!("● {}", note.summary)
+            } else {
+                format!("● {} — {}", note.summary, note.body)
+            }
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return "● no recent activity".to_owned();
+    }
+    let once = format!("{}     │     ", items.join("     │     "));
+    // Four copies keep the whole window filled even when there is only one
+    // short notification; the keyframe slides by exactly one copy (-25%).
+    once.repeat(4)
+}
+
+/// Seconds for one copy to scroll past. Roughly 30px/s at the ticker's 12px
+/// type size, clamped so a bare notification list is not a blur and a full one
+/// does not take a whole broadcast.
+fn ticker_duration(text: &str) -> String {
+    let per_copy = text.chars().count() / 4;
+    let seconds = (per_copy as f32 * 0.22).clamp(18.0, 180.0);
+    format!("{seconds:.0}s")
 }
 
 const fn state_label(state: PipelineState) -> &'static str {
@@ -1765,4 +1805,40 @@ const SHEET: &str = css!(r####"
 }
 .log { border-radius: 0; }
 .banner, .error { border-radius: 0; }
+
+/* The old wordmark row is now a news ticker for the daemon's event stream.
+   Only translate is animated: in this pinned zgui, glyphs under a scale
+   transform are dropped except at the rest keyframe. Four copies sliding by
+   one copy (-25%) keep the loop seamless and the window filled. */
+.app { padding: 14px 12px 10px; gap: 6px; }
+.header {
+    height: 30px;
+    min-height: 0;
+    padding: 0 10px;
+    align-items: center;
+    background-color: oklch(0.12 0.010 240);
+    border-bottom: 1px solid oklch(0.32 0.020 240);
+    overflow: hidden;
+}
+.header .conn {
+    flex: 0 0 auto;
+    color: oklch(0.80 0.012 240);
+    font-size: 12px;
+}
+.ticker {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+}
+.ticker__run {
+    display: inline-block;
+    white-space: nowrap;
+    font-size: 12px;
+    color: oklch(0.68 0.018 240);
+    animation: ticker-scroll var(--ticker-duration, 40s) linear infinite;
+}
+@keyframes ticker-scroll {
+    from { transform: translateX(0); }
+    to { transform: translateX(-25%); }
+}
 "####);

@@ -43,9 +43,11 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   motion from `--zui-motion-duration-normal`: zgui-ui's switch declares its own
   `transition-property` and reads that token, and the Terminal preset sets it
   to `0ms`, so the token is overridden in `THEME_CSS` rather than redeclaring
-  transitions in the app sheet. The live dot is a drawn box, not a glyph —
-  zgui does not paint text inside transformed elements, which made a pulsing
-  `●` disappear. The thumb keeps a 2px inset at both ends of its travel. Hover
+  transitions in the app sheet. The live dot is a drawn box, not a glyph: at
+  the pinned zgui revision a translated glyph animates and paints fine, but a
+  `scale()` transform drops the glyph except at its rest keyframe (verified on
+  the live Wayland window with kwin-mcp). Only translation is animated in the
+  app. The thumb keeps a 2px inset at both ends of its travel. Hover
   tooltips wait 400ms so dragging the pointer across a row does not flash a
   label.
 - Avoid the default "sloth look": no purple `#9146ff` primary, no soft cards on
@@ -76,12 +78,25 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   ZGUI supports variable fonts through `font-variation-settings`; `font-weight`
   alone does not drive the axes. The narrow `wdth` axis is useful for dense
   table rows.
-- **Chillax** for the top "Siphon" wordmark only. Downloaded from Fontshare to
+- **Chillax** was downloaded for the old top "Siphon" wordmark from Fontshare to
   `/tmp/opencode/fonts/chillax-extract/.../Chillax-Variable.ttf`. It is under
   the ITF Free Font License: embedding in a desktop app is allowed, but the
   font files may not be modified/subset or redistributed through a repository.
-  Keep it unmodified and out of git unless the licence is reviewed again.
-- Keep the top "Siphon" text even though it is redundant; it looks good.
+  The wordmark is gone; keep the font out of git unless a use for it returns.
+
+## Header / activity ticker
+
+- The compositor's title bar already carries "Siphon", so the in-app wordmark
+  was redundant. Its row is now a news ticker over the daemon's notification
+  stream: newest first, each item `summary — body`, separated by `│`.
+- The run repeats four times and slides by `-25%` (one copy) on a linear loop
+  whose duration scales with the text length. Four copies keep the window full
+  even when there is only one short notification. Connection health is pinned
+  at the left; the update banner still sits at the right when present.
+- Keep the 14px top padding and the 6px gap below the 30px strip. Deleting the
+  space entirely makes the tabs look clipped against the title bar; filling
+  it with live activity is what makes the gap read as deliberate.
+- Do not use `scale()` on the ticker text (see the transform note above).
 
 ## Channels view
 
