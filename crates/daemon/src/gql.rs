@@ -22,8 +22,8 @@ use crate::time::parse_iso_ms;
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 
-const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) lastBroadcast{id title game{id name displayName}}stream{id createdAt viewersCount collaborationViewersCount}}}";
-const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login displayName profileImageURL(width:70) lastBroadcast{id title game{id name displayName}}stream{id createdAt viewersCount collaborationViewersCount}}}";
+const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
+const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
 
 #[derive(Debug, Error)]
 pub enum GqlError {
@@ -48,7 +48,7 @@ pub struct ChannelDetail {
     pub profile_image_url: String,
     /// Local avatar file, once the app has cached the remote picture.
     pub avatar_path: Option<String>,
-    /// Twitch's `BROADCAST-ID` from the last broadcast; 0 when absent.
+    /// Twitch's `BROADCAST-ID` from the active stream; 0 when offline.
     pub stream_id: u64,
     pub stream_title: Option<String>,
     /// Milliseconds since the unix epoch; `None` when offline.
@@ -132,15 +132,13 @@ struct GqlUser {
     display_name: Option<String>,
     #[serde(rename = "profileImageURL")]
     profile_image_url: Option<String>,
-    #[serde(rename = "lastBroadcast")]
-    broadcast: Option<GqlBroadcast>,
+    #[serde(rename = "broadcastSettings")]
+    broadcast_settings: Option<GqlBroadcastSettings>,
     stream: Option<GqlStream>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GqlBroadcast {
-    #[serde(default, deserialize_with = "de_opt_u64")]
-    id: Option<u64>,
+struct GqlBroadcastSettings {
     title: Option<String>,
     game: Option<GqlGame>,
 }
@@ -156,6 +154,8 @@ struct GqlGame {
 
 #[derive(Debug, Deserialize)]
 struct GqlStream {
+    #[serde(default, deserialize_with = "de_opt_u64")]
+    id: Option<u64>,
     #[serde(rename = "createdAt")]
     created_at: Option<String>,
     #[serde(rename = "viewersCount")]
@@ -214,7 +214,22 @@ where
 
 impl GqlUser {
     fn into_channel(self) -> Option<ChannelDetail> {
-        let broadcast = self.broadcast?;
+        let settings = self.broadcast_settings?;
+        // `stream` is the single source of truth for liveness and the broadcast
+        // identity: it is non-null only while the channel is live, and its `id`
+        // is the `BROADCAST-ID` the rest of the pipeline keys off. `title` and
+        // `game` live on `broadcastSettings`, which is present even offline.
+        let stream_id = self
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.id)
+            .unwrap_or(0);
+        let viewers = self.stream.as_ref().and_then(|stream| stream.viewers_count);
+        let collaboration_viewers = self
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.collaboration_viewers_count);
+        let live = self.stream.is_some();
         // `createdAt` is only useful as a parsed instant. If Twitch ever sends
         // a string we cannot parse, say so in the error path rather than
         // carrying the raw value through the happy path as redundant state.
@@ -237,22 +252,19 @@ impl GqlUser {
             display_name: self.display_name.filter(|name| !name.is_empty())?,
             profile_image_url: self.profile_image_url.filter(|url| !url.is_empty())?,
             avatar_path: None,
-            stream_id: broadcast.id?,
-            stream_title: broadcast.title.filter(|title| !title.is_empty()),
+            stream_id,
+            stream_title: settings.title.filter(|title| !title.is_empty()),
             stream_start,
-            game: broadcast.game.and_then(|game| {
+            game: settings.game.and_then(|game| {
                 Some(StreamGame {
                     id: game.id?,
                     name: game.name?,
                     display_name: game.display_name?,
                 })
             }),
-            collaboration_viewers: self
-                .stream
-                .as_ref()
-                .and_then(|stream| stream.collaboration_viewers_count),
-            viewers: self.stream.as_ref().and_then(|stream| stream.viewers_count),
-            live: self.stream.is_some(),
+            collaboration_viewers,
+            viewers,
+            live,
         })
     }
 }
@@ -403,10 +415,10 @@ mod tests {
         let body = br#"{"data": {"users": [
                 {"id": "123", "login": "alice", "displayName": "Alice",
                  "profileImageURL": "http://x/y.png",
-                 "lastBroadcast": {"id": "999", "title": "hi",
+                 "broadcastSettings": {"title": "hi",
                     "game": {"id": "10", "name": "g", "displayName": "G"}},
-                 "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z",
-                    "viewersCount": 583, "collaborationViewersCount": null}}
+                 "stream": {"viewersCount": 583, "collaborationViewersCount": null,
+                    "id": "42", "createdAt": "2026-09-10T18:35:06Z"}}
             ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
@@ -415,7 +427,7 @@ mod tests {
         assert_eq!(user.login, "alice");
         assert_eq!(user.display_name, "Alice");
         assert_eq!(user.profile_image_url, "http://x/y.png");
-        assert_eq!(user.stream_id, 999);
+        assert_eq!(user.stream_id, 42);
         assert_eq!(user.stream_title.as_deref(), Some("hi"));
         assert_eq!(user.stream_start, parse_iso_ms("2026-09-10T18:35:06Z"));
         let game = user.game.as_ref().expect("game should decode");
@@ -432,19 +444,25 @@ mod tests {
         let body = br#"{"data": {"users": [
                 {"id": 456, "login": "bob", "displayName": "Bob",
                  "profileImageURL": "http://x/z.png",
-                 "lastBroadcast": {"id": 777, "title": "", "game": null},
+                 "broadcastSettings": {"title": "last night",
+                    "game": {"id": 7, "name": "gg", "displayName": "GG"}},
                  "stream": null}
             ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         let user = &users[0];
         assert_eq!(user.id, 456);
-        assert_eq!(user.stream_id, 777);
-        assert!(user.stream_title.is_none());
+        // Offline: `stream` is null, so no broadcast identity — but the title
+        // and game still come through from `broadcastSettings`.
+        assert_eq!(user.stream_id, 0);
+        assert_eq!(user.stream_title.as_deref(), Some("last night"));
+        assert_eq!(
+            user.game.as_ref().map(|game| game.display_name.as_str()),
+            Some("GG")
+        );
         assert!(user.stream_start.is_none());
         assert!(user.viewers.is_none());
         assert!(user.collaboration_viewers.is_none());
-        assert!(user.game.is_none());
         assert!(!user.live);
     }
 
@@ -453,19 +471,20 @@ mod tests {
         let body = br#"{"data": {"users": [
                 null,
                 {"id": "bad", "login": "ghost",
-                 "lastBroadcast": {"id": "1", "title": "t", "game": null},
+                 "broadcastSettings": {"title": "t", "game": null},
                  "stream": null},
                 {"id": "789", "login": "nobra",
-                 "lastBroadcast": null, "stream": null},
+                 "broadcastSettings": null, "stream": null},
                 {"id": "123", "login": "alice", "displayName": "Alice",
                  "profileImageURL": "http://x/y.png",
-                 "lastBroadcast": {"id": "999", "title": "hi",
+                 "broadcastSettings": {"title": "hi",
                     "game": {"id": "10", "name": "g", "displayName": "G"}},
                  "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z"}}
             ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         assert_eq!(users[0].id, 123);
+        assert_eq!(users[0].stream_id, 1);
     }
 
     #[test]
@@ -484,7 +503,7 @@ mod tests {
                 br#"{"data": {"user":
                     {"id": "123", "login": "alice", "displayName": "Alice",
                      "profileImageURL": "http://x/y.png",
-                     "lastBroadcast": null, "stream": null}
+                     "broadcastSettings": null, "stream": null}
                 }}"#
             )
             .is_none()
