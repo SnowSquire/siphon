@@ -97,16 +97,19 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 ## Header / activity ticker
 
 - The compositor's title bar already carries "Siphon", so the in-app wordmark
-  was redundant. Its row is now a news ticker over the daemon's notification
-  stream: newest first, each item `summary — body`, separated by `│`.
-- The run repeats four times and slides by `-25%` (one copy) on a linear loop
-  whose duration scales with the text length. Four copies keep the window full
-  even when there is only one short notification. Connection health lives at
+  was redundant. Its row is now a news ticker over the channel stream titles
+  (`name — title`) followed by the newest notifications (`summary — body`),
+  separated by `│`. Titles belong in the top marquee, not in the table rows.
+- The run repeats eight times and slides by `-12.5%` (one copy) on a linear
+  loop whose duration scales with the text length. Eight copies keep the window
+  full even for one short title and no notifications. Connection health lives at
   the right end of the **tab row**, not in the ticker; the update banner still
   sits at the right of the ticker row when present.
 - Keep the 14px top padding and the 6px gap below the 30px strip. Deleting the
   space entirely makes the tabs look clipped against the title bar; filling
-  it with live activity is what makes the gap read as deliberate.
+  it with live activity is what makes the gap read as deliberate. The ticker
+  viewport is a flex row with `align-items: center` and full header height, so
+  the run stays centred both windowed and maximized.
 - Do not use `scale()` on the ticker text (see the transform note above).
 
 ## Channels view
@@ -123,9 +126,8 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   below the last row.
 - Keep the row's avatar/display name and the live dot; those are the primary
   identity and state. Display names use Chillax (see Typography).
-- Titles longer than 55 characters repeat three times and scroll by `-33.333%`
-  **on row hover only** (`animation-play-state: paused` until hover), so a
-  dense list does not have every row moving at once.
+- Row titles stay single-line and truncated. The full text is in the top
+  marquee and the expanded detail panel.
 - Row hover/open/pending states should be subtle background changes, not
   rounded cards.
 

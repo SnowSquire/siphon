@@ -280,7 +280,9 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
         }
     });
 
-    let ticker = Signal::derive_local(move || ticker_text(notifications_sig.get()));
+    let ticker = Signal::derive_local(move || {
+        ticker_text(channels_sig.get(), notifications_sig.get())
+    });
     let tab = RwSignal::new_local(Tab::Channels);
     let expanded = RwSignal::new_local(BTreeSet::<u64>::new());
     let draft = RwSignal::new_local(String::new());
@@ -509,19 +511,6 @@ fn ChannelRow(
         .clone()
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| "—".to_owned());
-    // A title that cannot fit its cell scrolls on hover. Three copies sliding
-    // by one copy keep the cell filled for the whole loop; shorter titles are
-    // left alone.
-    let long_title = title.chars().count() > 55;
-    let title_run = if long_title {
-        format!("{title}     │     ").repeat(3)
-    } else {
-        title.clone()
-    };
-    let title_duration = format!(
-        "{}s",
-        (title.chars().count() as f32 * 0.22).clamp(10.0, 60.0) as u32
-    );
     let viewers = viewers(&channel);
     let live = channel.live;
     let notify_live = RwSignal::new_local(channel.notify_live);
@@ -569,13 +558,7 @@ fn ChannelRow(
                 }
                 Tooltip {
                     TooltipTrigger(class = "cell cell--title") {
-                        box(class = "channel-title") {
-                            text(
-                                class = "channel-title__run",
-                                class:active = long_title,
-                                var:--title-duration = Some(title_duration),
-                            ) {{title_run}}
-                        }
+                        text(class = "channel-title") {{title.clone()}}
                     }
                     TooltipContent {{stream_tooltip(&channel)}}
                 }
@@ -1061,36 +1044,43 @@ fn conn_summary(conn: ConnHealth, channels: &[ChannelView]) -> String {
     }
 }
 
-/// One loop of the activity ticker, newest first. The run repeats four times
-/// so a short notification list still fills the window, and the -25% keyframe
-/// lands on an identical string with no seam.
-fn ticker_text(notifications: Rc<Vec<NotificationView>>) -> String {
-    let items = notifications
+/// One loop of the top marquee: every channel's stream title, then the newest
+/// notifications. Eight copies keep the strip filled even when one channel has
+/// a short title and there are no notifications; the keyframe slides by one
+/// copy (-12.5%) and lands on an identical string with no seam.
+fn ticker_text(
+    channels: Rc<Vec<ChannelView>>,
+    notifications: Rc<Vec<NotificationView>>,
+) -> String {
+    let mut items = channels
         .iter()
-        .rev()
-        .take(8)
-        .map(|note| {
-            if note.body.is_empty() {
-                format!("● {}", note.summary)
-            } else {
-                format!("● {} — {}", note.summary, note.body)
-            }
+        .filter_map(|channel| {
+            channel
+                .title
+                .as_deref()
+                .filter(|title| !title.is_empty())
+                .map(|title| format!("● {} — {}", channel.display_name, title))
         })
         .collect::<Vec<_>>();
+    items.extend(notifications.iter().rev().take(8).map(|note| {
+        if note.body.is_empty() {
+            format!("● {}", note.summary)
+        } else {
+            format!("● {} — {}", note.summary, note.body)
+        }
+    }));
     if items.is_empty() {
         return "● no recent activity".to_owned();
     }
     let once = format!("{}     │     ", items.join("     │     "));
-    // Four copies keep the whole window filled even when there is only one
-    // short notification; the keyframe slides by exactly one copy (-25%).
-    once.repeat(4)
+    once.repeat(8)
 }
 
 /// Seconds for one copy to scroll past. Roughly 30px/s at the ticker's 12px
 /// type size, clamped so a bare notification list is not a blur and a full one
 /// does not take a whole broadcast.
 fn ticker_duration(text: &str) -> String {
-    let per_copy = text.chars().count() / 4;
+    let per_copy = text.chars().count() / 8;
     let seconds = (per_copy as f32 * 0.22).clamp(18.0, 180.0);
     format!("{seconds:.0}s")
 }
@@ -1765,25 +1755,7 @@ const SHEET: &str = css!(r####"
     font-size: 14px;
     font-variation-settings: "wght" 600, "wdth" 100;
 }
-.channel-title {
-    width: 100%;
-    overflow: hidden;
-}
-.channel-title__run {
-    display: inline-block;
-    white-space: nowrap;
-    font-size: 12px;
-    color: oklch(0.70 0.018 240);
-}
-.channel-title__run.active {
-    animation: title-scroll var(--title-duration, 20s) linear infinite;
-    animation-play-state: paused;
-}
-.channel-row:hover .channel-title__run.active { animation-play-state: running; }
-@keyframes title-scroll {
-    from { transform: translateX(0); }
-    to { transform: translateX(-33.333%); }
-}
+.channel-title { font-size: 12px; }
 .detail {
     margin: 2px 6px 6px 6px;
     padding: 10px 12px;
@@ -1902,17 +1874,21 @@ const SHEET: &str = css!(r####"
 .ticker {
     flex: 1 1 auto;
     min-width: 0;
+    height: 100%;
+    display: flex;
+    align-items: center;
     overflow: hidden;
 }
 .ticker__run {
     display: inline-block;
     white-space: nowrap;
+    line-height: 1;
     font-size: 12px;
     color: oklch(0.68 0.018 240);
     animation: ticker-scroll var(--ticker-duration, 40s) linear infinite;
 }
 @keyframes ticker-scroll {
     from { transform: translateX(0); }
-    to { transform: translateX(-25%); }
+    to { transform: translateX(-12.5%); }
 }
 "####);
