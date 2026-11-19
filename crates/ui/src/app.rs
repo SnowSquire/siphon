@@ -1296,14 +1296,11 @@ const SHEET: &str = css!(r####"
 :root {
         background-color: oklch(0.16 0.012 240);
         color: oklch(0.95 0.008 240);
-        font-family: sans-serif;
     }
 
     .app {
         width: 100%;
         height: 100%;
-        padding: 18px 22px;
-        gap: 12px;
     }
 
     .header {
@@ -1311,24 +1308,11 @@ const SHEET: &str = css!(r####"
         gap: 12px;
     }
 
-    .brand-block { gap: 1px; }
-
-    .brand {
-        font-size: 24px;
-        font-weight: 700;
-        letter-spacing: 0.4px;
-    }
-
-    .conn {
-        color: oklch(0.62 0.020 240);
-        font-size: 12px;
-    }
-
     .banner {
         align-items: center;
         gap: 8px;
         padding: 4px 8px;
-        border-radius: 8px;
+        border-radius: 0;
         background-color: #1c2a1e;
         color: #b9e4bd;
         font-size: 13px;
@@ -1338,7 +1322,7 @@ const SHEET: &str = css!(r####"
         align-items: center;
         gap: 8px;
         padding: 8px 10px;
-        border-radius: 8px;
+        border-radius: 0;
         background-color: #3a1d22;
         color: #f0b8be;
         font-size: 13px;
@@ -1347,18 +1331,21 @@ const SHEET: &str = css!(r####"
     .error__text { flex-grow: 1; }
 
     .tabs {
-        gap: 2px;
-        align-items: flex-end;
+        gap: 0;
+        align-items: center;
         padding: 0 2px;
+        border-bottom: 1px solid oklch(0.32 0.020 240);
     }
 
     .tab {
-        padding: 8px 18px;
+        padding: 5px 14px;
         border-radius: 10px 10px 0 0;
+        font-family: BrandFont, Chillax, sans-serif;
+        font-variation-settings: "wght" var(--tab-wght, 200), "wdth" 92;
         border: 1px solid transparent;
         border-bottom: 0;
         color: oklch(0.70 0.018 240);
-        font-size: 14px;
+        font-size: 13px;
         cursor: pointer;
     }
 
@@ -1395,20 +1382,20 @@ const SHEET: &str = css!(r####"
     .tablehead {
         gap: 10px;
         align-items: center;
-        padding: 0 10px 8px;
-        border-bottom: 1px solid oklch(0.30 0.018 240);
+        padding: 6px 10px;
+        border-bottom: 1px solid oklch(0.32 0.020 240);
     }
 
     .tablehead .cell {
         color: oklch(0.62 0.020 240);
-        font-size: 11px;
+        font-size: 10px;
         font-weight: 600;
         letter-spacing: 0.6px;
         white-space: nowrap;
     }
 
     .cell {
-        font-size: 13px;
+        font-size: 12px;
         color: oklch(0.88 0.010 240);
     }
 
@@ -1432,8 +1419,18 @@ const SHEET: &str = css!(r####"
         min-width: 0;
         overflow: hidden;
     }
-    .cell--notify { width: 124px; }
-    .cell--record { width: 62px; }
+    .cell--notify {
+        width: 124px;
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        gap: 10px;
+    }
+    .cell--record {
+        width: 62px;
+        display: flex;
+        align-items: center;
+    }
     .cell--viewers { width: 82px; text-align: right; }
     .cell--action { width: 34px; }
     .cell--quality { width: 90px; }
@@ -1444,8 +1441,8 @@ const SHEET: &str = css!(r####"
     .cell--runs { width: 56px; }
 
     .list {
-        gap: 2px;
-        padding: 6px 2px;
+        gap: 0;
+        padding: 0 6px 0 0;
     }
 
     .channels, .recordings, .words, .logs {
@@ -1458,12 +1455,12 @@ const SHEET: &str = css!(r####"
     .channel-row {
         align-items: center;
         gap: 10px;
-        padding: 7px 10px;
-        border-radius: 9px;
+        padding: 2px 10px;
+        border-radius: 0;
+        min-height: 28px;
+        background-color: oklch(0.18 0.012 240);
     }
 
-    .channel-row:hover { background-color: oklch(0.26 0.017 240); }
-    .channel-row.open { background-color: oklch(0.25 0.016 240); }
     .channel-row.pending { opacity: 0.65; }
 
     .live-dot {
@@ -1473,8 +1470,8 @@ const SHEET: &str = css!(r####"
         width: 10px;
     }
 
-    /* A drawn box, not a text glyph: zgui does not paint text inside a
-       transformed element, which made a pulsing "●" disappear entirely. */
+    /* A drawn box, not a text glyph: in the pinned zgui a scaled glyph drops
+       out except at rest, which made a pulsing "●" disappear. */
     .live-dot__lamp {
         width: 6px;
         height: 6px;
@@ -1498,9 +1495,12 @@ const SHEET: &str = css!(r####"
         min-width: 0;
     }
 
+    /* The one display face in the table: the old wordmark's Chillax. */
     .channel-name {
         flex-grow: 1;
         min-width: 0;
+        font-family: BrandFont, Chillax, sans-serif;
+        font-variation-settings: "wght" 600, "wdth" 100;
         font-size: 14px;
         font-weight: 600;
         color: oklch(0.95 0.008 240);
@@ -1511,23 +1511,12 @@ const SHEET: &str = css!(r####"
 
     .channel-title {
         width: 100%;
+        height: 18px;
         font-size: 13px;
         color: oklch(0.70 0.018 240);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-    }
-
-    .cell--notify {
-        display: flex;
-        flex-direction: row;
-        align-items: center;
-        gap: 10px;
-    }
-
-    .cell--record {
-        display: flex;
-        align-items: center;
     }
 
     .mini {
@@ -1548,24 +1537,17 @@ const SHEET: &str = css!(r####"
     }
 
     .detail {
-        margin: 2px 6px 8px 40px;
-        padding: 14px 16px;
+        margin: 2px 6px 6px 6px;
+        padding: 10px 12px;
         gap: 12px;
-        border-radius: 10px;
-        border: 1px solid oklch(0.30 0.018 240);
-        background-color: oklch(0.20 0.013 240);
+        border: 1px solid oklch(0.32 0.020 240);
+        border-radius: 0;
+        background-color: oklch(0.18 0.012 240);
     }
 
     .detail-head {
         align-items: center;
         gap: 12px;
-    }
-
-    .detail-id { gap: 1px; }
-
-    .detail-name {
-        font-size: 15px;
-        font-weight: 600;
     }
 
     .detail-login {
@@ -1610,16 +1592,11 @@ const SHEET: &str = css!(r####"
         color: oklch(0.62 0.020 240);
     }
 
-    .detail-value {
-        flex-grow: 1;
+    .detail-value, .detail-value__text {
         font-size: 12px;
         color: oklch(0.88 0.010 240);
     }
-
-    .detail-value__text {
-        font-size: 12px;
-        color: oklch(0.88 0.010 240);
-    }
+    .detail-value { flex-grow: 1; }
 
     .settings { gap: 8px; }
 
@@ -1673,7 +1650,8 @@ const SHEET: &str = css!(r####"
         border-radius: 8px;
     }
 
-    .word:hover { background-color: oklch(0.26 0.017 240); }
+    .word:hover, .recording-row:hover, .notification:hover,
+    .pipeline:hover, .log:hover { background-color: oklch(0.26 0.017 240); }
 
     .word__text {
         font-size: 13px;
@@ -1688,8 +1666,6 @@ const SHEET: &str = css!(r####"
         padding: 8px 10px;
         border-radius: 9px;
     }
-
-    .recording-row:hover { background-color: oklch(0.26 0.017 240); }
 
     .recording__error {
         padding: 0 10px 6px 10px;
@@ -1737,8 +1713,6 @@ const SHEET: &str = css!(r####"
         border-radius: 8px;
     }
 
-    .notification:hover { background-color: oklch(0.26 0.017 240); }
-
     .notification__body { gap: 1px; flex-grow: 1; }
 
     .notification__summary {
@@ -1758,8 +1732,6 @@ const SHEET: &str = css!(r####"
         padding: 6px 10px;
         border-radius: 8px;
     }
-
-    .pipeline:hover { background-color: oklch(0.26 0.017 240); }
 
     .pipeline__name {
         width: 220px;
@@ -1794,10 +1766,8 @@ const SHEET: &str = css!(r####"
         align-items: baseline;
         gap: 10px;
         padding: 5px 10px;
-        border-radius: 7px;
+        border-radius: 0;
     }
-
-    .log:hover { background-color: oklch(0.26 0.017 240); }
 
     .log__time {
         width: 58px;
@@ -1830,32 +1800,10 @@ const SHEET: &str = css!(r####"
     font-variation-settings: "wght" 400, "wdth" 92;
 }
 
-.app { padding: 10px 12px; gap: 4px; }
-.brand-block { gap: 0; }
-.brand {
-    font-family: BrandFont, Chillax, sans-serif;
-    font-size: 24px;
-    font-weight: 700;
-    font-variation-settings: "wght" 700, "wdth" 100;
-    letter-spacing: 0.2px;
-}
-
-.tabs {
-    gap: 0;
-    padding: 0 2px;
-    border-bottom: 1px solid oklch(0.32 0.020 240);
-}
 .tab__label {
     display: inline-block;
     width: var(--tab-label-w, 60px);
     text-align: center;
-}
-.tab {
-    padding: 5px 14px;
-    border-radius: 10px 10px 0 0;
-    font-family: BrandFont, Chillax, sans-serif;
-    font-size: 13px;
-    font-variation-settings: "wght" var(--tab-wght, 200), "wdth" 92;
 }
 .tabbody {
     gap: 0;
@@ -1864,12 +1812,6 @@ const SHEET: &str = css!(r####"
     border-radius: 0;
     background-color: transparent;
 }
-.tablehead {
-    padding: 6px 10px;
-    border-bottom: 1px solid oklch(0.32 0.020 240);
-}
-.tablehead .cell { font-size: 10px; }
-.cell { font-size: 12px; }
 .channels {
     background-color: oklch(0.11 0.010 240);
 }
@@ -1878,29 +1820,10 @@ const SHEET: &str = css!(r####"
    rows overflow; expanding a row can no longer pull the columns sideways. */
 .channels .zui-scroll-area__viewport { overflow: scroll; }
 .list { gap: 0; padding: 0 6px 0 0; }
-.channel { padding: 0; }
-.channel-row {
-    min-height: 28px;
-    padding: 2px 10px;
-    border-radius: 0;
-    background-color: oklch(0.18 0.012 240);
-}
+/* Zebra rows; hover/open must follow the even-row rule to win. */
 .channel:nth-child(even) .channel-row { background-color: oklch(0.21 0.014 240); }
 .channel-row:hover { background-color: oklch(0.25 0.016 240); }
 .channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: oklch(0.25 0.016 240); }
-/* Channel names are the one place with a display face: the old wordmark's
-   Chillax, registered as BrandFont (or its Chillax fallback in dev). */
-.channel-name {
-    font-family: BrandFont, Chillax, sans-serif;
-    font-size: 14px;
-    font-variation-settings: "wght" 600, "wdth" 100;
-}
-.channel-title {
-    width: 100%;
-    height: 18px;
-    overflow: hidden;
-    white-space: nowrap;
-}
 .channel-title__run {
     display: inline-block;
     white-space: nowrap;
@@ -1911,14 +1834,6 @@ const SHEET: &str = css!(r####"
 .channel-title__run.active {
     transform: translateX(var(--title-shift, 0px));
 }
-.detail {
-    margin: 2px 6px 6px 6px;
-    padding: 10px 12px;
-    border: 1px solid oklch(0.32 0.020 240);
-    border-radius: 0;
-    background-color: oklch(0.18 0.012 240);
-}
-
 /* The row truncates the title to keep Notify aligned; the expanded panel is
    where the whole thing goes, wrapped rather than clipped. */
 .detail-title {
@@ -2000,25 +1915,18 @@ const SHEET: &str = css!(r####"
 .app .zui-switch[data-size="sm"]:checked > .zui-switch__thumb {
     transform: translateX(14px);
 }
-.log { border-radius: 0; }
-.banner, .error { border-radius: 0; }
-
 /* The old wordmark row is now a news ticker for the daemon's event stream.
    Only translate is animated: in this pinned zgui, glyphs under a scale
-   transform are dropped except at the rest keyframe. Four copies sliding by
-   one copy (-25%) keep the loop seamless and the window filled. */
+   transform are dropped except at the rest keyframe. Eight copies sliding by
+   one copy (-12.5%) keep the loop seamless and the window filled. */
 .app { padding: 14px 12px 10px; gap: 6px; }
 .header {
     height: 30px;
     min-height: 0;
     padding: 0 10px;
-    align-items: center;
     background-color: oklch(0.12 0.010 240);
     border-bottom: 1px solid oklch(0.32 0.020 240);
     overflow: hidden;
-}
-.tabs {
-    align-items: center;
 }
 .tabs .conn {
     flex: 0 0 auto;
