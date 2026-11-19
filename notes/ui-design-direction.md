@@ -40,7 +40,8 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   padding. Expanding a row cannot pull the columns sideways.
 - Motion is back for four controls: the switch track/thumb transition over
   160ms, a live dot pulse, the two marquees, and the tab weight. Tab names use
-  Chillax; the selected tab's `wght` axis eases 600→800 over 180ms on a switch
+  Chillax, whose `wght` axis tops out at 700: unselected tabs sit at its
+  minimum 200 and the selected tab at 600, with a cubic ease-out over 180ms
   while the outgoing tab eases back, driven by `font-variation-settings` and a
   per-frame signal. The switch gets its
   motion from `--zui-motion-duration-normal`: zgui-ui's switch declares its own

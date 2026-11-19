@@ -1145,7 +1145,8 @@ fn tab_weight_value(
         } else {
             1.0 - weight.get()
         };
-        Some(format!("{:.0}", 600.0 + 200.0 * progress))
+        // Chillax's wght axis is 200–700; 200 is the lightest it can go.
+        Some(format!("{:.0}", 200.0 + 400.0 * progress))
     }
 }
 
@@ -1180,7 +1181,9 @@ fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u
     let slot = Rc::new(RefCell::new(None));
     next_frame(generation, token, slot, move || {
         let t = (started.elapsed().as_secs_f32() / 0.18).min(1.0);
-        weight.set(t * t * (3.0 - 2.0 * t));
+        // Cubic ease-out: the weight lands quickly, then settles into place.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        weight.set(eased);
         t == 1.0
     });
 }
@@ -1840,7 +1843,7 @@ const SHEET: &str = css!(r####"
     border-radius: 10px 10px 0 0;
     font-family: BrandFont, Chillax, sans-serif;
     font-size: 13px;
-    font-variation-settings: "wght" var(--tab-wght, 600), "wdth" 92;
+    font-variation-settings: "wght" var(--tab-wght, 200), "wdth" 92;
 }
 .tabbody {
     gap: 0;
