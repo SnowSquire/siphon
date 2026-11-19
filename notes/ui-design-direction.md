@@ -41,7 +41,7 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 - Motion is back for four controls: the switch track/thumb transition over
   160ms, a live dot pulse, the two marquees, and the tab weight. Tab names use
   Chillax, whose `wght` axis tops out at 700: unselected tabs sit at its
-  minimum 200 and the selected tab at 600, with a cubic ease-out over 180ms
+  minimum 200 and the selected tab at 600, with a cubic ease-out over 250ms
   while the outgoing tab eases back; the outgoing tab is tracked explicitly so
   the other tabs stay at 200 instead of blinking through the ramp. Driven by
   `font-variation-settings` and a per-frame signal. The switch gets its

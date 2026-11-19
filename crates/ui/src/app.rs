@@ -1177,7 +1177,7 @@ fn next_frame(
     *slot.borrow_mut() = Some(handle);
 }
 
-/// Eases the variable weight from the old tab to the new one over 180ms. A
+/// Eases the variable weight from the old tab to the new one over 250ms. A
 /// generation counter makes a quick series of tab clicks restart the tween
 /// instead of letting older frames fight over the signal.
 fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u64>>) {
@@ -1187,7 +1187,7 @@ fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u
     let started = std::time::Instant::now();
     let slot = Rc::new(RefCell::new(None));
     next_frame(generation, token, slot, move || {
-        let t = (started.elapsed().as_secs_f32() / 0.18).min(1.0);
+        let t = (started.elapsed().as_secs_f32() / 0.25).min(1.0);
         // Cubic ease-out: the weight lands quickly, then settles into place.
         let eased = 1.0 - (1.0 - t).powi(3);
         weight.set(eased);
