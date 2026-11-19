@@ -357,7 +357,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Channels),
                     on:click = tab_click(Tab::Channels)
                 ) {
-                    text {"Channels"}
+                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Channels"}
                 }
                 box(
                     class = "tab",
@@ -365,7 +365,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Filter),
                     on:click = tab_click(Tab::Filter)
                 ) {
-                    text {"Filter"}
+                    text(class = "tab__label", var:--tab-label-w = Some("36px".to_owned())) {"Filter"}
                 }
                 box(
                     class = "tab",
@@ -373,7 +373,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Recordings),
                     on:click = tab_click(Tab::Recordings)
                 ) {
-                    text {"Recordings"}
+                    text(class = "tab__label", var:--tab-label-w = Some("74px".to_owned())) {"Recordings"}
                 }
                 box(
                     class = "tab",
@@ -381,7 +381,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Logs),
                     on:click = tab_click(Tab::Logs)
                 ) {
-                    text {"Logs"}
+                    text(class = "tab__label", var:--tab-label-w = Some("32px".to_owned())) {"Logs"}
                 }
                 // The video surface is the next milestone. A tab that changes
                 // nothing is worse than a tab that says it cannot be used yet,
@@ -1844,6 +1844,11 @@ const SHEET: &str = css!(r####"
     gap: 0;
     padding: 0 2px;
     border-bottom: 1px solid oklch(0.32 0.020 240);
+}
+.tab__label {
+    display: inline-block;
+    width: var(--tab-label-w, 60px);
+    text-align: center;
 }
 .tab {
     padding: 5px 14px;
