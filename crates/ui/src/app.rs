@@ -286,11 +286,13 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
         ticker_text(channels_sig.get(), notifications_sig.get())
     });
     let tab_weight = RwSignal::new_local(1.0f32);
+    let previous_tab = RwSignal::new_local(None::<Tab>);
     let tab_generation = Rc::new(Cell::new(0u64));
     let tab = RwSignal::new_local(Tab::Channels);
     let tab_click = move |target: Tab| {
         let generation = Rc::clone(&tab_generation);
         move |_: &mut EventCx<'_, events::Click>| {
+            previous_tab.set(Some(tab.get_untracked()));
             tab.set(target);
             animate_tab_weight(tab_weight, Rc::clone(&generation));
         }
@@ -352,7 +354,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Channels,
-                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Channels),
+                    var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Channels),
                     on:click = tab_click(Tab::Channels)
                 ) {
                     text {"Channels"}
@@ -360,7 +362,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Filter,
-                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Filter),
+                    var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Filter),
                     on:click = tab_click(Tab::Filter)
                 ) {
                     text {"Filter"}
@@ -368,7 +370,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Recordings,
-                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Recordings),
+                    var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Recordings),
                     on:click = tab_click(Tab::Recordings)
                 ) {
                     text {"Recordings"}
@@ -376,7 +378,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 box(
                     class = "tab",
                     class:on = move || tab.get() == Tab::Logs,
-                    var:--tab-wght = tab_weight_value(tab, tab_weight, Tab::Logs),
+                    var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Logs),
                     on:click = tab_click(Tab::Logs)
                 ) {
                     text {"Logs"}
@@ -1136,14 +1138,19 @@ fn ticker_duration(text: &str) -> String {
 /// while the outgoing one goes 800→600.
 fn tab_weight_value(
     tab: RwSignal<Tab, LocalStorage>,
+    previous: RwSignal<Option<Tab>, LocalStorage>,
     weight: RwSignal<f32, LocalStorage>,
     mine: Tab,
 ) -> impl Fn() -> Option<String> {
     move || {
+        // Only the incoming and outgoing tabs take part in the tween;
+        // everyone else stays light instead of blinking through the ramp.
         let progress = if tab.get() == mine {
             weight.get()
-        } else {
+        } else if previous.get() == Some(mine) {
             1.0 - weight.get()
+        } else {
+            0.0
         };
         // Chillax's wght axis is 200–700; 200 is the lightest it can go.
         Some(format!("{:.0}", 200.0 + 400.0 * progress))

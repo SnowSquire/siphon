@@ -42,8 +42,9 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   160ms, a live dot pulse, the two marquees, and the tab weight. Tab names use
   Chillax, whose `wght` axis tops out at 700: unselected tabs sit at its
   minimum 200 and the selected tab at 600, with a cubic ease-out over 180ms
-  while the outgoing tab eases back, driven by `font-variation-settings` and a
-  per-frame signal. The switch gets its
+  while the outgoing tab eases back; the outgoing tab is tracked explicitly so
+  the other tabs stay at 200 instead of blinking through the ramp. Driven by
+  `font-variation-settings` and a per-frame signal. The switch gets its
   motion from `--zui-motion-duration-normal`: zgui-ui's switch declares its own
   `transition-property` and reads that token, and the Terminal preset sets it
   to `0ms`, so the token is overridden in `THEME_CSS` rather than redeclaring
