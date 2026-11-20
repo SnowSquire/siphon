@@ -4,7 +4,6 @@
 //! the admin surface can never follow `--bind 0.0.0.0`, and the OS access
 //! check is the process user's.
 
-#[cfg(unix)]
 use std::path::PathBuf;
 
 /// The endpoint for one app id: a pipe name on Windows, a socket path on Unix.
@@ -22,6 +21,31 @@ pub fn admin_endpoint(app_id: &str) -> String {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+/// Where one app id keeps its state that is not configuration: the log, and
+/// later anything else that is rewritten rather than edited by a person.
+///
+/// Windows uses `%LOCALAPPDATA%`; Unix uses `XDG_STATE_HOME` (`~/.local/state`)
+/// for the same reason — a log is per-machine and per-user, and must not travel
+/// with a synced config directory.
+#[must_use]
+pub fn state_dir(app_id: &str) -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
+    #[cfg(unix)]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(app_id)
+}
+
+/// The daemon's log: everything it prints, plus the panic message that would
+/// otherwise be lost when the UI spawned it with no console.
+#[must_use]
+pub fn log_path(app_id: &str) -> PathBuf {
+    state_dir(app_id).join("daemon.log")
 }
 
 /// Whether a daemon is listening on `endpoint`, without blocking.

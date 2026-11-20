@@ -22,6 +22,8 @@ mod gql;
 #[allow(clippy::future_not_send)]
 mod hermes;
 #[allow(clippy::future_not_send)]
+mod logging;
+
 mod matcher;
 #[allow(dead_code, clippy::future_not_send)]
 mod metrics;
@@ -75,7 +77,6 @@ use mimalloc::MiMalloc;
 #[cfg(windows)]
 use tauri_winrt_notification as _;
 use tracing::error;
-use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 use crate::app::AppHandle;
@@ -193,9 +194,7 @@ fn default_bind() -> SocketAddr {
 
 #[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    logging::init(config::APP_ID);
 
     let cfg = Config::parse();
     match &cfg.command {

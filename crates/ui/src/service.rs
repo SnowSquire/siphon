@@ -88,11 +88,8 @@ fn wait_ports_closed(iterations: usize) {
 pub fn start() {
     let path = daemon_path();
     let mut command = Command::new(&path);
-    command
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.arg("daemon").stdin(Stdio::null());
+    inherit_log(&mut command);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -119,6 +116,46 @@ pub fn start() {
             "failed to start {}: {error}",
             path.display()
         ),
+    }
+}
+
+/// Points the child's stdout and stderr at the daemon's log file.
+///
+/// The daemon logs through tracing, which writes to that file itself; this
+/// catches what bypasses it — the message a panic prints before `abort`, and
+/// anything a startup warning writes before the subscriber exists.
+fn inherit_log(command: &mut Command) {
+    let path = siphon_rpc::log_path(APP_ID);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
+    match opened {
+        Ok(file) => {
+            let copy = file.try_clone();
+            command.stdout(Stdio::from(file));
+            match copy {
+                Ok(copy) => {
+                    command.stderr(Stdio::from(copy));
+                }
+                Err(error) => {
+                    tracing::warn!(target: "service", %error, "daemon stderr is discarded");
+                    command.stderr(Stdio::null());
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "service",
+                path = %path.display(),
+                %error,
+                "cannot open the daemon log; its output is discarded"
+            );
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
     }
 }
 

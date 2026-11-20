@@ -67,6 +67,8 @@ detail: `notes/architecture.md`.
 - `scheduler.rs` — manifest poll, Twitch tags, fetch dispatch, consumer fan-out; the `#EXT-X-TWITCH-*` quirks are in `notes.txt`.
 - `variant.rs` — master-playlist resolution through Twitch GQL + usher.
 - `config.rs`, `gql.rs`, `hermes.rs`, `matcher.rs`, `notifier.rs`, `update.rs` — the Siphon backend: persisted config, GQL, Hermes pubsub, word filter, toasts/webhook, update check (`notes/rpc.md`).
+- `logging.rs` — the daemon's stdout/stderr, appended to `daemon.log` in the
+  per-user state dir (`%LOCALAPPDATA%`, `~/.local/state`) and rotated at 4 MiB.
 - `app.rs`, `bus.rs`, `rpc.rs`, `metrics.rs` — the backend app loop, entity update bus, admin RPC server and telemetry.
 - `registry.rs` — the stream registry and monitors behind `daemon` mode (`notes/rtsp-daemon.md`).
 - `downloader.rs` — bounded fetch workers streaming into spools.
