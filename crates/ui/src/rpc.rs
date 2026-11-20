@@ -1,7 +1,7 @@
 //! The UI-side RPC worker: connect, forward snapshots and updates, send intents.
 //!
 //! The worker runs on its own compio thread. The UI thread only renders the
-//! latest snapshot and sends [`UiCommand`]s; it never blocks on the socket.
+//! latest snapshot and sends [`Request`]s; it never blocks on the socket.
 
 #![allow(clippy::future_not_send)]
 
@@ -26,19 +26,13 @@ use siphon_rpc::DownloaderSummary;
 use siphon_rpc::LogEntry;
 use siphon_rpc::NotificationView;
 use siphon_rpc::PipelineView;
-use siphon_rpc::Request;
+pub use siphon_rpc::Request;
 use siphon_rpc::Snapshot;
 use siphon_rpc::Update;
 use siphon_rpc::UpdateView;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
 use zgui::reactive::prelude::*;
-
-/// One UI action.
-#[derive(Debug)]
-pub enum UiCommand {
-    Request(Request),
-}
 
 /// One snapshot or entity update for the UI thread.
 #[derive(Debug, Clone)]
@@ -82,24 +76,28 @@ impl Wake {
 /// The UI's sending end for intents.
 #[derive(Clone)]
 pub struct IntentSender {
-    tx: kanal::Sender<UiCommand>,
+    tx: kanal::Sender<Request>,
     wake: Arc<Wake>,
 }
 
 impl IntentSender {
-    /// Queues an intent and wakes the worker. The command stays in the channel
+    /// Queues an intent and wakes the worker. The request stays in the channel
     /// until the worker drains it, so a wake that races an update cannot drop a
     /// user action.
-    pub fn send(&self, command: UiCommand) {
-        let _ = self.tx.try_send(command);
+    ///
+    /// Returns `false` when the queue is full or the worker is gone; the caller
+    /// is free to ignore that, the intent will simply not be applied.
+    pub fn send(&self, request: Request) -> bool {
+        let queued = matches!(self.tx.try_send(request), Ok(true));
         self.wake.wake();
+        queued
     }
 }
 
 /// Creates the intent channel, its sender and the shared wake.
 #[must_use]
-pub fn intent_channel() -> (IntentSender, kanal::Receiver<UiCommand>, Arc<Wake>) {
-    let (tx, rx) = kanal::unbounded();
+pub fn intent_channel() -> (IntentSender, kanal::Receiver<Request>, Arc<Wake>) {
+    let (tx, rx) = kanal::bounded(INTENT_CAP);
     let wake = Wake::new();
     (
         IntentSender {
@@ -119,7 +117,6 @@ const LOG_CAP: usize = 512;
 #[must_use]
 pub fn empty_snapshot() -> Snapshot {
     Snapshot {
-        revision: 0,
         config: Config::default(),
         conn: ConnHealth::Connecting,
         channels: Vec::new(),
@@ -134,9 +131,28 @@ pub fn empty_snapshot() -> Snapshot {
     }
 }
 
+/// How many events may sit between the RPC worker and the UI thread.
+///
+/// Past this the UI is further behind than a replay can fix, so further updates
+/// are dropped and a snapshot is requested once there is room again.
+pub const EVENT_QUEUE_CAP: usize = 512;
+/// How many decoded events the worker buffers before dropping the oldest.
+const IN_FLIGHT_CAP: usize = 1024;
+/// How many user intents may queue. A person cannot click fast enough to fill
+/// this unless something is already wrong.
+const INTENT_CAP: usize = 256;
+
+/// Why one connection ended.
+enum End {
+    /// The UI dropped its receiver; the thread is shutting down.
+    UiGone,
+    /// The backend went away; reconnect.
+    BackendLost,
+}
+
 /// Runs forever, reconnecting with backoff. One connection at a time.
 pub async fn run(
-    intents: kanal::Receiver<UiCommand>,
+    intents: kanal::Receiver<Request>,
     wake: Arc<Wake>,
     events: kanal::Sender<UiEvent>,
 ) {
@@ -144,48 +160,57 @@ pub async fn run(
     tracing::info!(target: "rpc", %endpoint, "admin endpoint");
     let mut backoff = Duration::from_secs(1);
     loop {
-        let connected = match Client::connect(&endpoint, env!("CARGO_PKG_VERSION")).await {
+        let failure = match Client::connect(&endpoint, env!("CARGO_PKG_VERSION")).await {
             Ok((client, snapshot)) => {
                 backoff = Duration::from_secs(1);
                 let _ = events.try_send(UiEvent::Snapshot(Box::new(snapshot)));
-                serve_connection(client, &intents, &wake, &events).await
+                match serve_connection(client, &intents, &wake, &events).await {
+                    End::UiGone => return,
+                    End::BackendLost => Some("backend disconnected".to_owned()),
+                }
             }
-            Err(error) => {
-                let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(format!(
-                    "backend: {error}"
-                ))))));
-                false
-            }
+            Err(error) => Some(format!("backend: {error}")),
         };
-        if !connected {
-            let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(
-                "backend disconnected".to_owned(),
-            )))));
+        let _ = events.try_send(UiEvent::Update(Box::new(Update::Conn(
+            ConnHealth::Connecting,
+        ))));
+        if let Some(message) = failure {
+            let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(message)))));
         }
         compio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(2));
     }
 }
 
-/// Serves one connection; returns false when the UI went away.
+/// Serves one connection until the backend or the UI goes away.
 async fn serve_connection(
     client: Client,
-    intents: &kanal::Receiver<UiCommand>,
+    intents: &kanal::Receiver<Request>,
     wake: &Arc<Wake>,
     events: &kanal::Sender<UiEvent>,
-) -> bool {
+) -> End {
     let client = Rc::new(client);
-    let stream = client.events();
+    let stream = client.events().clone();
     let queue: Rc<RefCell<VecDeque<ClientEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
     let closed = Rc::new(Cell::new(false));
+    // Set whenever an event had to be dropped. The next event that does fit
+    // then asks for a snapshot, which supersedes everything that was lost.
+    let lost = Rc::new(Cell::new(false));
 
     // The forwarder owns the async receive; the worker drains its queue. A
     // select between the two receivers would drop a completed receive.
     let feed_queue = Rc::clone(&queue);
     let feed_closed = Rc::clone(&closed);
+    let feed_lost = Rc::clone(&lost);
     let feed_wake = Arc::clone(wake);
     compio::runtime::spawn(async move {
         while let Ok(event) = stream.recv().await {
+            if feed_queue.borrow().len() >= IN_FLIGHT_CAP {
+                // Bound the buffer even while the window is in the tray: the
+                // oldest events go, and the snapshot below repairs the state.
+                feed_queue.borrow_mut().pop_front();
+                feed_lost.set(true);
+            }
             feed_queue.borrow_mut().push_back(event);
             feed_wake.wake();
         }
@@ -202,9 +227,11 @@ async fn serve_connection(
 
         let disconnected = closed.get() && queue.borrow().is_empty();
 
-        while let Ok(Some(command)) = intents.try_recv() {
-            let UiCommand::Request(request) = command;
-            if let Err(error) = client.request(request).await {
+        while let Ok(Some(request)) = intents.try_recv() {
+            // Fire and forget: a slow handler must not stall the update stream,
+            // and the ack would be discarded anyway. A rejected intent arrives
+            // as an `Update`.
+            if let Err(error) = client.send(request) {
                 let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(
                     error.to_string(),
                 )))));
@@ -214,21 +241,28 @@ async fn serve_connection(
         loop {
             let event = queue.borrow_mut().pop_front();
             let Some(event) = event else { break };
-            match event {
-                ClientEvent::Snapshot(snapshot) => {
-                    let _ = events.try_send(UiEvent::Snapshot(snapshot));
+            let forwarded = match event {
+                ClientEvent::Snapshot(snapshot) => events.try_send(UiEvent::Snapshot(snapshot)),
+                ClientEvent::Update(update) => events.try_send(UiEvent::Update(update)),
+            };
+            match forwarded {
+                // Room again: replace whatever was dropped with one snapshot.
+                Ok(true) => {
+                    if lost.replace(false) {
+                        let _ = client.send(Request::GetSnapshot);
+                    }
                 }
-                ClientEvent::Update { update, .. } => {
-                    let _ = events.try_send(UiEvent::Update(update));
-                }
+                Ok(false) => lost.set(true),
+                // The UI is gone; the loop below reports it.
+                Err(_) => {}
             }
         }
 
         if disconnected {
-            return true;
+            return End::BackendLost;
         }
         if (intents.is_closed() && intents.is_empty()) || events.is_closed() {
-            return false;
+            return End::UiGone;
         }
     }
 }

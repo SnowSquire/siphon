@@ -297,7 +297,6 @@ pub struct UpdateView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
-    pub revision: u64,
     pub config: Config,
     pub conn: ConnHealth,
     pub channels: Vec<ChannelView>,
@@ -354,7 +353,7 @@ pub enum Request {
     SetNotifyTitleChanges(bool),
     SetSound(bool),
     AddFilteredWord(String),
-    RemoveFilteredWord(u32),
+    RemoveFilteredWord(String),
     /// Turn the per-channel recording monitor on or off.
     SetRecord {
         channel: u64,
@@ -473,10 +472,7 @@ pub enum ServerMessage {
     Rejected(String),
     /// The full state, sent once after `Welcome` and on `GetSnapshot`.
     Snapshot(Box<Snapshot>),
-    Update {
-        revision: u64,
-        update: Update,
-    },
+    Update(Update),
     Response {
         id: u64,
         result: Result<Response, RpcError>,

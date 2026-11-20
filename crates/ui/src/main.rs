@@ -42,6 +42,7 @@ mod tray;
 fn main() {
     use tracing_subscriber::EnvFilter;
 
+    use crate::rpc::EVENT_QUEUE_CAP;
     use crate::rpc::intent_channel;
     use crate::rpc::run;
     use crate::service::APP_ID;
@@ -78,7 +79,7 @@ fn main() {
     service::ensure_running();
 
     let (intents, intent_rx, wake) = intent_channel();
-    let (event_tx, event_rx) = kanal::unbounded();
+    let (event_tx, event_rx) = kanal::bounded(EVENT_QUEUE_CAP);
     std::thread::Builder::new()
         .name("rpc worker".to_owned())
         .spawn(move || {
@@ -102,6 +103,7 @@ fn main() {
 fn main() {
     use tracing_subscriber::EnvFilter;
 
+    use crate::rpc::EVENT_QUEUE_CAP;
     use crate::rpc::intent_channel;
     use crate::rpc::run;
 
@@ -118,7 +120,7 @@ fn main() {
     service::ensure_running();
 
     let (intents, intent_rx, wake) = intent_channel();
-    let (event_tx, event_rx) = kanal::unbounded();
+    let (event_tx, event_rx) = kanal::bounded(EVENT_QUEUE_CAP);
     std::thread::Builder::new()
         .name("rpc worker".to_owned())
         .spawn(move || {

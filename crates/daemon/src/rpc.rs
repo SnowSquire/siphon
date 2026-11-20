@@ -234,8 +234,8 @@ async fn writer<W: AsyncWrite + Unpin>(mut write: W, outbound_rx: kanal::Receive
                 return;
             }
         }
-        for (revision, update) in coalescer.finish() {
-            if codec::write(&mut write, &ServerMessage::Update { revision, update })
+        for (_, update) in coalescer.finish() {
+            if codec::write(&mut write, &ServerMessage::Update(update))
                 .await
                 .is_err()
             {
@@ -282,7 +282,7 @@ mod tests {
                 .await
                 .ok()
                 .and_then(Result::ok);
-            if let Some(ClientEvent::Update { update, .. }) = event
+            if let Some(ClientEvent::Update(update)) = event
                 && matches!(*update, Update::Config(_))
             {
                 return;
@@ -300,7 +300,7 @@ mod tests {
             let Some(event) = event else {
                 continue;
             };
-            let ClientEvent::Update { update, .. } = event else {
+            let ClientEvent::Update(update) = event else {
                 continue;
             };
             match *update {
@@ -399,8 +399,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(&events, "sunnys", false).await;
-            next_config(&second_events).await;
+            next_pipeline(events, "sunnys", false).await;
+            next_config(second_events).await;
 
             let response = client
                 .request(Request::GetDisk(siphon_rpc::StreamKey::new("sunnys", None)))
@@ -416,7 +416,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(&events, "sunnys", true).await;
+            next_pipeline(events, "sunnys", true).await;
 
             // A one-shot recording starts without a persisted monitor and can
             // be stopped again with the same lifecycle.
@@ -429,7 +429,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(&events, "sunnys", false).await;
+            next_pipeline(events, "sunnys", false).await;
 
             let response = client
                 .request(Request::DisconnectViewers(key.clone()))
@@ -442,7 +442,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(&events, "sunnys", true).await;
+            next_pipeline(events, "sunnys", true).await;
         });
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -485,9 +485,7 @@ impl App {
                 Ok(Response::Ack)
             }
             Request::AddFilteredWord(word) => Ok(self.apply_add_filtered_word(&word)),
-            Request::RemoveFilteredWord(index) => {
-                self.apply_remove_filtered_word(usize::try_from(index).unwrap_or(usize::MAX))
-            }
+            Request::RemoveFilteredWord(word) => self.apply_remove_filtered_word(&word),
             Request::SetRecord { channel, record } => self.apply_set_record(channel, record),
             Request::SetNotifyLive { channel, notify } => {
                 self.apply_set_notify_live(channel, notify)
@@ -573,7 +571,6 @@ impl App {
             channels.push(view);
         }
         Snapshot {
-            revision: self.bus.revision(),
             config: self.config.clone(),
             conn: self.conn,
             channels,
@@ -923,13 +920,19 @@ impl App {
         Response::Ack
     }
 
-    fn apply_remove_filtered_word(&mut self, index: usize) -> Result<Response, RpcError> {
-        if index >= self.config.filtered_words.len() {
-            return Err(RpcError::BadRequest(
-                "filtered word out of range".to_owned(),
-            ));
-        }
-        self.config.filtered_words.remove(index);
+    fn apply_remove_filtered_word(&mut self, word: &str) -> Result<Response, RpcError> {
+        // By value, not by position: the view can be stale by the time the
+        // click lands, and removing a position would delete a word the user
+        // never saw.
+        let Some(position) = self
+            .config
+            .filtered_words
+            .iter()
+            .position(|entry| entry == word)
+        else {
+            return Err(RpcError::Failed(format!("no filtered word {word:?}")));
+        };
+        self.config.filtered_words.remove(position);
         self.config.version = Config::VERSION;
         self.matcher = crate::hermes::build_matcher(&self.config.filtered_words);
         self.publish_config();

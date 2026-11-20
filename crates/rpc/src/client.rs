@@ -57,12 +57,9 @@ pub enum ConnectError {
 #[derive(Debug)]
 pub enum ClientEvent {
     Snapshot(Box<Snapshot>),
-    Update {
-        revision: u64,
-        /// Boxed: one update is much larger than a snapshot handle, and the
-        /// worker keeps a queue of them.
-        update: Box<Update>,
-    },
+    /// One entity update. Boxed: it is much larger than a snapshot handle, and
+    /// the worker keeps a queue of them.
+    Update(Box<Update>),
 }
 
 type Pending = Rc<RefCell<HashMap<u64, Sender<Result<Response, RpcError>>>>>;
@@ -183,8 +180,34 @@ impl Client {
 
     /// The stream of `Snapshot`/`Update` events. Closes when the backend
     /// disconnects.
-    pub fn events(&self) -> AsyncReceiver<ClientEvent> {
-        self.events.clone()
+    ///
+    /// Borrowed, not cloned: the stream is single-consumer, and handing out a
+    /// clone would silently split it between two callers.
+    pub const fn events(&self) -> &AsyncReceiver<ClientEvent> {
+        &self.events
+    }
+
+    /// Queues one request without waiting for its ack.
+    ///
+    /// Intents are fire-and-forget: the state change arrives as an `Update`,
+    /// and a rejected intent is reported the same way, so nothing on the UI
+    /// path should block on the ack.
+    ///
+    /// # Errors
+    ///
+    /// `Disconnected` when the socket has already closed.
+    pub fn send(&self, request: Request) -> Result<(), RpcError> {
+        if self.out.closed.get() {
+            return Err(RpcError::Disconnected);
+        }
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        self.out
+            .queue
+            .borrow_mut()
+            .push_back(ClientMessage::Request { id, request });
+        self.out.wake.wake();
+        Ok(())
     }
 
     /// Sends one request and waits for its typed result.
@@ -242,11 +265,8 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
             () = woken => continue,
         };
         match selected {
-            Ok(ServerMessage::Update { revision, update }) => {
-                let _ = events.try_send(ClientEvent::Update {
-                    revision,
-                    update: Box::new(update),
-                });
+            Ok(ServerMessage::Update(update)) => {
+                let _ = events.try_send(ClientEvent::Update(Box::new(update)));
             }
             Ok(ServerMessage::Snapshot(snapshot)) => {
                 let _ = events.try_send(ClientEvent::Snapshot(snapshot));

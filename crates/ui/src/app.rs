@@ -36,7 +36,6 @@ use crate::format::format_duration_ms;
 use crate::format::format_iso_ms;
 use crate::format::format_time_ms;
 use crate::rpc::IntentSender;
-use crate::rpc::UiCommand;
 use crate::rpc::UiEvent;
 use crate::rpc::UiState;
 #[cfg(windows)]
@@ -326,7 +325,9 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                             variant = ButtonVariant::Outline,
                             on:click = {
                                 let update = Rc::clone(&update);
-                                move |_| update.send(UiCommand::Request(Request::ApplyUpdate))
+                                move |_| {
+                                    update.send(Request::ApplyUpdate);
+                                }
                             }
                         ) {"Install"}
                     }
@@ -342,7 +343,9 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                         variant = ButtonVariant::Ghost,
                         on:click = {
                             let dismiss = Rc::clone(&dismiss);
-                            move |_| dismiss.send(UiCommand::Request(Request::ClearError))
+                            move |_| {
+                                dismiss.send(Request::ClearError);
+                            }
                         }
                     ) {"Dismiss"}
                 }
@@ -450,7 +453,7 @@ fn ChannelsTab(
             if login.is_empty() {
                 return;
             }
-            intents.send(UiCommand::Request(Request::AddLogin(login)));
+            intents.send(Request::AddLogin(login));
             draft.set(String::new());
         }
     };
@@ -621,10 +624,10 @@ fn ChannelRow(
                                     size = SwitchSize::Sm,
                                     checked = notify_live,
                                     on_change = UnsyncCallback::new(move |on| {
-                                        live_intents.send(UiCommand::Request(Request::SetNotifyLive {
+                                        live_intents.send(Request::SetNotifyLive {
                                             channel: id,
                                             notify: on,
-                                        }));
+                                        });
                                     })
                                 )
                                 text(class = "mini__label") {"live"}
@@ -639,10 +642,10 @@ fn ChannelRow(
                                     size = SwitchSize::Sm,
                                     checked = notify_titles,
                                     on_change = UnsyncCallback::new(move |on| {
-                                        title_intents.send(UiCommand::Request(Request::SetNotifyTitles {
+                                        title_intents.send(Request::SetNotifyTitles {
                                             channel: id,
                                             notify: on,
-                                        }));
+                                        });
                                     })
                                 )
                                 text(class = "mini__label") {"title"}
@@ -656,10 +659,10 @@ fn ChannelRow(
                         size = SwitchSize::Sm,
                         checked = record,
                         on_change = UnsyncCallback::new(move |on| {
-                            record_intents.send(UiCommand::Request(Request::SetRecord {
+                            record_intents.send(Request::SetRecord {
                                 channel: id,
                                 record: on,
-                            }));
+                            });
                         })
                     )
                 }
@@ -669,7 +672,7 @@ fn ChannelRow(
                     variant = ButtonVariant::Ghost,
                     class = "remove",
                     on:click:stop = move |_| {
-                        remove_intents.send(UiCommand::Request(Request::RemoveChannel(id)));
+                        remove_intents.send(Request::RemoveChannel(id));
                     }
                 ) {"×"}
             }
@@ -772,7 +775,7 @@ fn FilterTab(
             if word.is_empty() {
                 return;
             }
-            intents.send(UiCommand::Request(Request::AddFilteredWord(word)));
+            intents.send(Request::AddFilteredWord(word));
             draft.set(String::new());
         }
     };
@@ -792,7 +795,9 @@ fn FilterTab(
                     Switch(
                         checked = Binding::controlled(
                             Signal::derive_local(move || title_changes.get()),
-                            move |on| titles.send(UiCommand::Request(Request::SetNotifyTitleChanges(on))),
+                            move |on| {
+                                titles.send(Request::SetNotifyTitleChanges(on));
+                            },
                         )
                     )
                 }
@@ -805,7 +810,9 @@ fn FilterTab(
                     Switch(
                         checked = Binding::controlled(
                             Signal::derive_local(move || sound.get()),
-                            move |on| sound_switch.send(UiCommand::Request(Request::SetSound(on))),
+                            move |on| {
+                                sound_switch.send(Request::SetSound(on));
+                            },
                         )
                     )
                 }
@@ -818,17 +825,8 @@ fn FilterTab(
             }
             ScrollArea(class = "words") {
                 column(class = "list") {
-                    for word in move || {
-                        (*words.get())
-                            .iter()
-                            .enumerate()
-                            .map(|(index, word)| WordRow {
-                                index: u32::try_from(index).unwrap_or(u32::MAX),
-                                text: word.clone(),
-                            })
-                            .collect::<Vec<_>>()
-                    }, key = |word: &WordRow| word.index {
-                        WordRowView(word = word.clone(), intents = Rc::clone(&word_rows))
+                    for word in move || (*words.get()).clone(), key = |word: &String| word.clone() {
+                        WordRowView(word = word, intents = Rc::clone(&word_rows))
                     }
                 }
             }
@@ -836,26 +834,22 @@ fn FilterTab(
     }
 }
 
-#[derive(Clone, Debug)]
-struct WordRow {
-    index: u32,
-    text: String,
-}
-
 #[component]
 #[allow(clippy::needless_pass_by_value)]
-fn WordRowView(word: WordRow, intents: Rc<IntentSender>) -> impl IntoView {
-    let index = word.index;
+fn WordRowView(word: String, intents: Rc<IntentSender>) -> impl IntoView {
+    let remove = word.clone();
     view! {
         row(class = "word") {
-            text(class = "word__text") {{word.text}}
+            text(class = "word__text") {{word}}
             spacer()
             Button(
                 size = ButtonSize::IconSm,
                 variant = ButtonVariant::Ghost,
                 on:click = {
                     let intents = Rc::clone(&intents);
-                    move |_| intents.send(UiCommand::Request(Request::RemoveFilteredWord(index)))
+                    move |_| {
+                        intents.send(Request::RemoveFilteredWord(remove.clone()));
+                    }
                 }
             ) {"×"}
         }
@@ -878,10 +872,10 @@ fn RecordingsTab(
                 return;
             }
             let quality = quality.get_untracked().trim().to_owned();
-            intents.send(UiCommand::Request(Request::RecordOnce {
+            intents.send(Request::RecordOnce {
                 login,
                 quality: (!quality.is_empty()).then_some(quality),
-            }));
+            });
             draft.set(String::new());
         }
     };
@@ -975,10 +969,12 @@ fn RecordingRow(pipeline: PipelineView, intents: Rc<IntentSender>) -> impl IntoV
                         on:click = {
                             let intents = Rc::clone(&intents);
                             let key = key.clone();
-                            move |_| intents.send(UiCommand::Request(Request::PipelineStop {
-                                key: key.clone(),
-                                force: false,
-                            }))
+                            move |_| {
+                                intents.send(Request::PipelineStop {
+                                    key: key.clone(),
+                                    force: false,
+                                });
+                            }
                         }
                     ) {"Stop"}
                 }
