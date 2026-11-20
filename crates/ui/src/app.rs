@@ -57,6 +57,37 @@ enum Tab {
     Settings,
 }
 
+/// Writes the wall time of every frame that took more than a few milliseconds
+/// to stderr, which the app log captures. `SIPHON_FRAME_LOG` turns it on; it
+/// exists to measure a hitch, not to ship in a window.
+///
+/// The `gap` is the time since the previous frame ended: a stall that blocks
+/// the UI thread between frames shows up there, not in a frame's own `elapsed`.
+struct FrameLog {
+    last: Cell<Option<std::time::Instant>>,
+}
+
+impl zgui::runtime::FrameProbe for FrameLog {
+    fn frame_ended(&self, window: &zgui::runtime::Window) {
+        let now = std::time::Instant::now();
+        let gap = self.last.get().map_or(0.0, |last| (now - last).as_secs_f64() * 1000.0);
+        self.last.set(Some(now));
+        let Some(report) = window.last_frame_report() else {
+            return;
+        };
+        let elapsed = report.elapsed.as_secs_f64() * 1000.0;
+        let paint = report.paint_elapsed.as_secs_f64() * 1000.0;
+        if gap < 30.0 && elapsed < 20.0 && paint < 20.0 {
+            return;
+        }
+        let size = window.surface().size();
+        eprintln!(
+            "frame gap {gap:.1}ms {elapsed:.1}ms paint {paint:.1}ms {}x{} restyled {} animated {} timers {}",
+            size.width.0, size.height.0, report.restyled, report.animated, report.timers_fired
+        );
+    }
+}
+
 pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Result<()> {
     let state = UiState::new();
     // The preset dark scheme is close, but the window has its own ink. The
@@ -80,6 +111,15 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
         // arrive one serial late; see `chain::wayland::wait_for_frame`.
         .with_compose_ahead(ComposeAhead::Always)
         .with_stylesheet(sheet);
+
+    // Frame timings for the resize A/B. stderr is what the app log captures.
+    let window = if std::env::var_os("SIPHON_FRAME_LOG").is_some() {
+        window.with_probe(Rc::new(FrameLog {
+            last: Cell::new(None),
+        }))
+    } else {
+        window
+    };
 
     // Shipped fonts are registered by path in dev so typography can be tried
     // without a rebuild: SIPHON_FONT_UI, SIPHON_FONT_BRAND. Release builds
@@ -485,7 +525,7 @@ fn App(
 fn ListThumb() -> impl IntoView {
     let context = ScrollAreaContext::current();
     let element = NodeRef::new();
-    let metrics = move || {
+    let metrics = Signal::derive_local(move || {
         let position = context?.position();
         let scale = element.scale();
         let scale = if scale > 0.0 { scale } else { 1.0 };
@@ -497,15 +537,15 @@ fn ListThumb() -> impl IntoView {
             let top = offset / (extent - viewport) * (viewport - height);
             (top, height)
         })
-    };
+    });
     view! {
         box(
             node_ref = element,
             class = "list-thumb",
-            class:hidden = move || metrics().is_none(),
+            class:hidden = move || metrics.get().is_none(),
             a11y:hidden = true,
-            style:top = move || metrics().map(|(top, _)| format!("{top:.1}px")),
-            style:height = move || metrics().map(|(_, height)| format!("{height:.1}px")),
+            style:top = move || metrics.get().map(|(top, _)| format!("{top:.1}px")),
+            style:height = move || metrics.get().map(|(_, height)| format!("{height:.1}px")),
         )
     }
 }
@@ -2294,6 +2334,7 @@ const SHEET: &str = css!(
 }
 
 .list-thumb.hidden { display: none; }
+
 /* Zebra rows; hover/open must follow the even-row rule to win. Each one also
    carries the 16px strip that paints under the scrollbar in its own colour. */
 .channel:nth-child(even) .channel-row {
