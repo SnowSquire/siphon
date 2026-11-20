@@ -66,7 +66,7 @@ pub fn idle_canvas(width: u32, height: u32) -> (u32, u32) {
 
 /// The resize timer and extent of the Windows chain.
 #[cfg(windows)]
-pub(crate) struct Canvas {
+pub struct Canvas {
     width: u32,
     height: u32,
     settle_at: Option<std::time::Instant>,
@@ -87,7 +87,7 @@ impl Canvas {
     }
 
     /// Whether the chain is at least as large as the window.
-    pub(crate) fn covers(&self, ui: (u32, u32)) -> bool {
+    pub(crate) const fn covers(&self, ui: (u32, u32)) -> bool {
         self.width >= ui.0 && self.height >= ui.1
     }
 
@@ -96,7 +96,7 @@ impl Canvas {
         self.settle_at = Some(std::time::Instant::now() + SETTLE);
     }
 
-    pub(crate) fn resized(&mut self, size: (u32, u32)) {
+    pub(crate) const fn resized(&mut self, size: (u32, u32)) {
         self.width = size.0;
         self.height = size.1;
     }
@@ -144,12 +144,17 @@ pub fn renderer(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Bgra8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        // COPY_SRC/COPY_DST: a rebuilt texture is seeded with the one it
+        // replaces, because ZGUI only copies its damage into a supplied one.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let placebo =
         Rc::new(Placebo::import(gpu).map_err(|error| gpu_error(format!("libplacebo: {error}")))?);
-    let chain = Chain::new(gpu, &placebo, surface, &gpu_surface, width, height)
+    let chain = Chain::new(gpu, Rc::clone(&placebo), surface, &gpu_surface, width, height)
         .map_err(|error| gpu_error(format!("{error}")))?;
     let inner = graphics
         .renderer_supplied(target, vec![ui.clone()])
@@ -171,3 +176,10 @@ pub fn renderer(
 pub fn gpu_error(reason: impl Into<String>) -> AppError {
     AppError::GpuUnavailable(GpuUnavailable::new().rejected("presentation", reason))
 }
+
+#[cfg(windows)]
+pub use windows::note_present;
+
+
+#[cfg(not(windows))]
+pub const fn note_present() {}

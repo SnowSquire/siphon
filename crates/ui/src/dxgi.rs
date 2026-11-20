@@ -230,9 +230,14 @@ pub struct DxgiSwapchain {
     /// out is valid after that, and every call that touches it fails the same
     /// way, so it is asked once and then left alone.
     removed: Cell<bool>,
-    hdr: bool,
-    max_luminance: f32,
-    sdr_white: f32,
+    /// Whether the chain is presenting PQ/Rec.2020. A cell because the display
+    /// can be switched under a running window and `begin` only has `&self`.
+    hdr: Cell<bool>,
+    /// The mode the chain was created with; a refresh re-applies it, because a
+    /// window that moved to another output may have found a different one.
+    hdr_mode: HdrMode,
+    max_luminance: Cell<f32>,
+    sdr_white: Cell<f32>,
 }
 
 impl DxgiSwapchain {
@@ -316,7 +321,7 @@ impl DxgiSwapchain {
         unsafe { factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }
             .context("MakeWindowAssociation")?;
 
-        let (hdr, max_luminance, sdr_white) = configure_hdr(&swapchain, hdr)?;
+        let (active, max_luminance, sdr_white) = configure_hdr(&swapchain, hdr, true, None)?;
         let format = wgpu::TextureFormat::Rgb10a2Unorm;
 
         let mut this = Self {
@@ -330,9 +335,10 @@ impl DxgiSwapchain {
             width,
             height,
             removed: Cell::new(false),
-            hdr,
-            max_luminance,
-            sdr_white,
+            hdr: Cell::new(active),
+            hdr_mode: hdr,
+            max_luminance: Cell::new(max_luminance),
+            sdr_white: Cell::new(sdr_white),
         };
         this.attach_backbuffers(d3d12, gpu, width, height)?;
         Ok(this)
@@ -352,7 +358,12 @@ impl DxgiSwapchain {
     ) -> eros::Result<()> {
         eros::ensure!(width > 0 && height > 0, "zero-sized swapchain");
         eros::ensure!(!self.removed.get(), "the device was removed");
-        self.release_buffers();
+        // The D3D12 resources have to be let go before `ResizeBuffers`, but the
+        // Vulkan imports over them must not be freed yet: `ResizeBuffers` is
+        // what waits for the compositor to finish with the buffers it is
+        // holding, and freeing their memory before that drains is a use after
+        // free on the GPU, which is the device being removed.
+        self.backbuffers.clear();
         // SAFETY: every reference to the old buffers has been dropped, and the
         // flags are the ones the chain was created with.
         unsafe {
@@ -369,12 +380,37 @@ impl DxgiSwapchain {
         }
         .inspect_err(|error| self.note_removal(error))
         .context("ResizeBuffers")?;
+        // The presents are drained: the old imports and their handles can go.
+        self.release_buffers();
         self.attach_backbuffers(d3d12, gpu, width, height)?;
         self.width = width;
         self.height = height;
-        // The colour space, HDR metadata and SDR white point are decisions
-        // about the display and survive a resize; only a window that moved to
-        // another output changes them, which is the next feature's problem.
+        // The colour space, the metadata and the white point are re-read by
+        // `refresh` on the present path, not here: this runs for every step of
+        // a resize drag, where a `QueryDisplayConfig` per step is milliseconds
+        // of stall each time.
+        Ok(())
+    }
+
+    /// Re-reads the output under the running window: the SDR white point the
+    /// user set in Windows, and whether the display is in HDR or SDR now.
+    ///
+    /// The colour space is only re-applied when the answer changed, so a steady
+    /// display costs one `QueryDisplayConfig` and no present-path work.
+    pub fn refresh(&self) -> eros::Result<()> {
+        eros::ensure!(!self.removed.get(), "the device was removed");
+        let (active, max_luminance, sdr_white) =
+            configure_hdr(&self.swapchain, self.hdr_mode, false, Some(self.hdr.get()))?;
+        if active != self.hdr.get() {
+            tracing::info!(
+                target: "ui",
+                "DXGI: the display moved to {}",
+                if active { "HDR" } else { "SDR" }
+            );
+        }
+        self.hdr.set(active);
+        self.max_luminance.set(max_luminance);
+        self.sdr_white.set(sdr_white);
         Ok(())
     }
 
@@ -470,19 +506,19 @@ impl DxgiSwapchain {
     /// Whether the swapchain is presenting PQ/Rec.2020.
     #[must_use]
     pub const fn hdr(&self) -> bool {
-        self.hdr
+        self.hdr.get()
     }
 
     /// The display's reported peak luminance in nits, or zero when unknown.
     #[must_use]
     pub const fn max_luminance(&self) -> f32 {
-        self.max_luminance
+        self.max_luminance.get()
     }
 
     /// The display's SDR white point in nits.
     #[must_use]
     pub const fn sdr_white(&self) -> f32 {
-        self.sdr_white
+        self.sdr_white.get()
     }
 
     /// Waits until the flip queue has room for another frame.
@@ -577,8 +613,15 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> eros::Result<LUID> {
 /// Puts the swapchain in HDR when requested and available.
 ///
 /// Also answers where the user put SDR white, which is what the interface and
-/// any SDR video have to be rendered against.
-fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> eros::Result<(bool, f32, f32)> {
+/// any SDR video have to be rendered against. `announce` prints the output's
+/// state at creation; `current` is what the chain is presenting now, so a
+/// refresh that finds nothing changed does no present-path work.
+fn configure_hdr(
+    swapchain: &IDXGISwapChain3,
+    mode: HdrMode,
+    announce: bool,
+    current: Option<bool>,
+) -> eros::Result<(bool, f32, f32)> {
     // SAFETY: the swapchain is alive for the call.
     let output = unsafe { swapchain.GetContainingOutput() }.context("GetContainingOutput")?;
     let output6: IDXGIOutput6 = output.cast().context("IDXGIOutput6")?;
@@ -589,10 +632,12 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> eros::Result<(bo
         unsafe { swapchain.CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) }
             .context("CheckColorSpaceSupport")?;
     let supported = support & (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) != 0;
-    eprintln!(
-        "DXGI output: color space {:?}, peak {} nits, max full-frame {} nits, bits {}",
-        desc.ColorSpace, desc.MaxLuminance, desc.MaxFullFrameLuminance, desc.BitsPerColor
-    );
+    if announce {
+        eprintln!(
+            "DXGI output: color space {:?}, peak {} nits, max full-frame {} nits, bits {}",
+            desc.ColorSpace, desc.MaxLuminance, desc.MaxFullFrameLuminance, desc.BitsPerColor
+        );
+    }
 
     let active = match mode {
         HdrMode::Off => false,
@@ -606,14 +651,11 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> eros::Result<(bo
     let space = if active {
         DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
     } else {
+        // The SDR desktop space Windows treats as sRGB; the chain's
+        // `target_color` has to declare the same one, or the interface is
+        // graded to a curve the compositor does not decode.
         DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
     };
-    // SAFETY: the swapchain is alive and `space` is one it just reported supporting
-    // (or the default SDR space).
-    unsafe { swapchain.SetColorSpace1(space) }.context("SetColorSpace1")?;
-    if active {
-        set_hdr_metadata(swapchain)?;
-    }
     let sdr_white = match crate::sdr::white_nits(&desc.DeviceName) {
         Ok(nits) => nits,
         Err(error) => {
@@ -621,24 +663,57 @@ fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> eros::Result<(bo
             200.0
         }
     };
-    eprintln!("SDR white: {sdr_white:.0} nits (level from the display configuration)");
+    if announce {
+        eprintln!("SDR white: {sdr_white:.0} nits (level from the display configuration)");
+    }
+    let changed = current != Some(active);
+    if changed {
+        // SAFETY: the swapchain is alive and `space` is one it just reported
+        // supporting (or the default SDR space).
+        unsafe { swapchain.SetColorSpace1(space) }.context("SetColorSpace1")?;
+        if active {
+            let content_peak = desc.MaxLuminance.max(sdr_white).round();
+            set_hdr_metadata(swapchain, content_peak, sdr_white.round())?;
+        }
+    }
+    if announce || changed {
+        eprintln!("DXGI present space: {space:?}");
+    }
     Ok((active, desc.MaxLuminance, sdr_white))
 }
 
 /// Publishes the mastering metadata for the HDR10 container.
-fn set_hdr_metadata(swapchain: &IDXGISwapChain3) -> eros::Result<()> {
+///
+/// `peak` is what the display can do; `content_peak` is the brightest this
+/// interface ever gets, which is its SDR white. Saying so tells the display it
+/// does not have to tone map anything down.
+fn set_hdr_metadata(
+    swapchain: &IDXGISwapChain3,
+    peak: f32,
+    content_peak: f32,
+) -> eros::Result<()> {
     let swapchain4: IDXGISwapChain4 = swapchain.cast().context("IDXGISwapChain4")?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "nits are small positive values"
+    )]
+    let (mastering, content) = (
+        peak.max(1.0) as u32,
+        content_peak.clamp(1.0, 65535.0) as u16,
+    );
     let metadata = DXGI_HDR_METADATA_HDR10 {
         // Rec.2020 primaries and D65 white, in 1/50000 units.
         RedPrimary: [35400, 14600],
         GreenPrimary: [8500, 39850],
         BluePrimary: [6550, 2300],
         WhitePoint: [15635, 16450],
-        // 1000 nits mastering, 0.005 nits black, 1000/400 nits content.
-        MaxMasteringLuminance: 1000,
+        // Display peak for mastering, 0.005 nits black, and the interface's own
+        // peak as content light level.
+        MaxMasteringLuminance: mastering,
         MinMasteringLuminance: 50,
-        MaxContentLightLevel: 1000,
-        MaxFrameAverageLightLevel: 400,
+        MaxContentLightLevel: content,
+        MaxFrameAverageLightLevel: content,
     };
     // SAFETY: the struct is plain data and the slice covers exactly it.
     let bytes = unsafe {

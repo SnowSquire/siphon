@@ -69,7 +69,7 @@ impl Placebo {
             ..Default::default()
         };
 
-        #[expect(
+        #[allow(
             clippy::needless_update,
             reason = "`pl_vulkan_queue` gains `flags` after libplacebo 7.360; the update keeps this compiling on both"
         )]
@@ -271,11 +271,45 @@ impl Placebo {
         }
     }
 
+    /// Creates a flat texture libplacebo can sample, e.g. a mask for a
+    /// monochrome overlay part.
+    pub fn create_flat(&self, width: u32, height: u32, texel: [u8; 4]) -> eros::Result<pl::pl_tex> {
+        // SAFETY: the GPU is live; a four-component 8-bit UNORM format either
+        // exists or the null return is handled below.
+        let format = unsafe {
+            pl::pl_find_fmt(
+                self.gpu,
+                pl::pl_fmt_type::PL_FMT_UNORM,
+                4,
+                8,
+                8,
+                pl::pl_fmt_caps::PL_FMT_CAP_SAMPLEABLE,
+            )
+        };
+        eros::ensure!(!format.is_null(), "no sampleable 8-bit RGBA format");
+        let params = pl::pl_tex_params {
+            w: std::os::raw::c_int::try_from(width)?,
+            h: std::os::raw::c_int::try_from(height)?,
+            format,
+            sampleable: true,
+            // Every texel is the same, so the format's component order does not
+            // matter: white in any order is white.
+            initial_data: texel.as_ptr().cast(),
+            ..Default::default()
+        };
+        // SAFETY: the parameters name a live format on this GPU and a texel
+        // buffer that outlives the call.
+        let texture = unsafe { pl::pl_tex_create(self.gpu, &params) };
+        eros::ensure!(!texture.is_null(), "libplacebo refused the texture");
+        Ok(texture)
+    }
+
     /// Blocks until every submission on the GPU has completed.
     pub fn finish(&self) {
         // SAFETY: the GPU is live for the borrow.
         unsafe { pl::pl_gpu_finish(self.gpu) };
     }
+
 }
 
 /// Converts an ash Vulkan format into libplacebo's spelling of the same enum.

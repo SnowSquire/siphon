@@ -26,6 +26,7 @@ mod app;
 mod chain;
 mod format;
 mod gpu;
+mod hdr;
 mod placebo;
 mod renderer;
 mod rpc;

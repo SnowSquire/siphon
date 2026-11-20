@@ -5,14 +5,32 @@
 //! latch and the monitor-sized resize canvas all live here; nothing above the
 //! chain knows DXGI exists.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use eros::Context as _;
 use libplacebo_sys as pl;
 use raw_window_handle::HasWindowHandle as _;
 use tracing::warn;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::LPARAM;
+use windows::Win32::Foundation::LRESULT;
+use windows::Win32::Foundation::WPARAM;
+use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::Shell::DefSubclassProc;
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::Shell::RemoveWindowSubclass;
+use windows::Win32::UI::Shell::SetWindowSubclass;
+use windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE;
+use windows::Win32::UI::WindowsAndMessaging::WM_ENTERSIZEMOVE;
+use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+use windows::Win32::UI::WindowsAndMessaging::WM_PAINT;
+use windows::Win32::UI::WindowsAndMessaging::WM_MOVING;
+use windows::Win32::UI::WindowsAndMessaging::WM_SIZE;
+use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
 use zgui::platform::GpuSurface;
 use zgui::platform::Surface;
 use zgui_render_wgpu::Gpu;
@@ -29,6 +47,19 @@ use crate::dxgi::resize_canvas;
 use crate::dxgi::set_window_background;
 use crate::placebo::Placebo;
 
+/// The presentation mode to ask DXGI for: `SIPHON_HDR=off|auto|on`.
+///
+/// Auto is the default and follows the output. `off` is the escape hatch for a
+/// display left in HDR mode that something cannot capture from; `on` fails the
+/// chain when the output cannot present PQ/Rec.2020.
+fn hdr_mode() -> HdrMode {
+    match std::env::var("SIPHON_HDR").as_deref() {
+        Ok(value) if value.eq_ignore_ascii_case("off") => HdrMode::Off,
+        Ok(value) if value.eq_ignore_ascii_case("on") => HdrMode::On,
+        _ => HdrMode::Auto,
+    }
+}
+
 /// The D3D12 device, the swapchain and the Vulkan views of its backbuffers.
 pub struct Chain {
     d3d12: Rc<D3d12>,
@@ -39,7 +70,122 @@ pub struct Chain {
     /// One libplacebo texture per backbuffer.
     targets: Vec<pl::pl_tex>,
     canvas: Canvas,
-    sdr_white: f32,
+    /// The display state libplacebo grades against. Cells because a refresh
+    /// runs under `&self` on the present path.
+    sdr_white: Cell<f32>,
+    hdr: Cell<bool>,
+    peak: Cell<f32>,
+    /// When the display was last re-read; the slider in Windows Settings moves
+    /// without a resize, so the chain polls it a few times a second.
+    refreshed: Cell<Option<Instant>>,
+    /// Which backbuffers this chain owns right now, as opposed to libplacebo.
+    ///
+    /// A wrapped image starts held by its owner and must be released to
+    /// libplacebo before it can be used; once libplacebo has drawn into it, it
+    /// has to be held back — transitioned out of its render layout — before
+    /// DXGI may present it.
+    owned: Cell<[bool; BUFFERS as usize]>,
+    /// The backbuffer the current frame acquired.
+    acquired: Cell<usize>,
+    /// Signalled when a backbuffer is handed back for presentation.
+    target_sem: pl::VkSemaphore,
+    target_value: Cell<u64>,
+}
+
+/// How often the display state is re-read on the present path.
+///
+/// There is no event for the SDR content brightness slider — the only public
+/// API is the getter — so this is a fallback poll. `WM_DISPLAYCHANGE` arrives
+/// for mode changes (HDR on/off, resolution) and refreshes immediately.
+const REFRESH: Duration = Duration::from_millis(500);
+
+/// Posted to ask for another frame once the current paint has been handled.
+///
+/// Invalidating from inside `RedrawRequested` does nothing: winit calls
+/// `DefWindowProc` for that same `WM_PAINT` afterwards, which validates the
+/// region the invalidation just set. One posted message later the paint is
+/// over and the invalidation sticks.
+const NUDGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+
+/// The subclass slot this chain owns on the window.
+const SUBCLASS_ID: usize = 0x5150;
+
+/// Frames the present path has actually begun, for the drag diagnostic.
+static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Paints the window procedure delivered, and invalidations we asked for.
+static PAINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INVALIDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records that the present path ran.
+pub fn note_present() {
+    PRESENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the shell owns the window in a modal move/resize loop.
+static IN_MOVE_LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the shell is running its move/resize loop right now.
+pub fn in_move_loop() -> bool {
+    IN_MOVE_LOOP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set by the window subclass when Windows broadcasts `WM_DISPLAYCHANGE`.
+static DISPLAY_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks the display state stale and lets every other message through.
+unsafe extern "system" fn display_change_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match message {
+        WM_DISPLAYCHANGE => DISPLAY_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed),
+        WM_ENTERSIZEMOVE => IN_MOVE_LOOP.store(true, std::sync::atomic::Ordering::Relaxed),
+        WM_EXITSIZEMOVE => IN_MOVE_LOOP.store(false, std::sync::atomic::Ordering::Relaxed),
+        WM_PAINT => {
+            PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        NUDGE => {
+            INVALIDATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: `hwnd` is this subclass's window.
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+        }
+        WM_MOUSEMOVE | WM_MOVING | WM_SIZE => {
+            // zgui composes on damage, and a window the shell is dragging is
+            // not damaged: its content just travels with it. Mark it damaged on
+            // every move message, which is exactly the rate the shell is
+            // moving it at, and let the modal loop deliver the paint.
+            // SAFETY: `hwnd` is the window this subclass belongs to.
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+            // Rate limited: this is only here to show whether the window is
+            // still being pumped while the shell owns the drag.
+            thread_local! {
+                static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
+            }
+            let now = Instant::now();
+            LAST.with(|last| {
+                if last
+                    .get()
+                    .is_none_or(|at| now.duration_since(at).as_millis() >= 500)
+                {
+                    last.set(Some(now));
+                    eprintln!(
+                        "wndproc: msg={message} drag={} presents={}",
+                        IN_MOVE_LOOP.load(std::sync::atomic::Ordering::Relaxed),
+                        PRESENTS.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                }
+            });
+        }
+        _ => {}
+    }
+    // SAFETY: chained to the next procedure in the subclass chain, which owns
+    // the window and the rest of its messages.
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 impl Chain {
@@ -55,12 +201,25 @@ impl Chain {
             .window_handle()
             .map_err(|error| eros::error!("window handle: {error}"))?;
         let hwnd = hwnd_from_raw(window.as_raw())?;
+        // A display mode change (HDR on/off, resolution) reaches us as
+        // `WM_DISPLAYCHANGE`; the SDR brightness slider does not, so the chain
+        // polls that. The two together are what keeps the presentation live.
+        // SAFETY: `hwnd` is this window and the procedure is a plain `extern
+        // "system"` fn; the id is unique to this chain.
+        let _ = unsafe {
+            SetWindowSubclass(hwnd, Some(display_change_proc), SUBCLASS_ID, 0)
+        };
         set_window_background(hwnd);
         // The icon helper speaks `windows-sys`, whose `HWND` is the raw handle;
         // `hwnd` is the `windows` crate's newtype around the same pointer.
         crate::tray::set_window_icon(hwnd.0);
 
         let d3d12 = Rc::new(D3d12::new(gpu).context("D3D12")?);
+        let target_sem = placebo.create_semaphore();
+        eros::ensure!(
+            !target_sem.is_null(),
+            "libplacebo refused the backbuffer semaphore"
+        );
         let mut this = Self {
             d3d12,
             gpu: Arc::clone(gpu),
@@ -69,20 +228,59 @@ impl Chain {
             swapchain: None,
             targets: Vec::new(),
             canvas: Canvas::new(width, height),
-            sdr_white: 200.0,
+            sdr_white: Cell::new(200.0),
+            hdr: Cell::new(false),
+            peak: Cell::new(0.0),
+            refreshed: Cell::new(None),
+            owned: Cell::new([false; BUFFERS as usize]),
+            acquired: Cell::new(0),
+            target_sem,
+            target_value: Cell::new(0),
         };
         this.rebuild(width, height)?;
         Ok(this)
     }
 
-    /// The backbuffer's SDR colour space.
+    /// The backbuffer's colour space.
+    ///
+    /// SDR is sRGB, not BT.1886: `DxgiSwapchain` hands the buffer to DXGI as
+    /// `DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709`, the space every SDR desktop
+    /// application writes and the one Windows treats as sRGB. Encoding the
+    /// interface to γ2.4 and letting the compositor decode it as γ2.2 lifted
+    /// the near-black background and washed the palette out. Declaring the
+    /// space the overlay is already in makes the libplacebo pass an identity,
+    /// which is also what the Wayland chain gets from its swapchain.
+    ///
+    /// HDR is PQ over Rec.2020 with the output's own peak, and the interface's
+    /// SDR white (`sdr_white`, the user's SDR content brightness) as its
+    /// reference white: libplacebo then places signal white at that many nits,
+    /// which is the same place DWM would have put an SDR window instead of
+    /// leaving the mapping to the compositor's HDR path.
     fn target_color(&self) -> pl::pl_color_space {
+        if self.hdr.get() {
+            return pl::pl_color_space {
+                primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_2020,
+                transfer: pl::pl_color_transfer::PL_COLOR_TRC_PQ,
+                hdr: pl::pl_hdr_metadata {
+                    // Unknown peak: the SDR white is still the highest value
+                    // this interface produces, so treating it as the peak is
+                    // closer than letting the white point tone map.
+                    max_luma: if self.peak.get() > 0.0 {
+                        self.peak.get()
+                    } else {
+                        self.sdr_white.get()
+                    },
+                    max_cll: self.sdr_white.get(),
+                    ..Default::default()
+                },
+            };
+        }
         pl::pl_color_space {
             primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_709,
-            transfer: pl::pl_color_transfer::PL_COLOR_TRC_BT_1886,
+            transfer: pl::pl_color_transfer::PL_COLOR_TRC_SRGB,
             hdr: pl::pl_hdr_metadata {
-                max_luma: self.sdr_white,
-                max_cll: self.sdr_white,
+                max_luma: self.sdr_white.get(),
+                max_cll: self.sdr_white.get(),
                 ..Default::default()
             },
         }
@@ -112,7 +310,10 @@ impl Chain {
                 self.hwnd,
                 width,
                 height,
-                HdrMode::Off,
+                // PQ when the output is already in HDR, SDR otherwise, so the
+                // interface is graded to the display instead of being handed
+                // to DWM's SDR-in-HDR mapping.
+                hdr_mode(),
             )
             .map(|fresh| {
                 self.swapchain = Some(fresh);
@@ -143,10 +344,65 @@ impl Chain {
             placebo.release(target, pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
             targets.push(target);
         }
-        self.sdr_white = swapchain.sdr_white();
+        // Fresh wraps start held by their owner, exactly like creation.
+        self.owned.set([false; BUFFERS as usize]);
+        self.sdr_white.set(swapchain.sdr_white());
+        self.hdr.set(swapchain.hdr());
+        self.peak.set(swapchain.max_luminance());
         self.targets = targets;
         self.canvas.resized((width, height));
         Ok(())
+    }
+
+    /// Asks for one more frame while the shell owns the window, so a held
+    /// drag keeps composing instead of freezing on its last picture.
+    ///
+    /// The present path calls this once per frame it presents: the modal loop
+    /// delivers the paint, zgui composes, and the next present asks again. The
+    /// swapchain's frame-latency waitable paces the result at the display's
+    /// rate, so nothing here is a timer.
+    pub fn request_frame(&self) {
+        if !in_move_loop() {
+            return;
+        }
+        // A swapchain the driver took away cannot present, and asking it to
+        // paint again would spin the loop for nothing.
+        if self
+            .swapchain
+            .as_ref()
+            .is_none_or(DxgiSwapchain::is_removed)
+        {
+            return;
+        }
+        // TEMP: prove the loop is still running through a held drag, which
+        // produces no messages to log from.
+        thread_local! {
+            static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
+        }
+        let now = Instant::now();
+        LAST.with(|last| {
+            if last
+                .get()
+                .is_none_or(|at| now.duration_since(at).as_millis() >= 500)
+            {
+                last.set(Some(now));
+                eprintln!(
+                    "drag frame presents={} paints={} invalidates={}",
+                    PRESENTS.load(std::sync::atomic::Ordering::Relaxed),
+                    PAINTS.load(std::sync::atomic::Ordering::Relaxed),
+                    INVALIDATES.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+        });
+        // SAFETY: this is the window the chain presents into.
+        let _ = unsafe {
+            PostMessageW(
+                Some(self.hwnd),
+                NUDGE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
     }
 
     /// Whether the chain can present: a live swapchain the driver has not removed.
@@ -157,7 +413,17 @@ impl Chain {
     }
 
     pub const fn sdr_white(&self) -> f32 {
-        self.sdr_white
+        self.sdr_white.get()
+    }
+
+    /// Whether the chain is presenting PQ/Rec.2020.
+    pub const fn hdr(&self) -> bool {
+        self.hdr.get()
+    }
+
+    /// The output's peak luminance in nits, zero when it did not say.
+    pub const fn peak(&self) -> f32 {
+        self.peak.get()
     }
 
     /// Waits until the flip queue has room for another frame.
@@ -170,7 +436,15 @@ impl Chain {
     /// Called when the window's extent changes. The UI follows it exactly; the
     /// chain grows to the monitor only while the window outgrows its canvas,
     /// and shrinks back in [`Chain::settle`].
-    pub fn declare(&self, _width: u32, _height: u32, _scale: f32) {}
+    ///
+    /// A no-op here, but the seam keeps the Wayland signature, where the
+    /// compositor's configure wants the geometry declared before the swapchain
+    /// is rebuilt.
+    #[expect(
+        clippy::unused_self,
+        reason = "the interface is shared with the Wayland chain, which needs the chain"
+    )]
+    pub const fn declare(&self, _width: u32, _height: u32, _scale: f32) {}
 
     pub fn configure(&mut self, ui: (u32, u32)) -> (u32, u32) {
         self.canvas.configured();
@@ -207,15 +481,64 @@ impl Chain {
         }
     }
 
+    /// Re-reads the display under the running window, at most twice a second.
+    ///
+    /// The SDR content brightness slider and the HDR switch move without a
+    /// resize, so nothing else would tell the chain that the value it grades
+    /// against has changed.
+    fn refresh_display(&self, swapchain: &DxgiSwapchain) {
+        // The shell owns the window during a move or a size drag, and DXGI
+        // work in that loop is what was seen to take the device away. The
+        // state is re-read the moment the drag ends.
+        if in_move_loop() {
+            return;
+        }
+        let now = Instant::now();
+        let forced = DISPLAY_CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !forced
+            && self
+                .refreshed
+                .get()
+                .is_some_and(|last| now.duration_since(last) < REFRESH)
+        {
+            return;
+        }
+        self.refreshed.set(Some(now));
+        if let Err(error) = swapchain.refresh() {
+            warn!(target: "ui", "DXGI: display refresh failed: {error:?}");
+            return;
+        }
+        let white = swapchain.sdr_white();
+        if (white - self.sdr_white.get()).abs() > 0.5 {
+            eprintln!(
+                "SDR white: {white:.0} nits (level from the display configuration)",
+            );
+        }
+        self.sdr_white.set(white);
+        self.hdr.set(swapchain.hdr());
+        self.peak.set(swapchain.max_luminance());
+    }
+
     /// Acquires the backbuffer DXGI will present next and builds its frame.
     pub fn begin(&self, _ui: (u32, u32)) -> Option<Acquired> {
         let swapchain = self.swapchain.as_ref()?;
         if swapchain.is_removed() {
             return None;
         }
+        self.refresh_display(swapchain);
         let (width, height) = self.canvas.size();
         let index = usize::try_from(swapchain.current_index()).ok()?;
         let texture = *self.targets.get(index)?;
+        // Hand this buffer to libplacebo for the frame, if we took it back
+        // after presenting it last time.
+        if self.owned.get()[index] {
+            self.placebo
+                .release(texture, pl::VkImageLayout::VK_IMAGE_LAYOUT_GENERAL);
+            let mut owned = self.owned.get();
+            owned[index] = false;
+            self.owned.set(owned);
+        }
+        self.acquired.set(index);
         let mut frame = pl::pl_frame {
             num_planes: 1,
             planes: [pl::pl_plane {
@@ -251,10 +574,40 @@ impl Chain {
         let Some(swapchain) = self.swapchain.as_ref() else {
             return false;
         };
+        // Take the backbuffer back in a layout DXGI can present. Without this
+        // the image is still owned by Vulkan, in a render layout, when Present
+        // reads it.
+        let index = self.acquired.get();
+        if let Some(texture) = self.targets.get(index) {
+            let value = self.target_value.get() + 1;
+            let sem = pl::pl_vulkan_sem {
+                sem: self.target_sem,
+                value,
+            };
+            if self
+                .placebo
+                .hold(*texture, pl::VkImageLayout::VK_IMAGE_LAYOUT_GENERAL, sem)
+            {
+                self.target_value.set(value);
+                let mut owned = self.owned.get();
+                owned[index] = true;
+                self.owned.set(owned);
+            } else {
+                warn!(target: "ui", "DXGI: could not take backbuffer {index} back");
+                return false;
+            }
+        }
+        // One wait for the frame: the render, the interface handover and the
+        // backbuffer transition are all complete by the time Present runs.
+        self.placebo.finish();
         swapchain.present().is_ok()
     }
 
     /// The inner renderer's failures are already logged; this one needs a line.
+    #[expect(
+        clippy::unused_self,
+        reason = "the interface is shared with the Wayland chain, which reports through the chain"
+    )]
     pub fn present_failed(&self) {
         warn!(target: "ui", "DXGI present failed");
     }
@@ -262,6 +615,13 @@ impl Chain {
 
 impl Drop for Chain {
     fn drop(&mut self) {
+        if !self.target_sem.is_null() {
+            let mut sem = self.target_sem;
+            self.placebo.destroy_semaphore(&mut sem);
+        }
+        // SAFETY: the window outlives the chain, and removing a subclass that
+        // is not installed is a no-op.
+        let _ = unsafe { RemoveWindowSubclass(self.hwnd, Some(display_change_proc), SUBCLASS_ID) };
         // The views name the chain's images, so they go before it. The
         // swapchain's own Drop releases the D3D12 resources.
         for mut target in self.targets.drain(..) {

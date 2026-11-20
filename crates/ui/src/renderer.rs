@@ -49,6 +49,8 @@ pub struct UiRenderer {
     /// The extent the UI texture and inner renderer are built for.
     width: u32,
     height: u32,
+    /// A white texel mask for the diagnostics square, when it was asked for.
+    nits_mask: Option<pl::pl_tex>,
 }
 
 impl UiRenderer {
@@ -74,6 +76,10 @@ impl UiRenderer {
             "libplacebo refused to create the handover semaphore"
         );
 
+        // A white texel for monochrome overlay parts: the diagnostics square,
+        // and the fill that shows where the frame is not covered at all.
+        let nits_mask = Some(placebo.create_flat(1, 1, [255, 255, 255, 255])?);
+
         Ok(Self {
             inner,
             chain: Some(chain),
@@ -86,7 +92,55 @@ impl UiRenderer {
             gpu,
             width,
             height,
+            nits_mask,
         })
+    }
+
+    /// The SDR colour space, for parts that are plain interface colours.
+    fn srgb_space(chain: &Chain) -> pl::pl_color_space {
+        let white = chain.sdr_white();
+        pl::pl_color_space {
+            primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_709,
+            transfer: pl::pl_color_transfer::PL_COLOR_TRC_SRGB,
+            hdr: pl::pl_hdr_metadata {
+                max_luma: white,
+                max_cll: white,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// What the diagnostics square should be, in the presentation's own
+    /// encoding: the signal for the output's peak on HDR, plain white on SDR.
+    fn nits_square(chain: &Chain) -> (f32, pl::pl_color_space) {
+        let white = chain.sdr_white();
+        if chain.hdr() {
+            let peak = chain.peak().max(white);
+            return (
+                crate::hdr::pq_signal(peak),
+                pl::pl_color_space {
+                    primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_2020,
+                    transfer: pl::pl_color_transfer::PL_COLOR_TRC_PQ,
+                    hdr: pl::pl_hdr_metadata {
+                        max_luma: peak,
+                        max_cll: peak,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        (
+            1.0,
+            pl::pl_color_space {
+                primaries: pl::pl_color_primaries::PL_COLOR_PRIM_BT_709,
+                transfer: pl::pl_color_transfer::PL_COLOR_TRC_SRGB,
+                hdr: pl::pl_hdr_metadata {
+                    max_luma: white,
+                    max_cll: white,
+                    ..Default::default()
+                },
+            },
+        )
     }
 
     /// The interface overlay, in ZGUI's sRGB space.
@@ -98,7 +152,13 @@ impl UiRenderer {
             repr: pl::pl_color_repr {
                 sys: pl::pl_color_system::PL_COLOR_SYSTEM_RGB,
                 levels: pl::pl_color_levels::PL_COLOR_LEVELS_FULL,
-                alpha: pl::pl_alpha_mode::PL_ALPHA_PREMULTIPLIED,
+                // SIPHON_UI_OPAQUE: ignore the interface's alpha, to tell a
+                // transparent region from one no part covers.
+                alpha: if std::env::var_os("SIPHON_UI_OPAQUE").is_some() {
+                    pl::pl_alpha_mode::PL_ALPHA_NONE
+                } else {
+                    pl::pl_alpha_mode::PL_ALPHA_PREMULTIPLIED
+                },
                 ..Default::default()
             },
             color: pl::pl_color_space {
@@ -113,6 +173,145 @@ impl UiRenderer {
             parts: parts.as_ptr(),
             num_parts: parts.len() as std::os::raw::c_int,
         }
+    }
+
+    /// Paints the interface texture with the page background.
+    ///
+    /// ZGUI composes the regions it considers damaged, so a texture that was
+    /// just created can be presented with rows nobody wrote yet. Those rows are
+    /// transparent black, which shows as a hole in the overlay; starting from
+    /// the page background makes a not-yet-painted row look like the interface
+    /// instead of a band.
+    fn clear_ui_texture(&self, texture: &wgpu::Texture) {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("siphon.ui.background"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // The page background, sRGB-encoded (#090E14).
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 9.0 / 255.0,
+                            g: 14.0 / 255.0,
+                            b: 18.0 / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.gpu.queue().submit(Some(encoder.finish()));
+    }
+
+    /// TEMP: looks for the diagnostics fill in the frame and, if it is there,
+    /// writes the frame and the geometry that produced it.
+    ///
+    /// Magenta is a colour the interface never contains, so a pixel of it can
+    /// only be the underlay showing through. That means the frame is on disk
+    /// the moment it happens, instead of being caught by inference.
+    fn catch_band(&self, target: &pl::pl_frame) {
+        let texture = target.planes[0].texture;
+        if texture.is_null() {
+            return;
+        }
+        // SAFETY: the frame names a live texture of this GPU.
+        let (width, height) = unsafe { ((*texture).params.w, (*texture).params.h) };
+        let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) else {
+            return;
+        };
+        let Some(count) = width.checked_mul(height) else {
+            return;
+        };
+        let mut buffer = vec![0u32; count];
+        let params = pl::pl_tex_transfer_params {
+            tex: texture,
+            rc: pl::pl_rect3d {
+                x0: 0,
+                y0: 0,
+                z0: 0,
+                x1: width as std::os::raw::c_int,
+                y1: height as std::os::raw::c_int,
+                z1: 1,
+            },
+            ptr: buffer.as_mut_ptr().cast(),
+            ..Default::default()
+        };
+        // SAFETY: the buffer holds exactly width*height four-byte texels.
+        if !unsafe { pl::pl_tex_download(self.placebo.gpu(), &params) } {
+            return;
+        }
+        // 10-bit: magenta is (1023, 0, 1023).
+        let mut band = None;
+        for y in 0..height {
+            let row = &buffer[y * width..(y + 1) * width];
+            if row
+                .iter()
+                .any(|texel| texel & 0x3ff > 1000 && (texel >> 10) & 0x3ff < 20 && (texel >> 20) & 0x3ff > 1000)
+            {
+                band = Some(y);
+                break;
+            }
+        }
+        let Some(first) = band else {
+            return;
+        };
+        eprintln!(
+            "band: frame {width}x{height} ui {}x{} first row {first}",
+            self.width, self.height
+        );
+        let path = std::env::temp_dir().join("siphon-band.bmp");
+        if let Err(error) = write_bmp(&path, &buffer, width, height) {
+            eprintln!("band: could not write {}: {error}", path.display());
+        } else {
+            eprintln!("band: wrote {}", path.display());
+        }
+    }
+
+    /// Copies the interface's previous pixels into a freshly created texture.
+    ///
+    /// The overlap is 1:1 from the top-left, which is where the interface is
+    /// anchored; pixels outside it stay at the background the clear left.
+    fn carry_ui_texture(&self, texture: &wgpu::Texture) {
+        let (old_width, old_height) = (self.width, self.height);
+        let (new_width, new_height) = (texture.width(), texture.height());
+        let width = old_width.min(new_width);
+        let height = old_height.min(new_height);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let mut encoder = self
+            .gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.ui_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.gpu.queue().submit(Some(encoder.finish()));
     }
 
     /// Rebuilds the UI side of the presentation for a new target extent: the
@@ -134,9 +333,18 @@ impl UiRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Bgra8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        // A supplied texture is copied into by damage only and otherwise keeps
+        // what it holds, so a fresh one has to start as the frame that was on
+        // screen, not as a blank: the rows ZGUI is not owed this frame would
+        // otherwise show as bands.
+        self.clear_ui_texture(&ui_texture);
+        self.carry_ui_texture(&ui_texture);
         let ui = match self.placebo.wrap_wgpu(&ui_texture) {
             Ok(ui) => ui,
             Err(error) => {
@@ -185,9 +393,14 @@ impl UiRenderer {
     }
 
     fn present(&self, outcome: FrameOutcome) -> FrameOutcome {
+        crate::chain::note_present();
         let Some(chain) = self.chain.as_ref() else {
             return outcome;
         };
+        // Re-arm before anything can bail out: a held drag has no damage of its
+        // own, so the request for the next frame must not depend on this one
+        // reaching the present.
+        chain.request_frame();
         if !chain.presentable() {
             return outcome;
         }
@@ -282,8 +495,97 @@ impl UiRenderer {
             count += 1;
         }
         let overlay = self.ui_overlay(&parts[..count]);
-        target.overlays = &raw const overlay;
-        target.num_overlays = 1;
+        let mut overlays = [overlay; 3];
+        let mut overlay_count = 0;
+        let fill_part = [pl::pl_overlay_part {
+            src: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+            },
+            dst: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width_f,
+                y1: height_f,
+            },
+            color: [1.0, 0.0, 1.0, 1.0],
+        }];
+        // SIPHON_DEBUG_FILL: magenta under everything, so a region the overlay
+        // parts do not cover is magenta rather than the pass's black clear.
+        if std::env::var_os("SIPHON_DEBUG_FILL").is_some()
+            && let Some(mask) = self.nits_mask
+        {
+            {
+                overlays[0] = pl::pl_overlay {
+                    tex: mask,
+                    mode: pl::pl_overlay_mode::PL_OVERLAY_MONOCHROME,
+                    coords: pl::pl_overlay_coords::PL_OVERLAY_COORDS_DST_FRAME,
+                    repr: pl::pl_color_repr {
+                        sys: pl::pl_color_system::PL_COLOR_SYSTEM_RGB,
+                        levels: pl::pl_color_levels::PL_COLOR_LEVELS_FULL,
+                        alpha: pl::pl_alpha_mode::PL_ALPHA_PREMULTIPLIED,
+                        ..Default::default()
+                    },
+                    color: Self::srgb_space(chain),
+                    parts: fill_part.as_ptr(),
+                    num_parts: 1,
+                };
+                overlay_count = 1;
+            }
+        }
+        overlays[overlay_count] = overlay;
+        overlay_count += 1;
+        let mut nits_part = [pl::pl_overlay_part {
+            src: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+            },
+            dst: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 0.0,
+                y1: 0.0,
+            },
+            color: [0.0; 4],
+        }];
+        if let Some(mask) = self.nits_mask {
+            {
+                let (signal, space) = Self::nits_square(chain);
+                let side = 64.0_f32;
+                let inset = 24.0_f32;
+                let right = ui_width_f - inset;
+                let top = inset;
+                nits_part[0].dst = pl::pl_rect2df {
+                    x0: (right - side).max(0.0),
+                    y0: top,
+                    x1: right.max(side),
+                    y1: top + side,
+                };
+                // Premultiplied alpha: the part's colour is its own mask value.
+                nits_part[0].color = [signal, signal, signal, 1.0];
+                overlays[overlay_count] = pl::pl_overlay {
+                    tex: mask,
+                    mode: pl::pl_overlay_mode::PL_OVERLAY_MONOCHROME,
+                    coords: pl::pl_overlay_coords::PL_OVERLAY_COORDS_DST_FRAME,
+                    repr: pl::pl_color_repr {
+                        sys: pl::pl_color_system::PL_COLOR_SYSTEM_RGB,
+                        levels: pl::pl_color_levels::PL_COLOR_LEVELS_FULL,
+                        alpha: pl::pl_alpha_mode::PL_ALPHA_PREMULTIPLIED,
+                        ..Default::default()
+                    },
+                    color: space,
+                    parts: nits_part.as_ptr(),
+                    num_parts: 1,
+                };
+                overlay_count += 1;
+            }
+        }
+        target.overlays = overlays.as_ptr();
+        target.num_overlays = i32::try_from(overlay_count).unwrap_or(0);
 
         // ZGUI just finished a pass into the interface texture, so it is in
         // `COLOR_ATTACHMENT_OPTIMAL`; hand it to libplacebo and take it back.
@@ -293,8 +595,8 @@ impl UiRenderer {
         );
         if !self.placebo.render(None, &target) {
             tracing::warn!(target: "ui", "libplacebo: render failed for {width}x{height}");
+            eprintln!("libplacebo: render failed for {width}x{height}");
         }
-        self.placebo.finish();
 
         let value = self.handover_value.get() + 1;
         self.handover_value.set(value);
@@ -315,6 +617,9 @@ impl UiRenderer {
             .inner
             .target()
             .map_or(1.0, |target| f64::from(target.scale.get()));
+        if std::env::var_os("SIPHON_CATCH_BANDS").is_some() {
+            self.catch_band(&target);
+        }
         if !chain.end(width, height, scale) {
             chain.present_failed();
         }
@@ -322,8 +627,49 @@ impl UiRenderer {
     }
 }
 
+/// Writes a packed 10-bit frame as a 32-bit BMP, for the band trap.
+fn write_bmp(
+    path: &std::path::Path,
+    frame: &[u32],
+    width: usize,
+    height: usize,
+) -> std::io::Result<()> {
+    let row = width * 4;
+    let size = 54 + row * height;
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&u32::try_from(size).unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&i32::try_from(width).unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&i32::try_from(height).unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(row * height).unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for y in (0..height).rev() {
+        for x in 0..width {
+            let texel = frame[y * width + x];
+            let red = (texel & 0x3ff) >> 2;
+            let green = ((texel >> 10) & 0x3ff) >> 2;
+            let blue = ((texel >> 20) & 0x3ff) >> 2;
+            out.extend_from_slice(&[blue as u8, green as u8, red as u8, 255]);
+        }
+    }
+    std::fs::write(path, out)
+}
+
 impl Drop for UiRenderer {
     fn drop(&mut self) {
+        if let Some(mask) = self.nits_mask.take() {
+            let mut mask = mask;
+            self.placebo.destroy_texture(&mut mask);
+        }
         self.placebo.destroy_texture(&mut self.ui);
         self.placebo.destroy_semaphore(&mut self.handover);
     }

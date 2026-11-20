@@ -153,6 +153,20 @@ impl Chain {
         200.0
     }
 
+    /// Wayland presents through an SDR swapchain here, so nothing is graded to
+    /// PQ and there is no display peak to report.
+    pub const fn hdr(&self) -> bool {
+        false
+    }
+
+    pub const fn peak(&self) -> f32 {
+        0.0
+    }
+
+    /// The shell does not own the window in a modal loop here, so nothing has
+    /// to ask for frames on its behalf.
+    pub const fn request_frame(&self) {}
+
     /// Presentation is paced by libplacebo's Vulkan mailbox, not by ZGUI's
     /// surface callbacks. Every frame this renderer composes is submitted to
     /// the swapchain immediately; the compositor shows the newest one.

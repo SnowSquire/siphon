@@ -31,8 +31,8 @@ windows = { version = "0.62.2", features = [
 ] }
 # Pinned to the zgui commit the `zgui` / `libplacebo` project references are on.
 # The repository is still moving, so a branch would make the prototype drift under us.
-zgui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
-zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
+zgui = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
+zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
 
 [lints]
 workspace = true

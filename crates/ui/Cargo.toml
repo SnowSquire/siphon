@@ -30,10 +30,10 @@ raw-window-handle = "0.6"
 siphon-rpc = { path = "../rpc" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-zgui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
-zgui-ui = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
-zgui-ui-tokens = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
-zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "80baa3c7cb0fbbe1c058f10059e076e41c0a1b9a" }
+zgui = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
+zgui-ui = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
+zgui-ui-tokens = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
+zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
 
 # The Win32 shell: the tray, the single-instance handover and the DXGI chain.
 [target.'cfg(windows)'.dependencies]
@@ -45,9 +45,11 @@ windows = { version = "0.62.2", features = [
   "Win32_Graphics_Direct3D12",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
   "Win32_Security",
   "Win32_System_Threading",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 windows-sys = { version = "0.61", features = [

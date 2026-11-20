@@ -70,6 +70,7 @@ pub fn create() -> eros::Result<(Arc<Gpu>, Option<VideoDecode>)> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .context("no Vulkan adapter")?;
 
