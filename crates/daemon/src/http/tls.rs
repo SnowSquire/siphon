@@ -35,6 +35,11 @@ pub struct TlsConn {
     /// Decrypted bytes waiting to be served.
     plain: Carry,
     closed: bool,
+    /// A TLS error was returned once. rustls has already queued its fatal
+    /// alert and a second `process_tls_records` on the same connection trips
+    /// its `sent_fatal_alert` assertion, so a dead connection answers every
+    /// later call with `Closed` instead of touching the state machine again.
+    failed: bool,
 }
 
 /// What one state-machine step produced.
@@ -70,6 +75,7 @@ impl TlsConn {
             out: vec![0; OUT_BUFFER],
             plain: Carry::default(),
             closed: false,
+            failed: false,
         };
         this.handshake().await?;
         Ok(this)
@@ -84,7 +90,10 @@ impl TlsConn {
                 let status = self.conn.process_tls_records(&mut self.ct);
                 discard = status.discard;
                 action = match status.state {
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        self.failed = true;
+                        return Err(error.into());
+                    }
                     Ok(ConnectionState::WriteTraffic(_)) => return Ok(()),
                     Ok(ConnectionState::EncodeTlsData(mut encode)) => {
                         Action::Write(encode.encode(&mut self.out).map_err(encode_error)?)
@@ -142,7 +151,10 @@ impl TlsConn {
             let status = self.conn.process_tls_records(&mut self.ct);
             discard = status.discard;
             match status.state {
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error.into());
+                }
                 Ok(ConnectionState::ReadTraffic(mut traffic)) => {
                     while let Some(record) = traffic.next_record() {
                         let record = record?;
@@ -198,6 +210,9 @@ impl TlsConn {
     }
 
     pub async fn read_into(&mut self, dst: &mut [u8]) -> Result<usize, Error> {
+        if self.failed {
+            return Err(Error::Closed);
+        }
         loop {
             let served = self.plain.serve(dst);
             if served > 0 || dst.is_empty() {
@@ -214,6 +229,9 @@ impl TlsConn {
     }
 
     pub async fn write_all(&mut self, mut data: &[u8]) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Closed);
+        }
         while !data.is_empty() {
             let discard;
             let mut wrote = 0;
@@ -223,7 +241,10 @@ impl TlsConn {
                 let status = self.conn.process_tls_records(&mut self.ct);
                 discard = status.discard;
                 match status.state {
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        self.failed = true;
+                        return Err(error.into());
+                    }
                     Ok(ConnectionState::EncodeTlsData(mut encode)) => {
                         pending = Some(encode.encode(&mut self.out).map_err(encode_error)?);
                     }
@@ -263,7 +284,7 @@ impl TlsConn {
     }
 
     pub const fn is_closed(&self) -> bool {
-        self.closed
+        self.closed || self.failed
     }
 }
 
