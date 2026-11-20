@@ -71,7 +71,7 @@ use zgui_render_wgpu::Gpu;
 pub const BUFFERS: u32 = 3;
 
 /// The Vulkan spelling of the 10-bit swapchain format.
-const VK_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
+pub const VK_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
 
 /// What to do with HDR.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

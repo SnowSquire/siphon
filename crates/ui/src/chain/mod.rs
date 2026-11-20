@@ -31,6 +31,10 @@ use crate::placebo::Placebo;
 use crate::renderer::UiRenderer;
 
 #[cfg(windows)]
+mod plain;
+#[cfg(windows)]
+pub use plain::blit as blit_plain;
+#[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::Chain;

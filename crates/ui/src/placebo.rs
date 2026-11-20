@@ -252,7 +252,10 @@ impl Placebo {
             size.width,
             size.height,
             vk::Format::B8G8R8A8_UNORM,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
         )
     }
 
@@ -302,6 +305,45 @@ impl Placebo {
         let texture = unsafe { pl::pl_tex_create(self.gpu, &params) };
         eros::ensure!(!texture.is_null(), "libplacebo refused the texture");
         Ok(texture)
+    }
+
+    /// Copies `src` onto `dst` with no overlay or colour-management pass.
+    ///
+    /// A diagnostic path: it answers whether what reaches the screen is coming
+    /// from the overlay renderer at all.
+    pub fn blit(&self, src: pl::pl_tex, dst: pl::pl_tex) {
+        // SAFETY: both textures belong to this GPU and are live for the call.
+        let (src_w, src_h, dst_w, dst_h) = unsafe {
+            (
+                (*src).params.w,
+                (*src).params.h,
+                (*dst).params.w,
+                (*dst).params.h,
+            )
+        };
+        let params = pl::pl_tex_blit_params {
+            src,
+            dst,
+            src_rc: pl::pl_rect3d {
+                x0: 0,
+                y0: 0,
+                z0: 0,
+                x1: src_w,
+                y1: src_h,
+                z1: 1,
+            },
+            dst_rc: pl::pl_rect3d {
+                x0: 0,
+                y0: 0,
+                z0: 0,
+                x1: dst_w,
+                y1: dst_h,
+                z1: 1,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the parameters name live textures of this GPU.
+        unsafe { pl::pl_tex_blit(self.gpu, &params) };
     }
 
     /// Blocks until every submission on the GPU has completed.

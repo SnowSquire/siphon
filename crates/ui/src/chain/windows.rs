@@ -16,12 +16,12 @@ use libplacebo_sys as pl;
 use raw_window_handle::HasWindowHandle as _;
 use tracing::warn;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::Win32::Foundation::LPARAM;
 use windows::Win32::Foundation::LRESULT;
 use windows::Win32::Foundation::WPARAM;
-use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::Shell::DefSubclassProc;
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::Win32::UI::Shell::RemoveWindowSubclass;
 use windows::Win32::UI::Shell::SetWindowSubclass;
 use windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE;
@@ -32,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::WM_MOVING;
 use windows::Win32::UI::WindowsAndMessaging::WM_SIZE;
 use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
 use zgui::platform::GpuSurface;
+use zgui_render_wgpu::wgpu;
 use zgui::platform::Surface;
 use zgui_render_wgpu::Gpu;
 
@@ -99,14 +100,6 @@ pub struct Chain {
 /// for mode changes (HDR on/off, resolution) and refreshes immediately.
 const REFRESH: Duration = Duration::from_millis(500);
 
-/// Posted to ask for another frame once the current paint has been handled.
-///
-/// Invalidating from inside `RedrawRequested` does nothing: winit calls
-/// `DefWindowProc` for that same `WM_PAINT` afterwards, which validates the
-/// region the invalidation just set. One posted message later the paint is
-/// over and the invalidation sticks.
-const NUDGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
-
 /// The subclass slot this chain owns on the window.
 const SUBCLASS_ID: usize = 0x5150;
 
@@ -130,6 +123,9 @@ pub fn in_move_loop() -> bool {
     IN_MOVE_LOOP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Posted to ask for another frame once the current paint has been handled.
+const NUDGE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+
 /// Set by the window subclass when Windows broadcasts `WM_DISPLAYCHANGE`.
 static DISPLAY_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -146,19 +142,18 @@ unsafe extern "system" fn display_change_proc(
         WM_DISPLAYCHANGE => DISPLAY_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed),
         WM_ENTERSIZEMOVE => IN_MOVE_LOOP.store(true, std::sync::atomic::Ordering::Relaxed),
         WM_EXITSIZEMOVE => IN_MOVE_LOOP.store(false, std::sync::atomic::Ordering::Relaxed),
-        WM_PAINT => {
-            PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         NUDGE => {
             INVALIDATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: `hwnd` is this subclass's window.
             let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
         }
+        WM_PAINT => {
+            PAINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         WM_MOUSEMOVE | WM_MOVING | WM_SIZE => {
-            // zgui composes on damage, and a window the shell is dragging is
-            // not damaged: its content just travels with it. Mark it damaged on
-            // every move message, which is exactly the rate the shell is
-            // moving it at, and let the modal loop deliver the paint.
+            // A dragged window is not damaged: its content travels with it, so
+            // nothing asks ZGUI for a frame. Mark it damaged at the rate the
+            // shell is moving it at.
             // SAFETY: `hwnd` is the window this subclass belongs to.
             let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             // Rate limited: this is only here to show whether the window is
@@ -354,55 +349,39 @@ impl Chain {
         Ok(())
     }
 
-    /// Asks for one more frame while the shell owns the window, so a held
-    /// drag keeps composing instead of freezing on its last picture.
+    /// Asks for another frame while the shell owns the window.
     ///
-    /// The present path calls this once per frame it presents: the modal loop
-    /// delivers the paint, zgui composes, and the next present asks again. The
-    /// swapchain's frame-latency waitable paces the result at the display's
-    /// rate, so nothing here is a timer.
+    /// Posted rather than invalidated here: winit calls `DefWindowProc` for the
+    /// paint that produced this frame right after handing it over, and that
+    /// validates whatever region we set. One message later the paint is over.
     pub fn request_frame(&self) {
         if !in_move_loop() {
             return;
         }
-        // A swapchain the driver took away cannot present, and asking it to
-        // paint again would spin the loop for nothing.
-        if self
-            .swapchain
-            .as_ref()
-            .is_none_or(DxgiSwapchain::is_removed)
-        {
-            return;
-        }
-        // TEMP: prove the loop is still running through a held drag, which
-        // produces no messages to log from.
-        thread_local! {
-            static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
-        }
-        let now = Instant::now();
-        LAST.with(|last| {
-            if last
-                .get()
-                .is_none_or(|at| now.duration_since(at).as_millis() >= 500)
-            {
-                last.set(Some(now));
-                eprintln!(
-                    "drag frame presents={} paints={} invalidates={}",
-                    PRESENTS.load(std::sync::atomic::Ordering::Relaxed),
-                    PAINTS.load(std::sync::atomic::Ordering::Relaxed),
-                    INVALIDATES.load(std::sync::atomic::Ordering::Relaxed),
-                );
-            }
-        });
         // SAFETY: this is the window the chain presents into.
-        let _ = unsafe {
-            PostMessageW(
-                Some(self.hwnd),
-                NUDGE,
-                WPARAM(0),
-                LPARAM(0),
-            )
+        let _ = unsafe { PostMessageW(Some(self.hwnd), NUDGE, WPARAM(0), LPARAM(0)) };
+    }
+
+    /// Presents the interface texture with no libplacebo in the path.
+    ///
+    /// A test surface: ZGUI's wgpu (Vulkan) render is blitted straight into the
+    /// DXGI backbuffer's VkImage and presented.
+    pub fn present_plain(&self, gpu: &Gpu, ui: &wgpu::Texture) -> bool {
+        let Some(swapchain) = self.swapchain.as_ref() else {
+            return false;
         };
+        if swapchain.is_removed() {
+            return false;
+        }
+        let index = swapchain.current_index();
+        let Some(image) = swapchain.image(index) else {
+            return false;
+        };
+        if let Err(error) = super::blit_plain(gpu, ui, image, crate::dxgi::VK_FORMAT) {
+            warn!(target: "ui", "plain present: {error:?}");
+            return false;
+        }
+        swapchain.present().is_ok()
     }
 
     /// Whether the chain can present: a live swapchain the driver has not removed.

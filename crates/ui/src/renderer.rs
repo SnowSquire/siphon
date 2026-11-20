@@ -397,13 +397,20 @@ impl UiRenderer {
         let Some(chain) = self.chain.as_ref() else {
             return outcome;
         };
-        // Re-arm before anything can bail out: a held drag has no damage of its
-        // own, so the request for the next frame must not depend on this one
-        // reaching the present.
-        chain.request_frame();
+        // SIPHON_PLAIN: ZGUI's texture straight into the swapchain, no
+        // libplacebo anywhere in the path.
+        if std::env::var_os("SIPHON_PLAIN").is_some() {
+            if !chain.present_plain(&self.gpu, &self.ui_texture) {
+                chain.present_failed();
+            }
+            return outcome;
+        }
         if !chain.presentable() {
             return outcome;
         }
+        // Re-arm before anything can bail out: a held drag has no damage of its
+        // own, so the next frame must not depend on this one presenting.
+        chain.request_frame();
         if !chain.wait_for_frame(100) {
             return outcome;
         }
@@ -494,8 +501,53 @@ impl UiRenderer {
             };
             count += 1;
         }
-        let overlay = self.ui_overlay(&parts[..count]);
-        let mut overlays = [overlay; 3];
+        // SIPHON_UI_CONST: draw the interface as one flat colour instead of the
+        // texture. A band that survives this is not the texture's content.
+        let mut flat = [pl::pl_overlay_part {
+            src: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+            },
+            dst: pl::pl_rect2df {
+                x0: 0.0,
+                y0: 0.0,
+                x1: width_f,
+                y1: height_f,
+            },
+            color: [0.5, 0.5, 0.5, 1.0],
+        }];
+        // The flat colour steps every frame, so a band of *stale* content shows
+        // as a different shade while a band of *missing* content stays magenta.
+        if std::env::var_os("SIPHON_UI_CONST").is_some() {
+            static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let step = STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16;
+            #[allow(clippy::cast_precision_loss, reason = "sixteen steps")]
+            let level = (step as f32).mul_add(0.6 / 16.0, 0.2);
+            flat[0].color = [level, level, level, 1.0];
+        }
+        let overlay = if std::env::var_os("SIPHON_UI_CONST").is_some()
+            && let Some(mask) = self.nits_mask
+        {
+            pl::pl_overlay {
+                tex: mask,
+                mode: pl::pl_overlay_mode::PL_OVERLAY_MONOCHROME,
+                coords: pl::pl_overlay_coords::PL_OVERLAY_COORDS_DST_FRAME,
+                repr: pl::pl_color_repr {
+                    sys: pl::pl_color_system::PL_COLOR_SYSTEM_RGB,
+                    levels: pl::pl_color_levels::PL_COLOR_LEVELS_FULL,
+                    alpha: pl::pl_alpha_mode::PL_ALPHA_PREMULTIPLIED,
+                    ..Default::default()
+                },
+                color: Self::srgb_space(chain),
+                parts: flat.as_ptr(),
+                num_parts: 1,
+            }
+        } else {
+            self.ui_overlay(&parts[..count])
+        };
+        let mut overlays = [overlay; 4];
         let mut overlay_count = 0;
         let fill_part = [pl::pl_overlay_part {
             src: pl::pl_rect2df {
@@ -535,8 +587,17 @@ impl UiRenderer {
                 overlay_count = 1;
             }
         }
-        overlays[overlay_count] = overlay;
-        overlay_count += 1;
+        // SIPHON_UI_NONE: the underlay alone, a frame of one colour.
+        if std::env::var_os("SIPHON_UI_NONE").is_none() {
+            overlays[overlay_count] = overlay;
+            overlay_count += 1;
+        }
+        // SIPHON_UI_TWICE: the same overlay a second time. A band that survives
+        // is not a single pass going missing.
+        if std::env::var_os("SIPHON_UI_TWICE").is_some() && overlay_count < overlays.len() {
+            overlays[overlay_count] = overlays[overlay_count - 1];
+            overlay_count += 1;
+        }
         let mut nits_part = [pl::pl_overlay_part {
             src: pl::pl_rect2df {
                 x0: 0.0,
@@ -593,7 +654,13 @@ impl UiRenderer {
             self.ui,
             pl::VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         );
-        if !self.placebo.render(None, &target) {
+        // SIPHON_BLIT: a plain copy of the interface texture instead of the
+        // overlay render — is any of this coming from libplacebo's overlay path?
+        if std::env::var_os("SIPHON_BLIT").is_some() {
+            self.placebo
+                .blit(self.ui, target.planes[0].texture);
+            self.placebo.finish();
+        } else if !self.placebo.render(None, &target) {
             tracing::warn!(target: "ui", "libplacebo: render failed for {width}x{height}");
             eprintln!("libplacebo: render failed for {width}x{height}");
         }
