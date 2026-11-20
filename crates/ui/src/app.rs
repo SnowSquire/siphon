@@ -543,10 +543,9 @@ fn ChannelRow(
     });
     // Only titles that cannot fit their cell scroll. Three copies keep the
     // cell filled; the offset is a signal so leaving the row can rewind it.
-    let long_title = Signal::derive_local(move || title.get().chars().count() > 55);
     let title_run = Signal::derive_local(move || {
         let title = title.get();
-        if title.chars().count() > 55 {
+        if title.chars().count() > TITLE_SCROLL_MIN_CHARS {
             format!("{title}     │     ").repeat(3)
         } else {
             title
@@ -554,7 +553,7 @@ fn ChannelRow(
     });
     let title_limit = Signal::derive_local(move || {
         let count = u16::try_from(title.get().chars().count()).unwrap_or(u16::MAX);
-        if count > 55 {
+        if usize::from(count) > TITLE_SCROLL_MIN_CHARS {
             f32::from(count) * 6.4
         } else {
             0.0
@@ -661,8 +660,13 @@ fn ChannelRow(
                         box(class = "channel-title") {
                             text(
                                 class = "channel-title__run",
-                                class:active = long_title,
-                                var:--title-shift = move || Some(format!("-{:.1}px", title_shift.get())),
+                                // An inline transform, not a custom property read back
+                                // from the stylesheet: the style engine does not
+                                // substitute `var()` in a normal property, so a
+                                // `--title-shift` variable left the title motionless.
+                                style:transform = move || {
+                                    Some(format!("translateX(-{:.1}px)", title_shift.get()))
+                                },
                             ) {{move || title_run.get()}}
                         }
                     }
@@ -910,9 +914,9 @@ fn RecordingsTab(
     quality: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
-    let record_once = {
+    let record_once: Rc<dyn Fn()> = {
         let intents = Rc::clone(&intents);
-        move || {
+        Rc::new(move || {
             let login = draft.get_untracked().trim().to_lowercase();
             if login.is_empty() {
                 return;
@@ -923,7 +927,7 @@ fn RecordingsTab(
                 quality: (!quality.is_empty()).then_some(quality),
             });
             draft.set(String::new());
-        }
+        })
     };
     let rows = Rc::clone(&intents);
 
@@ -953,8 +957,24 @@ fn RecordingsTab(
                 }
             }
             row(class = "add") {
-                Input(value = draft, placeholder = "Add a channel to record once", class = "add__input")
-                Input(value = quality, placeholder = "quality (optional)", class = "add__quality")
+                Input(
+                    value = draft,
+                    placeholder = "Add a channel to record once",
+                    class = "add__input",
+                    on:key_down = {
+                        let record_once = Rc::clone(&record_once);
+                        move |ev| on_enter(ev, || record_once())
+                    },
+                )
+                Input(
+                    value = quality,
+                    placeholder = "quality (optional)",
+                    class = "add__quality",
+                    on:key_down = {
+                        let record_once = Rc::clone(&record_once);
+                        move |ev| on_enter(ev, || record_once())
+                    },
+                )
                 Button(on:click = move |_| record_once()) {"Record once"}
             }
         }
@@ -1302,6 +1322,18 @@ fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u
 /// Drives a channel title's horizontal offset while its row is hovered, then
 /// rewinds it to the start. Keeping the offset in a signal (rather than a CSS
 /// animation) means leaving mid-scroll can smoothly return to zero.
+/// A title that fits its cell does not scroll.
+const TITLE_SCROLL_MIN_CHARS: usize = 55;
+/// Pixels per second the hovered title slides away at. A frame-driven 0.9 px
+/// per 60 Hz frame, expressed as a rate so a 165 Hz window is not 2.75x faster.
+const TITLE_SCROLL_PX_PER_SEC: f32 = 54.0;
+/// Rewind: an exponential pull home at this rate, plus this constant drag.
+const TITLE_REWIND_RATE: f32 = 8.0;
+const TITLE_REWIND_PX_PER_SEC: f32 = 180.0;
+/// A frame this long is a stall (a covered window, a debugger break), not a
+/// frame: clamping it keeps the title from jumping when the window comes back.
+const TITLE_DT_MAX: f32 = 0.1;
+
 fn scroll_title(
     shift: RwSignal<f32, LocalStorage>,
     limit: f32,
@@ -1311,15 +1343,27 @@ fn scroll_title(
     let token = generation.get() + 1;
     generation.set(token);
     let slot = Rc::new(RefCell::new(None));
+    // Frame callbacks arrive at the display's rate, so every step is scaled by
+    // the time since the last one rather than by a fixed per-frame amount.
+    let mut last = std::time::Instant::now();
     next_frame(generation, token, &slot, move || {
+        let now_at = std::time::Instant::now();
+        let dt = (now_at - last).as_secs_f32().min(TITLE_DT_MAX);
+        last = now_at;
+
         let now = shift.get_untracked();
         let next = if rewind {
-            (now - (now / 8.0 + 3.0)).max(0.0)
+            // Pull home: `now - (now * rate + drag) * dt`, as one FMA each.
+            let pull = now.mul_add(TITLE_REWIND_RATE, TITLE_REWIND_PX_PER_SEC);
+            pull.mul_add(-dt, now).max(0.0)
         } else {
-            (now + 0.9).min(limit)
+            TITLE_SCROLL_PX_PER_SEC.mul_add(dt, now).min(limit)
         };
         shift.set(next);
-        (next - now).abs() < 0.01
+        // Stop at the end of the travel, not on a step size: the first callback
+        // of a run arrives within microseconds, so a per-step epsilon reports
+        // "done" before the title has moved at all.
+        if rewind { next <= 0.0 } else { next >= limit }
     });
 }
 
@@ -1935,9 +1979,6 @@ const SHEET: &str = css!(
     line-height: 18px;
     font-size: 12px;
     color: oklch(0.70 0.018 240);
-}
-.channel-title__run.active {
-    transform: translateX(var(--title-shift, 0px));
 }
 /* The row truncates the title to keep Notify aligned; the expanded panel is
    where the whole thing goes, wrapped rather than clipped. */
