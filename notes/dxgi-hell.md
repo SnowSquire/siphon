@@ -78,8 +78,8 @@ summary is here so a future session does not re-derive it by hand.
 | GDI `CopyFromScreen`, idle, under mouse motion, 40 programmatic resizes, 30 real mouse-driven resize frames | none | never showed magenta, not once | a 3 ms tear cannot be captured at 10–30 Hz; stop treating capture as the oracle |
 | full-frame, then per-column, interface alpha readback | none | 0 of 760 000 texels translucent | the fill does not bleed through the interface |
 | `D3D12` `COMMON → PRESENT` after `ResizeBuffers` | transition every backbuffer before its first present | `E_INVALIDARG` at `Close` | backbuffers are already `PRESENT`; there is no state to fix |
-| frame-latency waitable bypassed (`wait_for_frame` → `true`) | presentation paced only by `Present` | post-resize rate went 10 fps → ~380/s | the waitable goes silent after `ResizeBuffers` |
-| waitable re-taken after `ResizeBuffers` | close the old handle, `GetFrameLatencyWaitableObject` again, re-apply the latency | no change | the handle is not the whole story; the gate is not worth keeping |
+| frame-latency waitable bypassed (`wait_for_frame` → `true`) | presentation paced only by `Present` | the counter rose to ~380/s | **withdrawn**: the counter counts *attempts*, not presents, so it proved nothing. The 10 fps was concurrent with `ResizeBuffers` failing (see the leak below); the gate is fine |
+| waitable re-taken after `ResizeBuffers` | close the old handle, `GetFrameLatencyWaitableObject` again, re-apply the latency | no change | nothing to fix; the handle was never the problem |
 | `SIPHON_NO_SIGNAL` | queue `Wait` on a value that is never signalled | 10 fps, presents stopped retiring | the D3D12 queue wait is genuinely honoured |
 | `SIPHON_SYNC=none / compose / handover / present / all` | CPU waits on each of the three edges, in every combination | no combination removed the bands on the share path | the share path has no ordering hook to strengthen |
 | empty `ExecuteCommandLists` per frame | a real submission that touches nothing | no change | DXGI needs work that *writes* the buffer, not merely a submission |
@@ -94,12 +94,13 @@ painting or made the drag worse.
 
 ## Four bugs that were independent of the choice
 
-1. **`ResizeBuffers` invalidates the frame-latency waitable.** The old handle's
-   event is never signalled again, so `wait_for_frame` times out at 100 ms
-   forever — a permanent 10 fps after the first resize. Re-taking the handle did
-   not help; the gate is not worth keeping, because `SetMaximumFrameLatency(2)`
-   and `Present` already pace the loop. **This bug is present in `f2c68bfe`
-   today.**
+1. **A failing `ResizeBuffers` is indistinguishable from a dead waitable, and
+   I misread it as one.** The 10 fps after the first resize was taken for the
+   frame-latency waitable going silent, and "fixed" by bypassing the gate. The
+   real cause was the leaked references below breaking `ResizeBuffers`, which
+   leaves the swapchain in a state where presents stop retiring — the same
+   symptom. Measured since, on the tree without any D3D12 copy: a resize costs
+   nothing, `160–165` presents per 500 ms either side of it. The gate stays.
 2. **`ManuallyDrop` resource references leak.** `D3D12_TEXTURE_COPY_LOCATION
    .pResource` and `D3D12_RESOURCE_TRANSITION_BARRIER.pResource` are
    `ManuallyDrop<Option<ID3D12Resource>>`: the clone each one needs is not
