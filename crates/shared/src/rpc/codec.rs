@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-use crate::protocol::MAX_FRAME;
+use crate::rpc::protocol::MAX_FRAME;
 
 /// Staging buffer for one socket read. RPC traffic is user actions and state
 /// updates, never a hot loop, so this is about syscalls rather than throughput.
@@ -171,8 +171,8 @@ pub async fn write<T: Serialize, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ClientMessage;
-    use crate::protocol::Request;
+    use crate::rpc::protocol::ClientMessage;
+    use crate::rpc::protocol::Request;
 
     #[test]
     fn roundtrip_preserves_the_message() {

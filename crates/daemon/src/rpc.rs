@@ -9,13 +9,13 @@ use std::io;
 
 use compio::io::AsyncRead;
 use compio::io::AsyncWrite;
-use siphon_rpc::ClientMessage;
-use siphon_rpc::FrameReader;
-use siphon_rpc::MAGIC;
-use siphon_rpc::PROTOCOL_VERSION;
-use siphon_rpc::ServerMessage;
-use siphon_rpc::Update;
-use siphon_rpc::codec;
+use siphon_shared::rpc::ClientMessage;
+use siphon_shared::rpc::FrameReader;
+use siphon_shared::rpc::MAGIC;
+use siphon_shared::rpc::PROTOCOL_VERSION;
+use siphon_shared::rpc::ServerMessage;
+use siphon_shared::rpc::Update;
+use siphon_shared::rpc::codec;
 use tracing::info;
 #[cfg(unix)]
 use tracing::warn;
@@ -50,7 +50,7 @@ pub async fn serve(endpoint: String, handle: AppHandle) -> io::Result<()> {
 
     use compio::net::UnixListener;
 
-    if siphon_rpc::probe(&endpoint) {
+    if siphon_shared::rpc::probe(&endpoint) {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "admin socket is already in use",
@@ -251,13 +251,13 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use siphon_rpc::Channel;
-    use siphon_rpc::Client;
-    use siphon_rpc::ClientEvent;
-    use siphon_rpc::Config;
-    use siphon_rpc::Request;
-    use siphon_rpc::Response;
-    use siphon_rpc::Update;
+    use siphon_shared::rpc::Channel;
+    use siphon_shared::rpc::Client;
+    use siphon_shared::rpc::ClientEvent;
+    use siphon_shared::rpc::Config;
+    use siphon_shared::rpc::Request;
+    use siphon_shared::rpc::Response;
+    use siphon_shared::rpc::Update;
 
     use super::*;
     use crate::app::App;
@@ -369,7 +369,7 @@ mod tests {
             });
             compio::runtime::spawn(app.run()).detach();
 
-            let endpoint = siphon_rpc::admin_endpoint(&format!(
+            let endpoint = siphon_shared::rpc::admin_endpoint(&format!(
                 "test-{}-{}",
                 std::process::id(),
                 dir.file_name().unwrap().to_string_lossy()
@@ -377,7 +377,7 @@ mod tests {
             let serve_endpoint = endpoint.clone();
             compio::runtime::spawn(serve(serve_endpoint, handle)).detach();
             for _ in 0..50 {
-                if siphon_rpc::probe(&endpoint) {
+                if siphon_shared::rpc::probe(&endpoint) {
                     break;
                 }
                 compio::time::sleep(Duration::from_millis(20)).await;
@@ -403,14 +403,16 @@ mod tests {
             next_config(second_events).await;
 
             let response = client
-                .request(Request::GetDisk(siphon_rpc::StreamKey::new("sunnys", None)))
+                .request(Request::GetDisk(siphon_shared::rpc::StreamKey::new(
+                    "sunnys", None,
+                )))
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Disk(_)));
 
             let response = client
                 .request(Request::PipelineStop {
-                    key: siphon_rpc::StreamKey::new("sunnys", None),
+                    key: siphon_shared::rpc::StreamKey::new("sunnys", None),
                     force: true,
                 })
                 .await
@@ -420,7 +422,7 @@ mod tests {
 
             // A one-shot recording starts without a persisted monitor and can
             // be stopped again with the same lifecycle.
-            let key = siphon_rpc::StreamKey::new("sunnys", None);
+            let key = siphon_shared::rpc::StreamKey::new("sunnys", None);
             let response = client
                 .request(Request::RecordOnce {
                     login: "sunnys".to_owned(),

@@ -7,8 +7,8 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 use std::time::Instant;
 
-use siphon_rpc::LogLevel;
-use siphon_rpc::Update;
+use siphon_shared::rpc::LogLevel;
+use siphon_shared::rpc::Update;
 use sonic_rs::JsonValueTrait as _;
 use sonic_rs::Value;
 use sonic_rs::json;
@@ -267,7 +267,7 @@ impl App {
     ///
     /// Cloned because callers hold a mutable borrow of `channels` when they
     /// build the view, and a view needs both sides.
-    fn channel_config(&self, id: u64) -> Option<siphon_rpc::Channel> {
+    fn channel_config(&self, id: u64) -> Option<siphon_shared::rpc::Channel> {
         self.config
             .channels
             .iter()

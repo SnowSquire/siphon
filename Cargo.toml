@@ -2,7 +2,7 @@
 members = [
   "crates/daemon",
   "crates/libplacebo-sys",
-  "crates/rpc",
+  "crates/shared",
   "crates/ui",
   "crates/video",
 ]

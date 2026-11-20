@@ -14,6 +14,7 @@ use std::time::Instant;
 use eros::Context as _;
 use libplacebo_sys as pl;
 use raw_window_handle::HasWindowHandle as _;
+use siphon_shared::settings::HdrMode;
 use tracing::warn;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::InvalidateRect;
@@ -42,22 +43,28 @@ use super::idle_canvas;
 use crate::dxgi::BUFFERS;
 use crate::dxgi::D3d12;
 use crate::dxgi::DxgiSwapchain;
-use crate::dxgi::HdrMode;
 use crate::dxgi::hwnd_from_raw;
 use crate::dxgi::resize_canvas;
 use crate::dxgi::set_window_background;
 use crate::placebo::Placebo;
+use crate::settings::Display;
 
-/// The presentation mode to ask DXGI for: `SIPHON_HDR=off|auto|on`.
+/// The presentation mode to ask DXGI for: `SIPHON_HDR=off|auto|on`, then the
+/// client's own setting.
 ///
-/// Auto is the default and follows the output. `off` is the escape hatch for a
-/// display left in HDR mode that something cannot capture from; `on` fails the
-/// chain when the output cannot present PQ/Rec.2020.
-fn hdr_mode() -> HdrMode {
+/// The environment variable is the escape hatch for a display left in HDR mode
+/// that something cannot capture from, and for a test that must not depend on a
+/// file; `off` forces SDR, `on` fails the chain when the output cannot present
+/// PQ/Rec.2020. With neither set, `ui.json` decides, and its default follows the
+/// output: PQ when the display is already in HDR, SDR otherwise.
+fn hdr_mode(display: &Display) -> HdrMode {
     match std::env::var("SIPHON_HDR").as_deref() {
         Ok(value) if value.eq_ignore_ascii_case("off") => HdrMode::Off,
         Ok(value) if value.eq_ignore_ascii_case("on") => HdrMode::On,
-        _ => HdrMode::Auto,
+        Ok(value) if value.eq_ignore_ascii_case("auto") => HdrMode::Auto,
+        // No override in the environment: the client's own setting is what the
+        // switch in Preferences writes.
+        _ => display.present().hdr,
     }
 }
 
@@ -181,6 +188,8 @@ unsafe extern "system" fn display_change_proc(
     // SAFETY: chained to the next procedure in the subclass chain, which owns
     // the window and the rest of its messages.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+    /// The display settings this window is presented with.
+    display: Rc<Display>,
 }
 
 impl Chain {
@@ -191,6 +200,7 @@ impl Chain {
         gpu_surface: &Arc<dyn GpuSurface>,
         width: u32,
         height: u32,
+        display: Rc<Display>,
     ) -> eros::Result<Self> {
         let window = gpu_surface
             .window_handle()
@@ -231,6 +241,7 @@ impl Chain {
             acquired: Cell::new(0),
             target_sem,
             target_value: Cell::new(0),
+            display,
         };
         this.rebuild(width, height)?;
         Ok(this)
@@ -297,6 +308,17 @@ impl Chain {
         // The chain is reused through `ResizeBuffers`; creating a new one would
         // make the window association and the flip queue start over. A chain
         // that cannot be resized is dropped, and the next attempt creates one.
+        //
+        // An HDR mode is not resizable: the colour space and the metadata are
+        // chosen when the chain is created, so a new mode is a new chain.
+        let hdr = hdr_mode(&self.display);
+        if self
+            .swapchain
+            .as_ref()
+            .is_some_and(|chain| chain.hdr_mode() != hdr)
+        {
+            self.swapchain = None;
+        }
         let resized = match self.swapchain.as_mut() {
             Some(existing) => existing.resize(&self.d3d12, &self.gpu, width, height),
             None => DxgiSwapchain::new(
@@ -305,10 +327,10 @@ impl Chain {
                 self.hwnd,
                 width,
                 height,
-                // PQ when the output is already in HDR, SDR otherwise, so the
-                // interface is graded to the display instead of being handed
-                // to DWM's SDR-in-HDR mapping.
-                hdr_mode(),
+                // PQ when the client asks for it and the output is already in
+                // HDR, SDR otherwise, so the interface is graded to the display
+                // instead of being handed to DWM's SDR-in-HDR mapping.
+                hdr,
             )
             .map(|fresh| {
                 self.swapchain = Some(fresh);
@@ -548,6 +570,25 @@ impl Chain {
         })
     }
 
+    /// Follows a display setting that needs a new chain.
+    ///
+    /// `hdr` picks the colour space and the metadata at creation, so it cannot
+    /// change in place; the window's extent stays what it was.
+    pub fn apply_display(&mut self) {
+        let wanted = hdr_mode(&self.display);
+        let changed = self
+            .swapchain
+            .as_ref()
+            .is_some_and(|chain| chain.hdr_mode() != wanted);
+        if !changed {
+            return;
+        }
+        let (width, height) = self.canvas.size();
+        if let Err(error) = self.rebuild(width, height) {
+            warn!(target: "ui", "DXGI: could not change the display mode: {error:?}");
+        }
+    }
+
     /// Hands the backbuffer to the compositor.
     pub fn end(&self, _width: u32, _height: u32, _scale: f64) -> bool {
         let Some(swapchain) = self.swapchain.as_ref() else {
@@ -579,7 +620,7 @@ impl Chain {
         // One wait for the frame: the render, the interface handover and the
         // backbuffer transition are all complete by the time Present runs.
         self.placebo.finish();
-        swapchain.present().is_ok()
+        swapchain.present(self.display.present().tearing).is_ok()
     }
 
     /// The inner renderer's failures are already logged; this one needs a line.

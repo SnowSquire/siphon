@@ -31,6 +31,7 @@ mod placebo;
 mod renderer;
 mod rpc;
 mod service;
+mod settings;
 
 #[cfg(windows)]
 mod dxgi;

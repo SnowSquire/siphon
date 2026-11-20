@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::de::Visitor;
-use siphon_rpc::ChannelView;
+use siphon_shared::rpc::ChannelView;
 use thiserror::Error;
 
 use crate::constants::DEFAULT_CLIENT_ID;
@@ -80,7 +80,7 @@ impl ChannelDetail {
     /// the three switches the row draws. A resolve with no entry is a pending
     /// add, which the row does not show yet.
     #[must_use]
-    pub fn view(&self, channel: Option<&siphon_rpc::Channel>) -> ChannelView {
+    pub fn view(&self, channel: Option<&siphon_shared::rpc::Channel>) -> ChannelView {
         ChannelView {
             id: self.id,
             login: self.login.clone(),

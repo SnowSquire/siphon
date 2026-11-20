@@ -17,6 +17,7 @@
     reason = "the methods are shared with the Windows chain, which uses both"
 )]
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ash::khr;
@@ -59,6 +60,7 @@ impl Chain {
         gpu_surface: &Arc<dyn GpuSurface>,
         width: u32,
         height: u32,
+        _display: Rc<crate::settings::Display>,
     ) -> eros::Result<Self> {
         // SAFETY: `ash::Entry::load` only resolves the Vulkan loader's symbols;
         // the resulting entry is owned by the chain and outlives every use.
@@ -148,6 +150,13 @@ impl Chain {
         !self.swapchain.is_null()
     }
 
+    /// `SIPHON_PLAIN` is a DXGI experiment: it blits ZGUI's texture straight
+    /// into a backbuffer. Wayland's backbuffers are libplacebo's, so there is
+    /// nothing to blit into and the request is refused rather than ignored.
+    pub const fn present_plain(&self, _gpu: &Gpu, _ui: &wgpu::Texture) -> bool {
+        false
+    }
+
     pub const fn sdr_white(&self) -> f32 {
         // The desktop is SDR; the value only colours the interface overlay.
         200.0
@@ -166,6 +175,14 @@ impl Chain {
     /// The shell does not own the window in a modal loop here, so nothing has
     /// to ask for frames on its behalf.
     pub const fn request_frame(&self) {}
+
+    /// Nothing here changes with the display settings.
+    ///
+    /// A Wayland chain takes its colour space from the compositor's image
+    /// description, and a `VkSwapchainKHR` has no tearing mode: the present mode
+    /// chosen at creation is how the application asks, and mailbox is already it.
+    /// The settings are still persisted for a client whose chain does read them.
+    pub const fn apply_display(&mut self) {}
 
     /// Presentation is paced by libplacebo's Vulkan mailbox, not by ZGUI's
     /// surface callbacks. Every frame this renderer composes is submitted to

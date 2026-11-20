@@ -22,19 +22,19 @@ use kanal::AsyncReceiver;
 use kanal::Sender;
 use thiserror::Error;
 
-use crate::codec::CodecError;
-use crate::codec::FrameReader;
-use crate::codec::write;
-use crate::endpoint;
-use crate::protocol::ClientMessage;
-use crate::protocol::MAGIC;
-use crate::protocol::PROTOCOL_VERSION;
-use crate::protocol::Request;
-use crate::protocol::Response;
-use crate::protocol::RpcError;
-use crate::protocol::ServerMessage;
-use crate::protocol::Snapshot;
-use crate::protocol::Update;
+use crate::rpc::codec::CodecError;
+use crate::rpc::codec::FrameReader;
+use crate::rpc::codec::write;
+use crate::rpc::endpoint;
+use crate::rpc::protocol::ClientMessage;
+use crate::rpc::protocol::MAGIC;
+use crate::rpc::protocol::PROTOCOL_VERSION;
+use crate::rpc::protocol::Request;
+use crate::rpc::protocol::Response;
+use crate::rpc::protocol::RpcError;
+use crate::rpc::protocol::ServerMessage;
+use crate::rpc::protocol::Snapshot;
+use crate::rpc::protocol::Update;
 
 /// How long one request may wait for its response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);

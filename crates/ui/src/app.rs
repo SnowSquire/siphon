@@ -8,16 +8,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use siphon_rpc::ArenaSummary;
-use siphon_rpc::ChannelView;
-use siphon_rpc::ConnHealth;
-use siphon_rpc::DownloaderSummary;
-use siphon_rpc::LogEntry;
-use siphon_rpc::LogLevel;
-use siphon_rpc::NotificationView;
-use siphon_rpc::PipelineState;
-use siphon_rpc::PipelineView;
-use siphon_rpc::Request;
+use siphon_shared::rpc::ArenaSummary;
+use siphon_shared::rpc::ChannelView;
+use siphon_shared::rpc::ConnHealth;
+use siphon_shared::rpc::DownloaderSummary;
+use siphon_shared::rpc::LogEntry;
+use siphon_shared::rpc::LogLevel;
+use siphon_shared::rpc::NotificationView;
+use siphon_shared::rpc::PipelineState;
+use siphon_shared::rpc::PipelineView;
+use siphon_shared::rpc::Request;
+use siphon_shared::settings::HdrMode;
+use siphon_shared::settings::UiSettings;
 use zgui::prelude::*;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
@@ -40,6 +42,7 @@ use crate::format::format_time_ms;
 use crate::rpc::IntentSender;
 use crate::rpc::UiEvent;
 use crate::rpc::UiState;
+use crate::settings::Display;
 #[cfg(windows)]
 use crate::tray::TrayAction;
 
@@ -51,6 +54,7 @@ enum Tab {
     Filter,
     Recordings,
     Logs,
+    Settings,
 }
 
 pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Result<()> {
@@ -86,12 +90,17 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
     // Both platforms compose the interface into a texture and present it
     // through a chain: DXGI on Windows, a Vulkan swapchain on Wayland. Only the
     // chain differs, and it is chosen inside the renderer factory.
+    //
+    // The display settings are the client's own — they describe the screen the
+    // window is on — so they are read here rather than from the daemon.
+    let display = Display::load();
     let window = {
         let (gpu, _decode) = crate::gpu::create()?;
         let graphics = zgui_render_wgpu::SharedGraphics::with_gpu(Arc::clone(&gpu));
         let factory_gpu = Arc::clone(&gpu);
+        let factory_display = Rc::clone(&display);
         window.with_renderer(Box::new(move |surface, target| {
-            crate::chain::renderer(&graphics, &factory_gpu, surface, target)
+            crate::chain::renderer(&graphics, &factory_gpu, surface, target, &factory_display)
         }))
     };
 
@@ -102,11 +111,12 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
             let state = state.clone();
             let intents = intents.clone();
             let events = events.clone();
+            let display = Rc::clone(&display);
             let dark = dark;
             view! {
                 TooltipProvider(delay = Duration::from_millis(400)) {
                     ThemeProvider(scheme = ColorScheme::Dark, dark = dark) {
-                        App(state = state, intents = intents, events = events)
+                        App(state = state, intents = intents, events = events, display = display)
                     }
                 }
             }
@@ -190,7 +200,12 @@ fn release_hidden_memory() {
 
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
-fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) -> impl IntoView {
+fn App(
+    state: UiState,
+    intents: IntentSender,
+    events: kanal::Receiver<UiEvent>,
+    display: Rc<Display>,
+) -> impl IntoView {
     let intents = Rc::new(intents);
     // One handle per signal the view reads, so a closure depends on that field
     // alone: ZGUI reruns it when the signals it read change, not when any part of
@@ -297,6 +312,9 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
         }
     };
     let expanded = RwSignal::new_local(BTreeSet::<u64>::new());
+    // Panels that are playing their exit animation: still mounted, no longer
+    // "open" in the sense that a click should close them.
+    let closing = RwSignal::new_local(BTreeSet::<u64>::new());
     let draft = RwSignal::new_local(String::new());
     let word_draft = RwSignal::new_local(String::new());
     let once_login = RwSignal::new_local(String::new());
@@ -307,6 +325,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
     let channels_intents = Rc::clone(&intents);
     let filter_intents = Rc::clone(&intents);
     let recordings_intents = Rc::clone(&intents);
+    let settings_intents = Rc::clone(&intents);
 
     view! {
         column(class = "app") {
@@ -386,6 +405,14 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                 ) {
                     text(class = "tab__label", var:--tab-label-w = Some("32px".to_owned())) {"Logs"}
                 }
+                box(
+                    class = "tab",
+                    class:on = move || tab.get() == Tab::Settings,
+                    var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Settings),
+                    on:click = tab_click(Tab::Settings)
+                ) {
+                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Settings"}
+                }
                 // The video surface is the next milestone. A tab that changes
                 // nothing is worse than a tab that says it cannot be used yet,
                 // so it is drawn and never selected.
@@ -403,6 +430,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                     channels = channels_sig,
                     pending = pending_sig,
                     expanded = expanded,
+                    closing = closing,
                     draft = draft,
                     intents = Rc::clone(&channels_intents),
                 )
@@ -410,8 +438,6 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
             if move || tab.get() == Tab::Filter {
                 FilterTab(
                     words = words_sig,
-                    title_changes = title_sig,
-                    sound = sound_sig,
                     draft = word_draft,
                     intents = Rc::clone(&filter_intents),
                 )
@@ -435,6 +461,14 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
                     pipelines = pipelines_sig,
                 )
             }
+            if move || tab.get() == Tab::Settings {
+                SettingsTab(
+                    title_changes = title_sig,
+                    sound = sound_sig,
+                    display = Rc::clone(&display),
+                    intents = Rc::clone(&settings_intents),
+                )
+            }
         }
     }
 }
@@ -445,6 +479,7 @@ fn ChannelsTab(
     channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
+    closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
@@ -475,10 +510,15 @@ fn ChannelsTab(
                 text(class = "cell cell--chevron") {""}
                 text(class = "cell cell--channel") {"Channel"}
                 text(class = "cell cell--title") {"Title"}
-                text(class = "cell cell--notify") {"Notify"}
+                box(class = "cell cell--notify notify-head") {
+                    text(class = "notify-head__group") {"Notify"}
+                    row(class = "notify-head__labels") {
+                        text(class = "notify-head__label") {"live"}
+                        text(class = "notify-head__label") {"title"}
+                    }
+                }
                 text(class = "cell cell--record") {"Record"}
                 text(class = "cell cell--viewers") {"Viewers"}
-                text(class = "cell cell--action") {""}
             }
             ScrollArea(class = "channels") {
                 column(class = "list") {
@@ -486,6 +526,7 @@ fn ChannelsTab(
                         ChannelRow(
                             channel = channel,
                             expanded = expanded,
+                            closing = closing,
                             intents = Rc::clone(&rows),
                         )
                     }
@@ -495,7 +536,11 @@ fn ChannelsTab(
                             box(class = "live-dot") {box(class = "live-dot__lamp")}
                             text(class = "cell cell--channel") {{login.clone()}}
                             text(class = "cell cell--title") {"resolving…"}
-                            spacer()
+                        }
+                    }
+                    if move || channels.get().is_empty() && pending.get().is_empty() {
+                        text(class = "empty") {
+                            "No channels yet. Add a Twitch login below to follow a channel."
                         }
                     }
                 }
@@ -522,13 +567,22 @@ fn ChannelsTab(
 fn ChannelRow(
     channel: RwSignal<ChannelView, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
+    closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
     // Nothing below reads `channel` directly: the component body runs once, so
     // every value that has to follow the daemon is a derived signal read by the
     // hole that draws it.
     let id = channel.get_untracked().id;
-    let open = Signal::derive_local(move || expanded.get().contains(&id));
+    // A panel that is on its way out is still drawn, and the row keeps its
+    // open styling until it has gone.
+    let open =
+        Signal::derive_local(move || expanded.get().contains(&id) || closing.get().contains(&id));
+    let closing_this = Signal::derive_local(move || closing.get().contains(&id));
+    // The pending exit timeout, so re-opening cancels it instead of letting it
+    // unmount a panel the user just asked for.
+    let close_timer: Rc<RefCell<Option<zgui::view::TimeoutHandle>>> =
+        Rc::new(RefCell::new(None));
     let display_name = Signal::derive_local(move || channel.with(|c| c.display_name.clone()));
     let initials =
         Signal::derive_local(move || initials(&channel.with(|c| c.display_name.clone())));
@@ -587,7 +641,7 @@ fn ChannelRow(
     let live_intents = Rc::clone(&intents);
     let title_intents = Rc::clone(&intents);
     let record_intents = Rc::clone(&intents);
-    let remove_intents = Rc::clone(&intents);
+    let detail_intents = Rc::clone(&intents);
 
     // The three switches are controlled: the click sends the intent and the
     // switch moves when the daemon's word on it comes back, so a rejected
@@ -621,19 +675,50 @@ fn ChannelRow(
     );
 
     view! {
-        column(class = "channel") {
+        column(
+            class = "channel",
+            // The row, the switch and the expanded panel all read this, so it
+            // lives on the wrapper rather than on the row alone.
+            var:--channel-color = move || Some(color.get())
+        ) {
             row(
                 class = "channel-row",
                 class:open = open,
-                var:--channel-color = move || Some(color.get()),
+                class:offline = move || !live.get(),
                 on:pointer_enter = enter,
                 on:pointer_leave = leave,
-                on:click = move |_| {
-                    expanded.update(|expanded| {
-                        if !expanded.remove(&id) {
-                            expanded.insert(id);
+                on:click = {
+                    let close_timer = Rc::clone(&close_timer);
+                    move |_| {
+                        if closing.get_untracked().contains(&id) {
+                            // Re-opened while rolling away: keep it mounted and
+                            // cancel the unmount.
+                            closing.update(|set| {
+                                set.remove(&id);
+                            });
+                            *close_timer.borrow_mut() = None;
+                        } else if expanded.get_untracked().contains(&id) {
+                            closing.update(|set| {
+                                set.insert(id);
+                            });
+                            *close_timer.borrow_mut() =
+                                Some(set_timeout(
+                                    Duration::from_millis(DETAIL_ROLL_MS),
+                                    move || {
+                                        closing.update(|set| {
+                                            set.remove(&id);
+                                        });
+                                        expanded.update(|set| {
+                                            set.remove(&id);
+                                        });
+                                    },
+                                ));
+                        } else {
+                            expanded.update(|set| {
+                                set.insert(id);
+                            });
                         }
-                    });
+                    }
                 }
             ) {
                 box(class = "live-dot", class:live = live) {box(class = "live-dot__lamp")}
@@ -676,25 +761,19 @@ fn ChannelRow(
                 box(class = "cell cell--notify", on:click:stop = |_| {}) {
                     Tooltip {
                         TooltipTrigger {
-                            column(class = "mini") {
-                                Switch(
-                                    size = SwitchSize::Sm,
-                                    checked = notify_live,
-                                )
-                                text(class = "mini__label") {"live"}
-                            }
+                            Switch(
+                                size = SwitchSize::Sm,
+                                checked = notify_live,
+                            )
                         }
                         TooltipContent {"Notify when this channel goes live"}
                     }
                     Tooltip {
                         TooltipTrigger {
-                            column(class = "mini") {
-                                Switch(
-                                    size = SwitchSize::Sm,
-                                    checked = notify_titles,
-                                )
-                                text(class = "mini__label") {"title"}
-                            }
+                            Switch(
+                                size = SwitchSize::Sm,
+                                checked = notify_titles,
+                            )
                         }
                         TooltipContent {"Notify when the title or game changes"}
                     }
@@ -706,27 +785,37 @@ fn ChannelRow(
                     )
                 }
                 text(class = "cell cell--viewers") {{move || viewers(&channel.get())}}
-                Button(
-                    size = ButtonSize::IconSm,
-                    variant = ButtonVariant::Ghost,
-                    class = "remove",
-                    on:click:stop = move |_| {
-                        remove_intents.send(Request::RemoveChannel(id));
-                    }
-                ) {"×"}
             }
             if move || open.get() {
-                {move || channel_detail_view(channel.get())}
+                box(
+                    class = "detail-clip",
+                    class:closing = closing_this
+                ) {
+                    {channel_detail(channel, &detail_intents)}
+                }
             }
         }
     }
+}
+
+/// The expanded body, with its own handle on the intents.
+///
+/// The enclosing reactive `if` is an `Fn` that may be evaluated more than once,
+/// so it can only lend the row's clone; this builds a body that owns one.
+fn channel_detail(
+    channel: RwSignal<ChannelView, LocalStorage>,
+    intents: &Rc<IntentSender>,
+) -> impl IntoView {
+    let intents = Rc::clone(intents);
+    move || channel_detail_view(channel.get(), intents.clone())
 }
 
 #[allow(
     clippy::needless_pass_by_value,
     reason = "the returned view borrows the reference it is given"
 )]
-fn channel_detail_view(channel: ChannelView) -> impl IntoView {
+fn channel_detail_view(channel: ChannelView, intents: Rc<IntentSender>) -> impl IntoView {
+    let id = channel.id;
     let login = channel.login.clone();
     let title = channel
         .title
@@ -775,6 +864,17 @@ fn channel_detail_view(channel: ChannelView) -> impl IntoView {
                     {detail_item("Started", started)}
                 }
             }
+            row(class = "detail-foot") {
+                spacer()
+                Button(
+                    size = ButtonSize::Sm,
+                    variant = ButtonVariant::Outline,
+                    class = "detail-remove",
+                    on:click = move |_| {
+                        intents.send(Request::RemoveChannel(id));
+                    }
+                ) {"Remove"}
+            }
         }
     }
 }
@@ -806,8 +906,6 @@ fn detail_item_tip(key: &'static str, value: String, tip: String) -> impl IntoVi
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn FilterTab(
     words: RwSignal<Rc<Vec<String>>, LocalStorage>,
-    title_changes: RwSignal<bool, LocalStorage>,
-    sound: RwSignal<bool, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
@@ -822,12 +920,104 @@ fn FilterTab(
             draft.set(String::new());
         })
     };
-    let titles = Rc::clone(&intents);
-    let sound_switch = Rc::clone(&intents);
     let word_rows = Rc::clone(&intents);
 
     view! {
         column(class = "tabbody") {
+            text(class = "section-title") {"Filtered words"}
+            text(class = "section-hint") {"A notification whose title contains one of these is dropped."}
+            row(class = "add") {
+                Input(
+                    value = draft,
+                    placeholder = "Add a filtered word",
+                    class = "add__input",
+                    on:key_down = {
+                        let add_word = Rc::clone(&add_word);
+                        move |ev| on_enter(ev, || add_word())
+                    },
+                )
+                Button(on:click = move |_| add_word()) {"Add"}
+            }
+            ScrollArea(class = "words") {
+                column(class = "list") {
+                    for word in move || (*words.get()).clone(), key = |word: &String| word.clone() {
+                        WordRowView(word = word, intents = Rc::clone(&word_rows))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Everything that is a preference rather than a list.
+///
+/// Two sections: the screen the window is on (the client's own settings) and
+/// what the daemon does with a notification (the daemon's).
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn SettingsTab(
+    title_changes: RwSignal<bool, LocalStorage>,
+    sound: RwSignal<bool, LocalStorage>,
+    display: Rc<Display>,
+    intents: Rc<IntentSender>,
+) -> impl IntoView {
+    let titles = Rc::clone(&intents);
+    let sound_switch = Rc::clone(&intents);
+
+    view! {
+        column(class = "tabbody") {
+            text(class = "section-title") {"Display"}
+            column(class = "settings") {
+                row(class = "switch-row") {
+                    column(class = "switch-copy") {
+                        text(class = "switch-title") {"High dynamic range"}
+                        text(class = "switch-hint") {"Present in PQ/Rec.2020 when the display is already in HDR mode. Windows only."}
+                    }
+                    spacer()
+                    Switch(
+                        checked = Binding::controlled(
+                            Signal::derive_local({
+                                let display = Rc::clone(&display);
+                                move || display.get().hdr != HdrMode::Off
+                            }),
+                            {
+                                let display = Rc::clone(&display);
+                                move |on: bool| {
+                                    display.set(UiSettings {
+                                        hdr: if on { HdrMode::Auto } else { HdrMode::Off },
+                                        ..display.present()
+                                    });
+                                }
+                            },
+                        )
+                    )
+                }
+                row(class = "switch-row") {
+                    column(class = "switch-copy") {
+                        text(class = "switch-title") {"Variable refresh"}
+                        text(class = "switch-hint") {"Show the newest frame rather than queueing them, and let the display follow the frame rate. May tear on a fixed-rate display. Windows only."}
+                    }
+                    spacer()
+                    Switch(
+                        checked = Binding::controlled(
+                            Signal::derive_local({
+                                let display = Rc::clone(&display);
+                                move || display.get().tearing
+                            }),
+                            {
+                                let display = Rc::clone(&display);
+                                move |on: bool| {
+                                    display.set(UiSettings {
+                                        tearing: on,
+                                        ..display.present()
+                                    });
+                                }
+                            },
+                        )
+                    )
+                }
+            }
+            text(class = "section-title") {"Notifications"}
             column(class = "settings") {
                 row(class = "switch-row") {
                     column(class = "switch-copy") {
@@ -858,27 +1048,6 @@ fn FilterTab(
                             },
                         )
                     )
-                }
-            }
-            text(class = "section-title") {"Filtered words"}
-            text(class = "section-hint") {"A notification whose title contains one of these is dropped."}
-            row(class = "add") {
-                Input(
-                    value = draft,
-                    placeholder = "Add a filtered word",
-                    class = "add__input",
-                    on:key_down = {
-                        let add_word = Rc::clone(&add_word);
-                        move |ev| on_enter(ev, || add_word())
-                    },
-                )
-                Button(on:click = move |_| add_word()) {"Add"}
-            }
-            ScrollArea(class = "words") {
-                column(class = "list") {
-                    for word in move || (*words.get()).clone(), key = |word: &String| word.clone() {
-                        WordRowView(word = word, intents = Rc::clone(&word_rows))
-                    }
                 }
             }
         }
@@ -1226,6 +1395,9 @@ fn ticker_text(
 ) -> String {
     let mut items = channels
         .iter()
+        // Offline rows keep the title of a finished broadcast; a marquee full
+        // of stale titles is worse than an empty strip, so only live ones run.
+        .filter(|channel| channel.with_untracked(|channel| channel.live))
         .filter_map(|channel| {
             channel.with_untracked(|channel| {
                 channel
@@ -1334,6 +1506,11 @@ const TITLE_REWIND_PX_PER_SEC: f32 = 180.0;
 /// A frame this long is a stall (a covered window, a debugger break), not a
 /// frame: clamping it keeps the title from jumping when the window comes back.
 const TITLE_DT_MAX: f32 = 0.1;
+
+/// How long the expanded panel takes to roll out and back in. The collapse
+/// keeps it mounted this long so the exit animation can play before the view
+/// removes it. Keep in step with the `detail-in`/`detail-out` keyframes.
+const DETAIL_ROLL_MS: u64 = 200;
 
 fn scroll_title(
     shift: RwSignal<f32, LocalStorage>,
@@ -1483,7 +1660,10 @@ const SHEET: &str = css!(
     .tabs {
         gap: 0;
         align-items: center;
-        padding: 0 2px;
+        /* Full-bleed rule under the tabs: the chrome above is inset, the
+           divider between it and the content is not. */
+        margin: 0 -12px;
+        padding: 0 14px;
         border-bottom: 1px solid oklch(0.32 0.020 240);
     }
 
@@ -1533,6 +1713,11 @@ const SHEET: &str = css!(
         gap: 10px;
         align-items: center;
         padding: 6px 10px;
+        /* The rows sit inside the scroll viewport, which reserves the engine's
+           16px gutter plus the list's 6px on the right; the header has to give
+           the same 22px back or its last columns hang past the values. */
+        padding-right: 32px;
+        border-left: 2px solid transparent;
         border-bottom: 1px solid oklch(0.32 0.020 240);
     }
 
@@ -1549,7 +1734,7 @@ const SHEET: &str = css!(
         color: oklch(0.88 0.010 240);
     }
 
-    .cell--chevron { width: 14px; }
+    .cell--chevron { width: 16px; }
     .cell--dot { width: 10px; }
     /* A Twitch login is at most 25 characters; the avatar and the gap take
        the rest of this column, and the name truncates rather than widening
@@ -1570,12 +1755,33 @@ const SHEET: &str = css!(
         overflow: hidden;
     }
     .cell--notify {
-        width: 124px;
+        width: 78px;
         display: flex;
         flex-direction: row;
         align-items: center;
         gap: 10px;
     }
+    /* Column group over the two switches: the labels are read once here
+       instead of being repeated on every row. */
+    .notify-head {
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0;
+    }
+    .notify-head__group {
+        font-size: 10px;
+    }
+    .notify-head__labels { gap: 10px; }
+    .notify-head__label {
+        width: 34px;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.6px;
+        text-align: center;
+        color: oklch(0.62 0.020 240);
+    }
+    .tablehead .cell--viewers { text-align: right; }
     .cell--record {
         width: 62px;
         display: flex;
@@ -1605,10 +1811,13 @@ const SHEET: &str = css!(
     .channel-row {
         align-items: center;
         gap: 10px;
-        padding: 2px 10px;
+        padding: 6px 10px;
         border-radius: 0;
-        min-height: 28px;
-        background-color: oklch(0.18 0.012 240);
+        /* A transparent 2px edge on every row keeps the cells aligned with the
+           header; an open row paints it in the channel's colour. */
+        border-left: 2px solid transparent;
+        min-height: 30px;
+        background-color: oklch(0.145 0.011 240);
     }
 
     .channel-row.pending { opacity: 0.65; }
@@ -1669,30 +1878,64 @@ const SHEET: &str = css!(
         white-space: nowrap;
     }
 
-    .mini {
-        align-items: center;
-        gap: 3px;
+    /* The panel is part of the row, not a card under it: no gap, no top
+       border, and the open row's channel-coloured edge runs straight through
+       it. The wrapper clips the reveal and animates its own height, so the
+       panel rolls out from under the row and pushes the rows below it down. */
+    .detail-clip {
+        overflow: hidden;
+        animation: detail-in 200ms ease-out;
     }
 
-    .mini__label {
-        font-size: 9px;
-        color: oklch(0.62 0.020 240);
-        letter-spacing: 0.3px;
-    }
-
-    .remove {
-        width: 28px;
-        height: 28px;
-        color: oklch(0.56 0.020 240);
+    /* Leaving: the same roll in reverse, held until the row unmounts it. */
+    .detail-clip.closing {
+        animation: detail-out 200ms ease-in forwards;
     }
 
     .detail {
-        margin: 2px 6px 6px 6px;
-        padding: 10px 12px;
+        margin: 0;
+        padding: 10px;
         gap: 12px;
-        border: 1px solid oklch(0.32 0.020 240);
+        border: 0;
+        border-left: 2px solid var(--channel-color, var(--zui-color-primary));
         border-radius: 0;
-        background-color: oklch(0.18 0.012 240);
+        /* One step under the rows, close to the table's own surface: the open
+           row casts into it, so the panel reads as a well the row opened
+           rather than a card laid under it. */
+        background-color: oklch(0.12 0.010 240);
+        box-shadow: inset 0 8px 12px -8px rgba(0, 0, 0, 0.8);
+    }
+
+    /* The content is at most a wrapped title plus the grid, so 240px is a
+       ceiling that never clips the settled panel; the reveal finishes when
+       the used height reaches the content and the rest of the curve is flat. */
+    @keyframes detail-in {
+        from { max-height: 0; }
+        to { max-height: 240px; }
+    }
+
+    @keyframes detail-out {
+        from { max-height: 240px; }
+        to { max-height: 0; }
+    }
+
+    .detail-foot {
+        align-items: center;
+        padding-top: 8px;
+        border-top: 1px solid oklch(0.28 0.016 240);
+    }
+
+    /* The component's own scoped rules are what set a button's tone, so the
+       override has to be more specific than :scope[data-variant]. */
+    .app .detail-foot .detail-remove {
+        color: #ff9aa8;
+        border-color: oklch(0.40 0.06 20);
+    }
+
+    .app .detail-foot .detail-remove:hover {
+        color: #ffd3d9;
+        border-color: oklch(0.48 0.08 20);
+        background-color: oklch(0.26 0.035 20);
     }
 
     .detail-head {
@@ -1968,12 +2211,19 @@ const SHEET: &str = css!(
 /* The bar lives in a permanent right strip. `scrollbar-gutter` is unsupported
    here, so `overflow: scroll` keeps the gutter reserved whether or not the
    rows overflow; expanding a row can no longer pull the columns sideways. */
-.channels .zui-scroll-area__viewport { overflow: scroll; }
+.channels .zui-scroll-area__viewport { overflow-y: scroll; overflow-x: hidden; }
 .list { gap: 0; padding: 0 6px 0 0; }
 /* Zebra rows; hover/open must follow the even-row rule to win. */
-.channel:nth-child(even) .channel-row { background-color: oklch(0.21 0.014 240); }
-.channel-row:hover { background-color: oklch(0.25 0.016 240); }
-.channel-row.open, .channel:nth-child(even) .channel-row.open { background-color: oklch(0.25 0.016 240); }
+.channel:nth-child(even) .channel-row { background-color: oklch(0.165 0.012 240); }
+.channel-row:hover { background-color: oklch(0.19 0.014 240); }
+.channel-row.open, .channel:nth-child(even) .channel-row.open {
+    background-color: oklch(0.215 0.014 240);
+    border-left-color: var(--channel-color, var(--zui-color-primary));
+}
+/* A live row is full weight; offline rows step back so the live ones carry
+   the eye without introducing another accent. */
+.channel-row.offline .channel-name { color: oklch(0.78 0.010 240); }
+.channel-row.offline .channel-title__run { color: oklch(0.56 0.014 240); }
 .channel-title__run {
     display: inline-block;
     white-space: nowrap;
@@ -2009,6 +2259,9 @@ const SHEET: &str = css!(
     border-right: 1px solid oklch(0.50 0.020 240);
     border-bottom: 1px solid oklch(0.50 0.020 240);
     transform: rotate(-45deg);
+    transition-property: transform, border-color;
+    transition-duration: 160ms;
+    transition-timing-function: ease;
 }
 .chevron.open .chevron__tip {
     border-color: var(--channel-color, var(--zui-color-primary));
@@ -2022,7 +2275,7 @@ const SHEET: &str = css!(
    settings have no channel, so they fall through to the app's primary. The
    extra class in each selector outranks the component's own scoped sheet. */
 .app .zui-switch,
-.app .zui-switch[data-size="sm"] {
+.app .zui-switch.zui-switch--sm {
     width: 40px;
     height: 22px;
     border: 1px solid var(--zui-color-border);
@@ -2030,7 +2283,9 @@ const SHEET: &str = css!(
     background-color: var(--zui-color-control-switch-off);
     box-shadow: none;
 }
-.app .zui-switch[data-size="sm"] {
+/* The component's small size is a class in this revision, not a data
+   attribute; the dense rows are the only place that asks for it. */
+.app .zui-switch.zui-switch--sm {
     width: 34px;
     height: 18px;
 }
@@ -2039,7 +2294,7 @@ const SHEET: &str = css!(
     border-color: var(--channel-color, var(--zui-color-primary));
 }
 .app .zui-switch > .zui-switch__thumb,
-.app .zui-switch[data-size="sm"] > .zui-switch__thumb {
+.app .zui-switch.zui-switch--sm > .zui-switch__thumb {
     width: 18px;
     height: 18px;
     border-radius: 0;
@@ -2051,7 +2306,7 @@ const SHEET: &str = css!(
     transition-duration: var(--zui-motion-duration-normal);
     transition-timing-function: var(--zui-motion-ease-standard);
 }
-.app .zui-switch[data-size="sm"] > .zui-switch__thumb {
+.app .zui-switch.zui-switch--sm > .zui-switch__thumb {
     width: 14px;
     height: 14px;
 }
@@ -2059,7 +2314,7 @@ const SHEET: &str = css!(
     background-color: var(--zui-color-control-switch-thumb-on);
     transform: translateX(16px);
 }
-.app .zui-switch[data-size="sm"]:checked > .zui-switch__thumb {
+.app .zui-switch.zui-switch--sm:checked > .zui-switch__thumb {
     transform: translateX(14px);
 }
 /* The old wordmark row is now a news ticker for the daemon's event stream.

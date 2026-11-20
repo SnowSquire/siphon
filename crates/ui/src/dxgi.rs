@@ -14,6 +14,7 @@ use ash::khr;
 use ash::vk;
 use eros::Context as _;
 use eros::IntoUnion as _;
+use siphon_shared::settings::HdrMode;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::FALSE;
 use windows::Win32::Foundation::GENERIC_ALL;
@@ -38,10 +39,12 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::Graphics::Dxgi::CreateDXGIFactory2;
 use windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS;
+use windows::Win32::Graphics::Dxgi::DXGI_FEATURE_PRESENT_ALLOW_TEARING;
 use windows::Win32::Graphics::Dxgi::DXGI_HDR_METADATA_HDR10;
 use windows::Win32::Graphics::Dxgi::DXGI_HDR_METADATA_TYPE_HDR10;
 use windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
+use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_ALLOW_TEARING;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS;
 use windows::Win32::Graphics::Dxgi::DXGI_RGBA;
 use windows::Win32::Graphics::Dxgi::DXGI_SCALING_NONE;
@@ -53,6 +56,7 @@ use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_DISCARD;
 use windows::Win32::Graphics::Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT;
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter4;
+use windows::Win32::Graphics::Dxgi::IDXGIFactory5;
 use windows::Win32::Graphics::Dxgi::IDXGIFactory7;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
@@ -73,16 +77,27 @@ pub const BUFFERS: u32 = 3;
 /// The Vulkan spelling of the 10-bit swapchain format.
 pub const VK_FORMAT: vk::Format = vk::Format::A2B10G10R10_UNORM_PACK32;
 
-/// What to do with HDR.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HdrMode {
-    /// Enable HDR when the display is already in HDR mode.
-    #[default]
-    Auto,
-    /// Require HDR; fail if the display cannot present PQ/Rec.2020.
-    On,
-    /// Present SDR.
-    Off,
+/// Whether this adapter can present with tearing, which is the only way to let a
+/// variable-refresh display take its timing from the frames themselves.
+///
+/// A swapchain created with the tearing flag on an adapter that does not support
+/// it fails to be created at all, so the flag is set from this answer and not
+/// from the setting alone.
+fn tearing_supported(factory: &IDXGIFactory7) -> bool {
+    let Ok(factory5) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut supported = 0u32;
+    // SAFETY: the factory is alive, and the only size this feature accepts is
+    // that of the `BOOL` it fills in.
+    let result = unsafe {
+        factory5.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut supported).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
+    result.is_ok() && supported != 0
 }
 
 /// The chain's extent while the window's size is settled.
@@ -238,6 +253,10 @@ pub struct DxgiSwapchain {
     hdr_mode: HdrMode,
     max_luminance: Cell<f32>,
     sdr_white: Cell<f32>,
+    /// Whether a present may be unpaced and tear.
+    tearing: bool,
+    /// The flags the chain was created with; `ResizeBuffers` has to be given them.
+    flags: u32,
 }
 
 impl DxgiSwapchain {
@@ -252,7 +271,7 @@ impl DxgiSwapchain {
         hwnd: HWND,
         width: u32,
         height: u32,
-        hdr: HdrMode,
+        mode: HdrMode,
     ) -> eros::Result<Self> {
         eros::ensure!(width > 0 && height > 0, "zero-sized swapchain");
 
@@ -270,6 +289,15 @@ impl DxgiSwapchain {
         let factory = &d3d12.factory;
         let queue = &d3d12.queue;
 
+        // Tearing is the only way to hand presentation timing to a
+        // variable-refresh display, and a chain created with the flag on an
+        // adapter that lacks it fails to be created at all.
+        let tearing = tearing_supported(factory);
+        let mut flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
+        if tearing {
+            flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
+        }
+
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
@@ -285,12 +313,12 @@ impl DxgiSwapchain {
             // the window and the compositor shows its top-left corner 1:1.
             Scaling: DXGI_SCALING_NONE,
             // Discard, not sequential: every frame is drawn from scratch, so
-            // preserving the backbuffer's contents buys nothing and rules out
-            // the independent-flip paths that variable refresh needs.
+            // preserving the backbuffer's contents buys nothing, and it costs the
+            // compositor the path that reuses this buffer as its own when other
+            // windows are on screen — a copy a present does not have to pay.
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0
-                | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0) as u32,
+            Flags: flags,
         };
         // SAFETY: the queue and HWND are alive, and the descriptor is a valid local.
         let swapchain1 = unsafe {
@@ -321,7 +349,7 @@ impl DxgiSwapchain {
         unsafe { factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }
             .context("MakeWindowAssociation")?;
 
-        let (active, max_luminance, sdr_white) = configure_hdr(&swapchain, hdr, true, None)?;
+        let (active, max_luminance, sdr_white) = configure_hdr(&swapchain, mode, true, None)?;
         let format = wgpu::TextureFormat::Rgb10a2Unorm;
 
         let mut this = Self {
@@ -336,9 +364,11 @@ impl DxgiSwapchain {
             height,
             removed: Cell::new(false),
             hdr: Cell::new(active),
-            hdr_mode: hdr,
+            hdr_mode: mode,
             max_luminance: Cell::new(max_luminance),
             sdr_white: Cell::new(sdr_white),
+            tearing,
+            flags,
         };
         this.attach_backbuffers(d3d12, gpu, width, height)?;
         Ok(this)
@@ -372,10 +402,7 @@ impl DxgiSwapchain {
                 width,
                 height,
                 DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG(
-                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0
-                        | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0,
-                ),
+                DXGI_SWAP_CHAIN_FLAG(self.flags),
             )
         }
         .inspect_err(|error| self.note_removal(error))
@@ -509,6 +536,15 @@ impl DxgiSwapchain {
         self.hdr.get()
     }
 
+    /// The mode the chain was created with.
+    ///
+    /// The colour space and the HDR metadata are chosen at creation, so this is
+    /// also what a caller compares against to know a new chain is needed.
+    #[must_use]
+    pub const fn hdr_mode(&self) -> HdrMode {
+        self.hdr_mode
+    }
+
     /// The display's reported peak luminance in nits, or zero when unknown.
     #[must_use]
     pub const fn max_luminance(&self) -> f32 {
@@ -533,15 +569,29 @@ impl DxgiSwapchain {
     }
 
     /// Hands the current backbuffer to the compositor.
+    ///
+    /// `tearing` asks for the unpaced form: a present that does not wait for a
+    /// vertical blank, so the newest frame wins instead of a queue of older ones
+    /// being shown in order, and a variable-refresh display may take its timing
+    /// from the frames. On a display that cannot vary its rate the same call can
+    /// tear; on one that cannot tear at all it is still unpaced, and the
+    /// compositor decides when the frame is shown.
     #[allow(
         clippy::borrow_as_ptr,
         reason = "the Windows bindings take a pointer to the present parameters"
     )]
-    pub fn present(&self) -> eros::Result<()> {
+    pub fn present(&self, tearing: bool) -> eros::Result<()> {
         let params = DXGI_PRESENT_PARAMETERS::default();
-        // SAFETY: the swapchain lives in `self`; the parameters describe the whole frame
-        // (no dirty rects), which is what a flip-model present expects.
-        let result = unsafe { self.swapchain.Present1(1, DXGI_PRESENT(0), &params) };
+        let (interval, flags) = match (tearing, self.tearing) {
+            // The flag is only legal together with a zero interval, and the
+            // swapchain was created with it only when the adapter supports it.
+            (true, true) => (0, DXGI_PRESENT_ALLOW_TEARING),
+            (true, false) => (0, DXGI_PRESENT(0)),
+            (false, _) => (1, DXGI_PRESENT(0)),
+        };
+        // SAFETY: the swapchain lives in `self`; the parameters describe the whole
+        // frame (no dirty rects), which is what a flip-model present expects.
+        let result = unsafe { self.swapchain.Present1(interval, flags, &params) };
         result
             .ok()
             .inspect_err(|error| self.note_removal(error))

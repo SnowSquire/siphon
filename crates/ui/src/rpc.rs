@@ -16,19 +16,19 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 
-use siphon_rpc::ArenaSummary;
-use siphon_rpc::ChannelView;
-use siphon_rpc::Client;
-use siphon_rpc::ClientEvent;
-use siphon_rpc::ConnHealth;
-use siphon_rpc::DownloaderSummary;
-use siphon_rpc::LogEntry;
-use siphon_rpc::NotificationView;
-use siphon_rpc::PipelineView;
-pub use siphon_rpc::Request;
-use siphon_rpc::Snapshot;
-use siphon_rpc::Update;
-use siphon_rpc::UpdateView;
+use siphon_shared::rpc::ArenaSummary;
+use siphon_shared::rpc::ChannelView;
+use siphon_shared::rpc::Client;
+use siphon_shared::rpc::ClientEvent;
+use siphon_shared::rpc::ConnHealth;
+use siphon_shared::rpc::DownloaderSummary;
+use siphon_shared::rpc::LogEntry;
+use siphon_shared::rpc::NotificationView;
+use siphon_shared::rpc::PipelineView;
+pub use siphon_shared::rpc::Request;
+use siphon_shared::rpc::Snapshot;
+use siphon_shared::rpc::Update;
+use siphon_shared::rpc::UpdateView;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
 use zgui::reactive::prelude::*;
@@ -143,7 +143,7 @@ pub async fn run(
     wake: Arc<Wake>,
     events: kanal::Sender<UiEvent>,
 ) {
-    let endpoint = siphon_rpc::admin_endpoint(crate::service::APP_ID);
+    let endpoint = siphon_shared::rpc::admin_endpoint(crate::service::APP_ID);
     tracing::info!(target: "rpc", %endpoint, "admin endpoint");
     let mut backoff = Duration::from_secs(1);
     loop {

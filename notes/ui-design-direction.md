@@ -38,8 +38,9 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   is 8px, the viewport uses `overflow: scroll` so the gutter is always reserved
   (`scrollbar-gutter` is unsupported in ZGUI), and the list keeps 6px of right
   padding. Expanding a row cannot pull the columns sideways.
-- Motion is back for four controls: the switch track/thumb transition over
-  160ms, a live dot pulse, the two marquees, and the tab weight. Tab names use
+- Motion is back for these controls: the switch track/thumb transition over
+  160ms, a live dot pulse, the two marquees, the tab weight, the row chevron's
+  90-degree turn over 160ms, and the expanded panel's 200ms roll. Tab names use
   Chillax, whose `wght` axis tops out at 700: unselected tabs sit at its
   minimum 200 and the selected tab at 600, with a cubic ease-out over 250ms
   while the outgoing tab eases back; the outgoing tab is tracked explicitly so
@@ -127,11 +128,30 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 - Remove the visual gap between the tab bar and the channels content. Add a
   full-width divider/line spanning the whole window between them.
 - Alternate row colours (zebra striping) so the dense list remains scannable.
-  The neutral ramp is a three-step one: empty table background `#04060a`,
-  odd/dark rows `#0b0d12`, even rows `#10131a`. The chrome/root background is
-  `#080a10`. The dark rows need their own explicit colour — if they are left
-  transparent they inherit the table background and the banding disappears
-  below the last row.
+  The neutral ramp is a three-step one in OKLCH at hue 240: empty table
+  `0.11`, odd rows `0.145`, even rows `0.165`, hover `0.19`, open `0.215`.
+  The chrome/root background is `0.16`. The dark rows need their own explicit
+  colour — if they are left transparent they inherit the table background and
+  the banding disappears below the last row. Offline rows step their name and
+  title back (`0.78` / `0.56`) so the live ones carry the eye.
+- The header is one row of identical type (10px, 600, 0.6 letter-spacing) and
+  each label sits over its column: the notify switches are labelled once, with
+  `Notify` centred over `live` and `title`, instead of repeating the two words
+  on every row. The header must give back what the scroll viewport takes on
+  the right (the engine's 16px gutter plus the list's 6px padding) or the last
+  columns hang past their values; `Viewers` is right-aligned like the counts.
+- Rows are 36px tall: the 24px avatar plus 6px top and bottom padding. The
+  two switches no longer set the row height, so the padding is explicit. Each
+  row carries a transparent 2px left edge that an open row paints in its
+  channel colour; the cells line up with the header because the edge is
+  reserved on both.
+- The switch override must select `.zui-switch--sm`: this zgui revision emits
+  the class and no `data-size` attribute, so a `[data-size="sm"]` rule silently
+  leaves every switch at 40x22.
+- Row actions stay out of the row: `Remove channel` lives in the expanded
+  detail, where an undo toast can follow it (pinning is planned next).
+- Empty and pending states are explicit: a list with no channels says how to
+  add one, and a resolving login keeps every column aligned.
 - Keep the row's avatar/display name and the live dot; those are the primary
   identity and state. Display names use Chillax (see Typography).
 - Row titles are single-line and truncated to one cell height; the full text
@@ -159,6 +179,21 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   warning with the raw value, not state carried through the system.
 - Keep Channel ID, Stream ID, Game ID/Game, Viewers and Collab in the detail
   grid. The grid itself should be denser and flatter than today.
+- The panel is part of the row, not a card under it: no top border, no margin,
+  and the open row's channel-coloured 2px edge runs straight down through it.
+  Its background is a step darker than the open row (`0.175` against `0.215`).
+- It rolls out from the row rather than appearing: the clipping wrapper
+  animates `max-height` 0 → 240px over 200ms, so the rows below are pushed
+  down as it reveals, and `detail-out` runs the same curve backwards. The
+  collapse keeps the panel mounted for 200ms via `set_timeout` before the view
+  removes it, so the exit is animated too; re-opening inside that window
+  clears `closing` and cancels the timeout. The panel's background is one step
+  under the rows (`0.12`, close to the table's own `0.11`) with an inset top
+  shadow, so the open row reads as casting into a well.
+- `Remove` is a bordered destructive button in a footer at the bottom of the
+  panel, behind a hairline, not a floating red label at the top: the top-right
+  corner already means "collapse" to anyone who reads an X there. It is not an
+  icon yet because zgui-ui has no icon set wired into this crate.
 
 ## Reference points
 

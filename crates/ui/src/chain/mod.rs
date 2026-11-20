@@ -125,6 +125,7 @@ pub fn renderer(
     gpu: &Arc<Gpu>,
     surface: &Arc<dyn Surface>,
     target: RenderTarget,
+    display: &Rc<crate::settings::Display>,
 ) -> Result<Box<dyn Renderer>, AppError> {
     let gpu_surface = Arc::clone(surface)
         .gpu_shared()
@@ -158,8 +159,30 @@ pub fn renderer(
     });
     let placebo =
         Rc::new(Placebo::import(gpu).map_err(|error| gpu_error(format!("libplacebo: {error}")))?);
-    let chain = Chain::new(gpu, Rc::clone(&placebo), surface, &gpu_surface, width, height)
-        .map_err(|error| gpu_error(format!("{error}")))?;
+    // Windows' chain keeps libplacebo alive for its per-backbuffer cache, so it
+    // takes a share; the Wayland chain only needs it while the swapchain is
+    // created.
+    #[cfg(windows)]
+    let chain = Chain::new(
+        gpu,
+        Rc::clone(&placebo),
+        surface,
+        &gpu_surface,
+        width,
+        height,
+        Rc::clone(display),
+    );
+    #[cfg(not(windows))]
+    let chain = Chain::new(
+        gpu,
+        &placebo,
+        surface,
+        &gpu_surface,
+        width,
+        height,
+        Rc::clone(display),
+    );
+    let chain = chain.map_err(|error| gpu_error(format!("{error}")))?;
     let inner = graphics
         .renderer_supplied(target, vec![ui.clone()])
         .map_err(AppError::from)?;

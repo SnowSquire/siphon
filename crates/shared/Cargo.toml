@@ -1,20 +1,23 @@
 #:schema https://www.schemastore.org/cargo.json
 
 [package]
-name = "siphon-rpc"
+name = "siphon-shared"
 version.workspace = true
 edition = "2024"
-description = "Typed RPC protocol shared by the Siphon backend and its UI"
+description = "What the Siphon backend and its clients share: the typed RPC, the client settings schema and the file store"
 authors = ["Ozeniken"]
 publish = false
 
 [dependencies]
 compio = { version = "0.19", features = ["fs", "net", "time"] }
+dirs = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 kanal = "0.1.1"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
+sonic-rs = "0.5.8"
 thiserror = "2.0.20"
+tracing = "0.1.44"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes"] }

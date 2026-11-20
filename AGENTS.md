@@ -74,7 +74,9 @@ detail: `notes/architecture.md`.
 - `downloader.rs` — bounded fetch workers streaming into spools.
 - `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`). Sink only, and slated to become a compile-time optional feature: keep it correct, but do not invest in its hot path.
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
-- `crates/rpc` (`siphon-rpc`) — the typed protocol, postcard framing and the UI-side client.
+- `crates/shared` (`siphon-shared`) — what both sides agree on: `rpc/` (the
+  typed protocol, postcard framing, the UI-side client), `settings/` (the
+  per-client settings schema) and `store/` (the JSON file layer).
 - `crates/ui` (`siphon-ui`, binary `siphon`) — the ZGUI window presented through the video spike's DXGI flip chain and libplacebo pass, the native tray, the RPC client worker, and the daemon lifecycle (auto-start, PID-file restart). Windows-only; `notes/rpc.md` has the split and the SDR/HDR state.
 
 ## Rules (do not "simplify")

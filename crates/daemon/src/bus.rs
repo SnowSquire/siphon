@@ -15,10 +15,10 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::rc::Weak;
 
-use siphon_rpc::LogEntry;
-use siphon_rpc::LogLevel;
-use siphon_rpc::ServerMessage;
-use siphon_rpc::Update;
+use siphon_shared::rpc::LogEntry;
+use siphon_shared::rpc::LogLevel;
+use siphon_shared::rpc::ServerMessage;
+use siphon_shared::rpc::Update;
 
 /// How many frames a connection may fall behind before it is disconnected.
 const BACKLOG: usize = 64;
@@ -172,7 +172,7 @@ impl Bus {
 
 #[cfg(test)]
 mod tests {
-    use siphon_rpc::ConnHealth;
+    use siphon_shared::rpc::ConnHealth;
 
     use super::*;
 

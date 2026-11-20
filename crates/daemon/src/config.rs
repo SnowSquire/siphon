@@ -1,15 +1,17 @@
 //! Persisted configuration: Siphon's JSON schema, migrated to the current
 //! version on load and written asynchronously on the work thread.
 //!
-//! The type itself lives in `siphon-rpc` because the UI receives it in the
+//! The type itself lives in `siphon-shared` because the UI receives it in the
 //! snapshot; this module owns the file.
 
 use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use siphon_rpc::Channel;
-use siphon_rpc::Config;
+use siphon_shared::rpc::Channel;
+use siphon_shared::rpc::Config;
+use siphon_shared::store;
+use siphon_shared::store::StoreError;
 use thiserror::Error;
 
 /// Config directory name. Debug builds use a separate id so a debug daemon
@@ -26,8 +28,8 @@ const DEFAULT_FILTERED_WORD: &str = "offline";
 pub enum ConfigError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("json: {0}")]
-    Json(#[from] sonic_rs::Error),
+    #[error(transparent)]
+    Store(#[from] StoreError),
     #[error("{0}")]
     Invalid(String),
 }
@@ -47,10 +49,7 @@ struct RawConfig {
 /// The config path under the platform config directory.
 #[must_use]
 pub fn default_path(app_id: &str) -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(app_id)
-        .join("config.json")
+    store::path(app_id, "config.json")
 }
 
 /// Loads and migrates a config. Any failure starts from a fresh default: a
@@ -67,8 +66,8 @@ pub fn load(path: &Path) -> Config {
 }
 
 fn load_versioned(path: &Path) -> Result<Config, ConfigError> {
-    let bytes = std::fs::read(path)?;
-    let mut raw: RawConfig = sonic_rs::from_slice(&bytes)?;
+    let mut raw: RawConfig = store::read(path)?
+        .ok_or_else(|| ConfigError::Invalid(format!("no config at {}", path.display())))?;
     let from = raw.version.unwrap_or(0);
     if from > Config::VERSION {
         return Err(ConfigError::Invalid(format!(
@@ -111,7 +110,7 @@ pub async fn save(config: &Config, path: &Path) -> Result<(), ConfigError> {
             .await
             .map_err(ConfigError::Io)?;
     }
-    let json = sonic_rs::to_string_pretty(config)?;
+    let json = store::to_json(config)?;
     compio::fs::write(path, json)
         .await
         .0

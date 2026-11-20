@@ -1,11 +1,13 @@
 # Daemon RPC and the Siphon backend/UI split
 
-Status: phases 0–2 backend landed. `crates/rpc` (`siphon-rpc`) owns the typed
-protocol, postcard framing and client; `crates/daemon` owns config, GQL,
+Status: phases 0–2 backend landed. `crates/shared` (`siphon-shared`) owns the
+typed protocol, postcard framing and client in its `rpc` module, the per-client
+settings schema in `settings`, and the JSON file layer in `store`;
+`crates/daemon` owns config, GQL,
 Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI is
 now `crates/ui` (ZGUI, binary `siphon`) and talks only over the RPC. It presents
-through the video spike's DXGI flip chain and libplacebo pass (SDR for now; the
-HDR path is kept dormant), starts the daemon when the admin port is idle and
+through the video spike's DXGI flip chain and libplacebo pass (SDR unless the
+client's HDR setting asks otherwise), starts the daemon when the admin port is idle and
 restarts it at the process level (PID file + terminate), never through the
 socket: a frozen daemon must still be restartable from the tray.
 
@@ -114,7 +116,7 @@ game id, viewers, stream start as milliseconds, Twitch's `BROADCAST-ID`, and
 the per-channel `notifyLive` / `notifyTitles` / `record` switches. ZGUI's
 image element reads files, not URLs, so `avatar::ensure` downloads each picture
 once into the app data directory and the row is re-published when the path
-exists. The workspace version (`0.5.0`) is shared by `daemon`, `siphon-rpc` and
+exists. The workspace version (`0.5.0`) is shared by `daemon`, `siphon-shared` and
 `siphon-ui` because the Hello/Welcome carries it; `libplacebo-sys` and the
 `video` prototype keep their own `0.1.0`. `PipelineView` carries key, state (live/offline/stopped),
 pinned, recording, sessions, position, live edge, segment tail, window size,
@@ -243,9 +245,11 @@ like `StreamKey`; changing quality is remove + add.
 
 ## Crates
 
-- `crates/rpc`: serde message types, `postcard` codec, frame decoder, compio
-  client. No ZGUI and no daemon internals, so the UI and the daemon can share
-  it. Package `siphon-rpc`.
+- `crates/shared` (package `siphon-shared`): everything both sides agree on. The
+  `rpc` module holds the serde message types, the `postcard` codec, the frame
+  decoder and the compio client — no ZGUI and no daemon internals. `settings`
+  is the per-client schema a UI persists for itself, `store` the versioned-JSON
+  file layer it and the daemon's config both read and write through.
 - `crates/daemon`: the backend app and the RPC server module; `registry.rs`
   owns pipelines, `app.rs` owns everything else.
 - `crates/ui` (`siphon-ui`, binary `siphon`): the ZGUI window presented through

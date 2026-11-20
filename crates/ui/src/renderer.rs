@@ -613,7 +613,13 @@ impl UiRenderer {
             },
             color: [0.0; 4],
         }];
-        if let Some(mask) = self.nits_mask {
+        // SIPHON_NITS_SQUARE: the 64 px diagnostic square in the top-right
+        // corner, drawn at the output's peak so a capture can be measured. It
+        // is a measurement overlay, not part of the interface, so it is only
+        // drawn when asked for.
+        if std::env::var_os("SIPHON_NITS_SQUARE").is_some()
+            && let Some(mask) = self.nits_mask
+        {
             {
                 let (signal, space) = Self::nits_square(chain);
                 let side = 64.0_f32;
@@ -775,6 +781,9 @@ impl Renderer for UiRenderer {
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome {
         if let Some(chain) = self.chain.as_mut() {
             chain.settle((self.width, self.height));
+            // A display setting that needs a new chain is followed before this
+            // frame acquires one: a chain's colour space is fixed at its creation.
+            chain.apply_display();
         }
         if !self.inner.present_into(0) {
             tracing::warn!(target: "ui", "the UI texture was not supplied");

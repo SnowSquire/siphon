@@ -22,7 +22,7 @@ on the consequences.
 
 ## What replaces it
 
-A media channel alongside the existing RPC (`crates/rpc`: typed messages,
+A media channel alongside the existing RPC (`crates/shared::rpc`: typed messages,
 postcard framing, loopback, `Hello`/`Welcome`), carrying **elementary stream, not
 decoded frames** — decode belongs to the UI because it needs the Vulkan device.
 

@@ -6,9 +6,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use siphon_rpc::SegmentRecord;
-use siphon_rpc::StreamKey;
-use siphon_rpc::Update;
+use siphon_shared::rpc::SegmentRecord;
+use siphon_shared::rpc::StreamKey;
+use siphon_shared::rpc::Update;
 
 use crate::bus::Bus;
 

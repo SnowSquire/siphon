@@ -21,13 +21,13 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const RTSP: &str = "127.0.0.1:7417";
 
 fn endpoint() -> String {
-    siphon_rpc::admin_endpoint(APP_ID)
+    siphon_shared::rpc::admin_endpoint(APP_ID)
 }
 
 /// Whether the daemon's admin endpoint accepts a connection.
 #[must_use]
 pub fn reachable() -> bool {
-    siphon_rpc::probe(&endpoint())
+    siphon_shared::rpc::probe(&endpoint())
 }
 
 fn port_open(address: &str) -> bool {
@@ -125,7 +125,7 @@ pub fn start() {
 /// catches what bypasses it — the message a panic prints before `abort`, and
 /// anything a startup warning writes before the subscriber exists.
 fn inherit_log(command: &mut Command) {
-    let path = siphon_rpc::log_path(APP_ID);
+    let path = siphon_shared::rpc::log_path(APP_ID);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

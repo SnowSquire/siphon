@@ -90,6 +90,68 @@ same thing with the swapchain Vulkan already has:
   actual extent rather than the surface's possibly stale one. Maximize lands at
   the origin and restore returns to the old geometry.
 
+## Display settings
+
+Two presentation choices belong to the client rather than the daemon, so they
+live in `crates/ui/src/settings.rs` over `siphon_shared::settings::UiSettings`: a
+`ui.json` beside the daemon's `config.json`, because a display belongs to the
+screen a window is on and a second UI — or a remote one — must be able to differ.
+
+- **HDR.** `HdrMode::Off | Auto | On` is what `configure_hdr` asks DXGI for;
+  `SIPHON_HDR=off|auto|on` overrides it for a session. When the chain actually
+  ends up in PQ/Rec.2020, `target_color` declares the target as BT.2020/PQ with
+  the display's reported peak, so libplacebo encodes into the container instead
+  of writing the SDR transfer into it. The interface overlay stays declared SDR
+  with `max_luma = sdr_white`: it *is* SDR content, and mapping it into the
+  container is libplacebo's job. With `Auto` the chain follows the output: the
+  present path re-reads the display twice a second (and on `WM_DISPLAYCHANGE`),
+  so a window on a display switched to HDR re-applies the colour space in place.
+  The *mode* is fixed at chain creation, so a different `Off`/`Auto`/`On` is a
+  new chain: `Chain::apply_display` runs from `draw`, before the frame is
+  acquired. The default is `Auto`; `Off` is the switch's answer for a display
+  left in HDR that something cannot capture from.
+- **Tearing.** The switch asks for an unpaced present —
+  `Present1(0, DXGI_PRESENT_ALLOW_TEARING)` when the adapter reports
+  `DXGI_FEATURE_PRESENT_ALLOW_TEARING`, `Present1(0, …)` when it does not (still
+  latest-frame-wins; nothing can tear), and `Present1(1, …)` when off. The
+  feature has to be checked before the chain exists: the flag in
+  `DXGI_SWAP_CHAIN_DESC1` makes `CreateSwapChainForHwnd` fail outright on an
+  adapter without it, so it is queried once and the flags kept for
+  `ResizeBuffers` to be given back unchanged.
+
+Wayland ignores both. A `VkSwapchainKHR` takes its colour space from the
+compositor's image description and has no tearing mode — mailbox, chosen at
+creation, is already the unpaced path. The settings are still read and saved so
+one client file moves between platforms intact.
+
+The Windows half of both is **type-checked only**; it has not been run on
+hardware, so the HDR target colour, the SDR white point inside an HDR container
+and the tear behaviour all still want a real display.
+
+## The marquee jitters under the pinned zgui
+
+Known regression, not chased to a commit: scrolling text in the header ticker
+shimmers along its edges as it moves, where it did not before `2a5dcfd` moved the
+zgui pin from `80baa3c7` to `aacaa469`.
+
+It is not the subpixel-coverage work that landed in between. On this display
+ZGUI still draws *one coverage for each pixel*, and a capture says so directly:
+of the edge pixels in a static text run, 94% carry the text's own hue and 6% the
+other side, where per-channel coverage would split them roughly evenly and tint
+one side of every stem red and the other blue. It is not the present path either
+— `Placebo::render` is untouched,
+and everything the merge added around it (`request_frame`, `SIPHON_PLAIN`, the
+diagnostics) is inert on Wayland. What is left is how the pinned ZGUI composes a
+translate-animated text run inside the interface texture: the ticker is a CSS
+`translateX` over eight copies, so every frame asks for glyphs at a new
+fractional phase.
+
+To pin it down, bisect the pin: `f38307f` is the tree just before
+partial-present (`#72`) and `80baa3c7` is the pre-pull revision, so a build at
+each says which side of that merge owns it. A workaround that does not depend on
+the answer is to drive the marquee from the frame callback in whole device
+pixels instead of animating a transform.
+
 ## Why the switch did not slide
 
 The switch's `:checked` transition is fine: ZGUI's harness interpolates it

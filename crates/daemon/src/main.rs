@@ -426,7 +426,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         let endpoint = args
             .admin
             .clone()
-            .unwrap_or_else(|| siphon_rpc::admin_endpoint(config::APP_ID));
+            .unwrap_or_else(|| siphon_shared::rpc::admin_endpoint(config::APP_ID));
         compio::runtime::spawn(async move {
             if let Err(error) = rpc::serve(endpoint, handle).await {
                 error!(%error, "rpc: listener failed");

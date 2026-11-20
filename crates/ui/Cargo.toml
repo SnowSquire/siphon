@@ -27,7 +27,7 @@ kanal = "0.1.1"
 libplacebo-sys = { path = "../libplacebo-sys" }
 pollster = "0.4"
 raw-window-handle = "0.6"
-siphon-rpc = { path = "../rpc" }
+siphon-shared = { path = "../shared" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zgui = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }

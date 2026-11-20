@@ -16,22 +16,22 @@ use std::time::Duration;
 use std::time::Instant;
 
 use futures_util::FutureExt as _;
-use siphon_rpc::ArenaSummary;
-use siphon_rpc::ChannelView;
-use siphon_rpc::Config;
-use siphon_rpc::ConnHealth;
-use siphon_rpc::DownloaderSummary;
-use siphon_rpc::LogLevel;
-use siphon_rpc::NotificationView;
-use siphon_rpc::PipelineView;
-use siphon_rpc::Request;
-use siphon_rpc::Response;
-use siphon_rpc::RpcError;
-use siphon_rpc::ServerMessage;
-use siphon_rpc::Snapshot;
-use siphon_rpc::StreamKey;
-use siphon_rpc::Update;
-use siphon_rpc::UpdateView;
+use siphon_shared::rpc::ArenaSummary;
+use siphon_shared::rpc::ChannelView;
+use siphon_shared::rpc::Config;
+use siphon_shared::rpc::ConnHealth;
+use siphon_shared::rpc::DownloaderSummary;
+use siphon_shared::rpc::LogLevel;
+use siphon_shared::rpc::NotificationView;
+use siphon_shared::rpc::PipelineView;
+use siphon_shared::rpc::Request;
+use siphon_shared::rpc::Response;
+use siphon_shared::rpc::RpcError;
+use siphon_shared::rpc::ServerMessage;
+use siphon_shared::rpc::Snapshot;
+use siphon_shared::rpc::StreamKey;
+use siphon_shared::rpc::Update;
+use siphon_shared::rpc::UpdateView;
 
 use crate::balesh::CheapRng;
 use crate::balesh::NanoId;
@@ -810,7 +810,7 @@ impl App {
                     "channel",
                     format!("added {} ({})", user.login, id),
                 );
-                self.config.channels.push(siphon_rpc::Channel {
+                self.config.channels.push(siphon_shared::rpc::Channel {
                     login: user.login.clone(),
                     id,
                     display_name: Some(user.display_name.clone()),
@@ -1031,7 +1031,7 @@ impl App {
 
     /// Re-sends one channel row after a switch moved, so a controlled toggle
     /// in the UI follows the backend rather than snapping back.
-    fn publish_channel_flags(&self, flags: &siphon_rpc::Channel) {
+    fn publish_channel_flags(&self, flags: &siphon_shared::rpc::Channel) {
         if let Some(detail) = self.channels.get(&flags.id) {
             self.bus
                 .publish(Update::ChannelUpsert(detail.view(Some(flags))));

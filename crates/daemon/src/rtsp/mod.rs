@@ -108,7 +108,7 @@ const SDES_CNAME: &[u8] = b"daemon";
 
 /// Identity of one RTSP presentation. The type lives in the RPC crate so a
 /// pipeline key crosses the wire without a second layout.
-pub use siphon_rpc::StreamKey;
+pub use siphon_shared::rpc::StreamKey;
 
 /// Why a DESCRIBE could not be served. `status` is the RTSP status line.
 #[derive(Clone, Copy, Debug)]
