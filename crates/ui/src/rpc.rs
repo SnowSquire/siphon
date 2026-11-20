@@ -20,7 +20,6 @@ use siphon_rpc::ArenaSummary;
 use siphon_rpc::ChannelView;
 use siphon_rpc::Client;
 use siphon_rpc::ClientEvent;
-use siphon_rpc::Config;
 use siphon_rpc::ConnHealth;
 use siphon_rpc::DownloaderSummary;
 use siphon_rpc::LogEntry;
@@ -116,19 +115,7 @@ const LOG_CAP: usize = 512;
 /// A fresh snapshot for the first frame.
 #[must_use]
 pub fn empty_snapshot() -> Snapshot {
-    Snapshot {
-        config: Config::default(),
-        conn: ConnHealth::Connecting,
-        channels: Vec::new(),
-        pending: Vec::new(),
-        pipelines: Vec::new(),
-        arena: ArenaSummary::default(),
-        downloader: DownloaderSummary::default(),
-        notifications: Vec::new(),
-        logs: Vec::new(),
-        error: None,
-        update: None,
-    }
+    Snapshot::default()
 }
 
 /// How many events may sit between the RPC worker and the UI thread.
@@ -294,9 +281,9 @@ pub struct UiState {
     pub conn: RwSignal<ConnHealth, LocalStorage>,
     pub error: RwSignal<Option<String>, LocalStorage>,
     pub update: RwSignal<Option<UpdateView>, LocalStorage>,
-    pub channels: RwSignal<Rc<Vec<ChannelView>>, LocalStorage>,
+    pub channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     pub pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
-    pub pipelines: RwSignal<Rc<Vec<PipelineView>>, LocalStorage>,
+    pub pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
     pub arena: RwSignal<ArenaSummary, LocalStorage>,
     pub downloader: RwSignal<DownloaderSummary, LocalStorage>,
     pub notifications: RwSignal<Rc<Vec<NotificationView>>, LocalStorage>,
@@ -304,6 +291,79 @@ pub struct UiState {
     pub words: RwSignal<Rc<Vec<String>>, LocalStorage>,
     pub title_changes: RwSignal<bool, LocalStorage>,
     pub sound: RwSignal<bool, LocalStorage>,
+}
+
+/// A list of rows, each behind its own signal.
+///
+/// The keyed list watches the *key list* and nothing else, so an update to one
+/// row's data has to travel through that row's signal: rewriting the vector
+/// would rebuild every row, and rebuilding only the changed one is not
+/// something a keyed list does for you. Mutating a row signal touches no list.
+type Rows<T> = RwSignal<Rc<Vec<RwSignal<T, LocalStorage>>>, LocalStorage>;
+
+/// Replaces one row's data, or appends a row for a key not seen before.
+fn upsert_row<T, K>(list: &Rows<T>, item: T, key: impl Fn(&T) -> K)
+where
+    T: PartialEq + 'static,
+    K: PartialEq,
+{
+    let wanted = key(&item);
+    let rows = list.get_untracked();
+    if let Some(row) = rows
+        .iter()
+        .find(|row| row.with_untracked(|current| key(current) == wanted))
+    {
+        if !row.with_untracked(|current| *current == item) {
+            row.set(item);
+        }
+        return;
+    }
+    let mut next = (*rows).clone();
+    next.push(RwSignal::new_local(item));
+    list.set(Rc::new(next));
+}
+
+/// Replaces a whole list, reusing the signal of every row that still exists.
+///
+/// Reusing matters more than the values: a snapshot with fresh signals behind
+/// the same keys would leave every row drawing its predecessor's data.
+fn sync_rows<T, K>(list: &Rows<T>, incoming: Vec<T>, key: impl Fn(&T) -> K)
+where
+    T: PartialEq + 'static,
+    K: PartialEq,
+{
+    let rows = list.get_untracked();
+    let mut next = Vec::with_capacity(incoming.len());
+    for item in incoming {
+        let wanted = key(&item);
+        match rows
+            .iter()
+            .find(|row| row.with_untracked(|current| key(current) == wanted))
+        {
+            Some(row) => {
+                if !row.with_untracked(|current| *current == item) {
+                    row.set(item);
+                }
+                next.push(*row);
+            }
+            None => next.push(RwSignal::new_local(item)),
+        }
+    }
+    list.set(Rc::new(next));
+}
+
+/// Drops every row whose key is not in `keep`.
+fn retain_rows<T>(list: &Rows<T>, keep: impl Fn(&T) -> bool)
+where
+    T: 'static,
+{
+    let rows = list.get_untracked();
+    if rows.iter().all(|row| row.with_untracked(&keep)) {
+        return;
+    }
+    let mut next = (*rows).clone();
+    next.retain(|row| row.with_untracked(&keep));
+    list.set(Rc::new(next));
 }
 
 impl UiState {
@@ -315,9 +375,9 @@ impl UiState {
             conn: RwSignal::new_local(state.conn),
             error: RwSignal::new_local(state.error),
             update: RwSignal::new_local(state.update),
-            channels: RwSignal::new_local(Rc::new(state.channels)),
+            channels: RwSignal::new_local(Rc::new(Vec::new())),
             pending: RwSignal::new_local(Rc::new(state.pending)),
-            pipelines: RwSignal::new_local(Rc::new(state.pipelines)),
+            pipelines: RwSignal::new_local(Rc::new(Vec::new())),
             arena: RwSignal::new_local(state.arena),
             downloader: RwSignal::new_local(state.downloader),
             notifications: RwSignal::new_local(Rc::new(state.notifications)),
@@ -333,9 +393,11 @@ impl UiState {
         self.conn.set(state.conn);
         self.error.set(state.error);
         self.update.set(state.update);
-        self.channels.set(Rc::new(state.channels));
+        sync_rows(&self.channels, state.channels, |channel| channel.id);
         self.pending.set(Rc::new(state.pending));
-        self.pipelines.set(Rc::new(state.pipelines));
+        sync_rows(&self.pipelines, state.pipelines, |pipeline| {
+            pipeline.key.clone()
+        });
         self.arena.set(state.arena);
         self.downloader.set(state.downloader);
         self.notifications.set(Rc::new(state.notifications));
@@ -353,21 +415,11 @@ impl UiState {
                     self.conn.set(conn);
                 }
             }
-            // One row of the list, not the list: the clone is what the keyed
-            // list needs to iterate, and it is the only allocation this costs.
-            Update::ChannelUpsert(view) => {
-                let mut channels = (*self.channels.get_untracked()).clone();
-                if let Some(existing) = channels.iter_mut().find(|row| row.id == view.id) {
-                    *existing = view;
-                } else {
-                    channels.push(view);
-                }
-                self.channels.set(Rc::new(channels));
-            }
+            // One row of the list, not the list: the row's own signal carries
+            // the change, so the keyed list never re-runs.
+            Update::ChannelUpsert(view) => upsert_row(&self.channels, view, |channel| channel.id),
             Update::ChannelRemove(id) => {
-                let mut channels = (*self.channels.get_untracked()).clone();
-                channels.retain(|row| row.id != id);
-                self.channels.set(Rc::new(channels));
+                retain_rows(&self.channels, |channel| channel.id != id);
             }
             Update::Pending(pending) => {
                 if *self.pending.get_untracked() != pending {
@@ -386,26 +438,27 @@ impl UiState {
                 if *self.words.get_untracked() != config.filtered_words {
                     self.words.set(Rc::new(config.filtered_words));
                 }
-                let mut channels = (*self.channels.get_untracked()).clone();
-                let before = channels.len();
-                channels.retain(|row| config.channels.iter().any(|channel| channel.id == row.id));
-                if channels.len() != before {
-                    self.channels.set(Rc::new(channels));
-                }
+                let ids: Vec<u64> = config.channels.iter().map(|channel| channel.id).collect();
+                retain_rows(&self.channels, |channel| ids.contains(&channel.id));
             }
             Update::PipelineUpsert(view) => {
-                let mut pipelines = (*self.pipelines.get_untracked()).clone();
-                if let Some(existing) = pipelines.iter_mut().find(|row| row.key == view.key) {
-                    *existing = view;
-                } else {
-                    pipelines.push(view);
+                let recorded = view.recording || view.disk.is_some();
+                let was = self
+                    .pipelines
+                    .get_untracked()
+                    .iter()
+                    .find(|row| row.with_untracked(|pipeline| pipeline.key == view.key))
+                    .map(|row| row.with_untracked(|pipeline| pipeline.recording || pipeline.disk.is_some()));
+                upsert_row(&self.pipelines, view, |pipeline| pipeline.key.clone());
+                // The Recordings list filters on this, and a keyed list does not
+                // watch row data: re-run it when a row joins or leaves.
+                if was != Some(recorded) {
+                    let rows = (*self.pipelines.get_untracked()).clone();
+                    self.pipelines.set(Rc::new(rows));
                 }
-                self.pipelines.set(Rc::new(pipelines));
             }
             Update::PipelineRemove(key) => {
-                let mut pipelines = (*self.pipelines.get_untracked()).clone();
-                pipelines.retain(|row| row.key != key);
-                self.pipelines.set(Rc::new(pipelines));
+                retain_rows(&self.pipelines, |pipeline| pipeline.key != key);
             }
             Update::Arena(arena) => {
                 if self.arena.get_untracked() != arena {
@@ -472,5 +525,107 @@ impl UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zgui::reactive::Mounted;
+    use zgui::reactive::install;
+
+    use super::*;
+
+    fn view(id: u64, viewers: u32) -> ChannelView {
+        ChannelView {
+            id,
+            login: format!("channel{id}"),
+            display_name: format!("Channel {id}"),
+            chat_color: "#ffffff".to_owned(),
+            profile_image_url: String::new(),
+            avatar_path: None,
+            live: true,
+            title: Some("a title".to_owned()),
+            game: None,
+            game_id: None,
+            viewers: Some(viewers),
+            collaboration_viewers: None,
+            stream_start_ms: None,
+            stream_id: None,
+            notify_live: true,
+            notify_titles: true,
+            record: false,
+        }
+    }
+
+    /// A keyed list watches its key list and nothing else, so an upsert has to
+    /// reach the row through the row's own signal. Replacing the vector would
+    /// leave the row drawing the value it was built with, forever.
+    #[test]
+    fn an_upsert_reaches_the_row_without_rebuilding_the_list() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let state = UiState::new();
+            state.reset(Snapshot {
+                channels: vec![view(1, 10)],
+                ..Snapshot::default()
+            });
+
+            let rows = state.channels.get_untracked();
+            let row = rows[0];
+            state.apply(Update::ChannelUpsert(view(1, 99)));
+
+            assert!(
+                Rc::ptr_eq(&rows, &state.channels.get_untracked()),
+                "one row's data must not rebuild the list"
+            );
+            assert_eq!(row.get_untracked().viewers, Some(99));
+        });
+        scope.unmount();
+    }
+
+    /// A reconnect ends with a whole snapshot; the rows it names already exist,
+    /// and a fresh signal behind the same key would keep drawing the old value.
+    #[test]
+    fn a_snapshot_reuses_the_rows_it_already_has() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let state = UiState::new();
+            state.reset(Snapshot {
+                channels: vec![view(1, 10)],
+                ..Snapshot::default()
+            });
+            let row = state.channels.get_untracked()[0];
+
+            state.reset(Snapshot {
+                channels: vec![view(1, 20), view(2, 30)],
+                ..Snapshot::default()
+            });
+
+            assert_eq!(row.get_untracked().viewers, Some(20));
+            let rows = state.channels.get_untracked();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get_untracked().id, 1);
+        });
+        scope.unmount();
+    }
+
+    #[test]
+    fn removing_a_channel_drops_its_row() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let state = UiState::new();
+            state.reset(Snapshot {
+                channels: vec![view(1, 10), view(2, 20)],
+                ..Snapshot::default()
+            });
+            state.apply(Update::ChannelRemove(1));
+            let rows = state.channels.get_untracked();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_untracked().id, 2);
+        });
+        scope.unmount();
     }
 }

@@ -440,7 +440,7 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn ChannelsTab(
-    channels: RwSignal<Rc<Vec<ChannelView>>, LocalStorage>,
+    channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
@@ -480,9 +480,9 @@ fn ChannelsTab(
             }
             ScrollArea(class = "channels") {
                 column(class = "list") {
-                    for channel in move || (*channels.get()).clone(), key = |channel: &ChannelView| channel.id {
+                    for channel in move || (*channels.get()).clone(), key = |channel: &RwSignal<ChannelView, LocalStorage>| channel.get_untracked().id {
                         ChannelRow(
-                            channel = channel.clone(),
+                            channel = channel,
                             expanded = expanded,
                             intents = Rc::clone(&rows),
                         )
@@ -514,53 +514,67 @@ fn ChannelsTab(
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn ChannelRow(
-    channel: ChannelView,
+    channel: RwSignal<ChannelView, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
-    let id = channel.id;
+    // Nothing below reads `channel` directly: the component body runs once, so
+    // every value that has to follow the daemon is a derived signal read by the
+    // hole that draws it.
+    let id = channel.get_untracked().id;
     let open = Signal::derive_local(move || expanded.get().contains(&id));
-    let display_name = channel.display_name.clone();
-    let initials = initials(&display_name);
-    let color = channel.chat_color.clone();
-    let avatar_path = channel.avatar_path.clone();
-    let title = channel
-        .title
-        .clone()
-        .filter(|title| !title.is_empty())
-        .unwrap_or_else(|| "—".to_owned());
-    let viewers = viewers(&channel);
-    let live = channel.live;
-    let notify_live = RwSignal::new_local(channel.notify_live);
-    let notify_titles = RwSignal::new_local(channel.notify_titles);
-    let record = RwSignal::new_local(channel.record);
-    let detail = channel.clone();
-
+    let display_name = Signal::derive_local(move || channel.with(|c| c.display_name.clone()));
+    let initials = Signal::derive_local(move || initials(&channel.with(|c| c.display_name.clone())));
+    let avatar_path = Signal::derive_local(move || channel.with(|c| c.avatar_path.clone()));
+    let color = Signal::derive_local(move || channel.with(|c| c.chat_color.clone()));
+    let live = Signal::derive_local(move || channel.with(|c| c.live));
+    let title = Signal::derive_local(move || {
+        channel
+            .with(|c| c.title.clone())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "—".to_owned())
+    });
     // Only titles that cannot fit their cell scroll. Three copies keep the
     // cell filled; the offset is a signal so leaving the row can rewind it.
-    let long_title = title.chars().count() > 55;
-    let title_run = if long_title {
-        format!("{title}     │     ").repeat(3)
-    } else {
-        title.clone()
-    };
+    let long_title = Signal::derive_local(move || title.get().chars().count() > 55);
+    let title_run = Signal::derive_local(move || {
+        let title = title.get();
+        if title.chars().count() > 55 {
+            format!("{title}     │     ").repeat(3)
+        } else {
+            title
+        }
+    });
+    let title_limit = Signal::derive_local(move || {
+        let count = u16::try_from(title.get().chars().count()).unwrap_or(u16::MAX);
+        if count > 55 {
+            f32::from(count) * 6.4
+        } else {
+            0.0
+        }
+    });
     let title_shift = RwSignal::new_local(0.0f32);
     let title_gen = Rc::new(Cell::new(0u64));
-    let title_limit = if long_title {
-        title.chars().count() as f32 * 6.4
-    } else {
-        0.0
-    };
     let enter = {
         let token = Rc::clone(&title_gen);
         move |_: &mut EventCx<'_, events::PointerEnter>| {
-            scroll_title(title_shift, title_limit, Rc::clone(&token), false);
+            scroll_title(
+                title_shift,
+                title_limit.get_untracked(),
+                Rc::clone(&token),
+                false,
+            );
         }
     };
     let leave = {
         let token = Rc::clone(&title_gen);
         move |_: &mut EventCx<'_, events::PointerLeave>| {
-            scroll_title(title_shift, title_limit, Rc::clone(&token), true);
+            scroll_title(
+                title_shift,
+                title_limit.get_untracked(),
+                Rc::clone(&token),
+                true,
+            );
         }
     };
 
@@ -569,12 +583,43 @@ fn ChannelRow(
     let record_intents = Rc::clone(&intents);
     let remove_intents = Rc::clone(&intents);
 
+    // The three switches are controlled: the click sends the intent and the
+    // switch moves when the daemon's word on it comes back, so a rejected
+    // change cannot sit on screen looking applied.
+    let notify_live = Binding::controlled(
+        Signal::derive_local(move || channel.with(|c| c.notify_live)),
+        move |on: bool| {
+            live_intents.send(Request::SetNotifyLive {
+                channel: id,
+                notify: on,
+            });
+        },
+    );
+    let notify_titles = Binding::controlled(
+        Signal::derive_local(move || channel.with(|c| c.notify_titles)),
+        move |on: bool| {
+            title_intents.send(Request::SetNotifyTitles {
+                channel: id,
+                notify: on,
+            });
+        },
+    );
+    let record = Binding::controlled(
+        Signal::derive_local(move || channel.with(|c| c.record)),
+        move |on: bool| {
+            record_intents.send(Request::SetRecord {
+                channel: id,
+                record: on,
+            });
+        },
+    );
+
     view! {
         column(class = "channel") {
             row(
                 class = "channel-row",
                 class:open = open,
-                var:--channel-color = color,
+                var:--channel-color = move || Some(color.get()),
                 on:pointer_enter = enter,
                 on:pointer_leave = leave,
                 on:click = move |_| {
@@ -594,12 +639,12 @@ fn ChannelRow(
                         row(class = "identity") {
                             Avatar(
                                 size = AvatarSize::Sm,
-                                src = Signal::stored_local(avatar_path.clone()),
-                                label = display_name.clone()
+                                src = avatar_path,
+                                label = Some(display_name.get_untracked()),
                             ) {
-                                text {{initials.clone()}}
+                                text {{move || initials.get()}}
                             }
-                            text(class = "channel-name") {{display_name.clone()}}
+                            text(class = "channel-name") {{move || display_name.get()}}
                         }
                     }
                     TooltipContent {{format!("Channel ID {id}")}}
@@ -611,10 +656,10 @@ fn ChannelRow(
                                 class = "channel-title__run",
                                 class:active = long_title,
                                 var:--title-shift = move || Some(format!("-{:.1}px", title_shift.get())),
-                            ) {{title_run}}
+                            ) {{move || title_run.get()}}
                         }
                     }
-                    TooltipContent {{stream_tooltip(&channel)}}
+                    TooltipContent {{move || stream_tooltip(&channel.get())}}
                 }
                 box(class = "cell cell--notify", on:click:stop = |_| {}) {
                     Tooltip {
@@ -623,12 +668,6 @@ fn ChannelRow(
                                 Switch(
                                     size = SwitchSize::Sm,
                                     checked = notify_live,
-                                    on_change = UnsyncCallback::new(move |on| {
-                                        live_intents.send(Request::SetNotifyLive {
-                                            channel: id,
-                                            notify: on,
-                                        });
-                                    })
                                 )
                                 text(class = "mini__label") {"live"}
                             }
@@ -641,12 +680,6 @@ fn ChannelRow(
                                 Switch(
                                     size = SwitchSize::Sm,
                                     checked = notify_titles,
-                                    on_change = UnsyncCallback::new(move |on| {
-                                        title_intents.send(Request::SetNotifyTitles {
-                                            channel: id,
-                                            notify: on,
-                                        });
-                                    })
                                 )
                                 text(class = "mini__label") {"title"}
                             }
@@ -658,15 +691,9 @@ fn ChannelRow(
                     Switch(
                         size = SwitchSize::Sm,
                         checked = record,
-                        on_change = UnsyncCallback::new(move |on| {
-                            record_intents.send(Request::SetRecord {
-                                channel: id,
-                                record: on,
-                            });
-                        })
                     )
                 }
-                text(class = "cell cell--viewers") {{viewers.clone()}}
+                text(class = "cell cell--viewers") {{move || viewers(&channel.get())}}
                 Button(
                     size = ButtonSize::IconSm,
                     variant = ButtonVariant::Ghost,
@@ -677,13 +704,17 @@ fn ChannelRow(
                 ) {"×"}
             }
             if move || open.get() {
-                {channel_detail_view(&detail)}
+                {move || channel_detail_view(channel.get())}
             }
         }
     }
 }
 
-fn channel_detail_view(channel: &ChannelView) -> impl IntoView {
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the returned view borrows the reference it is given"
+)]
+fn channel_detail_view(channel: ChannelView) -> impl IntoView {
     let login = channel.login.clone();
     let title = channel
         .title
@@ -859,7 +890,7 @@ fn WordRowView(word: String, intents: Rc<IntentSender>) -> impl IntoView {
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn RecordingsTab(
-    pipelines: RwSignal<Rc<Vec<PipelineView>>, LocalStorage>,
+    pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
     quality: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
@@ -895,8 +926,11 @@ fn RecordingsTab(
             }
             ScrollArea(class = "recordings") {
                 column(class = "list") {
-                    for pipeline in move || recordings(&pipelines.get()), key = |pipeline: &PipelineView| (pipeline.key.login.clone(), pipeline.key.quality.clone()) {
-                        RecordingRow(pipeline = pipeline.clone(), intents = Rc::clone(&rows))
+                    for pipeline in move || recordings(&pipelines.get()), key = |pipeline: &RwSignal<PipelineView, LocalStorage>| {
+                        let key = pipeline.get_untracked().key;
+                        (key.login, key.quality)
+                    } {
+                        RecordingRow(pipeline = pipeline, intents = Rc::clone(&rows))
                     }
                     if move || recordings(&pipelines.get()).is_empty() {
                         text(class = "empty") {"No recording is running. Pick a channel above and press Record once, or turn Record on in Channels."}
@@ -912,62 +946,92 @@ fn RecordingsTab(
     }
 }
 
-fn recordings(pipelines: &[PipelineView]) -> Vec<PipelineView> {
+const fn is_recorded(pipeline: &PipelineView) -> bool {
+    pipeline.recording || pipeline.disk.is_some()
+}
+
+/// The rows the Recordings tab draws. Membership follows the row's own signal,
+/// so `UiState` re-runs the list whenever a pipeline starts or stops recording.
+fn recordings(pipelines: &[RwSignal<PipelineView, LocalStorage>]) -> Vec<RwSignal<PipelineView, LocalStorage>> {
     pipelines
         .iter()
-        .filter(|pipeline| pipeline.recording || pipeline.disk.is_some())
-        .cloned()
+        .filter(|pipeline| pipeline.with_untracked(is_recorded))
+        .copied()
         .collect()
 }
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
-fn RecordingRow(pipeline: PipelineView, intents: Rc<IntentSender>) -> impl IntoView {
-    let key = pipeline.key.clone();
+fn RecordingRow(
+    pipeline: RwSignal<PipelineView, LocalStorage>,
+    intents: Rc<IntentSender>,
+) -> impl IntoView {
+    let key = pipeline.get_untracked().key;
     let login = key.login.clone();
     let quality = key.quality.clone().unwrap_or_else(|| "best".to_owned());
-    let state = state_label(pipeline.state);
-    let position = pipeline
-        .disk
-        .as_ref()
-        .map_or_else(String::new, |disk| format_duration_ms(disk.position_ms));
-    let segments = pipeline
-        .disk
-        .as_ref()
-        .map_or_else(String::new, |disk| disk.segments.to_string());
-    let size = pipeline
-        .disk
-        .as_ref()
-        .map_or_else(String::new, |disk| format_bytes(disk.bytes));
-    let runs = pipeline
-        .disk
-        .as_ref()
-        .map_or_else(String::new, |disk| disk.runs.to_string());
-    let error = pipeline
-        .disk
-        .as_ref()
-        .and_then(|disk| disk.last_error.clone())
-        .or_else(|| pipeline.last_error.clone())
-        .unwrap_or_default();
-    let has_error = !error.is_empty();
-    let recording = pipeline.recording;
+    let state = Signal::derive_local(move || state_label(pipeline.get().state));
+    let position = Signal::derive_local(move || {
+        pipeline.with(|pipeline| {
+            pipeline
+                .disk
+                .as_ref()
+                .map_or_else(String::new, |disk| format_duration_ms(disk.position_ms))
+        })
+    });
+    let segments = Signal::derive_local(move || {
+        pipeline.with(|pipeline| {
+            pipeline
+                .disk
+                .as_ref()
+                .map_or_else(String::new, |disk| disk.segments.to_string())
+        })
+    });
+    let size = Signal::derive_local(move || {
+        pipeline.with(|pipeline| {
+            pipeline
+                .disk
+                .as_ref()
+                .map_or_else(String::new, |disk| format_bytes(disk.bytes))
+        })
+    });
+    let runs = Signal::derive_local(move || {
+        pipeline.with(|pipeline| {
+            pipeline
+                .disk
+                .as_ref()
+                .map_or_else(String::new, |disk| disk.runs.to_string())
+        })
+    });
+    let error = Signal::derive_local(move || {
+        pipeline.with(|pipeline| {
+            pipeline
+                .disk
+                .as_ref()
+                .and_then(|disk| disk.last_error.clone())
+                .or_else(|| pipeline.last_error.clone())
+                .unwrap_or_default()
+        })
+    });
+    let recording = Signal::derive_local(move || pipeline.with(|pipeline| pipeline.recording));
+    let has_error = Signal::derive_local(move || !error.get().is_empty());
 
+    let stop_intents = Rc::clone(&intents);
     view! {
         column(class = "recording") {
             row(class = "recording-row") {
                 text(class = "cell cell--channel") {{login}}
                 text(class = "cell cell--quality") {{quality}}
-                text(class = "cell cell--state") {{state}}
-                text(class = "cell cell--position") {{position}}
-                text(class = "cell cell--segments") {{segments}}
-                text(class = "cell cell--size") {{size}}
-                text(class = "cell cell--runs") {{runs}}
-                if move || recording {
+                text(class = "cell cell--state") {{move || state.get()}}
+                text(class = "cell cell--position") {{move || position.get()}}
+                text(class = "cell cell--segments") {{move || segments.get()}}
+                text(class = "cell cell--size") {{move || size.get()}}
+                text(class = "cell cell--runs") {{move || runs.get()}}
+                if move || recording.get() {
                     Button(
                         size = ButtonSize::Sm,
                         variant = ButtonVariant::Ghost,
                         on:click = {
-                            let intents = Rc::clone(&intents);
+                            let intents = Rc::clone(&stop_intents);
                             let key = key.clone();
                             move |_| {
                                 intents.send(Request::PipelineStop {
@@ -979,8 +1043,8 @@ fn RecordingRow(pipeline: PipelineView, intents: Rc<IntentSender>) -> impl IntoV
                     ) {"Stop"}
                 }
             }
-            if move || has_error {
-                text(class = "recording__error") {{error.clone()}}
+            if move || has_error.get() {
+                text(class = "recording__error") {{move || error.get()}}
             }
         }
     }
@@ -990,12 +1054,12 @@ fn RecordingRow(pipeline: PipelineView, intents: Rc<IntentSender>) -> impl IntoV
 #[allow(clippy::needless_pass_by_value)]
 fn LogsTab(
     conn: RwSignal<ConnHealth, LocalStorage>,
-    channels: RwSignal<Rc<Vec<ChannelView>>, LocalStorage>,
+    channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     arena: RwSignal<ArenaSummary, LocalStorage>,
     downloader: RwSignal<DownloaderSummary, LocalStorage>,
     notifications: RwSignal<Rc<Vec<NotificationView>>, LocalStorage>,
     logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
-    pipelines: RwSignal<Rc<Vec<PipelineView>>, LocalStorage>,
+    pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
 ) -> impl IntoView {
     view! {
         column(class = "tabbody") {
@@ -1035,12 +1099,20 @@ fn LogsTab(
                     if move || pipelines.get().is_empty() {
                         text(class = "empty") {"No pipeline is running."}
                     }
-                    for pipeline in move || (*pipelines.get()).clone(), key = |pipeline: &PipelineView| (pipeline.key.login.clone(), pipeline.key.quality.clone()) {
+                    for pipeline in move || recordings(&pipelines.get()), key = |pipeline: &RwSignal<PipelineView, LocalStorage>| {
+                        let key = pipeline.get_untracked().key;
+                        (key.login, key.quality)
+                    } {
                         row(class = "pipeline") {
-                            text(class = "pipeline__name") {{format!("{}{}", pipeline.key.login, pipeline.key.quality.as_ref().map_or_else(String::new, |quality| format!(" · {quality}")))}}
-                            text(class = "pipeline__state") {{state_label(pipeline.state)}}
-                            text(class = "pipeline__meta") {{format!("{} · {} viewers", format_duration_ms(pipeline.position_ms), pipeline.sessions)}}
-                            text(class = "pipeline__rec", class:on = pipeline.recording) {"REC"}
+                            text(class = "pipeline__name") {{move || {
+                                let key = pipeline.with(|pipeline| pipeline.key.clone());
+                                format!("{}{}", key.login, key.quality.as_ref().map_or_else(String::new, |quality| format!(" · {quality}")))
+                            }}}
+                            text(class = "pipeline__state") {{move || state_label(pipeline.get().state)}}
+                            text(class = "pipeline__meta") {{move || {
+                                pipeline.with(|pipeline| format!("{} · {} viewers", format_duration_ms(pipeline.position_ms), pipeline.sessions))
+                            }}}
+                            text(class = "pipeline__rec", class:on = move || pipeline.get().recording) {"REC"}
                         }
                     }
                     text(class = "section-title") {"Events"}
@@ -1082,8 +1154,11 @@ const fn conn_label(conn: ConnHealth) -> &'static str {
     }
 }
 
-fn conn_summary(conn: ConnHealth, channels: &[ChannelView]) -> String {
-    let live = channels.iter().filter(|channel| channel.live).count();
+fn conn_summary(conn: ConnHealth, channels: &[RwSignal<ChannelView, LocalStorage>]) -> String {
+    let live = channels
+        .iter()
+        .filter(|channel| channel.with_untracked(|channel| channel.live))
+        .count();
     if live == 0 {
         conn_label(conn).to_owned()
     } else {
@@ -1095,15 +1170,20 @@ fn conn_summary(conn: ConnHealth, channels: &[ChannelView]) -> String {
 /// notifications. Eight copies keep the strip filled even when one channel has
 /// a short title and there are no notifications; the keyframe slides by one
 /// copy (-12.5%) and lands on an identical string with no seam.
-fn ticker_text(channels: &[ChannelView], notifications: &[NotificationView]) -> String {
+fn ticker_text(
+    channels: &[RwSignal<ChannelView, LocalStorage>],
+    notifications: &[NotificationView],
+) -> String {
     let mut items = channels
         .iter()
         .filter_map(|channel| {
-            channel
-                .title
-                .as_deref()
-                .filter(|title| !title.is_empty())
-                .map(|title| format!("● {} — {}", channel.display_name, title))
+            channel.with_untracked(|channel| {
+                channel
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.is_empty())
+                    .map(|title| format!("● {} — {}", channel.display_name, title))
+            })
         })
         .collect::<Vec<_>>();
     items.extend(notifications.iter().rev().take(8).map(|note| {
