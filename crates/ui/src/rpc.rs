@@ -448,7 +448,9 @@ impl UiState {
                     .get_untracked()
                     .iter()
                     .find(|row| row.with_untracked(|pipeline| pipeline.key == view.key))
-                    .map(|row| row.with_untracked(|pipeline| pipeline.recording || pipeline.disk.is_some()));
+                    .map(|row| {
+                        row.with_untracked(|pipeline| pipeline.recording || pipeline.disk.is_some())
+                    });
                 upsert_row(&self.pipelines, view, |pipeline| pipeline.key.clone());
                 // The Recordings list filters on this, and a keyed list does not
                 // watch row data: re-run it when a row joins or leaves.
