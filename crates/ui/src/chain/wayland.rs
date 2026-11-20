@@ -8,7 +8,15 @@
 //! from the surface instead of cropping it, which makes the Windows monitor-
 //! sized canvas meaningless here.
 
-use std::rc::Rc;
+// The Wayland chain is the no-op half of a cross-platform interface: its
+// signatures have to match the Windows chain, where the same methods read a
+// live swapchain and a per-display white point.
+#![expect(
+    clippy::unused_self,
+    clippy::needless_pass_by_ref_mut,
+    reason = "the methods are shared with the Windows chain, which uses both"
+)]
+
 use std::sync::Arc;
 
 use ash::khr;
@@ -46,12 +54,14 @@ pub struct Chain {
 impl Chain {
     pub fn new(
         gpu: &Arc<Gpu>,
-        placebo: Rc<Placebo>,
+        placebo: &Placebo,
         surface: &Arc<dyn Surface>,
         gpu_surface: &Arc<dyn GpuSurface>,
         width: u32,
         height: u32,
     ) -> eros::Result<Self> {
+        // SAFETY: `ash::Entry::load` only resolves the Vulkan loader's symbols;
+        // the resulting entry is owned by the chain and outlives every use.
         let entry = unsafe { ash::Entry::load() }.context("load the Vulkan loader")?;
         // SAFETY: `as_hal` only asks that the adapter stay alive while borrowed.
         let hal_adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Vulkan>() }
@@ -72,7 +82,7 @@ impl Chain {
             _ => return Err(eros::error!("the surface is not a Wayland surface")),
         };
 
-        let wayland_ext = khr::wayland_surface::Instance::new(&entry, &instance);
+        let wayland_ext = khr::wayland_surface::Instance::new(&entry, instance);
         let create = vk::WaylandSurfaceCreateInfoKHR::default()
             .display(wl_display)
             .surface(wl_surface);
@@ -81,10 +91,11 @@ impl Chain {
         let vk_surface = unsafe { wayland_ext.create_wayland_surface(&create, None) }
             .context("vkCreateWaylandSurfaceKHR")?;
 
-        let surface_ext = khr::surface::Instance::new(&entry, &instance);
+        let surface_ext = khr::surface::Instance::new(&entry, instance);
         // SAFETY: the physical device and surface are live for the call.
-        let modes = unsafe { surface_ext.get_physical_device_surface_present_modes(physical, vk_surface) }
-            .context("vkGetPhysicalDeviceSurfacePresentModesKHR")?;
+        let modes =
+            unsafe { surface_ext.get_physical_device_surface_present_modes(physical, vk_surface) }
+                .context("vkGetPhysicalDeviceSurfacePresentModesKHR")?;
         let present_mode = [
             vk::PresentModeKHR::MAILBOX,
             vk::PresentModeKHR::FIFO_RELAXED,
@@ -115,7 +126,9 @@ impl Chain {
         if swapchain.is_null() {
             // SAFETY: the surface was made above and is destroyed exactly once.
             unsafe { surface_ext.destroy_surface(vk_surface, None) };
-            return Err(eros::error!("libplacebo refused to create the Wayland swapchain"));
+            return Err(eros::error!(
+                "libplacebo refused to create the Wayland swapchain"
+            ));
         }
 
         let mut this = Self {
@@ -131,7 +144,7 @@ impl Chain {
         Ok(this)
     }
 
-    pub fn presentable(&self) -> bool {
+    pub const fn presentable(&self) -> bool {
         !self.swapchain.is_null()
     }
 
@@ -154,7 +167,7 @@ impl Chain {
     /// owed, and the window is locked to a 200 ms cadence with half its frames
     /// dropped. `ComposeAhead::Always` on the window keeps ZGUI composing at
     /// the animation cadence while the mailbox decides what reaches the screen.
-    pub fn wait_for_frame(&self, _timeout_ms: u32) -> bool {
+    pub const fn wait_for_frame(&self, _timeout_ms: u32) -> bool {
         true
     }
 
@@ -186,7 +199,7 @@ impl Chain {
         (self.width, self.height)
     }
 
-    pub fn settle(&mut self, _ui: (u32, u32)) {}
+    pub const fn settle(&mut self, _ui: (u32, u32)) {}
 
     pub fn resize(&mut self, width: u32, height: u32) -> bool {
         if !self.presentable() {
@@ -242,10 +255,8 @@ impl Chain {
             warn!(target: "ui", "Wayland: swapchain submit failed");
             return false;
         }
-        self.surface.pre_present_frame(
-            Size::<i32, Device>::new(width as i32, height as i32),
-            scale,
-        );
+        self.surface
+            .pre_present_frame(Size::<i32, Device>::new(width as i32, height as i32), scale);
         // SAFETY: the submitted image is the one acquired by `begin`.
         unsafe { pl::pl_swapchain_swap_buffers(self.swapchain) };
         true

@@ -69,6 +69,10 @@ impl Placebo {
             ..Default::default()
         };
 
+        #[expect(
+            clippy::needless_update,
+            reason = "`pl_vulkan_queue` gains `flags` after libplacebo 7.360; the update keeps this compiling on both"
+        )]
         let params = pl::pl_vulkan_import_params {
             instance: instance.handle().as_raw() as usize as *mut pl::VkInstance_T,
             get_proc_addr,

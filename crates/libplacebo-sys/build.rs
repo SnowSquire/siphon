@@ -3,7 +3,7 @@
 //!
 //! Two platforms, two ways of finding the library:
 //!
-//! * **Windows** uses explicit prefixes (libplacebo, FFmpeg, the Vulkan SDK and
+//! * **Windows** uses explicit prefixes (`libplacebo`, `FFmpeg`, the Vulkan SDK and
 //!   the xwin splat), because the scoop packages ship no pkg-config files and
 //!   `clang-cl` needs the MSVC CRT and Windows SDK on its include path. Every
 //!   path is a knob with an environment override and a default, which is what
@@ -115,6 +115,10 @@ fn linux() {
     println!("cargo:rerun-if-env-changed=LIBPLACEBO_PREFIX");
     println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
 
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "the `Some` arm is multi-statement; a closure would obscure it"
+    )]
     let mut includes = match env::var_os("LIBPLACEBO_PREFIX") {
         Some(prefix) => {
             let prefix = PathBuf::from(prefix);
@@ -125,7 +129,7 @@ fn linux() {
             );
             let lib = prefix.join("lib");
             // The prefix may sit in `lib` or `lib64`.
-            for dir in [lib.clone(), prefix.join("lib64")] {
+            for dir in [lib, prefix.join("lib64")] {
                 if dir.is_dir() {
                     println!("cargo:rustc-link-search=native={}", dir.display());
                 }
@@ -164,9 +168,11 @@ fn linux() {
 
 /// A pkg-config lookup whose failure says what to install.
 fn probe(package: &str) -> pkg_config::Library {
-    pkg_config::Config::new().probe(package).unwrap_or_else(|error| {
-        panic!("pkg-config could not find {package}: {error}; install its -devel package")
-    })
+    pkg_config::Config::new()
+        .probe(package)
+        .unwrap_or_else(|error| {
+            panic!("pkg-config could not find {package}: {error}; install its -devel package")
+        })
 }
 
 /// clang's own include directory, the one holding `stdbool.h` and friends.
@@ -182,7 +188,11 @@ fn clang_include_dirs() -> Vec<PathBuf> {
     }
     let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     let include = dir.join("include");
-    if include.is_dir() { vec![include] } else { Vec::new() }
+    if include.is_dir() {
+        vec![include]
+    } else {
+        Vec::new()
+    }
 }
 
 // ------------------------------------------------------------------ shared

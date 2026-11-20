@@ -207,7 +207,7 @@ impl App {
                     stream_id_label(channel.stream_id),
                     channel
                         .stream_start
-                        .map_or("unknown".to_owned(), crate::time::format_iso_ms),
+                        .map_or_else(|| "unknown".to_owned(), crate::time::format_iso_ms),
                 );
             }
         }
@@ -301,7 +301,7 @@ impl App {
         if should_log_stream(self.channels.get(&id), &user) {
             let started = user
                 .stream_start
-                .map_or("an unknown time".to_owned(), crate::time::format_iso_ms);
+                .map_or_else(|| "an unknown time".to_owned(), crate::time::format_iso_ms);
             tracing::info!(
                 target: "hermes",
                 "stream {}({}): stream_id={} started={started}",

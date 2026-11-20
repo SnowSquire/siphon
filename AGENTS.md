@@ -70,7 +70,7 @@ detail: `notes/architecture.md`.
 - `app.rs`, `bus.rs`, `rpc.rs`, `metrics.rs` — the backend app loop, entity update bus, admin RPC server and telemetry.
 - `registry.rs` — the stream registry and monitors behind `daemon` mode (`notes/rtsp-daemon.md`).
 - `downloader.rs` — bounded fetch workers streaming into spools.
-- `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`).
+- `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`). Sink only, and slated to become a compile-time optional feature: keep it correct, but do not invest in its hot path.
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/rpc` (`siphon-rpc`) — the typed protocol, postcard framing and the UI-side client.
 - `crates/ui` (`siphon-ui`, binary `siphon`) — the ZGUI window presented through the video spike's DXGI flip chain and libplacebo pass, the native tray, the RPC client worker, and the daemon lifecycle (auto-start, PID-file restart). Windows-only; `notes/rpc.md` has the split and the SDR/HDR state.
@@ -83,10 +83,11 @@ detail: `notes/architecture.md`.
 4. `.instrument(span)`, never `enter()` held across an `.await`.
 5. `Reader: Clone` duplicates the cursor and never rewinds; never clone an advancing consumer's reader to replay.
 6. Loopback only: `socket2`, v4+v6 on the same port, never `[::]`; `AddrInUse` moves the pair to ephemeral ports.
-7. A completion read learns its size from the buffer capacity; `reserve` a fresh `Vec` first.
+7. A compio `read` learns its length from the **capacity** of the buffer it is handed, not from a count: a `Vec::new()` has none, so the read returns 0 and looks like EOF. `reserve` capacity before handing it over — on the buffer you already own (`mem::take`, `clear`, `reserve`), never by allocating one per read; `reserve` is a no-op when it is already big enough.
 8. Every panic is fatal (`abort_on_panic`); `main` returns a `Result`.
 9. The manifest poll is the only polling; everything else is event-driven.
 10. `crates/daemon/src/index.hexpat` mirrors the on-disk format; keep both in sync.
+11. Allocate in setup, not in the loop. A `Vec::with_capacity` on a path that runs per packet or per frame is a defect: reuse a buffer the task or struct owns (`mem::take` → `clear` → `reserve`, or a completion that hands the buffer back), or use a fixed array sized by the format's structural bound. `downloader::fetch` is the model — `writer.tail()` hands it arena capacity, so a segment is read once, straight into its slot. Per-segment and control-path allocations are fine.
 
 ## Repo conventions
 

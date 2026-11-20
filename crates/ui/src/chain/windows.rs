@@ -149,11 +149,11 @@ impl Chain {
         Ok(())
     }
 
-    /// Whether the driver has taken the device away.
+    /// Whether the chain can present: a live swapchain the driver has not removed.
     pub fn presentable(&self) -> bool {
         self.swapchain
             .as_ref()
-            .is_none_or(DxgiSwapchain::is_removed)
+            .is_some_and(|chain| !chain.is_removed())
     }
 
     pub const fn sdr_white(&self) -> f32 {

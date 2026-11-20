@@ -224,11 +224,18 @@ where
 /// they pick one). The channel id walked by the golden angle spreads hues
 /// across the wheel while keeping each channel's colour the same across
 /// refreshes and restarts, rather than flickering on every snapshot.
-pub(crate) fn fallback_color(id: u64) -> String {
+pub fn fallback_color(id: u64) -> String {
     const GOLDEN_ANGLE: f64 = 137.507_764_050_918;
-    let hue = (id as f64 * GOLDEN_ANGLE) % 360.0;
-    let lightness = 0.70 + f64::from((id % 2) as u8) * 0.03;
-    let chroma = 0.13 + f64::from((id % 3) as u8) * 0.01;
+    // Ids are only a hue seed here: the high bits survive, and a collision in
+    // the low 12 would pick the same colour anyway after `% 360`.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a channel id is a hue seed, not a quantity"
+    )]
+    let seed = id as f64;
+    let hue = (seed * GOLDEN_ANGLE) % 360.0;
+    let lightness = f64::from((id % 2) as u8).mul_add(0.03, 0.70);
+    let chroma = f64::from((id % 3) as u8).mul_add(0.01, 0.13);
     format!("oklch({lightness:.2} {chroma:.2} {hue:.0})")
 }
 
@@ -529,11 +536,11 @@ mod tests {
         ]}}"##;
         assert_eq!(decode_users(with)[0].chat_color, "#FF0000");
 
-        let without = br##"{"data": {"users": [
+        let without = br#"{"data": {"users": [
             {"id": "123", "login": "alice", "chatColor": null, "displayName": "Alice",
              "profileImageURL": "http://x/y.png",
              "broadcastSettings": {"title": "hi", "game": null}, "stream": null}
-        ]}}"##;
+        ]}}"#;
         let user = &decode_users(without)[0];
         assert!(user.chat_color.starts_with("oklch("), "{user:?}");
         assert_eq!(user.chat_color, fallback_color(123));

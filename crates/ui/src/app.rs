@@ -145,10 +145,9 @@ fn fonts() -> eros::Result<Fonts> {
     // font; the collection is shared with the shaper and rasterizer.
     let mut context = fonts.shaper().fonts().font_context();
     if let Some(id) = context.collection.family_id("SiphonEmoji") {
-        context.collection.set_generic_families(
-            fontique::GenericFamily::Emoji,
-            std::iter::once(id),
-        );
+        context
+            .collection
+            .set_generic_families(fontique::GenericFamily::Emoji, std::iter::once(id));
     }
 
     for (var, family) in [
@@ -158,8 +157,8 @@ fn fonts() -> eros::Result<Fonts> {
         let Some(path) = std::env::var_os(var) else {
             continue;
         };
-        let bytes = std::fs::read(&path)
-            .map_err(|error| eros::error!("{var} ({path:?}): {error}"))?;
+        let bytes =
+            std::fs::read(&path).map_err(|error| eros::error!("{var} ({path:?}): {error}"))?;
         let data: zgui::text::FontData = Arc::new(bytes);
         fonts
             .register(data, Some(family))
@@ -282,9 +281,8 @@ fn App(state: UiState, intents: IntentSender, events: kanal::Receiver<UiEvent>) 
         }
     });
 
-    let ticker = Signal::derive_local(move || {
-        ticker_text(channels_sig.get(), notifications_sig.get())
-    });
+    let ticker =
+        Signal::derive_local(move || ticker_text(&channels_sig.get(), &notifications_sig.get()));
     let tab_weight = RwSignal::new_local(1.0f32);
     let previous_tab = RwSignal::new_local(None::<Tab>);
     let tab_generation = Rc::new(Cell::new(0u64));
@@ -552,11 +550,15 @@ fn ChannelRow(
     };
     let enter = {
         let token = Rc::clone(&title_gen);
-        move |_: &mut EventCx<'_, events::PointerEnter>| scroll_title(title_shift, title_limit, Rc::clone(&token), false)
+        move |_: &mut EventCx<'_, events::PointerEnter>| {
+            scroll_title(title_shift, title_limit, Rc::clone(&token), false);
+        }
     };
     let leave = {
         let token = Rc::clone(&title_gen);
-        move |_: &mut EventCx<'_, events::PointerLeave>| scroll_title(title_shift, title_limit, Rc::clone(&token), true)
+        move |_: &mut EventCx<'_, events::PointerLeave>| {
+            scroll_title(title_shift, title_limit, Rc::clone(&token), true);
+        }
     };
 
     let live_intents = Rc::clone(&intents);
@@ -1097,10 +1099,7 @@ fn conn_summary(conn: ConnHealth, channels: &[ChannelView]) -> String {
 /// notifications. Eight copies keep the strip filled even when one channel has
 /// a short title and there are no notifications; the keyframe slides by one
 /// copy (-12.5%) and lands on an identical string with no seam.
-fn ticker_text(
-    channels: Rc<Vec<ChannelView>>,
-    notifications: Rc<Vec<NotificationView>>,
-) -> String {
+fn ticker_text(channels: &[ChannelView], notifications: &[NotificationView]) -> String {
     let mut items = channels
         .iter()
         .filter_map(|channel| {
@@ -1153,7 +1152,7 @@ fn tab_weight_value(
             0.0
         };
         // Chillax's wght axis is 200–700; 200 is the lightest it can go.
-        Some(format!("{:.0}", 200.0 + 400.0 * progress))
+        Some(format!("{:.0}", 400.0f32.mul_add(progress, 200.0)))
     }
 }
 
@@ -1162,16 +1161,16 @@ fn tab_weight_value(
 fn next_frame(
     generation: Rc<Cell<u64>>,
     token: u64,
-    slot: Rc<RefCell<Option<zgui::view::FrameHandle>>>,
+    slot: &Rc<RefCell<Option<zgui::view::FrameHandle>>>,
     mut step: impl FnMut() -> bool + 'static,
 ) {
-    let inner = Rc::clone(&slot);
+    let inner = Rc::clone(slot);
     let handle = request_frame(move |_| {
         if token != generation.get() {
             return;
         }
         if !step() {
-            next_frame(Rc::clone(&generation), token, Rc::clone(&inner), step);
+            next_frame(Rc::clone(&generation), token, &inner, step);
         }
     });
     *slot.borrow_mut() = Some(handle);
@@ -1186,12 +1185,12 @@ fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u
     generation.set(token);
     let started = std::time::Instant::now();
     let slot = Rc::new(RefCell::new(None));
-    next_frame(generation, token, slot, move || {
+    next_frame(generation, token, &slot, move || {
         let t = (started.elapsed().as_secs_f32() / 0.25).min(1.0);
         // Cubic ease-out: the weight lands quickly, then settles into place.
         let eased = 1.0 - (1.0 - t).powi(3);
         weight.set(eased);
-        t == 1.0
+        t >= 1.0
     });
 }
 
@@ -1207,7 +1206,7 @@ fn scroll_title(
     let token = generation.get() + 1;
     generation.set(token);
     let slot = Rc::new(RefCell::new(None));
-    next_frame(generation, token, slot, move || {
+    next_frame(generation, token, &slot, move || {
         let now = shift.get_untracked();
         let next = if rewind {
             (now - (now / 8.0 + 3.0)).max(0.0)
@@ -1258,7 +1257,7 @@ fn initials(display_name: &str) -> String {
 /// The token block the zgui-ui controls read. It is laid over the dark preset
 /// rather than written as a second style sheet so the provider owns the cascade
 /// and every control is themed by one palette.
-const THEME_CSS: &str = r####"
+const THEME_CSS: &str = r"
     --zui-color-background: oklch(0.16 0.012 240);
     --zui-color-foreground: oklch(0.94 0.008 240);
     --zui-color-card: oklch(0.21 0.015 240);
@@ -1290,9 +1289,10 @@ const THEME_CSS: &str = r####"
     /* A slim bar in a permanently reserved right strip: the engine cannot do
        `scrollbar-gutter`, so the channels viewport asks for a gutter always. */
     --zui-scrollbar-width: 8px;
-"####;
+";
 
-const SHEET: &str = css!(r####"
+const SHEET: &str = css!(
+    r####"
 :root {
         background-color: oklch(0.16 0.012 240);
         color: oklch(0.95 0.008 240);
@@ -1954,4 +1954,5 @@ const SHEET: &str = css!(r####"
     from { transform: translateX(0); }
     to { transform: translateX(-12.5%); }
 }
-"####);
+"####
+);

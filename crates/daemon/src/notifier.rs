@@ -17,6 +17,13 @@ const DISPLAY_NAME: &str = "Siphon";
 static ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 /// Registers the per-user AUMID so Windows attributes the toast to us.
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "the Windows body writes a file, so both definitions share one signature"
+    )
+)]
 pub fn register_aumid() {
     #[cfg(windows)]
     {

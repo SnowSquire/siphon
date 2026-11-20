@@ -147,10 +147,9 @@ pub fn renderer(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let placebo = Rc::new(
-        Placebo::import(gpu).map_err(|error| gpu_error(format!("libplacebo: {error}")))?,
-    );
-    let chain = Chain::new(gpu, Rc::clone(&placebo), surface, &gpu_surface, width, height)
+    let placebo =
+        Rc::new(Placebo::import(gpu).map_err(|error| gpu_error(format!("libplacebo: {error}")))?);
+    let chain = Chain::new(gpu, &placebo, surface, &gpu_surface, width, height)
         .map_err(|error| gpu_error(format!("{error}")))?;
     let inner = graphics
         .renderer_supplied(target, vec![ui.clone()])
@@ -169,6 +168,6 @@ pub fn renderer(
 }
 
 /// Every failure here means the window cannot be presented by this backend.
-pub(crate) fn gpu_error(reason: impl Into<String>) -> AppError {
+pub fn gpu_error(reason: impl Into<String>) -> AppError {
     AppError::GpuUnavailable(GpuUnavailable::new().rejected("presentation", reason))
 }

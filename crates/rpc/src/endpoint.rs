@@ -16,9 +16,8 @@ pub fn admin_endpoint(app_id: &str) -> String {
     }
     #[cfg(unix)]
     {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        let dir =
+            std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
         dir.join(format!("siphon-{app_id}.sock"))
             .to_string_lossy()
             .into_owned()

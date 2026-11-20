@@ -696,8 +696,10 @@ impl Stream {
         }
         // Full: the player's buffer is the back-pressure signal, not a reason
         // to stop sending it media. The packet (or report) is dropped.
-        let _ = session.out.try_send(message);
-        true
+        // Closed: the writer is gone. `is_closed()` above cannot see that on
+        // its own -- kanal counts the send side too, which this session still
+        // holds -- so the `try_send` error is the only reliable signal.
+        session.out.try_send(message).is_ok()
     }
 
     /// Wait until every playing session subscribed to `track` can accept
@@ -1145,10 +1147,12 @@ async fn writer(mut stream: TcpStream, rx: AsyncReceiver<Outbound>, session: Rc<
     }
 
     // The writer is gone, so this session can never accept another packet.
-    // Dropping the receiver closes the channel, and `out_queue_blocked` then
-    // ignores the session -- but a media engine already parked here has to be
-    // told to re-check, or it would wait for a client that no longer exists.
+    // `kill` closes the sender, which is what makes `is_closed()` true: dropping
+    // only the receiver leaves the send side counted, so the session would stay
+    // registered, `has_sessions()` would keep the stream and its recording
+    // alive, and a full queue would park the pacer for every other viewer.
     drop(rx);
+    session.kill();
     session.drain.borrow().notify();
 }
 

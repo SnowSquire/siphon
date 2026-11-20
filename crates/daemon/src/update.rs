@@ -201,19 +201,21 @@ pub fn install_msi_and_relaunch(msi: &Path) -> Result<(), UpdateError> {
 }
 
 #[cfg(not(windows))]
-pub fn install_msi_and_relaunch(_msi: &Path) -> Result<(), UpdateError> {
+pub const fn install_msi_and_relaunch(_msi: &Path) -> Result<(), UpdateError> {
     Err(UpdateError::NoInstaller)
 }
 
 /// Opens the release page for builds with no installer hand-off.
+#[cfg(windows)]
 pub fn open_page(url: &str) {
-    #[cfg(windows)]
     let _ = std::process::Command::new("cmd")
         .args(["/C", "start", "", url])
         .spawn();
-    #[cfg(not(windows))]
-    let _ = url;
 }
+
+/// Opens the release page for builds with no installer hand-off.
+#[cfg(not(windows))]
+pub const fn open_page(_url: &str) {}
 
 /// `CREATE_NO_WINDOW`: no console flashes for the installer waiter.
 #[cfg(windows)]

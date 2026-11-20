@@ -184,7 +184,7 @@ impl UiRenderer {
         self.rebuild(target, width, height);
     }
 
-    fn present(&mut self, outcome: FrameOutcome) -> FrameOutcome {
+    fn present(&self, outcome: FrameOutcome) -> FrameOutcome {
         let Some(chain) = self.chain.as_ref() else {
             return outcome;
         };

@@ -2594,7 +2594,14 @@ fn spawn_fetch(
                 return;
             }
         }
-        let outcome = done_rx.recv().unwrap_or(FetchOutcome::Failed);
+        // The downloader sends `done` before it drops the writer, so waiting
+        // for it is not optional -- but it must not be a blocking `recv()`, which
+        // parks the only reactor thread the downloader needs to make progress.
+        let outcome = done_rx
+            .to_async()
+            .recv()
+            .await
+            .unwrap_or(FetchOutcome::Failed);
         let _ = events.send(Event::ChunkDone(outcome));
     })
     .detach();
