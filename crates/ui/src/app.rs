@@ -660,10 +660,11 @@ fn ChannelRow(
                         box(class = "channel-title") {
                             text(
                                 class = "channel-title__run",
-                                // An inline transform, not a custom property read back
-                                // from the stylesheet: the style engine does not
-                                // substitute `var()` in a normal property, so a
-                                // `--title-shift` variable left the title motionless.
+                                // An inline transform rather than a custom property
+                                // read back from the stylesheet: a bare `var()` value
+                                // works (the channel accents prove it), but the same
+                                // substitution inside `translateX()` was dropped and
+                                // the title never moved.
                                 style:transform = move || {
                                     Some(format!("translateX(-{:.1}px)", title_shift.get()))
                                 },
