@@ -473,6 +473,43 @@ fn App(
     }
 }
 
+/// The scrollbar's visible thumb.
+///
+/// The engine paints its own scrollbar with the scrollport, before the rows, so
+/// the rows' gutter strips cover it. This draws the same truth after them: it
+/// reads the scroll position the [`ScrollArea`] publishes (the engine's own
+/// source) and takes no pointer events, so dragging and paging still reach the
+/// engine's track underneath, while the engine's own thumb is made transparent
+/// in the sheet.
+#[component]
+fn ListThumb() -> impl IntoView {
+    let context = ScrollAreaContext::current();
+    let element = NodeRef::new();
+    let metrics = move || {
+        let position = context?.position();
+        let scale = element.scale();
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        let extent = position.content_size.height.0 / scale;
+        let viewport = position.scrollport.height.0 / scale;
+        let offset = position.offset.y.0 / scale;
+        (extent > viewport + 0.5).then(|| {
+            let height = (viewport * viewport / extent).max(24.0);
+            let top = offset / (extent - viewport) * (viewport - height);
+            (top, height)
+        })
+    };
+    view! {
+        box(
+            node_ref = element,
+            class = "list-thumb",
+            class:hidden = move || metrics().is_none(),
+            a11y:hidden = true,
+            style:top = move || metrics().map(|(top, _)| format!("{top:.1}px")),
+            style:height = move || metrics().map(|(_, height)| format!("{height:.1}px")),
+        )
+    }
+}
+
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn ChannelsTab(
@@ -544,6 +581,7 @@ fn ChannelsTab(
                         }
                     }
                 }
+                ListThumb()
             }
             row(class = "add") {
                 Input(
@@ -1713,9 +1751,10 @@ const SHEET: &str = css!(
         gap: 10px;
         align-items: center;
         padding: 6px 10px;
-        /* The rows sit inside the scroll viewport, which reserves the engine's
-           16px gutter plus the list's 6px on the right; the header has to give
-           the same 22px back or its last columns hang past the values. */
+        /* The cells end 32px from the edge: the 16px the viewport reserves for
+           the scrollbar, the cells' own 10px, and the 6px the list used to
+           keep. The rows paint the gutter strip with a shadow, so the header
+           ends where the cells do, not where the rows do. */
         padding-right: 32px;
         border-left: 2px solid transparent;
         border-bottom: 1px solid oklch(0.32 0.020 240);
@@ -1798,7 +1837,7 @@ const SHEET: &str = css!(
 
     .list {
         gap: 0;
-        padding: 0 6px 0 0;
+        padding: 0;
     }
 
     .channels, .recordings, .words, .logs {
@@ -1806,21 +1845,30 @@ const SHEET: &str = css!(
         min-height: 0;
     }
 
-    .channel { padding: 0; }
+    .channel {
+        padding: 0;
+    }
 
     .channel-row {
         align-items: center;
         gap: 10px;
-        padding: 6px 10px;
+        /* 16px on the right is the scroll gutter the viewport reserves: the
+           cells keep clear of it, and `box-shadow` paints that strip in the
+           row's own colour without changing the layout box (a negative margin
+           there made the whole scroll area stop scrolling). */
+        padding: 6px 16px 6px 10px;
         border-radius: 0;
         /* A transparent 2px edge on every row keeps the cells aligned with the
            header; an open row paints it in the channel's colour. */
         border-left: 2px solid transparent;
         min-height: 30px;
         background-color: oklch(0.145 0.011 240);
+        box-shadow: 16px 0 0 0 oklch(0.145 0.011 240);
     }
 
-    .channel-row.pending { opacity: 0.65; }
+    .channel-row.pending {
+        opacity: 0.65;
+    }
 
     .live-dot {
         display: inline-flex;
@@ -1881,10 +1929,15 @@ const SHEET: &str = css!(
     /* The panel is part of the row, not a card under it: no gap, no top
        border, and the open row's channel-coloured edge runs straight through
        it. The wrapper clips the reveal and animates its own height, so the
-       panel rolls out from under the row and pushes the rows below it down. */
+       panel rolls out from under the row and pushes the rows below it down
+       instead of those rows jumping a whole panel height at once. */
     .detail-clip {
         overflow: hidden;
         animation: detail-in 200ms ease-out;
+        /* The panel's 16px strip under the scrollbar. It sits on the wrapper
+           because the wrapper's `overflow: hidden` clips a shadow on
+           `.detail` itself; its own shadow is not clipped. */
+        box-shadow: 16px 0 0 0 oklch(0.12 0.010 240);
     }
 
     /* Leaving: the same roll in reverse, held until the row unmounts it. */
@@ -1894,16 +1947,22 @@ const SHEET: &str = css!(
 
     .detail {
         margin: 0;
-        padding: 10px;
+        padding: 10px 16px 10px 10px;
         gap: 12px;
         border: 0;
         border-left: 2px solid var(--channel-color, var(--zui-color-primary));
         border-radius: 0;
         /* One step under the rows, close to the table's own surface: the open
            row casts into it, so the panel reads as a well the row opened
-           rather than a card laid under it. */
+           rather than a card laid under it. The gradient is the drop shadow:
+           an inset `box-shadow` would have been the obvious way to draw it,
+           but this engine paints only the first shadow in a list and the
+           wrapper already spends its one on the gutter strip. */
         background-color: oklch(0.12 0.010 240);
-        box-shadow: inset 0 8px 12px -8px rgba(0, 0, 0, 0.8);
+        background-image: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0));
+        background-size: 100% 12px;
+        background-repeat: no-repeat;
+        background-position: top;
     }
 
     /* The content is at most a wrapped title plus the grid, so 240px is a
@@ -2199,6 +2258,7 @@ const SHEET: &str = css!(
     text-align: center;
 }
 .tabbody {
+    min-height: 0;
     gap: 0;
     padding: 0;
     border: 0;
@@ -2211,13 +2271,42 @@ const SHEET: &str = css!(
 /* The bar lives in a permanent right strip. `scrollbar-gutter` is unsupported
    here, so `overflow: scroll` keeps the gutter reserved whether or not the
    rows overflow; expanding a row can no longer pull the columns sideways. */
-.channels .zui-scroll-area__viewport { overflow-y: scroll; overflow-x: hidden; }
-.list { gap: 0; padding: 0 6px 0 0; }
-/* Zebra rows; hover/open must follow the even-row rule to win. */
-.channel:nth-child(even) .channel-row { background-color: oklch(0.165 0.012 240); }
-.channel-row:hover { background-color: oklch(0.19 0.014 240); }
+.channels .zui-scroll-area__viewport {
+    overflow-y: scroll;
+    overflow-x: hidden;
+    /* The engine's thumb is painted under the rows, so `ListThumb` draws the
+       visible one after them; this keeps the hidden one from showing through
+       the empty area below the last row. */
+    --zgui-scrollbar-thumb: transparent;
+}
+.list { gap: 0; padding: 0; }
+
+/* The visible thumb `ListThumb` draws: the engine's position, the engine's
+   look (a slim light capsule centred in the gutter), after the rows. */
+.list-thumb {
+    position: absolute;
+    top: 0;
+    right: 5px;
+    width: 6px;
+    border-radius: 3px;
+    background-color: rgba(255, 255, 255, 0.5);
+    pointer-events: none;
+}
+
+.list-thumb.hidden { display: none; }
+/* Zebra rows; hover/open must follow the even-row rule to win. Each one also
+   carries the 16px strip that paints under the scrollbar in its own colour. */
+.channel:nth-child(even) .channel-row {
+    background-color: oklch(0.165 0.012 240);
+    box-shadow: 16px 0 0 0 oklch(0.165 0.012 240);
+}
+.channel-row:hover {
+    background-color: oklch(0.19 0.014 240);
+    box-shadow: 16px 0 0 0 oklch(0.19 0.014 240);
+}
 .channel-row.open, .channel:nth-child(even) .channel-row.open {
     background-color: oklch(0.215 0.014 240);
+    box-shadow: 16px 0 0 0 oklch(0.215 0.014 240);
     border-left-color: var(--channel-color, var(--zui-color-primary));
 }
 /* A live row is full weight; offline rows step back so the live ones carry

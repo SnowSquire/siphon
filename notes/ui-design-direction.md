@@ -34,10 +34,25 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   (240): the empty table, odd/even rows, hover, the details panel and borders
   differ only in lightness and chroma, so they cannot drift into different
   hues. Semantic reds and per-channel colours are the only other hues.
-- The channels scrollbar lives in a permanent right strip: `--zui-scrollbar-width`
-  is 8px, the viewport uses `overflow: scroll` so the gutter is always reserved
-  (`scrollbar-gutter` is unsupported in ZGUI), and the list keeps 6px of right
-  padding. Expanding a row cannot pull the columns sideways.
+- The channels scrollbar lives in a permanent right strip (`--zui-scrollbar-width`
+  is 8px; the engine reserves about 16px of gutter for its bar, and
+  `scrollbar-gutter` is unsupported in ZGUI). The rows and the panel paint
+  *under* it with a `box-shadow` strip in their own colour (16px, no blur),
+  which is ink and leaves the layout alone; a negative margin would widen the
+  box into the gutter instead and fight the viewport's horizontal clip. The
+  cells keep 16px of right padding so they sit clear of the bar, and the header
+  keeps 32px so it ends where the cells do.
+- The list only scrolls while `.tabbody` has `min-height: 0`. Without it the
+  tab body takes its content height, the `ScrollArea` never overflows, the add
+  bar is pushed below the window, and the list looks stuck after one row of
+  wheel travel. The body has to shrink so the filter bar stays anchored and the
+  viewport gets the remaining height.
+- The engine paints its own scrollbar with the scrollport, *before* the rows,
+  so the gutter strips cover its thumb. `ListThumb` draws the visible thumb
+  after the rows from the same `ScrollAreaContext` position signal, and takes
+  no pointer events: drags and track paging still reach the engine's bar
+  underneath. The engine's own thumb is themed transparent so it cannot show
+  through the empty area below the last row.
 - Motion is back for these controls: the switch track/thumb transition over
   160ms, a live dot pulse, the two marquees, the tab weight, the row chevron's
   90-degree turn over 160ms, and the expanded panel's 200ms roll. Tab names use
@@ -137,9 +152,10 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 - The header is one row of identical type (10px, 600, 0.6 letter-spacing) and
   each label sits over its column: the notify switches are labelled once, with
   `Notify` centred over `live` and `title`, instead of repeating the two words
-  on every row. The header must give back what the scroll viewport takes on
-  the right (the engine's 16px gutter plus the list's 6px padding) or the last
-  columns hang past their values; `Viewers` is right-aligned like the counts.
+  on every row. The header and the rows both keep 32px of right padding (the
+  engine's 16px scroll gutter plus the cells' own 10px, plus the old 6px list
+  gap folded in) so the last columns sit over their values while the row
+  background runs past them; `Viewers` is right-aligned like the counts.
 - Rows are 36px tall: the 24px avatar plus 6px top and bottom padding. The
   two switches no longer set the row height, so the padding is explicit. Each
   row carries a transparent 2px left edge that an open row paints in its
@@ -181,15 +197,17 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   grid. The grid itself should be denser and flatter than today.
 - The panel is part of the row, not a card under it: no top border, no margin,
   and the open row's channel-coloured 2px edge runs straight down through it.
-  Its background is a step darker than the open row (`0.175` against `0.215`).
-- It rolls out from the row rather than appearing: the clipping wrapper
-  animates `max-height` 0 → 240px over 200ms, so the rows below are pushed
-  down as it reveals, and `detail-out` runs the same curve backwards. The
-  collapse keeps the panel mounted for 200ms via `set_timeout` before the view
-  removes it, so the exit is animated too; re-opening inside that window
-  clears `closing` and cancels the timeout. The panel's background is one step
-  under the rows (`0.12`, close to the table's own `0.11`) with an inset top
-  shadow, so the open row reads as casting into a well.
+  Its background is a step darker than the open row (`0.12` against `0.215`).
+- It rolls out from the row inside an `overflow: hidden` wrapper: the wrapper
+  animates `max-height` 0 → 240px over 200ms and `detail-out` runs it back, so
+  the rows below are pushed down as the panel reveals instead of jumping a
+  whole panel height at once. The collapse keeps the panel mounted for 200ms
+  via `set_timeout` before the view removes it, so the exit is animated too;
+  re-opening inside that window clears `closing` and cancels the timeout. The
+  panel's background is one step under the rows (`0.12`). Its top shadow is a
+  12px background gradient, not an inset `box-shadow`, because this engine
+  paints only the first shadow per box and the 16px strip that runs under the
+  scrollbar is that one.
 - `Remove` is a bordered destructive button in a footer at the bottom of the
   panel, behind a hairline, not a floating red label at the top: the top-right
   corner already means "collapse" to anyone who reads an X there. It is not an
