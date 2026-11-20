@@ -351,7 +351,6 @@ impl Placebo {
         // SAFETY: the GPU is live for the borrow.
         unsafe { pl::pl_gpu_finish(self.gpu) };
     }
-
 }
 
 /// Converts an ash Vulkan format into libplacebo's spelling of the same enum.

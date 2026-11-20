@@ -207,6 +207,5 @@ pub fn gpu_error(reason: impl Into<String>) -> AppError {
 #[cfg(windows)]
 pub use windows::note_present;
 
-
 #[cfg(not(windows))]
 pub const fn note_present() {}

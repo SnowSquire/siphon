@@ -737,11 +737,7 @@ fn configure_hdr(
 /// `peak` is what the display can do; `content_peak` is the brightest this
 /// interface ever gets, which is its SDR white. Saying so tells the display it
 /// does not have to tone map anything down.
-fn set_hdr_metadata(
-    swapchain: &IDXGISwapChain3,
-    peak: f32,
-    content_peak: f32,
-) -> eros::Result<()> {
+fn set_hdr_metadata(swapchain: &IDXGISwapChain3, peak: f32, content_peak: f32) -> eros::Result<()> {
     let swapchain4: IDXGISwapChain4 = swapchain.cast().context("IDXGISwapChain4")?;
     #[allow(
         clippy::cast_possible_truncation,

@@ -17,25 +17,25 @@ use raw_window_handle::HasWindowHandle as _;
 use siphon_shared::settings::HdrMode;
 use tracing::warn;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Gdi::InvalidateRect;
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::Win32::Foundation::LPARAM;
 use windows::Win32::Foundation::LRESULT;
 use windows::Win32::Foundation::WPARAM;
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::Shell::DefSubclassProc;
 use windows::Win32::UI::Shell::RemoveWindowSubclass;
 use windows::Win32::UI::Shell::SetWindowSubclass;
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE;
 use windows::Win32::UI::WindowsAndMessaging::WM_ENTERSIZEMOVE;
-use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
-use windows::Win32::UI::WindowsAndMessaging::WM_PAINT;
-use windows::Win32::UI::WindowsAndMessaging::WM_MOVING;
-use windows::Win32::UI::WindowsAndMessaging::WM_SIZE;
 use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
+use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+use windows::Win32::UI::WindowsAndMessaging::WM_MOVING;
+use windows::Win32::UI::WindowsAndMessaging::WM_PAINT;
+use windows::Win32::UI::WindowsAndMessaging::WM_SIZE;
 use zgui::platform::GpuSurface;
-use zgui_render_wgpu::wgpu;
 use zgui::platform::Surface;
 use zgui_render_wgpu::Gpu;
+use zgui_render_wgpu::wgpu;
 
 use super::Acquired;
 use super::Canvas;
@@ -98,6 +98,8 @@ pub struct Chain {
     /// Signalled when a backbuffer is handed back for presentation.
     target_sem: pl::VkSemaphore,
     target_value: Cell<u64>,
+    /// The display settings this window is presented with.
+    display: Rc<Display>,
 }
 
 /// How often the display state is re-read on the present path.
@@ -188,8 +190,6 @@ unsafe extern "system" fn display_change_proc(
     // SAFETY: chained to the next procedure in the subclass chain, which owns
     // the window and the rest of its messages.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
-    /// The display settings this window is presented with.
-    display: Rc<Display>,
 }
 
 impl Chain {
@@ -211,9 +211,7 @@ impl Chain {
         // polls that. The two together are what keeps the presentation live.
         // SAFETY: `hwnd` is this window and the procedure is a plain `extern
         // "system"` fn; the id is unique to this chain.
-        let _ = unsafe {
-            SetWindowSubclass(hwnd, Some(display_change_proc), SUBCLASS_ID, 0)
-        };
+        let _ = unsafe { SetWindowSubclass(hwnd, Some(display_change_proc), SUBCLASS_ID, 0) };
         set_window_background(hwnd);
         // The icon helper speaks `windows-sys`, whose `HWND` is the raw handle;
         // `hwnd` is the `windows` crate's newtype around the same pointer.
@@ -511,9 +509,7 @@ impl Chain {
         }
         let white = swapchain.sdr_white();
         if (white - self.sdr_white.get()).abs() > 0.5 {
-            eprintln!(
-                "SDR white: {white:.0} nits (level from the display configuration)",
-            );
+            eprintln!("SDR white: {white:.0} nits (level from the display configuration)",);
         }
         self.sdr_white.set(white);
         self.hdr.set(swapchain.hdr());

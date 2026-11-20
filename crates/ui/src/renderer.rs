@@ -184,7 +184,10 @@ impl UiRenderer {
     /// instead of a band.
     fn clear_ui_texture(&self, texture: &wgpu::Texture) {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = self
+            .gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("siphon.ui.background"),
@@ -253,10 +256,9 @@ impl UiRenderer {
         let mut band = None;
         for y in 0..height {
             let row = &buffer[y * width..(y + 1) * width];
-            if row
-                .iter()
-                .any(|texel| texel & 0x3ff > 1000 && (texel >> 10) & 0x3ff < 20 && (texel >> 20) & 0x3ff > 1000)
-            {
+            if row.iter().any(|texel| {
+                texel & 0x3ff > 1000 && (texel >> 10) & 0x3ff < 20 && (texel >> 20) & 0x3ff > 1000
+            }) {
                 band = Some(y);
                 break;
             }
@@ -663,8 +665,7 @@ impl UiRenderer {
         // SIPHON_BLIT: a plain copy of the interface texture instead of the
         // overlay render — is any of this coming from libplacebo's overlay path?
         if std::env::var_os("SIPHON_BLIT").is_some() {
-            self.placebo
-                .blit(self.ui, target.planes[0].texture);
+            self.placebo.blit(self.ui, target.planes[0].texture);
             self.placebo.finish();
         } else if !self.placebo.render(None, &target) {
             tracing::warn!(target: "ui", "libplacebo: render failed for {width}x{height}");
