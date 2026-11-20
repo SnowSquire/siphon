@@ -72,8 +72,7 @@ impl Placebo {
             get_proc_addr,
             phys_device: hal_device.raw_physical_device().as_raw() as usize
                 as *mut pl::VkPhysicalDevice_T,
-            device: hal_device.raw_device().handle().as_raw() as usize
-                as *mut pl::VkDevice_T,
+            device: hal_device.raw_device().handle().as_raw() as usize as *mut pl::VkDevice_T,
             extensions: extensions.as_ptr(),
             num_extensions: std::os::raw::c_int::try_from(extensions.len()).unwrap_or(0),
             queue_graphics: pl::pl_vulkan_queue {
@@ -185,7 +184,12 @@ impl Placebo {
     }
 
     /// Takes a wrapped image back, transitioning it to `layout` on the way.
-    pub fn hold(&self, texture: pl::pl_tex, layout: pl::VkImageLayout, semaphore: pl::pl_vulkan_sem) -> bool {
+    pub fn hold(
+        &self,
+        texture: pl::pl_tex,
+        layout: pl::VkImageLayout,
+        semaphore: pl::pl_vulkan_sem,
+    ) -> bool {
         let params = pl::pl_vulkan_hold_params {
             tex: texture,
             layout,
@@ -282,5 +286,3 @@ impl Drop for Placebo {
         }
     }
 }
-
-

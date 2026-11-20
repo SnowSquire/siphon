@@ -13,9 +13,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use ffmpeg_the_third as ffmpeg;
 use ffmpeg::format;
 use ffmpeg::media::Type;
+use ffmpeg_the_third as ffmpeg;
 use zgui::surface::SurfaceEvent;
 use zgui::surface::SurfaceHandle;
 use zgui::surface::wgpu;
@@ -92,4 +92,3 @@ pub fn spawn(handle: SurfaceHandle, fps: f64) {
         }
     });
 }
-

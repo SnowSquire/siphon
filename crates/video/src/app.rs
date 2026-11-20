@@ -46,8 +46,8 @@ pub fn run(file: Option<PathBuf>, hdr: HdrMode) -> anyhow::Result<()> {
         None => eprintln!("vulkan video: this device has no hardware HEVC decode"),
     }
     if !file.is_empty() {
-        let video = decode
-            .ok_or_else(|| anyhow::anyhow!("this device has no Vulkan video decode"))?;
+        let video =
+            decode.ok_or_else(|| anyhow::anyhow!("this device has no Vulkan video decode"))?;
         crate::hw::probe(&gpu, Path::new(&file), video)?;
     }
     let graphics = SharedGraphics::with_gpu(Arc::clone(&gpu));
@@ -163,12 +163,8 @@ fn dxgi_renderer(
     let player = if file.as_os_str().is_empty() {
         None
     } else {
-        let video = decode
-            .ok_or_else(|| dxgi_error("this device has no Vulkan video decode"))?;
-        Some(
-            Player::open(gpu, video, file)
-                .map_err(|error| dxgi_error(format!("{error:#}")))?,
-        )
+        let video = decode.ok_or_else(|| dxgi_error("this device has no Vulkan video decode"))?;
+        Some(Player::open(gpu, video, file).map_err(|error| dxgi_error(format!("{error:#}")))?)
     };
 
     let renderer = graphics

@@ -86,34 +86,33 @@ pub fn create() -> anyhow::Result<(Arc<Gpu>, Option<VideoDecode>)> {
             .context("the adapter is not Vulkan")?;
         let (decode, extensions) = video_support(&hal_adapter);
 
-        let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> =
-            Box::new(move |args| {
-                // The p_next chain points into this after the callback returns,
-                // so it has to outlive the device creation call. One tiny leak
-                // per device is cheaper than a vendored wgpu-hal.
-                let features: &'static mut vk::PhysicalDeviceVulkan12Features<'static> =
-                    Box::leak(Box::new(
-                        vk::PhysicalDeviceVulkan12Features::default()
-                            .host_query_reset(true)
-                            .timeline_semaphore(true),
-                    ));
-                let info = std::mem::take(args.create_info);
-                *args.create_info = info.push_next(features);
+        let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(move |args| {
+            // The p_next chain points into this after the callback returns,
+            // so it has to outlive the device creation call. One tiny leak
+            // per device is cheaper than a vendored wgpu-hal.
+            let features: &'static mut vk::PhysicalDeviceVulkan12Features<'static> =
+                Box::leak(Box::new(
+                    vk::PhysicalDeviceVulkan12Features::default()
+                        .host_query_reset(true)
+                        .timeline_semaphore(true),
+                ));
+            let info = std::mem::take(args.create_info);
+            *args.create_info = info.push_next(features);
 
-                args.extensions.extend_from_slice(&extensions);
-                if let Some(decode) = decode
-                    && !args
-                        .queue_create_infos
-                        .iter()
-                        .any(|info| info.queue_family_index == decode.family)
-                {
-                    args.queue_create_infos.push(
-                        vk::DeviceQueueCreateInfo::default()
-                            .queue_family_index(decode.family)
-                            .queue_priorities(&PRIORITIES),
-                    );
-                }
-            });
+            args.extensions.extend_from_slice(&extensions);
+            if let Some(decode) = decode
+                && !args
+                    .queue_create_infos
+                    .iter()
+                    .any(|info| info.queue_family_index == decode.family)
+            {
+                args.queue_create_infos.push(
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(decode.family)
+                        .queue_priorities(&PRIORITIES),
+                );
+            }
+        });
 
         // SAFETY: the callback only enables features and extensions the
         // physical device advertises, and leaves every other create-info field
@@ -134,10 +133,7 @@ pub fn create() -> anyhow::Result<(Arc<Gpu>, Option<VideoDecode>)> {
         (device, queue, decode)
     };
 
-    Ok((
-        Gpu::from_existing(instance, adapter, device, queue),
-        decode,
-    ))
+    Ok((Gpu::from_existing(instance, adapter, device, queue), decode))
 }
 
 /// Finds the queue family that decodes HEVC and the decode extensions the
@@ -145,7 +141,9 @@ pub fn create() -> anyhow::Result<(Arc<Gpu>, Option<VideoDecode>)> {
 ///
 /// Returns `None` when the driver cannot decode video at all, in which case the
 /// decoder falls back to whatever else it finds.
-fn video_support(adapter: &wgpu::hal::vulkan::Adapter) -> (Option<VideoDecode>, Vec<&'static CStr>) {
+fn video_support(
+    adapter: &wgpu::hal::vulkan::Adapter,
+) -> (Option<VideoDecode>, Vec<&'static CStr>) {
     let instance = adapter.shared_instance().raw_instance();
     let physical = adapter.raw_physical_device();
 
@@ -182,21 +180,22 @@ fn video_support(adapter: &wgpu::hal::vulkan::Adapter) -> (Option<VideoDecode>, 
     // element of `families` is written once.
     unsafe { instance.get_physical_device_queue_family_properties2(physical, &mut families) };
 
-    let decode = families
-        .iter()
-        .zip(&video)
-        .enumerate()
-        .find_map(|(family, (properties, video))| {
-            (properties
-                .queue_family_properties
-                .queue_flags
-                .contains(QUEUE_VIDEO_DECODE)
-                && video.video_codec_operations & DECODE_H265 != 0)
-                .then(|| VideoDecode {
-                    family: u32::try_from(family).unwrap_or(0),
-                    operations: video.video_codec_operations,
-                })
-        });
+    let decode =
+        families
+            .iter()
+            .zip(&video)
+            .enumerate()
+            .find_map(|(family, (properties, video))| {
+                (properties
+                    .queue_family_properties
+                    .queue_flags
+                    .contains(QUEUE_VIDEO_DECODE)
+                    && video.video_codec_operations & DECODE_H265 != 0)
+                    .then(|| VideoDecode {
+                        family: u32::try_from(family).unwrap_or(0),
+                        operations: video.video_codec_operations,
+                    })
+            });
     if decode.is_none() {
         return (None, Vec::new());
     }

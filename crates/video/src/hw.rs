@@ -92,7 +92,8 @@ impl HwDevice {
         let phys_device = hal_device.raw_physical_device();
         // SAFETY: the physical device belongs to the instance, and both outlive
         // the query.
-        let families = unsafe { raw_instance.get_physical_device_queue_family_properties(phys_device) };
+        let families =
+            unsafe { raw_instance.get_physical_device_queue_family_properties(phys_device) };
         let family = |index: u32| -> anyhow::Result<QueueFamily> {
             let properties = families
                 .get(index as usize)
@@ -141,8 +142,7 @@ impl HwDevice {
                 .handle()
                 .as_raw() as usize as *mut c_void;
             (*vk).phys_dev = hal_device.raw_physical_device().as_raw() as usize as *mut c_void;
-            (*vk).act_dev =
-                hal_device.raw_device().handle().as_raw() as usize as *mut c_void;
+            (*vk).act_dev = hal_device.raw_device().handle().as_raw() as usize as *mut c_void;
             (*vk).enabled_dev_extensions = extensions.as_ptr();
             (*vk).nb_enabled_dev_extensions =
                 std::os::raw::c_int::try_from(extensions.len()).unwrap_or(0);

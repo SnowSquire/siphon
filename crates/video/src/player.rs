@@ -8,12 +8,12 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use libplacebo_sys as pl;
 use ffmpeg_the_third::codec;
 use ffmpeg_the_third::ffi;
 use ffmpeg_the_third::format;
 use ffmpeg_the_third::frame;
 use ffmpeg_the_third::media::Type;
+use libplacebo_sys as pl;
 use zgui_render_wgpu::Gpu;
 
 use crate::gpu::VideoDecode;
@@ -162,8 +162,7 @@ fn copy_parameters(
             ffi::avcodec_parameters_free(&raw mut failed);
             anyhow::bail!("avcodec_parameters_copy failed: {code}");
         }
-        codec::Parameters::from_raw(copy)
-            .context("avcodec_parameters_alloc returned no parameters")
+        codec::Parameters::from_raw(copy).context("avcodec_parameters_alloc returned no parameters")
     }
 }
 
@@ -182,10 +181,7 @@ impl MappedFrame {
         let mut owned = frame::Video::empty();
         // SAFETY: both frames are live; `av_frame_ref` takes a new reference.
         unsafe {
-            let code = ffi::av_frame_ref(
-                owned.as_mut_ptr(),
-                picture.as_ptr(),
-            );
+            let code = ffi::av_frame_ref(owned.as_mut_ptr(), picture.as_ptr());
             anyhow::ensure!(code >= 0, "av_frame_ref failed: {code}");
         }
 

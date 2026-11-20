@@ -16,7 +16,7 @@
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
     clippy::cast_ptr_alignment,
-    clippy::unnecessary_cast,
+    clippy::unnecessary_cast
 )]
 
 #[cfg(windows)]

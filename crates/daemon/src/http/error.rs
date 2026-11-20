@@ -37,7 +37,10 @@ impl Error {
     /// excluded on purpose: a malformed response will parse the same way twice.
     #[must_use]
     pub const fn stale_connection(&self) -> bool {
-        matches!(self, Self::Io(_) | Self::Timeout(_) | Self::Closed | Self::Tls(_))
+        matches!(
+            self,
+            Self::Io(_) | Self::Timeout(_) | Self::Closed | Self::Tls(_)
+        )
     }
 
     /// Whether the same request could succeed on a fresh connection.

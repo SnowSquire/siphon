@@ -112,6 +112,9 @@ fn white_level(adapter: LUID, id: u32) -> anyhow::Result<f32> {
         reason = "the level is a small integer, far inside f32's exact range"
     )]
     let nits = level.SDRWhiteLevel as f32 / 1000.0 * SDR_REFERENCE_NITS;
-    anyhow::ensure!(nits > 1.0, "the display reports an unusable SDR white level");
+    anyhow::ensure!(
+        nits > 1.0,
+        "the display reports an unusable SDR white level"
+    );
     Ok(nits)
 }

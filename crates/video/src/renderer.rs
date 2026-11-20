@@ -14,8 +14,8 @@ use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
-use libplacebo_sys as pl;
 use ffmpeg_the_third::frame;
+use libplacebo_sys as pl;
 use zgui::atlas::TextureSink;
 use zgui::bits::DamageSet;
 use zgui::render::ExternalTexture;
@@ -106,10 +106,7 @@ impl DxgiRenderer {
                     | ash::vk::ImageUsageFlags::SAMPLED,
             )?;
             // Only libplacebo renders into these, so it keeps them from here on.
-            placebo.release(
-                target,
-                pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
-            );
+            placebo.release(target, pl::VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED);
             targets.push(target);
         }
 
@@ -233,10 +230,10 @@ impl DxgiRenderer {
                             .map_or(0.0, |(_, started)| started.elapsed().as_secs_f64());
                         if !self.eof.replace(true) {
                             eprintln!(
-                            "video: end of stream after {elapsed:.2} s                              ({} frames shown, {} presented)",
-                            self.shown.get(),
-                            self.presents.get()
-                        );
+                                "video: end of stream after {elapsed:.2} s                              ({} frames shown, {} presented)",
+                                self.shown.get(),
+                                self.presents.get()
+                            );
                         }
                         return changed;
                     }
@@ -279,10 +276,7 @@ impl DxgiRenderer {
     fn present(&mut self, outcome: FrameOutcome) -> FrameOutcome {
         let (width, height) = self.swapchain.borrow().size();
         let index = self.swapchain.borrow().current_index();
-        let Some(&target_tex) = self
-            .targets
-            .get(usize::try_from(index).unwrap_or(0))
-        else {
+        let Some(&target_tex) = self.targets.get(usize::try_from(index).unwrap_or(0)) else {
             return outcome;
         };
 
@@ -369,8 +363,10 @@ impl DxgiRenderer {
         // ZGUI just finished a render pass into the interface texture, so it is
         // in `COLOR_ATTACHMENT_OPTIMAL`; libplacebo samples from it, and has to
         // put it back there for the next frame's pass.
-        self.placebo
-            .release(self.ui, pl::VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        self.placebo.release(
+            self.ui,
+            pl::VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        );
 
         if !self.placebo.render(image, &target) {
             eprintln!("libplacebo: render failed for {width}x{height}");

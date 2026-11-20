@@ -18,20 +18,20 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_1;
-use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
 use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT;
 use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_DESC;
 use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_FLAG_NONE;
 use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::Win32::Graphics::Direct3D12::ID3D12DeviceChild;
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 use windows::Win32::Graphics::Dxgi::CreateDXGIFactory2;
 use windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS;
 use windows::Win32::Graphics::Dxgi::DXGI_HDR_METADATA_HDR10;
@@ -40,10 +40,10 @@ use windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS;
 use windows::Win32::Graphics::Dxgi::DXGI_SCALING_NONE;
+use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1;
-use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_DISCARD;
 use windows::Win32::Graphics::Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT;
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter4;
@@ -156,8 +156,8 @@ impl DxgiSwapchain {
             NodeMask: 0,
         };
         // SAFETY: the device is alive and the descriptor is a valid local.
-        let queue: ID3D12CommandQueue = unsafe { device.CreateCommandQueue(&queue_desc) }
-            .context("CreateCommandQueue")?;
+        let queue: ID3D12CommandQueue =
+            unsafe { device.CreateCommandQueue(&queue_desc) }.context("CreateCommandQueue")?;
 
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
@@ -177,8 +177,7 @@ impl DxgiSwapchain {
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             Flags: (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0
-                | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0)
-                as u32,
+                | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0) as u32,
         };
         // SAFETY: the queue and HWND are alive, and the descriptor is a valid local.
         let swapchain1 = unsafe {
@@ -212,15 +211,9 @@ impl DxgiSwapchain {
             let child: ID3D12DeviceChild = resource.cast().context("backbuffer child")?;
             // SAFETY: the resource is a D3D12 texture, the handle is an NT handle, and
             // `GENERIC_ALL` is what the reference DXGI interop path uses.
-            let handle = unsafe {
-                device.CreateSharedHandle(
-                    &child,
-                    None,
-                    GENERIC_ALL.0,
-                    PCWSTR::null(),
-                )
-            }
-            .with_context(|| format!("CreateSharedHandle({index})"))?;
+            let handle =
+                unsafe { device.CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null()) }
+                    .with_context(|| format!("CreateSharedHandle({index})"))?;
 
             // SAFETY: the image is created on the same device and memory is bound to it
             // below; `Drop` destroys both exactly once.
@@ -318,7 +311,6 @@ impl DxgiSwapchain {
         let result = unsafe { self.swapchain.Present1(1, DXGI_PRESENT(0), &params) };
         result.ok().context("Present1")
     }
-
 }
 
 impl Drop for DxgiSwapchain {
@@ -358,7 +350,10 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
     unsafe {
         instance.get_physical_device_properties2(physical, &mut properties);
     }
-    anyhow::ensure!(id.device_luid_valid != vk::FALSE, "the Vulkan device has no LUID");
+    anyhow::ensure!(
+        id.device_luid_valid != vk::FALSE,
+        "the Vulkan device has no LUID"
+    );
     let low = u32::from_ne_bytes(id.device_luid[0..4].try_into().expect("four bytes"));
     let high = i32::from_ne_bytes(id.device_luid[4..8].try_into().expect("four bytes"));
     Ok(LUID {
@@ -371,27 +366,20 @@ fn vulkan_luid(adapter: &wgpu::hal::vulkan::Adapter) -> anyhow::Result<LUID> {
 ///
 /// Also answers where the user put SDR white, which is what the interface and
 /// any SDR video have to be rendered against.
-fn configure_hdr(
-    swapchain: &IDXGISwapChain3,
-    mode: HdrMode,
-) -> anyhow::Result<(bool, f32, f32)> {
+fn configure_hdr(swapchain: &IDXGISwapChain3, mode: HdrMode) -> anyhow::Result<(bool, f32, f32)> {
     // SAFETY: the swapchain is alive for the call.
     let output = unsafe { swapchain.GetContainingOutput() }.context("GetContainingOutput")?;
     let output6: IDXGIOutput6 = output.cast().context("IDXGIOutput6")?;
     // SAFETY: `output6` is a live output.
     let desc = unsafe { output6.GetDesc1() }.context("GetDesc1")?;
     // SAFETY: the swapchain is alive for the call.
-    let support = unsafe {
-        swapchain.CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
-    }
-    .context("CheckColorSpaceSupport")?;
+    let support =
+        unsafe { swapchain.CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) }
+            .context("CheckColorSpaceSupport")?;
     let supported = support & (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) != 0;
     eprintln!(
         "DXGI output: color space {:?}, peak {} nits, max full-frame {} nits, bits {}",
-        desc.ColorSpace,
-        desc.MaxLuminance,
-        desc.MaxFullFrameLuminance,
-        desc.BitsPerColor
+        desc.ColorSpace, desc.MaxLuminance, desc.MaxFullFrameLuminance, desc.BitsPerColor
     );
 
     let active = match mode {
@@ -400,9 +388,7 @@ fn configure_hdr(
             anyhow::ensure!(supported, "the display does not support PQ/Rec.2020");
             true
         }
-        HdrMode::Auto => {
-            supported && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-        }
+        HdrMode::Auto => supported && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
     };
 
     let space = if active {
@@ -423,9 +409,7 @@ fn configure_hdr(
             200.0
         }
     };
-    eprintln!(
-        "SDR white: {sdr_white:.0} nits (level from the display configuration)"
-    );
+    eprintln!("SDR white: {sdr_white:.0} nits (level from the display configuration)");
     Ok((active, desc.MaxLuminance, sdr_white))
 }
 
@@ -519,10 +503,12 @@ unsafe fn import_backbuffer(
     .context("vkGetMemoryWin32HandlePropertiesKHR")?;
 
     // SAFETY: the physical device belongs to the instance and is still alive.
-    let memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical) };
+    let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
     let candidates = handle_properties.memory_type_bits & requirements.memory_type_bits;
-    anyhow::ensure!(candidates != 0, "no Vulkan memory type for the D3D12 resource");
+    anyhow::ensure!(
+        candidates != 0,
+        "no Vulkan memory type for the D3D12 resource"
+    );
     let memory_type = (0..memory_properties.memory_type_count)
         .find(|index| {
             candidates & (1 << index) != 0
@@ -530,7 +516,9 @@ unsafe fn import_backbuffer(
                     .property_flags
                     .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
         })
-        .or_else(|| (0..memory_properties.memory_type_count).find(|index| candidates & (1 << index) != 0))
+        .or_else(|| {
+            (0..memory_properties.memory_type_count).find(|index| candidates & (1 << index) != 0)
+        })
         .context("no usable Vulkan memory type")?;
 
     let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
