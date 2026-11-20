@@ -5,10 +5,16 @@ including the measurements, the dead ends and the two crashes. Read it before
 re-running any of the experiments below; it records which ones were already shown
 to be worthless.
 
-A record of the week spent chasing horizontal bands, TDRs and stalls in the
-Windows presentation path, what turned out to be true, and the shape the chain
-should take. The working version of the conclusion lives on the jj bookmark
-**`blit-path`** (`361d1b58`); the tree it was developed against is `f2c68bfe`.
+A record of one session: fourteen hours of wall clock, and — by the measure that
+matters to whoever reads this next, which is how much context it consumed and how
+many dead ends it opened before closing — about a week's worth of work. Both
+numbers earn their place. The second says what re-entering this will cost; the
+first says it did not take a fortnight of calendar, and most of it went on
+theories held without measurement rather than on the work itself.
+
+The working version of the conclusion lives on the jj bookmark **`blit-path`**
+(`244bd6aa`); the tree it was developed against is `f2c68bfe`, which is now part
+of `main`.
 
 ## The shape of the problem
 
