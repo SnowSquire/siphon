@@ -27,6 +27,8 @@ use zgui::reactive::UnsyncCallback;
 use zgui::runtime::use_window;
 #[cfg(windows)]
 use zgui::runtime::use_windows;
+use zgui::vocab::Key;
+use zgui::vocab::NamedKey;
 use zgui_ui::prelude::*;
 use zgui_ui_tokens::prelude::*;
 
@@ -446,16 +448,16 @@ fn ChannelsTab(
     draft: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
-    let add_login = {
+    let add_login: Rc<dyn Fn()> = {
         let intents = Rc::clone(&intents);
-        move || {
+        Rc::new(move || {
             let login = draft.get_untracked().trim().to_owned();
             if login.is_empty() {
                 return;
             }
             intents.send(Request::AddLogin(login));
             draft.set(String::new());
-        }
+        })
     };
     let rows = Rc::clone(&intents);
     // Twitch logins top out at 25 characters; stop the field there rather than
@@ -504,6 +506,10 @@ fn ChannelsTab(
                     placeholder = "Add a new streamer",
                     on_change = clamp_login,
                     class = "add__input",
+                    on:key_down = {
+                        let add_login = Rc::clone(&add_login);
+                        move |ev| on_enter(ev, || add_login())
+                    },
                 )
                 Button(on:click = move |_| add_login()) {"Add"}
             }
@@ -524,7 +530,8 @@ fn ChannelRow(
     let id = channel.get_untracked().id;
     let open = Signal::derive_local(move || expanded.get().contains(&id));
     let display_name = Signal::derive_local(move || channel.with(|c| c.display_name.clone()));
-    let initials = Signal::derive_local(move || initials(&channel.with(|c| c.display_name.clone())));
+    let initials =
+        Signal::derive_local(move || initials(&channel.with(|c| c.display_name.clone())));
     let avatar_path = Signal::derive_local(move || channel.with(|c| c.avatar_path.clone()));
     let color = Signal::derive_local(move || channel.with(|c| c.chat_color.clone()));
     let live = Signal::derive_local(move || channel.with(|c| c.live));
@@ -799,16 +806,16 @@ fn FilterTab(
     draft: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
-    let add_word = {
+    let add_word: Rc<dyn Fn()> = {
         let intents = Rc::clone(&intents);
-        move || {
+        Rc::new(move || {
             let word = draft.get_untracked().trim().to_owned();
             if word.is_empty() {
                 return;
             }
             intents.send(Request::AddFilteredWord(word));
             draft.set(String::new());
-        }
+        })
     };
     let titles = Rc::clone(&intents);
     let sound_switch = Rc::clone(&intents);
@@ -851,7 +858,15 @@ fn FilterTab(
             text(class = "section-title") {"Filtered words"}
             text(class = "section-hint") {"A notification whose title contains one of these is dropped."}
             row(class = "add") {
-                Input(value = draft, placeholder = "Add a filtered word", class = "add__input")
+                Input(
+                    value = draft,
+                    placeholder = "Add a filtered word",
+                    class = "add__input",
+                    on:key_down = {
+                        let add_word = Rc::clone(&add_word);
+                        move |ev| on_enter(ev, || add_word())
+                    },
+                )
                 Button(on:click = move |_| add_word()) {"Add"}
             }
             ScrollArea(class = "words") {
@@ -952,7 +967,9 @@ const fn is_recorded(pipeline: &PipelineView) -> bool {
 
 /// The rows the Recordings tab draws. Membership follows the row's own signal,
 /// so `UiState` re-runs the list whenever a pipeline starts or stops recording.
-fn recordings(pipelines: &[RwSignal<PipelineView, LocalStorage>]) -> Vec<RwSignal<PipelineView, LocalStorage>> {
+fn recordings(
+    pipelines: &[RwSignal<PipelineView, LocalStorage>],
+) -> Vec<RwSignal<PipelineView, LocalStorage>> {
     pipelines
         .iter()
         .filter(|pipeline| pipeline.with_untracked(is_recorded))
@@ -1151,6 +1168,18 @@ const fn conn_label(conn: ConnHealth) -> &'static str {
         ConnHealth::Connected => "connected",
         ConnHealth::Connecting => "connecting…",
         ConnHealth::NoChannels => "no channels",
+    }
+}
+
+/// Enter in a one-line field does what the field's button does.
+///
+/// A text input leaves `Enter` to its caller, so each add box has to opt in.
+/// `Shift` is left alone: it is how a field that later grows into a composer
+/// keeps its newline.
+fn on_enter(ev: &EventCx<'_, events::KeyDown>, run: impl Fn()) {
+    if matches!(ev.key, Key::Named(NamedKey::Enter)) && !ev.modifiers.shift() {
+        run();
+        ev.prevent_default();
     }
 }
 
