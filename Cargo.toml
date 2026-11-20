@@ -6,7 +6,17 @@ members = [
   "crates/ui",
   "crates/video",
 ]
+# The vendored `wgpu-hal` is a package in its own right: it must not inherit the
+# workspace's `deny` lints, and it is pinned to the exact version wgpu asks for.
+exclude = ["vendor/wgpu-hal"]
 resolver = "2"
+
+# `wgpu-hal` as published never enables `VK_KHR_external_semaphore_win32`, which
+# the Windows chain needs to import the swapchain's D3D12 fence as a timeline
+# semaphore. `vendor/wgpu-hal` is 30.0.2 with that one extension added; the diff
+# is marked `SIPHON` in `src/vulkan/adapter.rs`. Re-sync it when wgpu is bumped.
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }
 
 [workspace.package]
 version = "0.5.0"

@@ -25,10 +25,12 @@ use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT;
 use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_DESC;
 use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_FLAG_NONE;
 use windows::Win32::Graphics::Direct3D12::D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+use windows::Win32::Graphics::Direct3D12::D3D12_FENCE_FLAG_SHARED;
 use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::Win32::Graphics::Direct3D12::ID3D12DeviceChild;
+use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -166,9 +168,9 @@ fn virtual_screen() -> (u32, u32) {
 /// extent needs neither a new device nor a new queue: the swapchain is the
 /// only thing that has to be made again.
 pub struct D3d12 {
-    factory: IDXGIFactory7,
-    device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) factory: IDXGIFactory7,
+    pub(crate) device: ID3D12Device,
+    pub(crate) queue: ID3D12CommandQueue,
 }
 
 impl D3d12 {
@@ -210,6 +212,25 @@ impl D3d12 {
     }
 }
 
+/// One backbuffer, in flight from the moment DXGI offers it to the moment it is
+/// presented.
+///
+/// The two values are the handover between the two APIs: Vulkan waits for
+/// `wait` before it writes the image and signals `submit` when it has finished,
+/// and the D3D12 queue waits for `submit` before it presents. Both are points on
+/// the one timeline semaphore, so the two APIs never need to see each other's
+/// queues.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    /// Which backbuffer DXGI will present next.
+    pub index: u32,
+    /// The value the last frame in this backbuffer signalled, or zero when the
+    /// buffer has never been rendered into.
+    pub wait: u64,
+    /// The value this frame's Vulkan work signals when it is done.
+    pub submit: u64,
+}
+
 /// One D3D12 swapchain and the Vulkan images that stand for its backbuffers.
 pub struct DxgiSwapchain {
     /// The Vulkan images and memories libplacebo renders into.
@@ -219,8 +240,20 @@ pub struct DxgiSwapchain {
     /// The D3D12 resources themselves, kept alive while the Vulkan images exist.
     backbuffers: Vec<ID3D12Resource>,
     swapchain: IDXGISwapChain3,
+    /// The queue the chain was created on, for the wait that precedes `Present`.
+    queue: ID3D12CommandQueue,
     /// Signalled when there is room for another frame in the flip queue.
     latency: HANDLE,
+    /// The fence the presentation is paced by, and its shared handle.
+    fence: ID3D12Fence,
+    fence_handle: HANDLE,
+    /// `fence` as a Vulkan timeline semaphore: the value libplacebo signals when
+    /// a frame is finished is the value the D3D12 queue waits on to present it.
+    timeline: vk::Semaphore,
+    /// The last value handed out to a frame. Only ever grows.
+    fence_value: Cell<u64>,
+    /// The value each backbuffer's last frame signals, per buffer.
+    last_submit: Cell<[u64; BUFFERS as usize]>,
     /// The `vk::Device` the images and memories were created on.
     device_handle: ash::Device,
     format: wgpu::TextureFormat,
@@ -265,6 +298,12 @@ impl DxgiSwapchain {
         eros::ensure!(
             enabled.contains(&khr::external_memory_win32::NAME),
             "the Vulkan device does not have VK_KHR_external_memory_win32"
+        );
+        // The presentation is paced by a D3D12 fence imported as a timeline
+        // semaphore; without this the import is not permitted on the device.
+        eros::ensure!(
+            enabled.contains(&khr::external_semaphore_win32::NAME),
+            "the Vulkan device does not have VK_KHR_external_semaphore_win32"
         );
 
         let factory = &d3d12.factory;
@@ -324,12 +363,24 @@ impl DxgiSwapchain {
         let (active, max_luminance, sdr_white) = configure_hdr(&swapchain, hdr, true, None)?;
         let format = wgpu::TextureFormat::Rgb10a2Unorm;
 
+        // The fence is created before the buffers are imported, so a chain that
+        // cannot be paced is not left half-built.
+        let (fence, fence_handle, timeline) = create_timeline(d3d12, gpu)?;
+        // SAFETY: the device is live; both objects live as long as the chain and
+        // the list is only reset after the queue has been drained.
+
         let mut this = Self {
             images: Vec::with_capacity(BUFFERS as usize),
             shared_handles: Vec::with_capacity(BUFFERS as usize),
             backbuffers: Vec::with_capacity(BUFFERS as usize),
             swapchain,
+            queue: d3d12.queue.clone(),
             latency,
+            fence,
+            fence_handle,
+            timeline,
+            fence_value: Cell::new(0),
+            last_submit: Cell::new([0; BUFFERS as usize]),
             device_handle: hal_device.raw_device().clone(),
             format,
             width,
@@ -452,12 +503,28 @@ impl DxgiSwapchain {
             // SAFETY: the image is created on the same device and memory is bound to it
             // below; `release_buffers` destroys both exactly once.
             let imported = unsafe {
-                import_backbuffer(&hal_device, instance, handle, width, height, VK_FORMAT)
+                import_shared(&hal_device, instance, handle, width, height, VK_FORMAT)
             }
             .with_context(|| format!("import backbuffer {index}"))?;
             self.images.push(imported);
         }
+        // A resize hands out brand-new images: nothing has been rendered into
+        // them, so nothing has to be waited for before the first frame into
+        // each. The values themselves stay valid on the timeline.
+        self.last_submit.set([0; BUFFERS as usize]);
         Ok(())
+    }
+
+    /// Waits for the D3D12 queue to drain. Control paths only: this blocks.
+    pub(crate) fn drain(&self) {
+        let value = self.next_value();
+        // SAFETY: the queue and fence are live; a null event handle blocks
+        // until the value is reached.
+        unsafe {
+            if self.queue.Signal(&self.fence, value).is_ok() {
+                let _ = self.fence.SetEventOnCompletion(value, HANDLE::default());
+            }
+        }
     }
 
     /// Destroys the Vulkan images and closes everything that names a backbuffer.
@@ -483,6 +550,111 @@ impl DxgiSwapchain {
     pub fn current_index(&self) -> u32 {
         // SAFETY: the swapchain is alive for the borrow.
         unsafe { self.swapchain.GetCurrentBackBufferIndex() }
+    }
+
+    /// Hands out the next timeline value. Every signal the chain makes takes
+    /// one, so the counter is the one place values are allocated.
+    pub fn next_value(&self) -> u64 {
+        let value = self.fence_value.get() + 1;
+        self.fence_value.set(value);
+        value
+    }
+
+    /// The D3D12 queue the swapchain was created with.
+    #[must_use]
+    pub const fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
+    /// The fence the presentation is paced by.
+    #[must_use]
+    pub const fn fence(&self) -> &ID3D12Fence {
+        &self.fence
+    }
+
+    /// Backbuffer `index` as a D3D12 resource.
+    #[must_use]
+    pub fn backbuffer(&self, index: u32) -> Option<ID3D12Resource> {
+        self.backbuffers
+            .get(usize::try_from(index).ok()?)
+            .cloned()
+    }
+
+    /// Queues a wait for `value` on the D3D12 queue.
+    pub fn wait_queue(&self, value: u64) -> eros::Result<()> {
+        // SAFETY: the queue and the fence live in `self`; this only queues.
+        unsafe { self.queue.Wait(&self.fence, value) }
+            .inspect_err(|error| self.note_removal(error))
+            .context("D3D12 queue wait")?;
+        Ok(())
+    }
+
+    /// Queues a signal for `value` on the D3D12 queue.
+    pub fn signal_queue(&self, value: u64) -> eros::Result<()> {
+        // SAFETY: the queue and the fence live in `self`; this only queues.
+        unsafe { self.queue.Signal(&self.fence, value) }
+            .inspect_err(|error| self.note_removal(error))
+            .context("D3D12 queue signal")?;
+        Ok(())
+    }
+
+    /// Presents the current backbuffer with no further synchronisation.
+    pub fn present_only(&self) -> eros::Result<()> {
+        self.present(None, false)
+    }
+
+    /// Blocks until the timeline reaches `value`, or a second passes. Only the
+    /// `SIPHON_SYNC=present` A/B uses it now.
+    pub fn wait_present(&self, value: u64) -> bool {
+        self.wait_timeline(value, 1_000_000_000)
+    }
+
+    /// Takes the backbuffer DXGI will present next, with the timeline values
+    /// that hand it from Vulkan to D3D12.
+    ///
+    /// The caller must have waited for the flip queue first; this only asks
+    /// which buffer that wait made available, and allocates the value the
+    /// frame's GPU work will signal.
+    pub fn acquire(&self) -> eros::Result<Frame> {
+        eros::ensure!(!self.removed.get(), "the device was removed");
+        let index = self.current_index();
+        let slot = usize::try_from(index).ok().context("backbuffer index")?;
+        eros::ensure!(
+            slot < self.last_submit.get().len(),
+            "backbuffer {index} is outside the chain"
+        );
+        let wait = self.last_submit.get()[slot];
+        let submit = self.next_value();
+        Ok(Frame {
+            index,
+            wait,
+            submit,
+        })
+    }
+
+    /// The fence as a Vulkan timeline semaphore.
+    ///
+    /// The frame's GPU work is made to signal a value on it, and the D3D12
+    /// queue is made to wait for that value before the backbuffer is presented.
+    #[must_use]
+    pub const fn timeline(&self) -> vk::Semaphore {
+        self.timeline
+    }
+
+    /// Blocks until the timeline reaches `value`, or `timeout` nanoseconds pass.
+    ///
+    /// Used for the interface handover: `value` is the frame whose pass last
+    /// read the interface texture, so this waits for that pass to finish before
+    /// the next one overwrites it.
+    pub fn wait_timeline(&self, value: u64, timeout: u64) -> bool {
+        let semaphores = [self.timeline];
+        let values = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the semaphore is a timeline semaphore on this device and the
+        // info names live locals.
+        unsafe { self.device_handle.wait_semaphores(&info, timeout) }.is_ok()
     }
 
     /// The Vulkan image standing for backbuffer `index`.
@@ -533,11 +705,42 @@ impl DxgiSwapchain {
     }
 
     /// Hands the current backbuffer to the compositor.
+    ///
+    /// `submit` is the value the frame's Vulkan work signals when it is done.
+    /// It is given to the D3D12 queue as a wait, so the ordering lives on the
+    /// GPU: by the time the compositor reads the backbuffer, the render that
+    /// filled it has finished, and the CPU never had to stop and wait for it.
+    ///
+    /// `None` is for callers that have already waited for the GPU themselves
+    /// (the diagnostic path that presents without libplacebo).
     #[allow(
         clippy::borrow_as_ptr,
         reason = "the Windows bindings take a pointer to the present parameters"
     )]
-    pub fn present(&self) -> eros::Result<()> {
+    pub fn present(&self, submit: Option<u64>, wait_cpu: bool) -> eros::Result<()> {
+        if let Some(value) = submit {
+            // SAFETY: the queue and the fence live in `self`; this only queues
+            // the wait, it does not block.
+            unsafe { self.queue.Wait(&self.fence, value) }
+                .inspect_err(|error| self.note_removal(error))
+                .context("D3D12 queue wait")?;
+            if let Ok(slot) = usize::try_from(self.current_index())
+                && slot < self.last_submit.get().len()
+            {
+                let mut values = self.last_submit.get();
+                values[slot] = value;
+                self.last_submit.set(values);
+            }
+            // `SIPHON_SYNC=present`: the guaranteed form, at the cost of the
+            // CPU stopping here instead of the queue. A null event handle makes
+            // this block until the value is reached.
+            if wait_cpu {
+                // SAFETY: the fence is alive.
+                unsafe { self.fence.SetEventOnCompletion(value, HANDLE::default()) }
+                    .inspect_err(|error| self.note_removal(error))
+                    .context("fence wait")?;
+            }
+        }
         let params = DXGI_PRESENT_PARAMETERS::default();
         // SAFETY: the swapchain lives in `self`; the parameters describe the whole frame
         // (no dirty rects), which is what a flip-model present expects.
@@ -576,15 +779,85 @@ impl DxgiSwapchain {
 
 impl Drop for DxgiSwapchain {
     fn drop(&mut self) {
-        // The libplacebo textures over these images are destroyed by the renderer
-        // before the swapchain drops, so nothing can still be rendering into them.
+        self.drain();
+        // The textures over these images are destroyed by the renderer before
+        // the swapchain drops, so nothing can still be rendering into them.
         self.release_buffers();
         // SAFETY: the handle came from `GetFrameLatencyWaitableObject`, names
         // nothing else, and is closed once.
         unsafe {
             let _ = CloseHandle(self.latency);
         }
+        // SAFETY: the semaphore was created on this device and is destroyed
+        // once; the caller has waited for the GPU before dropping the chain.
+        unsafe {
+            self.device_handle.destroy_semaphore(self.timeline, None);
+        }
+        // SAFETY: the handle came from `CreateSharedHandle` and is closed once.
+        unsafe {
+            let _ = CloseHandle(self.fence_handle);
+        }
+        // `fence` is a COM interface and releases itself.
     }
+}
+
+/// Creates the D3D12 fence the presentation is paced by and imports it into
+/// Vulkan as a timeline semaphore.
+///
+/// This is the piece `vk_dxgi` is built around. The GPU writes the backbuffer
+/// with Vulkan and signals a value; the D3D12 queue waits for that same value
+/// before `Present` reads the buffer. One object, owned by this chain, is the
+/// whole contract between the two APIs.
+fn create_timeline(d3d12: &D3d12, gpu: &Gpu) -> eros::Result<(ID3D12Fence, HANDLE, vk::Semaphore)> {
+    // SAFETY: `as_hal` only asks that the resource behind the guard outlives the
+    // borrow. Both wgpu handles are alive for the whole call.
+    let hal_adapter = unsafe { gpu.adapter().as_hal::<wgpu::hal::api::Vulkan>() }
+        .context("the video device is not Vulkan")?;
+    // SAFETY: as above.
+    let hal_device = unsafe { gpu.device().as_hal::<wgpu::hal::api::Vulkan>() }
+        .context("the video device is not Vulkan")?;
+    let instance = hal_adapter.shared_instance().raw_instance();
+    // SAFETY: the device is alive and the flag is the documented constant for a
+    // fence that is shared outside the device.
+    let fence: ID3D12Fence =
+        unsafe { d3d12.device.CreateFence(0, D3D12_FENCE_FLAG_SHARED) }.context("CreateFence")?;
+    let child: ID3D12DeviceChild = fence.cast().context("fence device child")?;
+    // SAFETY: the fence is a device child and `GENERIC_ALL` is what the
+    // reference DXGI interop path asks for.
+    let handle = unsafe {
+        d3d12
+            .device
+            .CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null())
+    }
+    .context("CreateSharedHandle(fence)")?;
+
+    let raw = hal_device.raw_device();
+    let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    let info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type);
+    // SAFETY: the device is live and the chained structure outlives the call.
+    let semaphore = unsafe { raw.create_semaphore(&info, None) }.context("vkCreateSemaphore")?;
+
+    let importer = khr::external_semaphore_win32::Device::new(instance, raw);
+    let import = vk::ImportSemaphoreWin32HandleInfoKHR::default()
+        .semaphore(semaphore)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::D3D12_FENCE)
+        .handle(handle.0 as vk::HANDLE);
+    // SAFETY: `handle` names the fence created just above and `semaphore` is a
+    // timeline semaphore created for exactly this handle type.
+    if let Err(error) = unsafe { importer.import_semaphore_win32_handle(&import) } {
+        // SAFETY: both objects are ours, were just created, and nothing else
+        // names them.
+        unsafe {
+            raw.destroy_semaphore(semaphore, None);
+            let _ = CloseHandle(handle);
+        }
+        return Err(error)
+            .union()
+            .context("vkImportSemaphoreWin32HandleKHR");
+    }
+    Ok((fence, handle, semaphore))
 }
 
 /// Reads the LUID of the Vulkan physical device so DXGI can find the same adapter.
@@ -687,11 +960,7 @@ fn configure_hdr(
 /// `peak` is what the display can do; `content_peak` is the brightest this
 /// interface ever gets, which is its SDR white. Saying so tells the display it
 /// does not have to tone map anything down.
-fn set_hdr_metadata(
-    swapchain: &IDXGISwapChain3,
-    peak: f32,
-    content_peak: f32,
-) -> eros::Result<()> {
+fn set_hdr_metadata(swapchain: &IDXGISwapChain3, peak: f32, content_peak: f32) -> eros::Result<()> {
     let swapchain4: IDXGISwapChain4 = swapchain.cast().context("IDXGISwapChain4")?;
     #[allow(
         clippy::cast_possible_truncation,
@@ -735,7 +1004,7 @@ fn set_hdr_metadata(
 /// `handle` must be an NT handle from `ID3D12Device::CreateSharedHandle` for a
 /// texture matching `width` and `height`, and `device` must be the Vulkan device
 /// the handle was created for.
-unsafe fn import_backbuffer(
+pub unsafe fn import_shared(
     device: &wgpu::hal::vulkan::Device,
     instance: &ash::Instance,
     handle: HANDLE,

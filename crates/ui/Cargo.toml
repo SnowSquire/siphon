@@ -24,7 +24,6 @@ eros = { version = "=0.9.0-rc.0", default-features = false, features = [
 # is bound in the same font collection the shaper reads.
 fontique = "0.11.1"
 kanal = "0.1.1"
-libplacebo-sys = { path = "../libplacebo-sys" }
 pollster = "0.4"
 raw-window-handle = "0.6"
 siphon-rpc = { path = "../rpc" }

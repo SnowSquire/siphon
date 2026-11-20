@@ -1,23 +1,16 @@
-//! The presentation seam: one concrete swapchain chain per platform.
+//! The presentation seam: the Windows chain, and the ZGUI plumbing above it.
 //!
-//! Everything above the chain — the ZGUI compose into a `Bgra8Unorm` texture,
-//! the overlay parts, libplacebo's render call and the handover semaphore — is
-//! shared. Windows presents a D3D12 flip chain whose backbuffers are imported
-//! into Vulkan; Wayland lets libplacebo own a `VkSwapchainKHR` on the surface
-//! ZGUI gives us. Only one backend is linked, so the chain is selected with
-//! `#[cfg]` and called directly rather than through a trait object.
+//! Everything above the chain — the ZGUI compose into a `Bgra8Unorm` texture and
+//! the handover of that texture to the pass — is platform-free. The chain owns
+//! the D3D12 swapchain, the Vulkan images behind its backbuffers, and the pass
+//! that draws the interface over the diagnostics fill.
 //!
-//! Both chains answer the same questions: what frame to draw into, when it has
-//! been presented, and what extent the chain currently covers. The resize
-//! policy differs: Windows grows the chain to the monitor for the length of a
-//! drag and shrinks back once the size settles, while a Wayland chain follows
-//! the surface exactly (its WSI scales a mismatched image instead of cropping
-//! it, so there is no larger canvas to draw into).
+//! There is no libplacebo here: the fill and the colour conversion are the
+//! chain's own shaders, because the point of this build is to see whether the
+//! banding survives without it.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
-use libplacebo_sys as pl;
 use zgui::platform::Surface;
 use zgui::render::GpuUnavailable;
 use zgui::render::RenderTarget;
@@ -27,30 +20,16 @@ use zgui::surface::wgpu;
 use zgui_render_wgpu::Gpu;
 use zgui_render_wgpu::SharedGraphics;
 
-use crate::placebo::Placebo;
 use crate::renderer::UiRenderer;
 
 #[cfg(windows)]
-mod plain;
+mod blit;
 #[cfg(windows)]
-pub use plain::blit as blit_plain;
+mod pass;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::Chain;
-
-#[cfg(not(windows))]
-mod wayland;
-#[cfg(not(windows))]
-pub use wayland::Chain;
-
-/// The frame a chain acquired for this presentation, and the extent of the
-/// image it draws into. The overlay parts are expressed in that extent.
-pub struct Acquired {
-    pub frame: pl::pl_frame,
-    pub width: u32,
-    pub height: u32,
-}
 
 /// How long the window's size has to hold still before a grown chain shrinks
 /// back to it (Windows only).
@@ -135,8 +114,8 @@ pub fn renderer(
         .map_err(|_| gpu_error("the target height is not positive"))?;
 
     // The UI texture is always exactly the window's extent, whatever the chain
-    // covers: ZGUI composes into it and libplacebo edge-extends it over the
-    // rest of a larger canvas when resizing.
+    // covers: ZGUI composes into it and the pass samples it over the rest of a
+    // larger canvas, where its edge texels repeat.
     let ui = gpu.device().create_texture(&wgpu::TextureDescriptor {
         label: Some("siphon.ui"),
         size: wgpu::Extent3d {
@@ -156,24 +135,24 @@ pub fn renderer(
             | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let placebo =
-        Rc::new(Placebo::import(gpu).map_err(|error| gpu_error(format!("libplacebo: {error}")))?);
-    let chain = Chain::new(gpu, Rc::clone(&placebo), surface, &gpu_surface, width, height)
+    let mut chain = Chain::new(gpu, surface, &gpu_surface, width, height).map_err(|error| {
+        eprintln!("chain: {error:?}");
+        gpu_error(format!("{error}"))
+    })?;
+    chain
+        .set_interface(&ui)
         .map_err(|error| gpu_error(format!("{error}")))?;
     let inner = graphics
         .renderer_supplied(target, vec![ui.clone()])
         .map_err(AppError::from)?;
-    let renderer = UiRenderer::new(
+    Ok(Box::new(UiRenderer::new(
         inner,
         chain,
-        placebo,
         ui,
         graphics.clone(),
         Arc::clone(gpu),
         target,
-    )
-    .map_err(|error| gpu_error(format!("{error}")))?;
-    Ok(Box::new(renderer))
+    )))
 }
 
 /// Every failure here means the window cannot be presented by this backend.
@@ -183,7 +162,6 @@ pub fn gpu_error(reason: impl Into<String>) -> AppError {
 
 #[cfg(windows)]
 pub use windows::note_present;
-
 
 #[cfg(not(windows))]
 pub const fn note_present() {}

@@ -20,6 +20,9 @@ pub struct Placebo {
     vulkan: pl::pl_vulkan,
     gpu: pl::pl_gpu,
     renderer: pl::pl_renderer,
+    /// The Vulkan device wgpu created, loaded for the few calls libplacebo has
+    /// no wrapper for (waiting on a timeline semaphore).
+    device: ash::Device,
     /// Keeps the Vulkan loader alive for the `get_proc_addr` pointer below.
     _entry: ash::Entry,
 }
@@ -48,6 +51,10 @@ impl Placebo {
         // SAFETY: loading the system Vulkan loader; `Placebo` owns the entry for
         // as long as any pointer derived from it is used.
         let entry = unsafe { ash::Entry::load() }.context("load vulkan-1.dll")?;
+        // SAFETY: `hal_device` is the device wgpu created from this instance;
+        // loading its entry points again only reads them.
+        let device =
+            unsafe { ash::Device::load(instance.fp_v1_0(), hal_device.raw_device().handle()) };
         // SAFETY: both are the same Vulkan entry point, differing only in the
         // bindings' spelling of the handle types. The ABI and size are identical.
         let get_proc_addr: pl::PFN_vkGetInstanceProcAddr =
@@ -129,6 +136,7 @@ impl Placebo {
             vulkan,
             gpu,
             renderer,
+            device,
             _entry: entry,
         })
     }
@@ -184,16 +192,70 @@ impl Placebo {
     /// Hands a wrapped image back to libplacebo, saying what layout it is in.
     ///
     /// Wrapped images start held by their owner; every `pl_tex` call before a
-    /// release is undefined behaviour.
-    pub fn release(&self, texture: pl::pl_tex, layout: pl::VkImageLayout) {
+    /// release is undefined behaviour. `after` is waited on before libplacebo
+    /// touches the image, which is how the GPU work that last used it — a
+    /// previous frame in the same backbuffer — is ordered before this one. Pass
+    /// [`Placebo::no_sem`] when there is nothing to wait for.
+    pub fn release(
+        &self,
+        texture: pl::pl_tex,
+        layout: pl::VkImageLayout,
+        after: pl::pl_vulkan_sem,
+    ) {
         let params = pl::pl_vulkan_release_params {
             tex: texture,
             layout,
             qf: u32::MAX,
-            ..Default::default()
+            semaphore: after,
         };
         // SAFETY: the texture is held by us and the layout describes the image.
         unsafe { pl::pl_vulkan_release_ex(self.gpu, &params) };
+    }
+
+    /// A handover on a timeline semaphore: the value to signal or wait for.
+    pub fn sem(semaphore: vk::Semaphore, value: u64) -> pl::pl_vulkan_sem {
+        // SAFETY: ash and the bindings spell `VkSemaphore` as the same
+        // pointer-shaped handle, and every value here came from a semaphore
+        // created on this device.
+        pl::pl_vulkan_sem {
+            sem: semaphore.as_raw() as usize as *mut pl::VkSemaphore_T,
+            value,
+        }
+    }
+
+    /// The "nothing to wait for" handover.
+    pub const fn no_sem() -> pl::pl_vulkan_sem {
+        pl::pl_vulkan_sem {
+            sem: ptr::null_mut(),
+            value: 0,
+        }
+    }
+
+    /// A handover on one of libplacebo's own semaphores.
+    pub const fn sem_of(semaphore: pl::VkSemaphore, value: u64) -> pl::pl_vulkan_sem {
+        pl::pl_vulkan_sem {
+            sem: semaphore,
+            value,
+        }
+    }
+
+    /// Blocks until `semaphore` reaches `value`, or `timeout` nanoseconds pass.
+    ///
+    /// Returns whether the value was reached. This is the only place the present
+    /// path stops the CPU, and it waits on the *previous* frame's handover, so
+    /// that frame's GPU work runs while this one is composed.
+    pub fn wait(&self, semaphore: pl::pl_vulkan_sem, timeout: u64) -> bool {
+        if semaphore.sem.is_null() {
+            return true;
+        }
+        let semaphores = [vk::Semaphore::from_raw(semaphore.sem as usize as u64)];
+        let values = [semaphore.value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the semaphore is a timeline semaphore on this device and the
+        // info names live locals.
+        unsafe { self.device.wait_semaphores(&info, timeout) }.is_ok()
     }
 
     /// Takes a wrapped image back, transitioning it to `layout` on the way.
@@ -351,7 +413,6 @@ impl Placebo {
         // SAFETY: the GPU is live for the borrow.
         unsafe { pl::pl_gpu_finish(self.gpu) };
     }
-
 }
 
 /// Converts an ash Vulkan format into libplacebo's spelling of the same enum.

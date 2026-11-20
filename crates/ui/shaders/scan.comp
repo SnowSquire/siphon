@@ -1,0 +1,46 @@
+#version 450
+// Counts the fill colour in the finished frame.
+//
+// The fill is a colour the interface never produces, so any texel matching it
+// is a band. This runs after the render pass, in the same submission, and
+// writes into a persistent host-visible buffer: the CPU reads it whenever it
+// likes with no fence and no copy, so watching for bands costs the frame
+// nothing but this pass.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform sampler2D frame;
+layout(std430, binding = 1) buffer Report
+{
+    uint frame_id;
+    uint count;
+    uint first_row;
+    uint last_row;
+} report;
+
+layout(push_constant) uniform Params
+{
+    uint frame_id;
+    uint width;
+    uint height;
+} pc;
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    uint total = pc.width * pc.height;
+    if (index >= total)
+        return;
+
+    if (index == 0u)
+        report.frame_id = pc.frame_id;
+
+    ivec2 at = ivec2(int(index % pc.width), int(index / pc.width));
+    vec4 c = texelFetch(frame, at, 0);
+    // The clear colour, in whatever encoding the target is in: magenta.
+    if (c.r > 0.99 && c.g < 0.01 && c.b > 0.99)
+    {
+        atomicAdd(report.count, 1u);
+        atomicMin(report.first_row, uint(at.y));
+        atomicMax(report.last_row, uint(at.y));
+    }
+}

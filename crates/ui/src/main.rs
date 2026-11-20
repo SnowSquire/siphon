@@ -26,8 +26,8 @@ mod app;
 mod chain;
 mod format;
 mod gpu;
+#[cfg(test)]
 mod hdr;
-mod placebo;
 mod renderer;
 mod rpc;
 mod service;
