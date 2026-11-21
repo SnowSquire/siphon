@@ -1,115 +1,147 @@
 ---
 name: Merge worktree back
-description: Merge an OpenCode worktree's work into this jj repo, move the session into the main checkout, and delete the worktree.
+description: Merge an OpenCode worktree's work into this jj repo, rescue media the worktree created, and delete the worktree.
 ---
 
 # Merge a worktree back into the main repo
 
-A worktree at `~/.local/share/opencode/worktree/<project>/<name>` is a **jj
-workspace on this same repo** (shared `.jj`, one commit store, detached git
-HEAD), not a clone. So there is nothing to fetch, push or `git merge`: the
-worktree's commits are already in this repo's history and are visible from
-here with `jj log` / `jj edit`. Only the *workspace pointers* differ.
+A worktree created by `worktree_create` is a **jj workspace on this same repo**
+(shared `.jj`, one commit store, detached git HEAD), not a clone. There is
+nothing to fetch, push or `git merge`: its commits are already in this repo's
+history and visible with `jj log`. Only the *workspace pointers* differ.
 
-`.` is the default workspace (this directory). Every live worktree shows up as
-an extra entry in `jj workspace list` (named `opencode-<uuid>`), and as a second
-path in `git worktree list`.
+Use the absolute directory `worktree_create` returned — it is
+`worktree_under/<repo-parent>` in some setups and
+`~/.local/share/opencode/worktree/<project>/<name>` in others; do not assume.
+`. ` (this directory) is the default workspace. Each live worktree is an extra
+`opencode-<uuid>` entry in `jj workspace list` and a second path in
+`git worktree list`.
 
-## 1. Check the worktree
+## 1. Check both sides
 
 ```bash
 cd <worktree>
-jj status          # jj snapshots automatically: a dirty tree is already IN @
-jj log -r '@|@-' --no-graph -T 'change_id.short() ++ " " ++ description.first_line() ++ "\n"'
+jj status                        # jj snapshots automatically; @ always holds the work
+jj log -r '::@' --no-graph -T 'change_id.short() ++ " " ++ commit_id.short() ++ " " ++ description.first_line() ++ "\n"' | head
 ```
 
-Nothing needs stashing or committing first — `@` always holds the work. Note the
-**change id** of `@`; it is what you move next.
+**A subagent normally leaves `@` empty** (this repo's convention), so the work
+is in `@-`, `@--`, … — `jj edit @` would merge nothing. Find the **first
+described commit** of the worktree's line: that is the source for the rebase.
 
-## 2. Merge: check the worktree's commit out here
+Then look at the main checkout:
 
 ```bash
-cd <repo>          # this directory
-jj log -r 'all()' --no-graph -T 'change_id.short() ++ " " ++ commit_id.short() ++ " " ++ description.first_line() ++ "\n"' | head
-jj edit <change-id>
-jj status          # the worktree's files are now the working copy here
+cd <repo>
+jj log -r 'ancestors(@, 10)' --no-graph -T 'change_id.short() ++ " " ++ description.first_line() ++ "\n"'
 ```
 
-`jj edit` is the whole merge. It rewrites files into this workspace's working
-copy and leaves the worktree untouched. jj 0.47 allows a commit to be checked
-out in two workspaces at once (`edit` succeeds even while the worktree still
-exists); if a future jj refuses, run `jj workspace forget <workspace>` from the
-worktree's `jj workspace list` entry first, then retry.
+Both sides almost always have commits off a common base (you were working in
+parallel), so this is a **rebase**, not a checkout.
 
-If the worktree's history has diverged from this repo's `@` (e.g. both sides
-have commits), rebase instead of checking out the old tip:
+## 2. Move the worktree's commits on top of yours
 
 ```bash
-jj rebase -s <change-id> -d '@'     # put the worktree work on top of this @
+cd <repo>                                  # @ here is your empty working copy
+jj rebase -s <first-worktree-commit> -d '@'
+jj abandon <worktree-empty-@>              # the empty tip, if it came along
+jj edit <last-worktree-commit>             # @ = the merged tip
+jj new                                     # empty @ on top
+jj abandon <the-empty-commit-that-was-your-@>   # leaves no empty commit mid-history
 ```
 
-Then `jj edit` the resulting commit.
+Verify: `jj log -r 'ancestors(@, 10)'` shows your commits, then the worktree's,
+with `@` empty and undescribed on top. `jj status` must be clean — if it is not,
+the rebase dropped something; inspect with `jj diff --git` before going on.
 
-## 3. Finalize
+Do **not** squash the worktree's commits into one, and do not squash them into
+an undescribed parent: keep them as their own described commits so they can be
+reviewed or squashed later with `jj squash --from <id>`.
+
+## 3. Rescue anything the worktree *created* that git ignores
+
+The startup hook hardlinks `captures/` from this repo *into* the worktree, so
+those files already exist here. But anything the worktree **generated** —
+`servermock/segments/`, a fresh `captures/<name>/`, build output — exists only
+in that directory and dies with it. Copy it out first, hardlinked:
 
 ```bash
-jj commit -m "<type>: <what the worktree did>"    # leaves an empty @ on top
-jj log -r '@|@-' --no-graph
+[ -e <repo>/captures/servermock ] || cp -al <worktree>/servermock/segments <repo>/captures/servermock
+stat -c '%h %n' <repo>/captures/servermock/chunks/000.ts   # link count >= 2 means shared, no extra disk
 ```
 
-Keep the work as its own commit rather than squashing it into an unreviewed
-`wip:` parent — the maintainer can squash later with `jj squash --from <id>`.
+Repeat for every ignored path the task produced. Check with
+`git -C <worktree> status --ignored --short | head` if unsure.
 
-## 4. Move the session, then delete the worktree
+## 4. Confirm nothing unique is lost
 
-Both are tools, not shell commands, and the order matters — the session cannot
-outlive the directory it is sitting in.
+`diff -r` between the directories is **not** a useful check: the worktree's
+working copy is its own (usually older) base, so it differs wherever *your* side
+moved on — notes, `todo.md`, files you split or deleted. That is staleness, not
+lost work.
 
-```
-tools.opencode.session_move({ directory: "<repo>" })
-tools.opencode.worktree_remove({ directory: "<worktree>" })
-```
-
-`worktree_remove` **will refuse with "it has modified or untracked files"** even
-though `jj status` is clean. Its check is git's, and the colocated git HEAD /
-index lags behind jj: every file jj ever touched looks modified. Confirm there is
-no unique content, then force it:
+Compare the worktree's committed change instead:
 
 ```bash
-diff -r --exclude=target --exclude=.git --exclude=.jj --exclude=node_modules \
-     --exclude=segments --exclude=captures --exclude=manifest \
-     "<worktree>" "<repo>"     # only ignored build artefacts may differ
+jj diff --from <common-base> --to <last-worktree-commit> --stat   # what it actually changed
 ```
 
-```
-tools.opencode.worktree_remove({ directory: "<worktree>", force: true })
-```
+Then check only those paths exist identically in this checkout (for a
+`servermock/**`-only task, `diff -r <worktree>/servermock <repo>/servermock` —
+excluding the ignored media — must be empty). A diff in files the worktree never
+committed is expected and means nothing.
 
-Do not `rm -rf` the worktree and do not call `git worktree remove`: that leaves a
-stale `jj workspace` entry and jj then errors on every command in the repo.
+## 5. Remove the worktree
 
-## 5. Verify
+`worktree_remove` fails even with `force: true` in a jj-colocated repo (its check
+is git's, and git's index lags jj). Forget the workspace instead — that removes
+both the jj workspace and git's worktree registration:
 
 ```bash
-jj workspace list     # only "default (current)"
-git worktree list     # only this repo
-ls ~/.local/share/opencode/worktree/<project>/    # worktree dir gone
-jj status             # @ empty, @- is the merged commit
+jj workspace forget <opencode-uuid>     # prints "Removed Git worktree for ..."
+jj workspace list                       # entry gone
+git worktree list                       # entry gone
+```
+
+Then delete the directory (safe *after* the forget — the warning about `rm -rf`
+is about deleting it while the workspace is still registered):
+
+```bash
+rm -rf <worktree>
+```
+
+If you are sitting in the worktree, `tools.opencode.session_move({ directory:
+"<repo>" })` first: the session cannot outlive its directory. Never call
+`git worktree remove` — it leaves the jj workspace entry and every later jj
+command errors.
+
+## 6. Verify
+
+```bash
+jj status               # @ empty, @- is the merged commit
+jj workspace list       # only "default (current)" (plus unrelated worktrees)
+git worktree list       # only this repo (plus unrelated worktrees)
+ls <worktree-parent>    # the directory is gone
 ```
 
 ## Pitfalls
 
-- **`jj workspace list` names the workspace, not the worktree directory.** The
-  entry is `opencode-<uuid>`; match it by commit id, not by name.
-- **The two workspaces share one op log.** A `jj commit` / `describe` / `squash`
-  here rewrites `@`, and the worktree's `@` (same change id) follows on its next
-  jj command — which is why the worktree reads "no changes" after the merge
-  instead of showing the diff you just committed.
-- **`jj status` in the worktree after the merge is not evidence of anything**;
-  check `jj log` in the main repo instead.
-- **`git` is a trap here**: detached HEAD, stale index, and it reports the
-  merged files as modified. Use `jj diff --git` / `jj log`, and only force the
-  worktree removal after the `diff -r` check above.
-- The worktree startup hook hardlinks `captures/` and `servermock/segments/`
-  from this repo (`scripts/worktree-setup.sh`); deleting the worktree never
-  touches the originals.
+- **Empty `@` is the norm, not an exception.** Rebasing *from* the first
+  described commit is the merge; `jj edit @` is a no-op.
+- **`jj workspace list` names the workspace, not the directory.** The entry is
+  `opencode-<uuid>`; match it by commit id.
+- **The two workspaces share one op log.** A `jj commit`/`describe`/`rebase` here
+  rewrites `@`, and the worktree's `@` (same change id) follows on its next jj
+  command — which is why the worktree then reads "no changes" instead of showing
+  the diff you just committed. `jj status` in the worktree after the merge is
+  not evidence of anything.
+- **Ignored media is per-directory.** Hardlinks into the worktree point *at* this
+  repo's files; files the worktree generated point nowhere else. Rescue those
+  before removing it.
+- **`git` is a trap**: detached HEAD, stale index, reports merged files as
+  modified. Use `jj diff --git` / `jj log`, and only use git for
+  `git worktree list`.
+- **`rm -rf` only after `jj workspace forget`**. Deleting a registered workspace
+  leaves a stale entry and jj errors on every command in the repo.
+- The startup hook (`scripts/worktree-setup.sh`) hardlinks `captures/` from this
+  checkout; deleting the worktree never touches the originals.
