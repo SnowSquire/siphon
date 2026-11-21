@@ -686,14 +686,75 @@ struct RunRecordMeta {
 // Disk state
 // ---------------------------------------------------------------------------
 
+/// What the live recorder is doing. Orthogonal to where the DVR cursor is: the
+/// two together are the whole control state of the recording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    /// Discovery in progress; live segments are recorded into runs.
-    LiveRuns,
-    /// The canonical is the DVR file and live runs become holes.
-    Dvr,
-    /// No DVR ever appeared; the canonical is the live stream directly.
+enum Live {
+    /// Segments are still arriving and are recorded into runs.
+    Recording,
+    /// The DVR reached the run that is still recording: the main loop drains and
+    /// closes it, then the DVR continues past it.
+    Draining,
+    /// Nothing more will come from the live playlist.
+    Done,
+}
+
+/// A run the DVR cursor cannot pass: its hole is only sized once the run closes.
+/// Holds the chunk that crosses the run's start, whose `pdt - start` is the
+/// other side of the alignment check.
+#[derive(Clone, Debug)]
+struct Parked {
+    run: u32,
+    /// Time the DVR resumes at once the run's hole is reserved.
+    hole_start: u64,
+    crossing: DvrSegment,
+}
+
+/// Where the recording is in its life. Every combination the old flags allowed
+/// but never meant (a handoff with no parked run, a canonical with no DVR) is
+/// unrepresentable here.
+#[derive(Clone, Debug)]
+enum Phase {
+    /// Discovery in progress: live segments go into runs and there is no
+    /// canonical yet.
+    Discovering,
+    /// The canonical is the DVR file.
+    Dvr { live: Live, parked: Option<Parked> },
+    /// No DVR ever appeared: the canonical is the live stream directly.
     Promoted,
+}
+
+impl Phase {
+    /// The DVR file owns the canonical and nothing is parked.
+    const fn following() -> Self {
+        Self::Dvr {
+            live: Live::Recording,
+            parked: None,
+        }
+    }
+
+    const fn dvr(&self) -> bool {
+        matches!(self, Self::Dvr { .. })
+    }
+
+    const fn promoted(&self) -> bool {
+        matches!(self, Self::Promoted)
+    }
+
+    /// The live side's state; a non-DVR recording only ever records.
+    const fn live(&self) -> Live {
+        match self {
+            Self::Dvr { live, .. } => *live,
+            Self::Discovering | Self::Promoted => Live::Recording,
+        }
+    }
+
+    const fn parked(&self) -> Option<&Parked> {
+        match self {
+            Self::Dvr { parked, .. } => parked.as_ref(),
+            Self::Discovering | Self::Promoted => None,
+        }
+    }
 }
 
 type MapKey = (String, Option<(u64, u64)>);
@@ -746,12 +807,6 @@ impl RunData {
     }
 }
 
-struct Blocked {
-    run: u32,
-    hole_start: u64,
-    crossing: DvrSegment,
-}
-
 struct InFlightChunk {
     chunk: DvrSegment,
     dst_offset: u64,
@@ -787,7 +842,9 @@ struct Disk {
     /// once and can still be inserted if the canonical's active map changes.
     map_cache: MapCache,
 
-    mode: Mode,
+    /// The whole control state: what the canonical is, where the DVR cursor is
+    /// and what the live recorder may still do.
+    phase: Phase,
     canonical: Option<Canonical>,
     current_run: Option<RunData>,
     closed_runs: VecDeque<RunData>,
@@ -795,15 +852,12 @@ struct Disk {
     live_edge: Option<(u64, u64, bool)>, // (start, end, pdt domain)
     live_origin: Option<i64>,
     live_open: bool,
-    handoff: bool,
-    handoff_done: bool,
 
     clock: Option<Clock>,
     dvr_origin: Option<i64>,
     dvr_next_start_ms: u64,
     resume_abs: Option<u64>,
     resume_clock: Option<Clock>,
-    blocked: Option<Blocked>,
     in_flight: Option<InFlightChunk>,
     copies: Vec<CopyJob>,
     dvr_stall: u64,
@@ -852,7 +906,7 @@ async fn run_disk(
         dvr_arena: Rc::new(ArenaSet::new()),
         dvr_wakes: WakeSet::new(),
         map_cache: HashMap::new(),
-        mode: Mode::LiveRuns,
+        phase: Phase::Discovering,
         canonical: None,
         current_run: None,
         closed_runs: VecDeque::new(),
@@ -860,14 +914,11 @@ async fn run_disk(
         live_edge: None,
         live_origin: None,
         live_open: true,
-        handoff: false,
-        handoff_done: false,
         clock: None,
         dvr_origin: None,
         dvr_next_start_ms: 0,
         resume_abs: None,
         resume_clock: None,
-        blocked: None,
         in_flight: None,
         copies: Vec::new(),
         dvr_stall: 0,
@@ -1003,59 +1054,71 @@ impl Disk {
         self.notify(message);
     }
 
+    /// Resume, or start from nothing: the index decides which of the note's
+    /// five resume cases applies.
     async fn startup(&mut self) -> Result<(), DiskOutputError> {
-        let resume =
-            read_canonical(&self.dir, self.options.stream_id, self.options.keep_runs).await?;
         let has_url = self.dvr.url().is_some();
+        let snapshot = read_canonical(
+            &self.dir,
+            self.options.stream_id,
+            self.options.keep_runs,
+        )
+        .await?;
 
-        if let Some(snapshot) = resume {
-            self.next_run = snapshot.next_run;
-            self.live_origin = snapshot.live_origin;
-            if snapshot.has_dvr {
-                // DVR records: the canonical is the DVR file. Without a URL the
-                // discovery deadline decides; DVR -> live is not automatic.
-                self.mode = Mode::Dvr;
-                self.resume_abs = Some(snapshot.resume_abs);
-                self.resume_clock = snapshot.resume_clock;
-                self.dvr_seen_url = has_url;
-                self.canonical = Some(open_canonical(&self.dir, snapshot).await?);
-            } else if has_url {
-                // Promoted live recording, now with a DVR: rename it to a run,
-                // start a fresh canonical and prefill from the broadcast start.
-                let run_number = self.next_run;
-                let run = rename_canonical_to_run(&self.dir, run_number, snapshot).await?;
-                self.closed_runs.push_back(run);
-                self.next_run = run_number.saturating_add(1);
-                self.canonical = Some(create_canonical(&self.dir, self.options.stream_id).await?);
-                self.mode = Mode::Dvr;
-                self.dvr_next_start_ms = 0;
-                self.dvr_seen_url = true;
-            } else {
-                self.canonical = Some(open_canonical(&self.dir, snapshot).await?);
-                self.mode = Mode::Promoted;
-                self.live_open = true;
-            }
-        } else {
+        let Some(snapshot) = snapshot else {
             self.next_run = scan_run_number(&self.dir);
-            self.mode = Mode::LiveRuns;
             if has_url {
-                // The DVR URL can already be known (debug, or discovery won the
-                // race with the disk task); start the canonical immediately.
-                self.canonical = Some(create_canonical(&self.dir, self.options.stream_id).await?);
-                self.mode = Mode::Dvr;
-                self.dvr_seen_url = true;
+                // Discovery won the race with the disk task (debug, or a resume
+                // whose URL is already known): start the canonical immediately.
+                let canonical = create_canonical(&self.dir, self.options.stream_id).await?;
+                self.enter_dvr(canonical);
             }
+            debug!(
+                phase = ?self.phase,
+                next_run = self.next_run,
+                "disk: recording started"
+            );
+            return Ok(());
+        };
+
+        self.next_run = snapshot.next_run;
+        self.live_origin = snapshot.live_origin;
+        if snapshot.has_dvr {
+            // DVR records: the canonical is the DVR file. Without a URL the
+            // discovery deadline decides; DVR -> live is not automatic.
+            self.resume_abs = Some(snapshot.resume_abs);
+            self.resume_clock = snapshot.resume_clock;
+            let canonical = open_canonical(&self.dir, &snapshot).await?;
+            self.enter_dvr(canonical);
+            self.dvr_seen_url = has_url;
+        } else if has_url {
+            // A promoted live recording that now has a DVR: rename it to a run,
+            // start a fresh canonical and prefill from the broadcast start.
+            let run = rename_canonical_to_run(&self.dir, self.next_run, &snapshot).await?;
+            self.closed_runs.push_back(run);
+            self.next_run = self.next_run.saturating_add(1);
+            let canonical = create_canonical(&self.dir, self.options.stream_id).await?;
+            self.enter_dvr(canonical);
+            self.dvr_next_start_ms = 0;
+        } else {
+            self.canonical = Some(open_canonical(&self.dir, &snapshot).await?);
+            self.phase = Phase::Promoted;
+            self.live_open = true;
         }
 
-        if self.mode == Mode::Dvr && has_url {
-            self.dvr_seen_url = true;
-        }
         debug!(
-            mode = ?self.mode,
+            phase = ?self.phase,
             next_run = self.next_run,
             "disk: recording started"
         );
         Ok(())
+    }
+
+    /// Take the DVR file as the canonical from now on.
+    fn enter_dvr(&mut self, canonical: Canonical) {
+        self.canonical = Some(canonical);
+        self.phase = Phase::following();
+        self.dvr_seen_url = true;
     }
 
     async fn run(&mut self) -> Result<(), DiskOutputError> {
@@ -1100,7 +1163,7 @@ impl Disk {
                 }
             }
 
-            if self.handoff && !self.handoff_done {
+            if self.phase.live() == Live::Draining {
                 self.drain_live().await?;
             }
 
@@ -1136,18 +1199,18 @@ impl Disk {
     async fn on_dvr_update(&mut self) -> Result<(), DiskOutputError> {
         self.dvr_stall = self.dvr_stall.wrapping_add(1);
         self.stall_armed = None;
-        if self.dvr.url().is_some() && !self.dvr_seen_url {
-            self.dvr_seen_url = true;
-            if self.mode == Mode::Promoted {
-                self.notify(
-                    "disk: DVR playlist appeared after the live promotion; continuing live-only",
-                );
-            }
-            if self.mode == Mode::LiveRuns {
-                self.canonical = Some(create_canonical(&self.dir, self.options.stream_id).await?);
-                self.mode = Mode::Dvr;
-                info!("disk: DVR playlist discovered, switching to the canonical DVR file");
-            }
+        if self.dvr.url().is_none() || self.dvr_seen_url {
+            return Ok(());
+        }
+        self.dvr_seen_url = true;
+        if matches!(self.phase, Phase::Discovering) {
+            let canonical = create_canonical(&self.dir, self.options.stream_id).await?;
+            self.enter_dvr(canonical);
+            info!("disk: DVR playlist discovered, switching to the canonical DVR file");
+        } else if self.phase.promoted() {
+            self.notify(
+                "disk: DVR playlist appeared after the live promotion; continuing live-only",
+            );
         }
         Ok(())
     }
@@ -1170,37 +1233,36 @@ impl Disk {
                 return Ok(());
             }
         }
-        match self.mode {
-            Mode::LiveRuns => {
-                self.notify(
-                    "disk: no DVR playlist found; promoting the live recording to the canonical file",
-                );
-                self.promote().await?;
-            }
-            Mode::Promoted => {}
-            Mode::Dvr => {
-                self.notify_error("disk: DVR playlist disappeared; recording stopped");
-                return Err(DiskOutputError::Io(std::io::Error::other(
-                    "DVR disappeared",
-                )));
-            }
+        if matches!(self.phase, Phase::Discovering) {
+            self.notify(
+                "disk: no DVR playlist found; promoting the live recording to the canonical file",
+            );
+            self.promote().await?;
+        } else if self.phase.dvr() {
+            self.notify_error("disk: DVR playlist disappeared; recording stopped");
+            return Err(DiskOutputError::Io(std::io::Error::other(
+                "DVR disappeared",
+            )));
         }
         Ok(())
     }
 
     async fn on_live(&mut self, message: SegmentMessage) -> Result<(), DiskOutputError> {
-        if self.handoff || self.handoff_done {
+        if self.phase.live() != Live::Recording {
             return Ok(());
         }
         match message {
-            SegmentMessage::Segment(segment) => match self.mode {
-                Mode::Promoted => self.write_promoted(segment).await,
-                Mode::LiveRuns | Mode::Dvr => self.write_live(segment).await,
-            },
+            SegmentMessage::Segment(segment) => {
+                if self.phase.promoted() {
+                    self.write_promoted(segment).await
+                } else {
+                    self.write_live(segment).await
+                }
+            }
             // fMP4 map. TS streams carry none. A map change closes the current
             // run, so every run is self-contained: its init is always leading.
             SegmentMessage::Init { mut reader } => {
-                if self.mode == Mode::Promoted {
+                if self.phase.promoted() {
                     let bytes =
                         read_reader_bytes(&mut reader, &self.live_wake, MAX_INIT_BYTES).await?;
                     if let Some(canonical) = &mut self.canonical {
@@ -1460,9 +1522,31 @@ impl Disk {
         Ok(())
     }
 
+    /// Park the DVR cursor at a run's trailing edge.
+    fn park(&mut self, parked: Parked) {
+        if let Phase::Dvr {
+            parked: slot, ..
+        } = &mut self.phase
+        {
+            *slot = Some(parked);
+        }
+    }
+
+    const fn unpark(&mut self) -> Option<Parked> {
+        match &mut self.phase {
+            Phase::Dvr { parked, .. } => parked.take(),
+            Phase::Discovering | Phase::Promoted => None,
+        }
+    }
+
+    const fn set_live(&mut self, live: Live) {
+        if let Phase::Dvr { live: slot, .. } = &mut self.phase {
+            *slot = live;
+        }
+    }
+
     async fn drain_live(&mut self) -> Result<(), DiskOutputError> {
-        self.handoff_done = true;
-        self.handoff = true;
+        self.set_live(Live::Done);
         // The DVR is authoritative from the live edge on. Anything still queued
         // is content the DVR chunk we just wrote (and the chunks that follow)
         // already supplies, so it is dropped rather than becoming one more run.
@@ -1474,26 +1558,21 @@ impl Disk {
         // of queueing segments nobody reads (which would pin arena slots).
         self.live_rx = None;
         self.close_current_run().await?;
-        self.handoff = false;
         info!("disk: DVR reached the live edge, live recorder handed off");
         Ok(())
     }
 
     async fn on_live_closed(&mut self) -> Result<(), DiskOutputError> {
         self.close_current_run().await?;
-        match self.mode {
-            Mode::Promoted => {
-                self.finished = true;
-            }
-            Mode::LiveRuns => {
-                self.promote().await?;
-                self.finished = true;
-            }
-            Mode::Dvr => {
-                // Keep going until the DVR playlist says ENDLIST and every chunk
-                // has been written.
-                self.pump().await?;
-            }
+        if self.phase.promoted() {
+            self.finished = true;
+        } else if matches!(self.phase, Phase::Discovering) {
+            self.promote().await?;
+            self.finished = true;
+        } else {
+            // Keep going until the DVR playlist says ENDLIST and every chunk has
+            // been written.
+            self.pump().await?;
         }
         Ok(())
     }
@@ -1573,7 +1652,7 @@ impl Disk {
             }
         }
         self.canonical = Some(canonical);
-        self.mode = Mode::Promoted;
+        self.phase = Phase::Promoted;
         info!("disk: promoted the live recording to the canonical file");
         Ok(())
     }
@@ -1615,13 +1694,13 @@ impl Disk {
             ));
             self.dvr_stall = self.dvr_stall.wrapping_add(1);
             self.stall_armed = None;
-            if let Some(blocked) = self.blocked.take() {
+            if let Some(parked) = self.unpark()
+                && let Some(run) = self.take_run(parked.run)
+            {
                 // Without the crossing chunk there is no aligned hole; abandon
                 // the run and let the DVR's later chunks supply what they can.
-                if let Some(run) = self.take_run(blocked.run) {
-                    self.abandon_run(run, in_flight.chunk.start_ms, in_flight.chunk.start_ms)
-                        .await?;
-                }
+                self.abandon_run(run, in_flight.chunk.start_ms, in_flight.chunk.start_ms)
+                    .await?;
             }
             self.dvr_next_start_ms = in_flight
                 .chunk
@@ -1733,9 +1812,11 @@ impl Disk {
         self.closed_runs.front().or(self.current_run.as_ref())
     }
 
+    /// Drive the DVR: fetch the chunk the cursor points at, park when it reaches
+    /// a run, and continue once that run's hole is reserved.
     async fn pump(&mut self) -> Result<(), DiskOutputError> {
         loop {
-            if self.mode != Mode::Dvr || self.stop || self.finished {
+            if !self.phase.dvr() || self.stop || self.finished {
                 return Ok(());
             }
             if self.in_flight.is_some() {
@@ -1747,47 +1828,37 @@ impl Disk {
             };
             self.ensure_clock(&timeline);
 
-            if let Some(blocked) = &self.blocked {
-                let run_number = blocked.run;
-                if self.run_is_closed(run_number) {
-                    let Some(run) = self.take_run(run_number) else {
-                        self.blocked = None;
-                        continue;
-                    };
-                    let blocked = self.blocked.take().unwrap();
-                    self.process_hole(run, &blocked, &timeline).await?;
+            // The cursor cannot pass a run until its hole is sized, and a hole
+            // is only sized once the run closes.
+            if let Some(number) = self.phase.parked().map(|parked| parked.run) {
+                if self.run_is_closed(number) {
+                    self.reserve_parked_hole(&timeline).await?;
                     continue;
                 }
-                if self.run_is_open(run_number) && !self.handoff && !self.handoff_done {
-                    // The DVR has reached the run that is still recording: this
-                    // is the handoff point. The main loop drains and closes it.
-                    self.handoff = true;
+                if self.run_is_open(number) && self.phase.live() == Live::Recording {
+                    // The DVR reached the run that is still recording: this is
+                    // the handoff point. The main loop drains and closes it.
+                    self.set_live(Live::Draining);
                 }
                 self.arm_stall();
                 return Ok(());
             }
 
-            if self.handoff_done {
+            if self.phase.live() == Live::Done {
                 // A run created after the handoff is already covered by the DVR
                 // (or by the chunk that will be published next); discard it.
-                while let Some(run) = self.closed_runs.pop_front() {
-                    debug!(run = run.number, "disk: discarding post-handoff live run");
-                    self.delete_run(&run).await;
-                }
+                self.discard_closed_runs("post-handoff").await;
             } else if !self.live_open && self.next_unprocessed_run().is_none() {
                 // The live source closed before any run existed: the DVR owns the
                 // whole archive and there is nothing left to protect.
-                self.handoff_done = true;
+                self.set_live(Live::Done);
             }
 
             // The DVR has published everything it will ever have and the cursor
             // is past its last chunk: any remaining live run is past the end of
             // the broadcast and cannot be holed. Drop it rather than deadlock.
             if timeline.ended && !self.live_open && self.next_chunk(&timeline).is_none() {
-                while let Some(run) = self.closed_runs.pop_front() {
-                    debug!(run = run.number, "disk: discarding run past the DVR end");
-                    self.delete_run(&run).await;
-                }
+                self.discard_closed_runs("past the DVR end").await;
                 self.check_done();
                 return Ok(());
             }
@@ -1803,7 +1874,7 @@ impl Disk {
                 return Ok(());
             }
 
-            if !self.handoff_done && self.next_unprocessed_run().is_none() {
+            if self.phase.live() != Live::Done && self.next_unprocessed_run().is_none() {
                 // No live segment yet: wait for the live start before prefilling.
                 self.arm_stall();
                 return Ok(());
@@ -1818,7 +1889,7 @@ impl Disk {
                 return Ok(());
             };
 
-            if self.handoff_done {
+            if self.phase.live() == Live::Done {
                 self.start_fetch(chunk, false, &timeline).await?;
                 return Ok(());
             }
@@ -1830,6 +1901,7 @@ impl Disk {
             let Some(run_start) = run.first_time(clock, self.live_origin) else {
                 return Ok(());
             };
+            let run_number = run.number;
             let chunk_start = chunk_time_of(&chunk, clock, self.dvr_origin);
             let chunk_end = chunk_start.saturating_add(chunk.duration_ms);
 
@@ -1849,25 +1921,41 @@ impl Disk {
             // The DVR starts after the run (retention window): the run has no
             // recoverable leading content. The first available chunk is the
             // hole's start.
-            let run_number = run.number;
-            self.blocked = Some(Blocked {
+            self.park(Parked {
                 run: run_number,
                 hole_start: chunk_start,
                 crossing: chunk.clone(),
             });
             if self.run_is_closed(run_number) {
-                let Some(run) = self.take_run(run_number) else {
-                    self.blocked = None;
-                    continue;
-                };
-                let blocked = self.blocked.take().unwrap();
-                self.process_hole(run, &blocked, &timeline).await?;
+                self.reserve_parked_hole(&timeline).await?;
                 continue;
             }
-            if self.run_is_open(run_number) && !self.handoff_done {
-                self.handoff = true;
+            if self.run_is_open(run_number) && self.phase.live() != Live::Done {
+                self.set_live(Live::Draining);
             }
             return Ok(());
+        }
+    }
+
+    /// The parked run has closed: reserve its hole and let the DVR move on.
+    async fn reserve_parked_hole(
+        &mut self,
+        timeline: &DvrTimeline,
+    ) -> Result<(), DiskOutputError> {
+        let Some(parked) = self.unpark() else {
+            return Ok(());
+        };
+        let Some(run) = self.take_run(parked.run) else {
+            debug!(run = parked.run, "disk: parked run is gone");
+            return Ok(());
+        };
+        self.process_hole(run, &parked, timeline).await
+    }
+
+    async fn discard_closed_runs(&mut self, why: &str) {
+        while let Some(run) = self.closed_runs.pop_front() {
+            debug!(run = run.number, why, "disk: discarding live run");
+            self.delete_run(&run).await;
         }
     }
 
@@ -1918,14 +2006,20 @@ impl Disk {
             let clock = self.clock.unwrap_or(Clock::Elapsed);
             let hole_start =
                 chunk_time_of(&chunk, clock, self.dvr_origin).saturating_add(chunk.duration_ms);
-            let Some(run) = self.next_unprocessed_run() else {
+            let Some(run) = self.next_unprocessed_run().map(|run| run.number) else {
                 return Ok(());
             };
-            self.blocked = Some(Blocked {
-                run: run.number,
-                hole_start,
-                crossing: chunk.clone(),
-            });
+            // Direct field write: `canonical` is borrowed for `dst_offset` below.
+            if let Phase::Dvr {
+                parked: slot, ..
+            } = &mut self.phase
+            {
+                *slot = Some(Parked {
+                    run,
+                    hole_start,
+                    crossing: chunk.clone(),
+                });
+            }
         }
         let dst_offset = canonical.segs_end;
         self.in_flight = Some(InFlightChunk {
@@ -2007,43 +2101,45 @@ impl Disk {
         self.dvr_origin = dvr_origin;
     }
 
+    /// Size the parked run's hole, reserve it and start the copy: the run's
+    /// uncovered middle goes into the canonical in front of the DVR's next
+    /// chunk, and its edges are trimmed because the DVR wrote those chunks whole.
     async fn process_hole(
         &mut self,
         run: RunData,
-        blocked: &Blocked,
+        parked: &Parked,
         timeline: &DvrTimeline,
     ) -> Result<(), DiskOutputError> {
         let clock = self.clock.unwrap_or(Clock::Elapsed);
         let Some(run_end) = run.last_end(clock, self.live_origin) else {
-            self.abandon_run(run, blocked.hole_start, blocked.hole_start)
+            self.abandon_run(run, parked.hole_start, parked.hole_start)
                 .await?;
-            self.advance_past(timeline, blocked.hole_start, clock);
+            self.advance_past(timeline, parked.hole_start, clock);
             return Ok(());
         };
-        let end = hole_end(timeline, run_end, clock, self.dvr_origin).unwrap_or(blocked.hole_start);
-        let hole_end = end.max(blocked.hole_start);
+        let end = hole_end(timeline, run_end, clock, self.dvr_origin).unwrap_or(parked.hole_start);
+        let hole_end = end.max(parked.hole_start);
         let plan = plan_hole(
             &run.records,
-            blocked.hole_start,
+            parked.hole_start,
             hole_end,
             clock,
             self.live_origin,
         );
 
-        if self.origin_mismatch(&run, blocked, timeline, clock, hole_end) {
+        if self.origin_mismatch(&run, parked, timeline, clock, hole_end) {
             self.notify_error(format!(
                 "disk: DVR/live alignment mismatch around run {}; leaving a zero-filled hole",
                 run.number
             ));
-            self.abandon_run(run, blocked.hole_start, hole_end).await?;
+            self.abandon_run(run, parked.hole_start, hole_end).await?;
             self.advance_past(timeline, hole_end, clock);
             return Ok(());
         }
 
         if plan.segs_len == 0 || plan.records == 0 {
             // The run lies entirely inside a DVR chunk; no copy is needed.
-            self.write_run_marker(&run, &HolePlan::default(), blocked.hole_start, true)
-                .await?;
+            self.write_zero_filled_marker(&run, &HolePlan::default()).await?;
             self.delete_run(&run).await;
             self.advance_past(timeline, hole_end, clock);
             return Ok(());
@@ -2070,7 +2166,7 @@ impl Disk {
         for meta in &run.records {
             let time = record_time(&meta.segment, clock, self.live_origin);
             let record_end = time.saturating_add(record_duration(&meta.segment));
-            if time >= blocked.hole_start && record_end <= hole_end {
+            if time >= parked.hole_start && record_end <= hole_end {
                 let mut record = Record::Segment(meta.segment.clone());
                 record.rebase(delta, &mut init_counter);
                 record.encode(&mut rebased);
@@ -2157,17 +2253,18 @@ impl Disk {
     ) -> Result<(), DiskOutputError> {
         let clock = self.clock.unwrap_or(Clock::Elapsed);
         let plan = plan_hole(&run.records, hole_start, hole_end, clock, self.live_origin);
-        self.write_run_marker(&run, &plan, hole_start, true).await?;
+        self.write_zero_filled_marker(&run, &plan).await?;
         self.delete_run(&run).await;
         Ok(())
     }
 
-    async fn write_run_marker(
+    /// Reserve a complete `Run` marker whose bytes are never written, so the
+    /// span stays zero-filled: the run was covered by a DVR chunk, or its hole
+    /// was abandoned. Either way it is final, not pending.
+    async fn write_zero_filled_marker(
         &mut self,
         run: &RunData,
         plan: &HolePlan,
-        _hole_start: u64,
-        complete: bool,
     ) -> Result<(), DiskOutputError> {
         let Some(canonical) = &mut self.canonical else {
             return Ok(());
@@ -2179,7 +2276,7 @@ impl Disk {
             source_segs_offset: plan.source_segs_offset,
             source_index_offset: plan.source_index_offset,
             record_len: 0,
-            complete: u8::from(complete),
+            complete: 1,
         });
         write_record(&mut canonical.index, canonical.index_end, &marker).await?;
         canonical.index_end += u64::from(1 + RUN_BODY);
@@ -2191,7 +2288,7 @@ impl Disk {
     fn origin_mismatch(
         &self,
         run: &RunData,
-        blocked: &Blocked,
+        parked: &Parked,
         timeline: &DvrTimeline,
         clock: Clock,
         hole_end_time: u64,
@@ -2202,7 +2299,7 @@ impl Disk {
         let Some(live) = run.origin() else {
             return false;
         };
-        let Some(start_dvr) = origin_of(blocked.crossing.pdt_ms, blocked.crossing.start_ms) else {
+        let Some(start_dvr) = origin_of(parked.crossing.pdt_ms, parked.crossing.start_ms) else {
             return false;
         };
         if (live - start_dvr).abs() > ORIGIN_TOLERANCE_MS {
@@ -2268,17 +2365,18 @@ impl Disk {
         if self.stop || self.finished {
             return;
         }
-        if self.mode == Mode::Promoted {
+        if self.phase.promoted() {
             if !self.live_open {
                 self.finished = true;
             }
             return;
         }
-        if self.mode != Mode::Dvr {
+        if !self.phase.dvr() {
             return;
         }
         if !self.live_open
-            && !self.handoff
+            && self.phase.live() != Live::Draining
+            && self.phase.parked().is_none()
             && self.in_flight.is_none()
             && self.copies.is_empty()
             && self.closed_runs.is_empty()
@@ -2297,7 +2395,7 @@ impl Disk {
             canonical.segs.sync_all().await?;
             canonical.index.sync_all().await?;
         }
-        if self.mode == Mode::LiveRuns {
+        if matches!(self.phase, Phase::Discovering) {
             self.promote().await?;
         }
         Ok(())
@@ -2959,7 +3057,7 @@ async fn create_canonical(dir: &Path, stream_id: u64) -> Result<Canonical, DiskO
     })
 }
 
-async fn open_canonical(dir: &Path, snapshot: Snapshot) -> Result<Canonical, DiskOutputError> {
+async fn open_canonical(dir: &Path, snapshot: &Snapshot) -> Result<Canonical, DiskOutputError> {
     let segs = OpenOptions::new()
         .read(true)
         .write(true)
@@ -2983,7 +3081,7 @@ async fn open_canonical(dir: &Path, snapshot: Snapshot) -> Result<Canonical, Dis
 async fn rename_canonical_to_run(
     dir: &Path,
     number: u32,
-    snapshot: Snapshot,
+    snapshot: &Snapshot,
 ) -> Result<RunData, DiskOutputError> {
     let (segs_path, index_path) = run_paths(dir, number);
     compio::fs::rename(dir.join("segs"), &segs_path).await?;
