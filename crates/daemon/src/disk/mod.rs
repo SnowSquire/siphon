@@ -50,8 +50,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::io::Read;
-use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -61,7 +59,6 @@ use std::time::UNIX_EPOCH;
 use compio::buf::IoBuf;
 use compio::fs::File;
 use compio::fs::OpenOptions;
-use compio::io::AsyncReadAtExt;
 use compio::io::AsyncWriteAtExt;
 use futures_util::future::Either;
 use futures_util::future::select;
@@ -71,21 +68,59 @@ use kanal::AsyncSender;
 use kanal::Receiver;
 use kanal::Sender;
 use tracing::debug;
-use tracing::debug_span;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 use xxhash_rust::xxh3::Xxh3;
 use xxhash_rust::xxh3::xxh3_128;
 
-use crate::constants::DVR_SLOTS_MAX;
+use self::index::HEADER_LEN;
+use self::index::INDEX_VERSION;
+use self::index::InitRecord;
+use self::index::RUN_BODY;
+use self::index::RUN_COMPLETE_OFFSET;
+use self::index::Record;
+use self::index::RunRecord;
+use self::index::SEGMENT_BODY;
+use self::index::SOURCE_DVR;
+use self::index::SOURCE_LIVE;
+use self::index::SegmentRecord;
+use self::io::append_live_segment;
+use self::io::copy_between;
+use self::io::fetch_map;
+use self::io::read_exact_at;
+use self::io::read_reader_bytes;
+use self::io::read_run_init;
+use self::io::spawn_copy;
+use self::io::spawn_fetch;
+use self::io::write_discontinuities;
+use self::io::write_init;
+use self::io::write_init_bytes;
+use self::io::write_record;
+use self::plan::Clock;
+use self::plan::DiscontinuityMark;
+use self::plan::HolePlan;
+use self::plan::RunRecordMeta;
+use self::plan::chunk_time_of;
+use self::plan::hole_end;
+use self::plan::origin_of;
+use self::plan::plan_hole;
+use self::plan::record_duration;
+use self::plan::record_time;
+use self::resume::create_canonical;
+use self::resume::create_pair;
+use self::resume::ms_u32;
+use self::resume::open_canonical;
+use self::resume::read_canonical;
+use self::resume::rename_canonical_to_run;
+use self::resume::run_paths;
+use self::resume::scan_run_number;
 use crate::downloader::FetchOutcome;
 use crate::downloader::ToDownloader;
 use crate::http::Client;
 use crate::metrics::DiskMetrics;
 use crate::notify::Notifier;
 use crate::rtsp::dvr::Dvr;
-use crate::rtsp::dvr::DvrMap;
 use crate::rtsp::dvr::DvrSegment;
 use crate::rtsp::dvr::DvrTimeline;
 use crate::scheduler::ConsumerRegistration;
@@ -93,30 +128,8 @@ use crate::scheduler::Segment;
 use crate::scheduler::SegmentMessage;
 use crate::spool::ArenaSet;
 use crate::spool::ConsumerWake;
-use crate::spool::Reader;
 use crate::spool::SlotView;
-use crate::spool::Spool;
 use crate::spool::WakeSet;
-
-const INDEX_MAGIC: [u8; 8] = *b"OZENIKEN";
-const INDEX_VERSION: u32 = 4;
-const HEADER_LEN: usize = 8 + 4 + 8;
-
-const TAG_SEGMENT: u8 = 0;
-const TAG_INIT: u8 = 1;
-const TAG_DISCONTINUITY: u8 = 2;
-const TAG_RUN: u8 = 3;
-
-const SEGMENT_BODY: u32 = 1 + 8 + 4 + 8 + 4 + 8 + 4 + 16 + 1;
-const INIT_BODY: u32 = 1 + 8 + 8 + 4 + 16;
-const DISCONTINUITY_BODY: u32 = 2 + 2 + 2 + 2;
-const RUN_BODY: u32 = 4 + 8 + 8 + 8 + 8 + 4 + 1;
-
-/// Offset of the `complete` byte inside a serialized `Run` record.
-const RUN_COMPLETE_OFFSET: u64 = 1 + 4 + 8 + 8 + 8 + 8 + 4;
-
-const SOURCE_LIVE: u8 = 0;
-const SOURCE_DVR: u8 = 1;
 
 /// A jump larger than this between consecutive live records is a gap (an ad or
 /// a reconnect), never normal timestamp jitter.
@@ -135,9 +148,13 @@ const COPY_BLOCK: usize = 256 * 1024;
 /// Cap on an `EXT-X-MAP` / live init segment. Real inits are a few KiB; this is
 /// only a guard against a wrong URL returning a whole segment or a playlist.
 const MAX_INIT_BYTES: usize = 8 * 1024 * 1024;
-/// Sanity cap for a `Run` marker's reserved record area. A torn marker cannot
-/// make the resume path reserve an unbounded index range.
-const MAX_RUN_RECORDS: usize = 64 * 1024 * 1024;
+mod index;
+mod io;
+mod plan;
+mod resume;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(variant_size_differences)]
@@ -262,495 +279,7 @@ pub fn spawn_disk_output(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Index v4 records
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SegmentRecord {
-    source: u8,
-    sequence: u64,
-    elapsed_ms: u32,
-    pdt_ms: u64,
-    duration_ms: u32,
-    byte_offset: u64,
-    byte_length: u32,
-    hash: u128,
-    flags: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct InitRecord {
-    source: u8,
-    counter: u64,
-    byte_offset: u64,
-    byte_length: u32,
-    hash: u128,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DiscontinuityRecord {
-    width: u16,
-    height: u16,
-    rate_num: u16,
-    rate_denom: u16,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RunRecord {
-    run: u32,
-    dst_segs_offset: u64,
-    segs_len: u64,
-    source_segs_offset: u64,
-    source_index_offset: u64,
-    record_len: u32,
-    /// 0 while the copy is pending, 1 when it is done (or was abandoned).
-    complete: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Record {
-    Segment(SegmentRecord),
-    Init(InitRecord),
-    Discontinuity(DiscontinuityRecord),
-    Run(RunRecord),
-}
-
-impl Record {
-    const fn tag(&self) -> u8 {
-        match self {
-            Self::Segment(_) => TAG_SEGMENT,
-            Self::Init(_) => TAG_INIT,
-            Self::Discontinuity(_) => TAG_DISCONTINUITY,
-            Self::Run(_) => TAG_RUN,
-        }
-    }
-
-    const fn encoded_len(&self) -> u32 {
-        match self {
-            Self::Segment(_) => 1 + SEGMENT_BODY,
-            Self::Init(_) => 1 + INIT_BODY,
-            Self::Discontinuity(_) => 1 + DISCONTINUITY_BODY,
-            Self::Run(_) => 1 + RUN_BODY,
-        }
-    }
-
-    /// Bytes the record occupies in the index, including a `Run`'s reserved
-    /// record area.
-    fn span(&self) -> u64 {
-        match self {
-            Self::Run(run) => u64::from(1 + RUN_BODY) + u64::from(run.record_len),
-            other => u64::from(other.encoded_len()),
-        }
-    }
-
-    fn encode(&self, out: &mut Vec<u8>) {
-        out.push(self.tag());
-        match self {
-            Self::Segment(segment) => {
-                out.push(segment.source);
-                out.extend_from_slice(&segment.sequence.to_le_bytes());
-                out.extend_from_slice(&segment.elapsed_ms.to_le_bytes());
-                out.extend_from_slice(&segment.pdt_ms.to_le_bytes());
-                out.extend_from_slice(&segment.duration_ms.to_le_bytes());
-                out.extend_from_slice(&segment.byte_offset.to_le_bytes());
-                out.extend_from_slice(&segment.byte_length.to_le_bytes());
-                out.extend_from_slice(&segment.hash.to_le_bytes());
-                out.push(segment.flags);
-            }
-            Self::Init(init) => {
-                out.push(init.source);
-                out.extend_from_slice(&init.counter.to_le_bytes());
-                out.extend_from_slice(&init.byte_offset.to_le_bytes());
-                out.extend_from_slice(&init.byte_length.to_le_bytes());
-                out.extend_from_slice(&init.hash.to_le_bytes());
-            }
-            Self::Discontinuity(discontinuity) => {
-                out.extend_from_slice(&discontinuity.width.to_le_bytes());
-                out.extend_from_slice(&discontinuity.height.to_le_bytes());
-                out.extend_from_slice(&discontinuity.rate_num.to_le_bytes());
-                out.extend_from_slice(&discontinuity.rate_denom.to_le_bytes());
-            }
-            Self::Run(run) => {
-                out.extend_from_slice(&run.run.to_le_bytes());
-                out.extend_from_slice(&run.dst_segs_offset.to_le_bytes());
-                out.extend_from_slice(&run.segs_len.to_le_bytes());
-                out.extend_from_slice(&run.source_segs_offset.to_le_bytes());
-                out.extend_from_slice(&run.source_index_offset.to_le_bytes());
-                out.extend_from_slice(&run.record_len.to_le_bytes());
-                out.push(run.complete);
-            }
-        }
-    }
-
-    fn decode<R: Read>(tag: u8, reader: &mut R) -> std::io::Result<Self> {
-        Ok(match tag {
-            TAG_SEGMENT => Self::Segment(SegmentRecord {
-                source: read_u8(reader)?,
-                sequence: read_u64(reader)?,
-                elapsed_ms: read_u32(reader)?,
-                pdt_ms: read_u64(reader)?,
-                duration_ms: read_u32(reader)?,
-                byte_offset: read_u64(reader)?,
-                byte_length: read_u32(reader)?,
-                hash: read_u128(reader)?,
-                flags: read_u8(reader)?,
-            }),
-            TAG_INIT => Self::Init(InitRecord {
-                source: read_u8(reader)?,
-                counter: read_u64(reader)?,
-                byte_offset: read_u64(reader)?,
-                byte_length: read_u32(reader)?,
-                hash: read_u128(reader)?,
-            }),
-            TAG_DISCONTINUITY => Self::Discontinuity(DiscontinuityRecord {
-                width: read_u16(reader)?,
-                height: read_u16(reader)?,
-                rate_num: read_u16(reader)?,
-                rate_denom: read_u16(reader)?,
-            }),
-            TAG_RUN => Self::Run(RunRecord {
-                run: read_u32(reader)?,
-                dst_segs_offset: read_u64(reader)?,
-                segs_len: read_u64(reader)?,
-                source_segs_offset: read_u64(reader)?,
-                source_index_offset: read_u64(reader)?,
-                record_len: read_u32(reader)?,
-                complete: read_u8(reader)?,
-            }),
-            tag => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown record tag {tag}"),
-                ));
-            }
-        })
-    }
-
-    /// Hash-covered byte range, for resume integrity checks.
-    const fn hashed_range(&self) -> Option<(u64, u32, u128)> {
-        match self {
-            Self::Segment(segment) => {
-                Some((segment.byte_offset, segment.byte_length, segment.hash))
-            }
-            Self::Init(init) => Some((init.byte_offset, init.byte_length, init.hash)),
-            Self::Discontinuity(_) | Self::Run(_) => None,
-        }
-    }
-
-    /// Rebase a run's record into the canonical file.
-    fn rebase(&mut self, delta: i64, init_counter: &mut u64) {
-        match self {
-            Self::Segment(segment) => {
-                segment.byte_offset = add_signed(segment.byte_offset, delta);
-            }
-            Self::Init(init) => {
-                init.byte_offset = add_signed(init.byte_offset, delta);
-                init.counter = *init_counter;
-                *init_counter += 1;
-            }
-            Self::Discontinuity(_) | Self::Run(_) => {}
-        }
-    }
-}
-
-fn add_signed(value: u64, delta: i64) -> u64 {
-    i64::try_from(value)
-        .ok()
-        .and_then(|value| value.checked_add(delta))
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(value)
-}
-
-fn read_u8<R: Read>(reader: &mut R) -> std::io::Result<u8> {
-    let mut bytes = [0u8; 1];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes[0])
-}
-
-fn read_u16<R: Read>(reader: &mut R) -> std::io::Result<u16> {
-    let mut bytes = [0u8; 2];
-    reader.read_exact(&mut bytes)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_u32<R: Read>(reader: &mut R) -> std::io::Result<u32> {
-    let mut bytes = [0u8; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_u64<R: Read>(reader: &mut R) -> std::io::Result<u64> {
-    let mut bytes = [0u8; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_u128<R: Read>(reader: &mut R) -> std::io::Result<u128> {
-    let mut bytes = [0u8; 16];
-    reader.read_exact(&mut bytes)?;
-    Ok(u128::from_le_bytes(bytes))
-}
-
-const fn body_len(tag: u8) -> Option<u32> {
-    match tag {
-        TAG_SEGMENT => Some(SEGMENT_BODY),
-        TAG_INIT => Some(INIT_BODY),
-        TAG_DISCONTINUITY => Some(DISCONTINUITY_BODY),
-        TAG_RUN => Some(RUN_BODY),
-        _ => None,
-    }
-}
-
-fn encode_header(stream_id: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN);
-    out.extend_from_slice(&INDEX_MAGIC);
-    out.extend_from_slice(&INDEX_VERSION.to_le_bytes());
-    out.extend_from_slice(&stream_id.to_le_bytes());
-    out
-}
-
-fn parse_header(bytes: &[u8]) -> Result<u64, DiskOutputError> {
-    if bytes.len() < HEADER_LEN {
-        return Err(DiskOutputError::InvalidHeader);
-    }
-    if bytes[..8] != INDEX_MAGIC {
-        return Err(DiskOutputError::InvalidHeader);
-    }
-    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    let stream_id = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    if version != INDEX_VERSION {
-        return Err(DiskOutputError::InvalidHeader);
-    }
-    Ok(stream_id)
-}
-
-struct ParsedRecord {
-    offset: u64,
-    record: Record,
-    span: u64,
-}
-
-/// Structurally parse the index. A truncated tail is not an error: the caller
-/// truncates at the end of the last complete record.
-fn parse_records(bytes: &[u8]) -> Result<Vec<ParsedRecord>, DiskOutputError> {
-    let mut records = Vec::new();
-    let mut position = HEADER_LEN;
-    while position < bytes.len() {
-        let Some(&tag) = bytes.get(position) else {
-            break;
-        };
-        let Some(body) = body_len(tag) else {
-            break; // torn tail: no valid tag
-        };
-        let body = body as usize;
-        if position + 1 + body > bytes.len() {
-            break; // torn tail: partial body
-        }
-        let mut reader = &bytes[position + 1..position + 1 + body];
-        let record = Record::decode(tag, &mut reader)
-            .map_err(|error| DiskOutputError::Record(error.to_string()))?;
-        let span = record.span();
-        let fits = usize::try_from(span).is_ok_and(|span| span <= bytes.len() - position);
-        if !fits {
-            // A complete Run marker may be followed by a reserved record area
-            // that a crash left missing; keep the marker so resume can redo it.
-            if tag != TAG_RUN || position + 1 + body > bytes.len() {
-                break;
-            }
-            let Record::Run(run) = &record else {
-                break;
-            };
-            if usize::try_from(run.record_len).is_ok_and(|len| len > MAX_RUN_RECORDS) {
-                break;
-            }
-        }
-        records.push(ParsedRecord {
-            offset: position as u64,
-            record,
-            span,
-        });
-        let Some(next) = usize::try_from(span)
-            .ok()
-            .and_then(|span| position.checked_add(span))
-        else {
-            break;
-        };
-        position = next;
-    }
-    Ok(records)
-}
-
-// ---------------------------------------------------------------------------
-// Clock and hole arithmetic
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Clock {
-    Pdt,
-    Elapsed,
-}
-
-/// The `time` of a live record in the selected clock.
-fn record_time(record: &SegmentRecord, clock: Clock, live_origin: Option<i64>) -> u64 {
-    match clock {
-        Clock::Pdt => {
-            if record.pdt_ms != 0 {
-                record.pdt_ms
-            } else if let Some(origin) = live_origin {
-                add_signed_signed(record.elapsed_ms.into(), origin)
-            } else {
-                record.elapsed_ms.into()
-            }
-        }
-        Clock::Elapsed => record.elapsed_ms.into(),
-    }
-}
-
-fn add_signed_signed(value: u64, delta: i64) -> u64 {
-    add_signed(value, delta)
-}
-
-fn record_duration(record: &SegmentRecord) -> u64 {
-    u64::from(record.duration_ms)
-}
-
-fn origin_of(pdt: u64, elapsed: u64) -> Option<i64> {
-    if pdt == 0 {
-        None
-    } else {
-        Some(i64::try_from(pdt).ok()? - i64::try_from(elapsed).ok()?)
-    }
-}
-
-/// Start of the DVR chunk containing `time`, i.e. where the DVR resumes after a
-/// run so that the chunk crossing the run's end is written whole.
-fn hole_end(
-    timeline: &DvrTimeline,
-    time: u64,
-    clock: Clock,
-    dvr_origin: Option<i64>,
-) -> Option<u64> {
-    let chunk_time = |chunk: &DvrSegment| chunk_time_of(chunk, clock, dvr_origin);
-    let index = timeline
-        .segments
-        .partition_point(|chunk| chunk_time(chunk) <= time);
-    if index == 0 {
-        timeline.segments.first().map(chunk_time)
-    } else {
-        Some(chunk_time(&timeline.segments[index - 1]))
-    }
-}
-
-fn chunk_time_of(chunk: &DvrSegment, clock: Clock, dvr_origin: Option<i64>) -> u64 {
-    match clock {
-        Clock::Pdt => {
-            if chunk.pdt_ms != 0 {
-                chunk.pdt_ms
-            } else if let Some(origin) = dvr_origin {
-                add_signed(chunk.start_ms, origin)
-            } else {
-                chunk.start_ms
-            }
-        }
-        Clock::Elapsed => chunk.start_ms,
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct HolePlan {
-    /// Byte offset of the first kept record inside the run's `segs`.
-    source_segs_offset: u64,
-    /// Bytes in the run's uncovered middle.
-    segs_len: u64,
-    /// Index offset of the first kept record inside the run's `index`.
-    source_index_offset: u64,
-    /// Bytes reserved for the rebased records.
-    record_len: u32,
-    /// Number of kept records.
-    records: usize,
-}
-
-/// Pick the run records that the DVR's whole-chunk edges do not already cover.
-/// Trimming is by the selected clock (PDT whenever both sides have it).
-fn plan_hole(
-    records: &[RunRecordMeta],
-    hole_start: u64,
-    hole_end: u64,
-    clock: Clock,
-    live_origin: Option<i64>,
-) -> HolePlan {
-    if hole_end <= hole_start {
-        return HolePlan::default();
-    }
-
-    let mut first = None;
-    let mut last = None;
-    let mut segs_len = 0u64;
-    let mut record_len = 0u32;
-    for (index, meta) in records.iter().enumerate() {
-        let time = record_time(&meta.segment, clock, live_origin);
-        let end = time.saturating_add(record_duration(&meta.segment));
-        if time >= hole_start && end <= hole_end {
-            first.get_or_insert(index);
-            last = Some(index);
-            segs_len += u64::from(meta.segment.byte_length);
-            record_len += meta.record_len;
-        }
-    }
-
-    let (Some(first), Some(last)) = (first, last) else {
-        return HolePlan::default();
-    };
-
-    debug_assert!(first <= last);
-    let source_segs_offset = records[first].segment.byte_offset;
-    let source_index_offset = records[first].record_offset;
-    HolePlan {
-        source_segs_offset,
-        segs_len,
-        source_index_offset,
-        record_len,
-        records: last - first + 1,
-    }
-}
-
-/// A live record plus where it sits in the run's pair.
-struct RunRecordMeta {
-    segment: SegmentRecord,
-    record_offset: u64,
-    record_len: u32,
-}
-
-/// A `#EXT-X-DISCONTINUITY` from the live playlist, not yet placed in the
-/// canonical. Both clocks are kept so it can be ordered against a DVR chunk or a
-/// live record whichever clock the recording settled on.
-#[derive(Clone, Copy, Debug)]
-struct DiscontinuityMark {
-    pdt_ms: u64,
-    elapsed_ms: u64,
-}
-
-impl DiscontinuityMark {
-    fn time(self, clock: Clock, live_origin: Option<i64>) -> u64 {
-        match clock {
-            Clock::Pdt => {
-                if self.pdt_ms != 0 {
-                    self.pdt_ms
-                } else {
-                    live_origin.map_or(self.elapsed_ms, |origin| {
-                        add_signed(self.elapsed_ms, origin)
-                    })
-                }
-            }
-            Clock::Elapsed => self.elapsed_ms,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Disk state
-// ---------------------------------------------------------------------------
 
 /// What the live recorder is doing. Orthogonal to where the DVR cursor is: the
 /// two together are the whole control state of the recording.
@@ -770,10 +299,10 @@ enum Live {
 /// other side of the alignment check.
 #[derive(Clone, Debug)]
 struct Parked {
-    run: u32,
+    pub(super) run: u32,
     /// Time the DVR resumes at once the run's hole is reserved.
-    hole_start: u64,
-    crossing: DvrSegment,
+    pub(super) hole_start: u64,
+    pub(super) crossing: DvrSegment,
 }
 
 /// Where the recording is in its life. Every combination the old flags allowed
@@ -827,30 +356,30 @@ type MapKey = (String, Option<(u64, u64)>);
 type MapCache = HashMap<MapKey, (u128, Vec<u8>)>;
 
 struct Canonical {
-    segs: File,
-    index: File,
-    segs_end: u64,
-    index_end: u64,
-    init_counter: u64,
+    pub(super) segs: File,
+    pub(super) index: File,
+    pub(super) segs_end: u64,
+    pub(super) index_end: u64,
+    pub(super) init_counter: u64,
     /// Hash of the `Init` record currently in effect at the tail.
-    active_init: Option<u128>,
+    pub(super) active_init: Option<u128>,
 }
 
 struct RunData {
-    number: u32,
-    segs_path: PathBuf,
-    index_path: PathBuf,
-    records: Vec<RunRecordMeta>,
-    segs_len: u64,
-    index_len: u64,
-    init_counter: u64,
+    pub(super) number: u32,
+    pub(super) segs_path: PathBuf,
+    pub(super) index_path: PathBuf,
+    pub(super) records: Vec<RunRecordMeta>,
+    pub(super) segs_len: u64,
+    pub(super) index_len: u64,
+    pub(super) init_counter: u64,
     /// The run's leading `EXT-X-MAP`, if the live playlist had one. A map change
     /// closes the run, so a run has at most one init and it is always first.
-    init: Option<InitRecord>,
+    pub(super) init: Option<InitRecord>,
     /// `Some` only for the run currently being recorded.
-    files: Option<(File, File)>,
-    first_segment: Option<SegmentRecord>,
-    last_segment: Option<SegmentRecord>,
+    pub(super) files: Option<(File, File)>,
+    pub(super) first_segment: Option<SegmentRecord>,
+    pub(super) last_segment: Option<SegmentRecord>,
 }
 
 impl RunData {
@@ -874,68 +403,68 @@ impl RunData {
 }
 
 struct InFlightChunk {
-    chunk: DvrSegment,
-    dst_offset: u64,
-    written: u64,
-    hasher: Xxh3,
+    pub(super) chunk: DvrSegment,
+    pub(super) dst_offset: u64,
+    pub(super) written: u64,
+    pub(super) hasher: Xxh3,
 }
 
 struct CopyJob {
-    run: u32,
-    dst_segs: u64,
-    dst_index: u64,
-    segs_len: u64,
-    records: Vec<u8>,
-    written: u64,
-    segs_path: PathBuf,
-    index_path: PathBuf,
+    pub(super) run: u32,
+    pub(super) dst_segs: u64,
+    pub(super) dst_index: u64,
+    pub(super) segs_len: u64,
+    pub(super) records: Vec<u8>,
+    pub(super) written: u64,
+    pub(super) segs_path: PathBuf,
+    pub(super) index_path: PathBuf,
 }
 
 #[allow(clippy::struct_excessive_bools)] // a state machine, not flags of a data type
 struct Disk {
-    options: DiskOptions,
-    dir: PathBuf,
-    client: Rc<Client>,
-    live_rx: Option<AsyncReceiver<SegmentMessage>>,
-    events_rx: AsyncReceiver<Event>,
-    events_tx: Sender<Event>,
-    downloaders: AsyncSender<ToDownloader>,
-    live_wake: Rc<ConsumerWake>,
-    dvr: Rc<Dvr>,
-    dvr_arena: Rc<ArenaSet>,
-    dvr_wakes: Rc<WakeSet>,
+    pub(super) options: DiskOptions,
+    pub(super) dir: PathBuf,
+    pub(super) client: Rc<Client>,
+    pub(super) live_rx: Option<AsyncReceiver<SegmentMessage>>,
+    pub(super) events_rx: AsyncReceiver<Event>,
+    pub(super) events_tx: Sender<Event>,
+    pub(super) downloaders: AsyncSender<ToDownloader>,
+    pub(super) live_wake: Rc<ConsumerWake>,
+    pub(super) dvr: Rc<Dvr>,
+    pub(super) dvr_arena: Rc<ArenaSet>,
+    pub(super) dvr_wakes: Rc<WakeSet>,
     /// `(uri, byterange)` → `(init hash, bytes)`, so an unchanged map is fetched
     /// once and can still be inserted if the canonical's active map changes.
-    map_cache: MapCache,
+    pub(super) map_cache: MapCache,
 
     /// The whole control state: what the canonical is, where the DVR cursor is
     /// and what the live recorder may still do.
-    phase: Phase,
-    canonical: Option<Canonical>,
-    current_run: Option<RunData>,
-    closed_runs: VecDeque<RunData>,
-    next_run: u32,
-    live_edge: Option<(u64, u64, bool)>, // (start, end, pdt domain)
-    live_origin: Option<i64>,
-    live_open: bool,
+    pub(super) phase: Phase,
+    pub(super) canonical: Option<Canonical>,
+    pub(super) current_run: Option<RunData>,
+    pub(super) closed_runs: VecDeque<RunData>,
+    pub(super) next_run: u32,
+    pub(super) live_edge: Option<(u64, u64, bool)>, // (start, end, pdt domain)
+    pub(super) live_origin: Option<i64>,
+    pub(super) live_open: bool,
     /// Live-playlist discontinuities waiting for the archive to reach them.
-    discontinuities: Vec<DiscontinuityMark>,
+    pub(super) discontinuities: Vec<DiscontinuityMark>,
     /// A `Discontinuity` tag arrived; the next live segment supplies its time.
-    pending_discontinuity: bool,
+    pub(super) pending_discontinuity: bool,
 
-    clock: Option<Clock>,
-    dvr_origin: Option<i64>,
-    dvr_next_start_ms: u64,
-    resume_abs: Option<u64>,
-    resume_clock: Option<Clock>,
-    in_flight: Option<InFlightChunk>,
-    copies: Vec<CopyJob>,
-    dvr_stall: u64,
-    stall_armed: Option<u64>,
-    dvr_seen_url: bool,
+    pub(super) clock: Option<Clock>,
+    pub(super) dvr_origin: Option<i64>,
+    pub(super) dvr_next_start_ms: u64,
+    pub(super) resume_abs: Option<u64>,
+    pub(super) resume_clock: Option<Clock>,
+    pub(super) in_flight: Option<InFlightChunk>,
+    pub(super) copies: Vec<CopyJob>,
+    pub(super) dvr_stall: u64,
+    pub(super) stall_armed: Option<u64>,
+    pub(super) dvr_seen_url: bool,
 
-    stop: bool,
-    finished: bool,
+    pub(super) stop: bool,
+    pub(super) finished: bool,
 }
 
 enum Event {
@@ -1040,9 +569,9 @@ fn spawn_dvr_watcher(dvr: Rc<Dvr>, events: Sender<Event>) {
 }
 
 struct WaitGeneration<'a> {
-    dvr: &'a Dvr,
-    wake: &'a ConsumerWake,
-    seen: u64,
+    pub(super) dvr: &'a Dvr,
+    pub(super) wake: &'a ConsumerWake,
+    pub(super) seen: u64,
 }
 
 impl Future for WaitGeneration<'_> {
@@ -2440,1354 +1969,4 @@ impl Disk {
 enum Incoming {
     Live(Result<SegmentMessage, kanal::ReceiveError>),
     Event(Result<Event, kanal::ReceiveError>),
-}
-
-// ---------------------------------------------------------------------------
-// Live writes and copying
-// ---------------------------------------------------------------------------
-
-/// Append one live segment's bytes and its `Segment` record at the cursor.
-/// Returns `None` when the segment produced no bytes (a failed download); the
-/// next timestamp gap then closes the run and the DVR fills the span.
-async fn append_live_segment(
-    segs: &mut File,
-    index: &mut File,
-    segs_end: &mut u64,
-    index_end: &mut u64,
-    segment: Segment,
-    wake: &ConsumerWake,
-    metrics: &DiskMetrics,
-) -> Result<Option<SegmentRecord>, DiskOutputError> {
-    let mut hasher = Xxh3::new();
-    let start = *segs_end;
-    let mut reader = segment.reader;
-    let written = write_segment_body(segs, start, &mut reader, &mut hasher, wake).await?;
-    if written == 0 {
-        return Ok(None);
-    }
-    let record = SegmentRecord {
-        source: SOURCE_LIVE,
-        sequence: segment.sequence_num,
-        elapsed_ms: ms_u32(segment.timestamp_ms),
-        pdt_ms: segment.pdt_ms,
-        duration_ms: ms_u32(segment.duration_ms),
-        byte_offset: start,
-        byte_length: u32::try_from(written).unwrap_or(u32::MAX),
-        hash: hasher.digest128(),
-        flags: 0,
-    };
-    *segs_end += written;
-    metrics.note_written(segment.timestamp_ms, written);
-    write_record(index, *index_end, &Record::Segment(record.clone())).await?;
-    *index_end += u64::from(1 + SEGMENT_BODY);
-    Ok(Some(record))
-}
-
-async fn write_segment_body(
-    file: &mut File,
-    position: u64,
-    reader: &mut Reader,
-    hasher: &mut Xxh3,
-    wake: &ConsumerWake,
-) -> Result<u64, DiskOutputError> {
-    let mut written = 0u64;
-    let mut offset = position;
-    while let Some(view) = reader.next_view(wake).await {
-        let len = view.as_init().len() as u64;
-        hasher.update(view.as_init());
-        file.write_all_at(view, offset).await.0?;
-        offset += len;
-        written += len;
-    }
-    Ok(written)
-}
-
-#[allow(clippy::too_many_arguments)] // two files plus one cursor pair
-async fn write_init(
-    segs: &mut File,
-    index: &mut File,
-    segs_end: &mut u64,
-    index_end: &mut u64,
-    init_counter: &mut u64,
-    source: u8,
-    reader: &mut Reader,
-    wake: &ConsumerWake,
-) -> Result<InitRecord, DiskOutputError> {
-    let mut hasher = Xxh3::new();
-    let start = *segs_end;
-    let written = write_segment_body(segs, start, reader, &mut hasher, wake).await?;
-    let record = InitRecord {
-        source,
-        counter: *init_counter,
-        byte_offset: start,
-        byte_length: u32::try_from(written).unwrap_or(u32::MAX),
-        hash: hasher.digest128(),
-    };
-    write_record(index, *index_end, &Record::Init(record.clone())).await?;
-    *segs_end += written;
-    *index_end += u64::from(1 + INIT_BODY);
-    *init_counter += 1;
-    Ok(record)
-}
-
-/// Write an init into the canonical unless the same map is already active.
-/// Returns whether bytes were written. The `segs` sync is what makes the init
-/// durable before the DVR is allowed to write past it.
-async fn write_init_bytes(
-    canonical: &mut Canonical,
-    source: u8,
-    bytes: &[u8],
-) -> Result<bool, DiskOutputError> {
-    let hash = xxh3_128(bytes);
-    if canonical.active_init == Some(hash) {
-        return Ok(false);
-    }
-    let start = canonical.segs_end;
-    let len = bytes.len() as u64;
-    canonical.segs.write_all_at(bytes.to_vec(), start).await.0?;
-    canonical.segs.sync_data().await?;
-    let record = InitRecord {
-        source,
-        counter: canonical.init_counter,
-        byte_offset: start,
-        byte_length: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-        hash,
-    };
-    write_record(
-        &mut canonical.index,
-        canonical.index_end,
-        &Record::Init(record),
-    )
-    .await?;
-    canonical.segs_end += len;
-    canonical.index_end += u64::from(1 + INIT_BODY);
-    canonical.init_counter += 1;
-    canonical.active_init = Some(hash);
-    // The init record must be durable before any media record that depends on
-    // it, not just before the next fsync of the whole index.
-    canonical.index.sync_data().await?;
-    Ok(true)
-}
-
-async fn read_reader_bytes(
-    reader: &mut Reader,
-    wake: &ConsumerWake,
-    limit: usize,
-) -> Result<Vec<u8>, DiskOutputError> {
-    let mut out = Vec::new();
-    while let Some(view) = reader.next_view(wake).await {
-        let bytes = view.as_init();
-        if out.len().saturating_add(bytes.len()) > limit {
-            return Err(DiskOutputError::Record("init segment is too large".into()));
-        }
-        out.extend_from_slice(bytes);
-    }
-    Ok(out)
-}
-
-/// Read and verify a run's leading init from its own `segs` file.
-async fn read_run_init(run: &RunData) -> Result<Option<Vec<u8>>, DiskOutputError> {
-    let Some(init) = &run.init else {
-        return Ok(None);
-    };
-    let file = OpenOptions::new().read(true).open(&run.segs_path).await?;
-    let bytes = read_exact_at(
-        &file,
-        init.byte_offset,
-        usize::try_from(init.byte_length).unwrap_or(usize::MAX),
-    )
-    .await?;
-    if xxh3_128(&bytes) != init.hash {
-        return Err(DiskOutputError::Record(format!(
-            "run {} init failed verification",
-            run.number
-        )));
-    }
-    Ok(Some(bytes))
-}
-
-async fn fetch_map(client: &Client, map: &DvrMap) -> Result<Vec<u8>, DiskOutputError> {
-    let range = map.byterange.map(|(offset, length)| {
-        format!(
-            "bytes={offset}-{}",
-            offset.saturating_add(length).saturating_sub(1)
-        )
-    });
-    let mut response = if let Some(range) = range.as_deref() {
-        client.get_with(&map.uri, &[("Range", range)]).await?
-    } else {
-        client.get(&map.uri).await?
-    };
-    if !response.status.is_success() {
-        return Err(DiskOutputError::Io(std::io::Error::other(format!(
-            "map fetch returned {}",
-            response.status
-        ))));
-    }
-    let partial = response.status.as_u16() == 206;
-    let body = response.body.read_to_end(MAX_INIT_BYTES).await?;
-    match map.byterange {
-        None => Ok(body),
-        // A 206 already contains exactly the requested range.
-        Some((_, length)) if partial => {
-            if u64::try_from(body.len()).unwrap_or(u64::MAX) != length {
-                return Err(DiskOutputError::Io(std::io::Error::other(
-                    "map byte range returned the wrong length",
-                )));
-            }
-            Ok(body)
-        }
-        // A server that ignored Range returned the whole object.
-        Some((offset, length)) => {
-            let start = usize::try_from(offset).map_err(|_| {
-                DiskOutputError::Io(std::io::Error::other("map range offset is too large"))
-            })?;
-            let length = usize::try_from(length).map_err(|_| {
-                DiskOutputError::Io(std::io::Error::other("map range length is too large"))
-            })?;
-            let end = start
-                .checked_add(length)
-                .ok_or_else(|| DiskOutputError::Io(std::io::Error::other("map range overflows")))?;
-            body.get(start..end).map(<[u8]>::to_vec).ok_or_else(|| {
-                DiskOutputError::Io(std::io::Error::other(
-                    "map byte range is outside the object",
-                ))
-            })
-        }
-    }
-}
-
-/// Write a `Discontinuity` record for every mark the archive has reached.
-/// The record's position in the index is the information: everything before it
-/// belongs to the old timestamp domain. Its geometry fields are reserved (zero)
-/// until a demuxer has a reason to fill them.
-async fn write_discontinuities(
-    canonical: &mut Canonical,
-    marks: &mut Vec<DiscontinuityMark>,
-    upto: u64,
-    clock: Clock,
-    live_origin: Option<i64>,
-) -> Result<(), DiskOutputError> {
-    let mut placed = 0;
-    while marks
-        .first()
-        .is_some_and(|mark| mark.time(clock, live_origin) <= upto)
-    {
-        write_record(
-            &mut canonical.index,
-            canonical.index_end,
-            &Record::Discontinuity(DiscontinuityRecord {
-                width: 0,
-                height: 0,
-                rate_num: 0,
-                rate_denom: 0,
-            }),
-        )
-        .await?;
-        canonical.index_end += u64::from(1 + DISCONTINUITY_BODY);
-        marks.remove(0);
-        placed += 1;
-    }
-    if placed > 0 {
-        canonical.index.sync_data().await?;
-    }
-    Ok(())
-}
-
-async fn write_record(
-    file: &mut File,
-    position: u64,
-    record: &Record,
-) -> Result<(), DiskOutputError> {
-    let mut buffer =
-        Vec::with_capacity(usize::try_from(record.encoded_len()).unwrap_or(usize::MAX));
-    record.encode(&mut buffer);
-    file.write_all_at(buffer, position).await.0?;
-    Ok(())
-}
-
-/// Read exactly `len` bytes at `offset`.
-async fn read_exact_at(file: &File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-    let result = file.read_exact_at(vec![0u8; len], offset).await;
-    result.0.map(|()| result.1)
-}
-
-/// A file region read in fixed blocks. The block size and the cursor live here
-/// so every copy implementation shares them.
-struct Blocks<'a> {
-    file: &'a File,
-    offset: u64,
-    remaining: u64,
-}
-
-impl<'a> Blocks<'a> {
-    const fn new(file: &'a File, offset: u64, len: u64) -> Self {
-        Self {
-            file,
-            offset,
-            remaining: len,
-        }
-    }
-
-    async fn next(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        if self.remaining == 0 {
-            return Ok(None);
-        }
-        let take = block_take(self.remaining);
-        let buffer = read_exact_at(self.file, self.offset, take).await?;
-        self.offset += take as u64;
-        self.remaining -= take as u64;
-        Ok(Some(buffer))
-    }
-}
-
-async fn copy_between(
-    source: &File,
-    source_offset: u64,
-    destination: &mut File,
-    destination_offset: u64,
-    len: u64,
-) -> Result<(), DiskOutputError> {
-    let mut blocks = Blocks::new(source, source_offset, len);
-    let mut position = 0u64;
-    while let Some(buffer) = blocks.next().await? {
-        let take = buffer.len() as u64;
-        destination
-            .write_all_at(buffer, destination_offset + position)
-            .await
-            .0?;
-        position += take;
-    }
-    Ok(())
-}
-
-fn spawn_copy(run: u32, segs_path: PathBuf, source_offset: u64, len: u64, events: Sender<Event>) {
-    compio::runtime::spawn(async move {
-        let file = OpenOptions::new().read(true).open(&segs_path).await;
-        let Ok(file) = file else {
-            let _ = events.send(Event::CopyFailed {
-                run,
-                error: "cannot open run segs".to_owned(),
-            });
-            return;
-        };
-        let mut blocks = Blocks::new(&file, source_offset, len);
-        loop {
-            let buffer = match blocks.next().await {
-                Ok(Some(buffer)) => buffer,
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = events.send(Event::CopyFailed {
-                        run,
-                        error: error.to_string(),
-                    });
-                    return;
-                }
-            };
-            if events.send(Event::CopyPart { run, data: buffer }).is_err() {
-                return;
-            }
-        }
-        let _ = events.send(Event::CopyDone { run });
-    })
-    .detach();
-}
-
-fn spawn_fetch(
-    chunk: DvrSegment,
-    arena: Rc<ArenaSet>,
-    wakes: Rc<WakeSet>,
-    downloaders: AsyncSender<ToDownloader>,
-    events: Sender<Event>,
-) {
-    compio::runtime::spawn(async move {
-        let (writer, mut reader) = match Spool::open_with_cap(&arena, &wakes, DVR_SLOTS_MAX) {
-            Ok(pair) => pair,
-            Err(error) => {
-                warn!(%error, "disk: DVR spool allocation failed");
-                let _ = events.send(Event::ChunkDone(FetchOutcome::Failed));
-                return;
-            }
-        };
-        let (done_tx, done_rx) = kanal::bounded(1);
-        let span = debug_span!("dvr chunk", sequence = chunk.sequence);
-        let send = downloaders
-            .send(ToDownloader::FetchURL {
-                url: chunk.url.into(),
-                writer,
-                span,
-                done: Some(done_tx),
-                stats: None,
-            })
-            .await;
-        if send.is_err() {
-            let _ = events.send(Event::ChunkDone(FetchOutcome::Failed));
-            return;
-        }
-
-        let wake = ConsumerWake::new();
-        wakes.register(&wake);
-        while let Some(view) = reader.next_view(&wake).await {
-            if events.send(Event::ChunkPart(view)).is_err() {
-                return;
-            }
-        }
-        // The downloader sends `done` before it drops the writer, so waiting
-        // for it is not optional -- but it must not be a blocking `recv()`, which
-        // parks the only reactor thread the downloader needs to make progress.
-        let outcome = done_rx
-            .to_async()
-            .recv()
-            .await
-            .unwrap_or(FetchOutcome::Failed);
-        let _ = events.send(Event::ChunkDone(outcome));
-    })
-    .detach();
-}
-
-// ---------------------------------------------------------------------------
-// Canonical open/create and resume repair
-// ---------------------------------------------------------------------------
-
-struct Snapshot {
-    records: Vec<ParsedRecord>,
-    valid_end: u64,
-    segs_end: u64,
-    init_counter: u64,
-    active_init: Option<u128>,
-    next_run: u32,
-    live_origin: Option<i64>,
-    has_dvr: bool,
-    resume_abs: u64,
-    resume_clock: Option<Clock>,
-}
-
-async fn read_canonical(
-    dir: &Path,
-    stream_id: u64,
-    keep_runs: bool,
-) -> Result<Option<Snapshot>, DiskOutputError> {
-    let segs_path = dir.join("segs");
-    let index_path = dir.join("index");
-    let mut segs = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&segs_path)
-        .await
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let mut index = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&index_path)
-        .await
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-
-    let index_len = index.metadata().await?.len();
-    if index_len == 0 {
-        return Ok(None);
-    }
-    let result = index.read_to_end_at(Vec::new(), 0).await;
-    let bytes = result.1;
-    result.0?;
-
-    let header_stream = parse_header(&bytes)?;
-    if header_stream != stream_id {
-        return Err(DiskOutputError::InvalidHeader);
-    }
-    let mut records = parse_records(&bytes)?;
-
-    // Verify the last hash-bearing record and walk back while it is torn.
-    let mut valid = records.len();
-    while valid > 0 {
-        let record = &records[valid - 1].record;
-        let Some((offset, len, expected)) = record.hashed_range() else {
-            valid -= 1;
-            continue;
-        };
-        if hash_range(&segs, offset, len).await == Some(expected) {
-            break;
-        }
-        valid -= 1;
-    }
-    records.truncate(valid);
-
-    let mut valid_end = HEADER_LEN as u64;
-    let mut segs_max = 0u64;
-    let mut init_counter = 0u64;
-    let mut next_run = 0u32;
-    let mut has_dvr = false;
-    let mut resume_pdt = 0u64;
-    let mut resume_elapsed = 0u64;
-    let mut live_first_pdt = 0u64;
-    let mut live_first_elapsed = 0u64;
-    for parsed in &records {
-        valid_end = parsed.offset + parsed.span;
-        match &parsed.record {
-            Record::Segment(segment) => {
-                segs_max = segs_max.max(
-                    segment
-                        .byte_offset
-                        .saturating_add(u64::from(segment.byte_length)),
-                );
-                match segment.source {
-                    SOURCE_DVR => {
-                        has_dvr = true;
-                        let end = if segment.pdt_ms != 0 {
-                            segment
-                                .pdt_ms
-                                .saturating_add(u64::from(segment.duration_ms))
-                        } else {
-                            u64::from(segment.elapsed_ms)
-                                .saturating_add(u64::from(segment.duration_ms))
-                        };
-                        if segment.pdt_ms != 0 {
-                            resume_pdt = resume_pdt.max(end);
-                        } else {
-                            resume_elapsed = resume_elapsed.max(end);
-                        }
-                    }
-                    SOURCE_LIVE => {
-                        if live_first_pdt == 0
-                            && let Some(pdt) = (segment.pdt_ms != 0).then_some(segment.pdt_ms)
-                        {
-                            live_first_pdt = pdt;
-                            live_first_elapsed = segment.elapsed_ms.into();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Record::Init(init) => {
-                segs_max =
-                    segs_max.max(init.byte_offset.saturating_add(u64::from(init.byte_length)));
-                init_counter = init_counter.max(init.counter.saturating_add(1));
-            }
-            Record::Run(run) => {
-                segs_max = segs_max.max(run.dst_segs_offset.saturating_add(run.segs_len));
-                next_run = next_run.max(run.run.saturating_add(1));
-            }
-            Record::Discontinuity(_) => {}
-        }
-    }
-
-    index.set_len(valid_end).await?;
-    segs.set_len(segs_max).await?;
-
-    // Redo pending copies. The run pair is kept until the marker is complete, so
-    // the source is always still on disk.
-    for position in 0..records.len() {
-        let Record::Run(run) = records[position].record.clone() else {
-            continue;
-        };
-        if run.complete != 0 {
-            continue;
-        }
-        let marker_offset = records[position].offset;
-        let (segs_path, index_path) = run_paths(dir, run.run);
-        let source_exists = compio::fs::metadata(&segs_path).await.is_ok()
-            && compio::fs::metadata(&index_path).await.is_ok();
-        if !source_exists {
-            // The pair is gone: abandon the hole, leaving zeros and no records.
-            flip_complete(&mut index, marker_offset).await?;
-            if let Record::Run(run) = &mut records[position].record {
-                run.complete = 1;
-            }
-            warn!(run = run.run, "disk: pending run has no source; abandoned");
-            continue;
-        }
-
-        let source_index = OpenOptions::new().read(true).open(&index_path).await?;
-        let buffer = read_exact_at(
-            &source_index,
-            run.source_index_offset,
-            usize::try_from(run.record_len).unwrap_or(usize::MAX),
-        )
-        .await;
-        let Ok(buffer) = buffer else {
-            let error = buffer.unwrap_err();
-            warn!(run = run.run, %error, "disk: pending run index unreadable; abandoned");
-            flip_complete(&mut index, marker_offset).await?;
-            if let Record::Run(run) = &mut records[position].record {
-                run.complete = 1;
-            }
-            continue;
-        };
-
-        let mut init_base = canonical_init_base(&records, marker_offset);
-        let mut rebased = Vec::with_capacity(buffer.len());
-        let mut cursor: &[u8] = &buffer;
-        while !cursor.is_empty() {
-            let tag = cursor[0];
-            let Some(body) = body_len(tag) else {
-                break;
-            };
-            let body = body as usize;
-            if cursor.len() < 1 + body {
-                break;
-            }
-            let mut reader = &cursor[1..=body];
-            if let Ok(mut record) = Record::decode(tag, &mut reader) {
-                record.rebase(
-                    i64::try_from(run.dst_segs_offset).unwrap_or(i64::MAX)
-                        - i64::try_from(run.source_segs_offset).unwrap_or(0),
-                    &mut init_base,
-                );
-                record.encode(&mut rebased);
-            }
-            cursor = &cursor[1 + body..];
-        }
-
-        let source_segs = OpenOptions::new().read(true).open(&segs_path).await?;
-        copy_between(
-            &source_segs,
-            run.source_segs_offset,
-            &mut segs,
-            run.dst_segs_offset,
-            run.segs_len,
-        )
-        .await?;
-        index
-            .write_all_at(rebased, marker_offset + u64::from(1 + RUN_BODY))
-            .await
-            .0?;
-        segs.sync_data().await?;
-        flip_complete(&mut index, marker_offset).await?;
-        index.sync_data().await?;
-        if !keep_runs {
-            let _ = compio::fs::remove_file(&segs_path).await;
-            let _ = compio::fs::remove_file(&index_path).await;
-        }
-        if let Record::Run(run) = &mut records[position].record {
-            run.complete = 1;
-        }
-        info!(run = run.run, "disk: recovered pending run hole");
-    }
-
-    // A crash between flipping `complete` and deleting the pair leaves a
-    // completed run behind. It is redundant now.
-    if !keep_runs {
-        for parsed in &records {
-            if let Record::Run(run) = &parsed.record
-                && run.complete != 0
-            {
-                let (segs_path, index_path) = run_paths(dir, run.run);
-                let _ = compio::fs::remove_file(&segs_path).await;
-                let _ = compio::fs::remove_file(&index_path).await;
-            }
-        }
-    }
-
-    let live_origin =
-        (live_first_pdt != 0).then(|| origin_of(live_first_pdt, live_first_elapsed).unwrap_or(0));
-    // Every `Init` is top-level (a run's leading map is inserted before its
-    // marker), so the last one is the map in effect at the tail. Verify them all:
-    // there are few, and a torn init must not be played as garbage.
-    let mut active_init = None;
-    for parsed in &records {
-        if let Record::Init(init) = &parsed.record {
-            if hash_range(&segs, init.byte_offset, init.byte_length).await != Some(init.hash) {
-                return Err(DiskOutputError::Record(format!(
-                    "init record at {} failed verification",
-                    parsed.offset
-                )));
-            }
-            active_init = Some(init.hash);
-        }
-    }
-    let (resume_abs, resume_clock) = if resume_pdt != 0 {
-        (resume_pdt, Some(Clock::Pdt))
-    } else if resume_elapsed != 0 {
-        (resume_elapsed, Some(Clock::Elapsed))
-    } else {
-        (0, None)
-    };
-    Ok(Some(Snapshot {
-        records,
-        valid_end,
-        segs_end: segs_max,
-        init_counter,
-        active_init,
-        next_run: next_run.max(scan_run_number(dir)),
-        live_origin,
-        has_dvr,
-        resume_abs,
-        resume_clock,
-    }))
-}
-
-async fn hash_range(file: &File, offset: u64, len: u32) -> Option<u128> {
-    let buffer = read_exact_at(file, offset, usize::try_from(len).unwrap_or(usize::MAX))
-        .await
-        .ok()?;
-    Some(xxh3_128(&buffer))
-}
-
-async fn flip_complete(index: &mut File, marker_offset: u64) -> std::io::Result<()> {
-    index
-        .write_all_at(vec![1u8], marker_offset + RUN_COMPLETE_OFFSET)
-        .await
-        .0
-}
-
-fn canonical_init_base(records: &[ParsedRecord], marker_offset: u64) -> u64 {
-    let mut base = 0u64;
-    for parsed in records {
-        if parsed.offset >= marker_offset {
-            break;
-        }
-        if let Record::Init(init) = &parsed.record {
-            base = base.max(init.counter.saturating_add(1));
-        }
-    }
-    base
-}
-
-fn scan_run_number(dir: &Path) -> u32 {
-    let mut highest = 0u32;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(rest) = name.strip_prefix("live.") else {
-            continue;
-        };
-        let Some(number) = rest
-            .strip_suffix(".segs")
-            .or_else(|| rest.strip_suffix(".index"))
-        else {
-            continue;
-        };
-        if let Ok(number) = number.parse::<u32>() {
-            highest = highest.max(number.saturating_add(1));
-        }
-    }
-    highest
-}
-
-/// Create (or truncate) a `segs`+`index` pair and write the index header.
-async fn create_pair(
-    segs_path: &Path,
-    index_path: &Path,
-    stream_id: u64,
-) -> Result<(File, File), DiskOutputError> {
-    let mut segs = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(segs_path)
-        .await?;
-    let mut index = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(index_path)
-        .await?;
-    index.write_all_at(encode_header(stream_id), 0).await.0?;
-    // Touch `segs` so the file exists before the pair is ever a hole.
-    segs.write_all_at(Vec::<u8>::new(), 0).await.0?;
-    Ok((segs, index))
-}
-
-async fn create_canonical(dir: &Path, stream_id: u64) -> Result<Canonical, DiskOutputError> {
-    let (segs, index) = create_pair(&dir.join("segs"), &dir.join("index"), stream_id).await?;
-    Ok(Canonical {
-        segs,
-        index,
-        segs_end: 0,
-        index_end: HEADER_LEN as u64,
-        init_counter: 0,
-        active_init: None,
-    })
-}
-
-async fn open_canonical(dir: &Path, snapshot: &Snapshot) -> Result<Canonical, DiskOutputError> {
-    let segs = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join("segs"))
-        .await?;
-    let index = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join("index"))
-        .await?;
-    Ok(Canonical {
-        segs,
-        index,
-        segs_end: snapshot.segs_end,
-        index_end: snapshot.valid_end,
-        init_counter: snapshot.init_counter,
-        active_init: snapshot.active_init,
-    })
-}
-
-async fn rename_canonical_to_run(
-    dir: &Path,
-    number: u32,
-    snapshot: &Snapshot,
-) -> Result<RunData, DiskOutputError> {
-    let (segs_path, index_path) = run_paths(dir, number);
-    compio::fs::rename(dir.join("segs"), &segs_path).await?;
-    compio::fs::rename(dir.join("index"), &index_path).await?;
-
-    let mut records = Vec::new();
-    let mut first = None;
-    let mut last = None;
-    let mut init = None;
-    let mut first_media_offset = None;
-    for parsed in &snapshot.records {
-        if let Record::Init(record) = &parsed.record
-            && first_media_offset.is_none()
-        {
-            // The map in effect for the first live media. Later maps inside the
-            // promoted file are not split retroactively; they stay as bytes.
-            init = Some(record.clone());
-        }
-        if let Record::Segment(segment) = &parsed.record {
-            if segment.source != SOURCE_LIVE {
-                continue;
-            }
-            first_media_offset.get_or_insert(segment.byte_offset);
-            records.push(RunRecordMeta {
-                segment: segment.clone(),
-                record_offset: parsed.offset,
-                record_len: parsed.record.encoded_len(),
-            });
-            first.get_or_insert_with(|| segment.clone());
-            last = Some(segment.clone());
-        }
-    }
-    Ok(RunData {
-        number,
-        segs_path,
-        index_path,
-        records,
-        segs_len: snapshot.segs_end,
-        index_len: snapshot.valid_end,
-        init_counter: snapshot.init_counter,
-        init,
-        files: None,
-        first_segment: first,
-        last_segment: last,
-    })
-}
-
-fn run_paths(dir: &Path, number: u32) -> (PathBuf, PathBuf) {
-    (
-        dir.join(format!("live.{number:03}.segs")),
-        dir.join(format!("live.{number:03}.index")),
-    )
-}
-
-fn ms_u32(value: u64) -> u32 {
-    if value > u64::from(u32::MAX) {
-        u32::MAX
-    } else {
-        u32::try_from(value).unwrap_or(u32::MAX)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn segment(
-        source: u8,
-        pdt: u64,
-        elapsed: u64,
-        duration: u64,
-        offset: u64,
-        len: u32,
-    ) -> SegmentRecord {
-        SegmentRecord {
-            source,
-            sequence: 0,
-            elapsed_ms: ms_u32(elapsed),
-            pdt_ms: pdt,
-            duration_ms: ms_u32(duration),
-            byte_offset: offset,
-            byte_length: len,
-            hash: 0,
-            flags: 0,
-        }
-    }
-
-    #[test]
-    fn v4_records_round_trip() {
-        let records = [
-            Record::Segment(segment(SOURCE_LIVE, 1_794_119_852_191, 0, 2_000, 0, 1_000)),
-            Record::Init(InitRecord {
-                source: SOURCE_DVR,
-                counter: 7,
-                byte_offset: 10,
-                byte_length: 20,
-                hash: 42,
-            }),
-            Record::Discontinuity(DiscontinuityRecord {
-                width: 1920,
-                height: 1080,
-                rate_num: 60,
-                rate_denom: 1,
-            }),
-            Record::Run(RunRecord {
-                run: 3,
-                dst_segs_offset: 1,
-                segs_len: 2,
-                source_segs_offset: 3,
-                source_index_offset: 4,
-                record_len: 5,
-                complete: 1,
-            }),
-        ];
-
-        for record in records {
-            let mut encoded = Vec::new();
-            record.encode(&mut encoded);
-            assert_eq!(
-                u32::try_from(encoded.len()).expect("record length"),
-                record.encoded_len()
-            );
-            let mut reader = &encoded[1..];
-            let decoded = Record::decode(encoded[0], &mut reader).expect("decode");
-            assert_eq!(decoded, record);
-        }
-    }
-
-    #[test]
-    fn header_round_trips_and_rejects_old_versions() {
-        let header = encode_header(123);
-        assert_eq!(parse_header(&header).expect("header"), 123);
-        let mut old = header;
-        old[8..12].copy_from_slice(&3u32.to_le_bytes());
-        assert!(parse_header(&old).is_err());
-    }
-
-    #[test]
-    fn prefill_and_hole_boundaries_follow_chunk_edges() {
-        let timeline = DvrTimeline {
-            segments: vec![
-                DvrSegment {
-                    start_ms: 0,
-                    duration_ms: 10_000,
-                    pdt_ms: 1_000_000,
-                    sequence: 0,
-                    url: "a".into(),
-                    map: None,
-                },
-                DvrSegment {
-                    start_ms: 10_000,
-                    duration_ms: 10_000,
-                    pdt_ms: 1_010_000,
-                    sequence: 1,
-                    url: "b".into(),
-                    map: None,
-                },
-                DvrSegment {
-                    start_ms: 20_000,
-                    duration_ms: 10_000,
-                    pdt_ms: 1_020_000,
-                    sequence: 2,
-                    url: "c".into(),
-                    map: None,
-                },
-            ],
-            maps: Vec::new(),
-            end_ms: 30_000,
-            ended: false,
-        };
-        // Mid-chunk end: resume at the chunk's start.
-        assert_eq!(
-            hole_end(&timeline, 1_015_000, Clock::Pdt, Some(1_000_000)),
-            Some(1_010_000)
-        );
-        assert_eq!(
-            hole_end(&timeline, 1_020_000, Clock::Pdt, Some(1_000_000)),
-            Some(1_020_000)
-        );
-    }
-
-    #[test]
-    fn plan_trims_the_records_the_dvr_edges_supply() {
-        let records: Vec<RunRecordMeta> = [
-            (1_000_000, 0u64, 2_000u64, 100u32),
-            (1_002_000, 100, 2_000, 100),
-            (1_004_000, 200, 2_000, 100),
-            (1_006_000, 300, 2_000, 100),
-            (1_008_000, 400, 2_000, 100),
-        ]
-        .into_iter()
-        .map(|(pdt, offset, duration, len)| RunRecordMeta {
-            segment: segment(SOURCE_LIVE, pdt, pdt - 1_000_000, duration, offset, len),
-            record_offset: HEADER_LEN as u64 + offset / 50,
-            record_len: 1 + SEGMENT_BODY,
-        })
-        .collect();
-
-        // DVR covers [0, 1_004_000) and [1_010_000, ...): keep only the records
-        // fully inside the hole.
-        let plan = plan_hole(&records, 1_004_000, 1_010_000, Clock::Pdt, Some(1_000_000));
-        assert_eq!(plan.records, 3);
-        // Records at 1_004_000, 1_006_000, 1_008_000.
-        assert_eq!(plan.source_segs_offset, 200);
-        assert_eq!(plan.segs_len, 300);
-        assert_eq!(plan.record_len, 3 * (1 + SEGMENT_BODY));
-    }
-
-    #[test]
-    fn plan_is_empty_when_the_run_fits_in_one_chunk() {
-        let records = vec![RunRecordMeta {
-            segment: segment(SOURCE_LIVE, 1_000_000, 0, 2_000, 0, 100),
-            record_offset: HEADER_LEN as u64,
-            record_len: 1 + SEGMENT_BODY,
-        }];
-        assert_eq!(
-            plan_hole(&records, 1_010_000, 1_010_000, Clock::Pdt, None),
-            HolePlan::default()
-        );
-    }
-
-    #[test]
-    fn rebase_offsets_and_renumbers_init_counters() {
-        let mut init = Record::Init(InitRecord {
-            source: SOURCE_LIVE,
-            counter: 9,
-            byte_offset: 100,
-            byte_length: 10,
-            hash: 0,
-        });
-        let mut counter = 3;
-        init.rebase(50, &mut counter);
-        assert_eq!(
-            init,
-            Record::Init(InitRecord {
-                source: SOURCE_LIVE,
-                counter: 3,
-                byte_offset: 150,
-                byte_length: 10,
-                hash: 0,
-            })
-        );
-        assert_eq!(counter, 4);
-
-        let mut segment = Record::Segment(segment(SOURCE_LIVE, 0, 0, 2_000, 500, 10));
-        segment.rebase(-100, &mut counter);
-        let Record::Segment(segment) = segment else {
-            unreachable!()
-        };
-        assert_eq!(segment.byte_offset, 400);
-    }
-
-    #[test]
-    fn a_torn_tail_is_ignored_by_the_parser() {
-        let mut bytes = encode_header(0);
-        let record = Record::Segment(segment(SOURCE_DVR, 1, 0, 2_000, 0, 10));
-        record.encode(&mut bytes);
-        let complete = bytes.len();
-        record.encode(&mut bytes);
-        bytes.truncate(bytes.len() - 3);
-
-        let parsed = parse_records(&bytes).expect("parse");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].span, u64::from(1 + SEGMENT_BODY));
-        assert!(bytes.len() > complete);
-    }
-
-    #[test]
-    fn a_run_marker_skips_its_reserved_area() {
-        let mut bytes = encode_header(0);
-        let run = Record::Run(RunRecord {
-            run: 1,
-            dst_segs_offset: 0,
-            segs_len: 0,
-            source_segs_offset: 0,
-            source_index_offset: 0,
-            record_len: 20,
-            complete: 0,
-        });
-        run.encode(&mut bytes);
-        bytes.extend_from_slice(&[0u8; 20]);
-        let after = Record::Segment(segment(SOURCE_DVR, 2, 0, 2_000, 0, 5));
-        after.encode(&mut bytes);
-
-        let parsed = parse_records(&bytes).expect("parse");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].span, u64::from(1 + RUN_BODY) + 20);
-        assert_eq!(parsed[1].offset, parsed[0].offset + parsed[0].span);
-    }
-
-    #[cfg(not(miri))]
-    #[test]
-    fn resume_redoes_a_pending_run_hole() {
-        use std::fs;
-
-        let dir = std::env::temp_dir().join(format!(
-            "twitch-disk-resume-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("dir");
-
-        let before = b"0123456789";
-        let middle = b"abcdefghij";
-        let after = b"KLMNOPQRST";
-
-        let mut canonical_segs = Vec::new();
-        canonical_segs.extend_from_slice(before);
-        canonical_segs.extend_from_slice(&[0u8; 10]); // reserved hole
-        canonical_segs.extend_from_slice(after);
-
-        let mut canonical_index = encode_header(0);
-        Record::Segment(SegmentRecord {
-            source: SOURCE_DVR,
-            sequence: 0,
-            elapsed_ms: 0,
-            pdt_ms: 1_000_000,
-            duration_ms: 10_000,
-            byte_offset: 0,
-            byte_length: 10,
-            hash: xxh3_128(before),
-            flags: 0,
-        })
-        .encode(&mut canonical_index);
-        Record::Run(RunRecord {
-            run: 0,
-            dst_segs_offset: 10,
-            segs_len: 10,
-            source_segs_offset: 0,
-            source_index_offset: HEADER_LEN as u64,
-            record_len: 1 + SEGMENT_BODY,
-            complete: 0,
-        })
-        .encode(&mut canonical_index);
-        canonical_index.extend_from_slice(&[0u8; (1 + SEGMENT_BODY) as usize]);
-        Record::Segment(SegmentRecord {
-            source: SOURCE_DVR,
-            sequence: 1,
-            elapsed_ms: 20_000,
-            pdt_ms: 1_020_000,
-            duration_ms: 10_000,
-            byte_offset: 20,
-            byte_length: 10,
-            hash: xxh3_128(after),
-            flags: 0,
-        })
-        .encode(&mut canonical_index);
-
-        fs::write(dir.join("segs"), &canonical_segs).expect("segs");
-        fs::write(dir.join("index"), &canonical_index).expect("index");
-
-        let mut run_index = encode_header(0);
-        Record::Segment(SegmentRecord {
-            source: SOURCE_LIVE,
-            sequence: 7,
-            elapsed_ms: 10_000,
-            pdt_ms: 1_010_000,
-            duration_ms: 10_000,
-            byte_offset: 0,
-            byte_length: 10,
-            hash: xxh3_128(middle),
-            flags: 0,
-        })
-        .encode(&mut run_index);
-        let (segs_path, index_path) = run_paths(&dir, 0);
-        fs::write(&segs_path, middle).expect("run segs");
-        fs::write(&index_path, &run_index).expect("run index");
-
-        let snapshot = compio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(read_canonical(&dir, 0, false))
-            .expect("canonical")
-            .expect("snapshot");
-
-        assert!(snapshot.has_dvr);
-        let Record::Run(run) = &snapshot.records[1].record else {
-            panic!("second record is the run marker");
-        };
-        assert_eq!(run.complete, 1);
-        assert_eq!(snapshot.segs_end, 30);
-        assert!(!segs_path.exists(), "the source pair is deleted");
-        assert!(!index_path.exists(), "the source pair is deleted");
-
-        let segs = fs::read(dir.join("segs")).expect("segs");
-        assert_eq!(&segs[10..20], middle);
-        // The copied record is rebased into the hole and readable.
-        let index = fs::read(dir.join("index")).expect("index");
-        let marker_offset = usize::try_from(snapshot.records[1].offset).expect("marker offset");
-        let mut reader = &index[marker_offset + 1 + RUN_BODY as usize
-            ..marker_offset + 1 + RUN_BODY as usize + (1 + SEGMENT_BODY) as usize];
-        let tag = reader[0];
-        reader = &reader[1..];
-        let Record::Segment(copied) = Record::decode(tag, &mut reader).expect("copied record")
-        else {
-            panic!("copied segment");
-        };
-        assert_eq!(copied.byte_offset, 10);
-        assert_eq!(copied.sequence, 7);
-        assert_eq!(copied.hash, xxh3_128(middle));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(not(miri))]
-    #[test]
-    fn init_insertion_is_hash_gated_and_shifts_offsets() {
-        use std::fs;
-
-        let dir = std::env::temp_dir().join(format!(
-            "twitch-disk-init-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("dir");
-
-        compio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                let mut canonical = create_canonical(&dir, 0).await.expect("canonical");
-                let first = b"ftypA";
-                let second = b"ftypBBBB";
-
-                assert!(
-                    write_init_bytes(&mut canonical, SOURCE_DVR, first)
-                        .await
-                        .expect("first init")
-                );
-                let segs_after_first = canonical.segs_end;
-                let index_after_first = canonical.index_end;
-
-                // The same map is already active: no bytes, no record.
-                assert!(
-                    !write_init_bytes(&mut canonical, SOURCE_DVR, first)
-                        .await
-                        .expect("duplicate init")
-                );
-                assert_eq!(canonical.segs_end, segs_after_first);
-                assert_eq!(canonical.index_end, index_after_first);
-
-                assert!(
-                    write_init_bytes(&mut canonical, SOURCE_LIVE, second)
-                        .await
-                        .expect("second init")
-                );
-                assert_eq!(
-                    canonical.segs_end,
-                    segs_after_first + u64::try_from(second.len()).unwrap()
-                );
-                assert_eq!(
-                    canonical.index_end,
-                    index_after_first + u64::from(1 + INIT_BODY)
-                );
-                assert_eq!(canonical.active_init, Some(xxh3_128(second)));
-
-                drop(canonical);
-                let snapshot = read_canonical(&dir, 0, false)
-                    .await
-                    .expect("read")
-                    .expect("snapshot");
-                assert_eq!(snapshot.active_init, Some(xxh3_128(second)));
-                let inits: Vec<_> = snapshot
-                    .records
-                    .iter()
-                    .filter_map(|parsed| match &parsed.record {
-                        Record::Init(init) => Some(init.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(inits.len(), 2);
-                assert_eq!(inits[0].counter, 0);
-                assert_eq!(inits[1].counter, 1);
-                assert_eq!(inits[1].byte_offset, segs_after_first);
-                assert_eq!(inits[1].hash, xxh3_128(second));
-            });
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(not(miri))]
-    #[test]
-    fn discontinuity_markers_are_written_when_the_archive_reaches_them() {
-        use std::fs;
-
-        let dir = std::env::temp_dir().join(format!(
-            "twitch-disk-discontinuity-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("dir");
-
-        compio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                let mut canonical = create_canonical(&dir, 0).await.expect("canonical");
-                let mut marks = vec![
-                    DiscontinuityMark {
-                        pdt_ms: 1_000,
-                        elapsed_ms: 500,
-                    },
-                    DiscontinuityMark {
-                        pdt_ms: 9_000,
-                        elapsed_ms: 8_500,
-                    },
-                ];
-
-                // Before the first mark: nothing is placed.
-                write_discontinuities(&mut canonical, &mut marks, 999, Clock::Pdt, None)
-                    .await
-                    .expect("nothing");
-                assert_eq!(canonical.index_end, HEADER_LEN as u64);
-                assert_eq!(marks.len(), 2);
-
-                // Past the first: exactly one record, and the second stays pending.
-                write_discontinuities(&mut canonical, &mut marks, 1_000, Clock::Pdt, None)
-                    .await
-                    .expect("first");
-                assert_eq!(
-                    canonical.index_end,
-                    HEADER_LEN as u64 + u64::from(1 + DISCONTINUITY_BODY)
-                );
-                assert_eq!(marks.len(), 1);
-
-                write_discontinuities(&mut canonical, &mut marks, u64::MAX, Clock::Pdt, None)
-                    .await
-                    .expect("second");
-                assert!(marks.is_empty());
-
-                let index = fs::read(dir.join("index")).expect("index");
-                let mut position = HEADER_LEN;
-                let mut tags = Vec::new();
-                while position < index.len() {
-                    let tag = index[position];
-                    let body = body_len(tag).expect("tag");
-                    tags.push((tag, position));
-                    position += 1 + body as usize;
-                }
-                assert_eq!(tags.len(), 2);
-                assert!(tags.iter().all(|(tag, _)| *tag == TAG_DISCONTINUITY));
-                assert!(tags[0].1 < tags[1].1);
-                assert_eq!(position, index.len());
-            });
-
-        fs::remove_dir_all(&dir).ok();
-    }
 }
