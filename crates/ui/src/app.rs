@@ -486,10 +486,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Channels),
                     on:click = tab_click(Tab::Channels)
                 ) {
-                    box(class = "tab__label") {
-                        text(class = "tab__sizer", attr:aria-hidden = "true") {"Channels"}
-                        text(class = "tab__text") {"Channels"}
-                    }
+                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Channels"}
                     box(class = "tab__count tab__count--error", class:on = move || error_count.get() > 0) {
                         {move || if error_count.get() > 0 { error_count.get().to_string() } else { String::new() }}
                     }
@@ -500,10 +497,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Filter),
                     on:click = tab_click(Tab::Filter)
                 ) {
-                    box(class = "tab__label") {
-                        text(class = "tab__sizer", attr:aria-hidden = "true") {"Filter"}
-                        text(class = "tab__text") {"Filter"}
-                    }
+                    text(class = "tab__label", var:--tab-label-w = Some("36px".to_owned())) {"Filter"}
                 }
                 box(
                     class = "tab",
@@ -511,10 +505,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Recordings),
                     on:click = tab_click(Tab::Recordings)
                 ) {
-                    box(class = "tab__label") {
-                        text(class = "tab__sizer", attr:aria-hidden = "true") {"Recordings"}
-                        text(class = "tab__text") {"Recordings"}
-                    }
+                    text(class = "tab__label", var:--tab-label-w = Some("74px".to_owned())) {"Recordings"}
                     box(class = "tab__count tab__count--rec", class:on = move || rec_count.get() > 0) {
                         {move || if rec_count.get() > 0 { rec_count.get().to_string() } else { String::new() }}
                     }
@@ -525,10 +516,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Logs),
                     on:click = tab_click(Tab::Logs)
                 ) {
-                    box(class = "tab__label") {
-                        text(class = "tab__sizer", attr:aria-hidden = "true") {"Logs"}
-                        text(class = "tab__text") {"Logs"}
-                    }
+                    text(class = "tab__label", var:--tab-label-w = Some("32px".to_owned())) {"Logs"}
                 }
                 box(
                     class = "tab",
@@ -536,10 +524,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Settings),
                     on:click = tab_click(Tab::Settings)
                 ) {
-                    box(class = "tab__label") {
-                        text(class = "tab__sizer", attr:aria-hidden = "true") {"Settings"}
-                        text(class = "tab__text") {"Settings"}
-                    }
+                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Settings"}
                 }
                 // The video surface is the next milestone. A tab that changes
                 // nothing is worse than a tab that says it cannot be used yet,
@@ -2746,33 +2731,20 @@ const SHEET: &str = css!(
     font-variation-settings: "wght" 400, "wdth" 92;
 }
 
-/* The label sizes itself to the widest weight it will ever be drawn at, not to
-   a hand-measured width: a hidden copy at `wght 600` stays in flow and sets the
-   box, while the visible copy is taken out of flow and centred across that box.
-   The weight animation then changes glyphs inside a box the layout never
-   re-measures, so the label cannot jitter the tab row. */
+/* Each label keeps a fixed box, measured once for Chillax at the selected
+   weight so the `wght` tween cannot resize the tab or shift the row. The text
+   is centred by the box rather than by `text-align`: a fallback font measures
+   wider than the box, and flex centring makes that overflow spill equally on
+   both sides instead of hanging off the right. */
 .tab__label {
-    position: relative;
-    display: inline-flex;
-    justify-content: center;
+    display: flex;
     align-items: center;
-}
-
-.tab__sizer {
-    font-variation-settings: "wght" 600, "wdth" 92;
-    opacity: 0;
-}
-
-.tab__text {
-    position: absolute;
-    left: 0;
-    right: 0;
-    text-align: center;
+    justify-content: center;
+    width: var(--tab-label-w, 60px);
     white-space: nowrap;
-    font-variation-settings: "wght" var(--tab-wght, 200), "wdth" 92;
 }
-/* A count beside the tab's name. The slot is always there so the row does not
-   shift when a recording starts; only its opacity changes with the count. */
+/* A count in the tab's corner. It is out of flow so it can neither widen the
+   tab nor push its label off-centre; only its opacity changes with the count. */
 .tab__count {
     display: inline-flex;
     align-items: center;
