@@ -60,8 +60,11 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   minimum 200 and the selected tab at 600, with a cubic ease-out over 250ms
   while the outgoing tab eases back; the outgoing tab is tracked explicitly so
   the other tabs stay at 200 instead of blinking through the ramp. Each label
-  sits in a fixed-width box so changing glyph advances cannot resize the tab
-  and shift the row. Driven by `font-variation-settings` and a per-frame signal.
+  is sized by a hidden copy laid out at `wght` 600 (its widest state) and the
+  visible copy is absolutely centred across that box, so the tab width comes
+  from the font's own bold metrics instead of hand-measured pixels, the text is
+  centred, and the weight tween cannot resize the tab or shift the row. Driven
+  by `font-variation-settings` and a per-frame signal.
   The switch gets its
   motion from `--zui-motion-duration-normal`: zgui-ui's switch declares its own
   `transition-property` and reads that token, and the Terminal preset sets it
