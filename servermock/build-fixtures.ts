@@ -25,6 +25,7 @@ import { execFile } from "node:child_process";
 import {
   copyFileSync,
   linkSync,
+  statSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -80,6 +81,8 @@ interface LegacySegment {
 interface Manifest {
   source: string;
   pdt_origin_ms: number;
+  /** `#EXT-X-STREAM-INF` attributes for the mock's master. */
+  streamInf?: string;
   chunks: ChunkFixture[];
   live: LiveFixture[];
 }
@@ -397,9 +400,20 @@ async function main(): Promise<void> {
     }
   });
 
+  // The capture is one variant, so the mock's master advertises one. Bandwidth
+  // is what the chunks actually run at; nothing else here is measured.
+  const totalMs = chunks.reduce((sum, chunk) => sum + chunk.duration_ms, 0);
+  const totalBytes = chunks.reduce(
+    (sum, chunk) => sum + statSync(path.join(OUT, chunk.file)).size,
+    0,
+  );
+  const bandwidth = Math.round((totalBytes * 8 * 1000) / totalMs);
   const manifest: Manifest = {
     source: "natemek 2026-11-21T17:06:17Z",
     pdt_origin_ms: playlist[0].pdt,
+    streamInf:
+      `BANDWIDTH=${bandwidth},RESOLUTION=1920x1080,` +
+      'STABLE-VARIANT-ID="chunked",IVS-NAME="1080p60",IVS-GROUPS="landscape",IVS-VARIANT-SOURCE="source"',
     chunks,
     live,
   };

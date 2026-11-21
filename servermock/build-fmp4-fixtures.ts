@@ -21,6 +21,7 @@
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  existsSync,
   linkSync,
   mkdirSync,
   readFileSync,
@@ -102,6 +103,29 @@ function linkOrCopy(source: string, dest: string): void {
   } catch {
     copyFileSync(source, dest);
   }
+}
+
+/** The captured master's attribute line for this group, if the capture has one. */
+function streamInfFor(group: GroupName): string | undefined {
+  const file = path.join(CAPTURE_DIR, "live-master.m3u8");
+  if (!existsSync(file)) {
+    return undefined;
+  }
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    const attributes = line.trim().slice("#EXT-X-STREAM-INF:".length);
+    if (!line.trim().startsWith("#EXT-X-STREAM-INF:")) {
+      continue;
+    }
+    const resolution = /RESOLUTION=(\d+)x(\d+)/.exec(attributes);
+    if (!resolution) {
+      continue;
+    }
+    const portrait = Number(resolution[2]) > Number(resolution[1]);
+    if (portrait === (group === "portrait")) {
+      return attributes;
+    }
+  }
+  return undefined;
 }
 
 function fragmentDir(group: GroupName, kind: "live" | "dvr"): string {
@@ -264,8 +288,10 @@ function buildGroup(name: GroupName): GroupFixture {
       `(${(liveSpan / 1000).toFixed(3)} s), ${perChunk} fragments/chunk, ` +
       `init sha256 ${sha256(liveInit).slice(0, 16)}…`,
   );
+  const streamInf = streamInfFor(name);
   return {
     init: `${name}/init.mp4`,
+    ...(streamInf && { streamInf }),
     ...(eos && {
       eos: {
         file: eos.file,
@@ -280,15 +306,25 @@ function buildGroup(name: GroupName): GroupFixture {
 
 function main(): void {
   const groups = {} as Record<GroupName, GroupFixture>;
-  for (const name of GROUPS) {
+  // A capture only has the groups that were actually downloaded; a
+  // single-orientation stream is a perfectly good fixture set.
+  const present = GROUPS.filter((name) =>
+    existsSync(fragmentDir(name, "live")),
+  );
+  if (present.length === 0) {
+    throw new Error(`no live fragments under ${CAPTURE_DIR}`);
+  }
+  for (const name of present) {
     groups[name] = buildGroup(name);
   }
-  // The two groups really are different media: H.264 vs HEVC init boxes.
-  if (
-    sha256(readFileSync(path.join(OUT, groups.landscape.init))) ===
-    sha256(readFileSync(path.join(OUT, groups.portrait.init)))
-  ) {
-    throw new Error("groups have identical init bytes");
+  if (present.length === GROUPS.length) {
+    // The two groups really are different media: H.264 vs HEVC init boxes.
+    if (
+      sha256(readFileSync(path.join(OUT, groups.landscape.init))) ===
+      sha256(readFileSync(path.join(OUT, groups.portrait.init)))
+    ) {
+      throw new Error("groups have identical init bytes");
+    }
   }
 
   const manifest: Manifest = {

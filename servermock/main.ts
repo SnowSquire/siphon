@@ -32,6 +32,8 @@ interface GroupFixture {
   init?: string;
   /** Twitch's closing empty entry: no media, but it declares a second. */
   eos?: { file: string; start_ms: number; duration_ms: number };
+  /** `#EXT-X-STREAM-INF` attributes for the master, from the capture. */
+  streamInf?: string;
   live: Live[];
   chunks: Chunk[];
 }
@@ -308,7 +310,7 @@ for (const [name, fixture] of Object.entries(fixtures)) {
   groups[name] = makeGroup(name, fixture);
 }
 
-function groupForPath(path_name: string): Group {
+function groupForPath(path_name: string): Group | undefined {
   if (!FMP4) {
     return groups.ts;
   }
@@ -317,14 +319,21 @@ function groupForPath(path_name: string): Group {
 const liveGroupForPath = new Map<string, Group>();
 const dvrGroupForPath = new Map<string, Group>();
 for (const path_name of LIVE_PATHS) {
-  liveGroupForPath.set(path_name, groupForPath(path_name));
+  // A fixture set only has the groups that were captured; a path for a group
+  // that is not there must 404 rather than quietly serve the other one.
+  const group = groupForPath(path_name);
+  if (group) liveGroupForPath.set(path_name, group);
 }
 for (const path_name of DVR_PATHS) {
-  dvrGroupForPath.set(path_name, groupForPath(path_name));
+  const group = groupForPath(path_name);
+  if (group) dvrGroupForPath.set(path_name, group);
 }
 
 // Ads carry no media of their own: any decodable bytes from the group will do.
-const adSource = FMP4 ? groups.landscape : groups.ts;
+const adSource = groups.landscape ?? groups.portrait ?? groups.ts;
+if (!adSource) {
+  throw new Error("no groups in the fixture manifest");
+}
 const streamDuration = adSource.streamDuration;
 
 function generateLivePlaylist(
@@ -595,14 +604,29 @@ function playlist(res: ServerResponse, body: string): void {
  * absolute CDN URLs here; the daemon's live-master parser also ignores lines
  * that do not start with `http`, so relative paths would drop both variants.
  */
+/**
+ * The multivariant playlist, built from the groups this fixture set actually
+ * has: a set captured from one variant is a one-entry master, not a two-entry
+ * one that points at a 404. The attributes come from the capture's own master
+ * when it had one.
+ */
 function masterPlaylist(origin: string): string {
-  return `#EXTM3U
-#EXT-X-VERSION:6
-#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080,STABLE-VARIANT-ID="chunked",IVS-NAME="1080p60",IVS-GROUPS="landscape",IVS-VARIANT-SOURCE="source"
-${origin}/index.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1080x1920,STABLE-VARIANT-ID="1080p60-portrait",IVS-NAME="1080p60",IVS-GROUPS="portrait",IVS-VARIANT-SOURCE="source"
-${origin}/portrait.m3u8
-`;
+  let body = "#EXTM3U\n#EXT-X-VERSION:6\n";
+  for (const [name, group] of Object.entries(groups)) {
+    const portrait = name === "portrait";
+    const streamInf =
+      group.fixture.streamInf ??
+      (portrait
+        ? 'BANDWIDTH=8000000,RESOLUTION=1080x1920,STABLE-VARIANT-ID="1080p60-portrait",IVS-NAME="1080p60",IVS-GROUPS="portrait",IVS-VARIANT-SOURCE="source"'
+        : 'BANDWIDTH=8000000,RESOLUTION=1920x1080,STABLE-VARIANT-ID="chunked",IVS-NAME="1080p60",IVS-GROUPS="landscape",IVS-VARIANT-SOURCE="source"');
+    const livePath = !FMP4
+      ? "/index.m3u8"
+      : portrait
+        ? "/portrait.m3u8"
+        : "/index.m3u8";
+    body += `#EXT-X-STREAM-INF:${streamInf}\n${origin}${livePath}\n`;
+  }
+  return body;
 }
 
 function segment(res: ServerResponse, bytes: Buffer): void {
