@@ -80,6 +80,8 @@ interface Variant {
 
 interface DvrChoice {
   kind: "landscape" | "portrait";
+  /// Which route resolved it: the archive master, a private object, or chunked/.
+  via: string;
   url: string;
 }
 
@@ -836,37 +838,45 @@ async function main(): Promise<void> {
         );
       }
 
-      // The per-variant private path is the only way to reach the portrait group
-      // when the archive master does not list it.
+      // Resolution order mirrors the daemon's `dvr::discover`: the public
+      // archive master first, then the per-variant private object, then
+      // `chunked/`. They are not interchangeable: a group's live id is not
+      // necessarily its DVR object id. The landscape source is `chunked/` and
+      // its live id 403s, while portrait's live id is its own object and
+      // answers. Only the archive master states which object belongs to which
+      // group (`IVS-GROUPS`), so it has to be the primary route.
       const choices: DvrChoice[] = [];
+      try {
+        const archive = channelId ? await archiveMaster(channelId, startSeconds) : null;
+        if (archive) {
+          writeFileSync(path.join(options.out, "dvr-master.m3u8"), archive);
+          console.log(`capture: DVR master saved to ${path.join(options.out, "dvr-master.m3u8")}`);
+          const archiveVariants = parseMaster(archive);
+          printVariants(
+            "archive variants (kind, bandwidth, id, resolution, source)",
+            archiveVariants,
+          );
+          for (const kind of wanted) {
+            const url = pick(archiveVariants, kind);
+            if (!url) continue;
+            const id = archiveVariants.find((variant) => variant.url === url)?.id;
+            choices.push({ kind, url, via: `archive:${id || "?"}` });
+          }
+        }
+      } catch (error) {
+        record({ src: "watch", event: "archive_failed", error: String(error) });
+      }
+
+      // The private object is the fallback, not the primary: it needs nothing
+      // from the VOD endpoint, and for a secondary group it is the same object
+      // the archive master points at anyway.
       for (const kind of wanted) {
+        if (choices.some((choice) => choice.kind === kind)) continue;
         const live = kind === "landscape" ? liveLandscape : livePortrait;
         const id = variants.find((variant) => variant.url === live)?.id;
         if (!id) continue;
         const url = await probeDvr(stream.id, startSeconds, `${id}/index-dvr.m3u8`);
-        if (url) choices.push({ kind, url });
-      }
-
-      if (choices.length < wanted.length) {
-        try {
-          const archive = channelId ? await archiveMaster(channelId, startSeconds) : null;
-          if (archive) {
-            writeFileSync(path.join(options.out, "dvr-master.m3u8"), archive);
-            console.log(`capture: DVR master saved to ${path.join(options.out, "dvr-master.m3u8")}`);
-            const archiveVariants = parseMaster(archive);
-            printVariants(
-              "archive variants (kind, bandwidth, id, resolution, source)",
-              archiveVariants,
-            );
-            for (const kind of wanted) {
-              if (choices.some((choice) => choice.kind === kind)) continue;
-              const url = pick(archiveVariants, kind);
-              if (url) choices.push({ kind, url });
-            }
-          }
-        } catch (error) {
-          record({ src: "watch", event: "archive_failed", error: String(error) });
-        }
+        if (url) choices.push({ kind, url, via: `private:${id}` });
       }
 
       // `chunked/` is the source group, and on a dual-format broadcast that is
@@ -875,15 +885,21 @@ async function main(): Promise<void> {
         const chunked = await probeDvr(stream.id, startSeconds, "chunked/index-dvr.m3u8");
         if (chunked) {
           console.log("capture: attributing chunked/ to landscape (the source group)");
-          choices.push({ kind: "landscape", url: chunked });
+          choices.push({ kind: "landscape", url: chunked, via: "chunked/" });
         }
       }
 
       for (const choice of choices) {
         if (spawned.has(choice.kind)) continue;
         spawned.add(choice.kind);
-        console.log(`capture: DVR ${choice.kind} ${choice.url}`);
-        record({ src: "watch", event: "dvr", kind: choice.kind, url: choice.url });
+        console.log(`capture: DVR ${choice.kind} via ${choice.via}: ${choice.url}`);
+        record({
+          src: "watch",
+          event: "dvr",
+          kind: choice.kind,
+          via: choice.via,
+          url: choice.url,
+        });
         spawnRecorder(`${options.channel}-${choice.kind}-dvr`, choice.url, [
           "--live-wait-time",
           "5",
