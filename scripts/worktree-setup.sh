@@ -19,6 +19,13 @@
 # so nothing may write to a segment in place.
 set -euo pipefail
 
+# `set -e` is not inherited by a command substitution, so `x=$(a; b)` succeeds
+# when only `a` fails. This closes that hole; bash 4.4+.
+shopt -s inherit_errexit || {
+	echo "$0: needs bash 4.4+ (shopt inherit_errexit)" >&2
+	exit 1
+}
+
 base=${OPENCODE_WORKTREE_BASE:?run from the worktree startup step}
 new=${OPENCODE_WORKTREE_PATH:?run from the worktree startup step}
 

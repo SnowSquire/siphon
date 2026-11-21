@@ -33,6 +33,13 @@
 #   LIBPLACEBO_VENV    venv holding meson + ninja     $TEMP/libplacebo-venv
 set -euo pipefail
 
+# `set -e` is not inherited by a command substitution, so `x=$(a; b)` succeeds
+# when only `a` fails. This closes that hole; bash 4.4+.
+shopt -s inherit_errexit || {
+	echo "$0: needs bash 4.4+ (shopt inherit_errexit)" >&2
+	exit 1
+}
+
 command -v cygpath >/dev/null || {
 	echo "build-libplacebo: needs git-bash/MSYS on Windows (no cygpath)" >&2
 	exit 1
@@ -40,6 +47,13 @@ command -v cygpath >/dev/null || {
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(dirname "$here")
+
+for tool in meson ninja clang-cl llvm-lib llvm-strip pkg-config; do
+	command -v "$tool" >/dev/null || {
+		echo "build-libplacebo: $tool is not on PATH" >&2
+		exit 1
+	}
+done
 
 # TODO: fix this script so it does not need a hand-placed libplacebo checkout.
 #
