@@ -28,6 +28,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   appendFileSync,
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   writeFileSync,
@@ -565,6 +566,11 @@ function spawnRecorder(label: string, url: string, extra: string[]): void {
   }
   mkdirSync(path.join(dir, "tmp"), { recursive: true });
   const logPath = path.join(dir, `${label}.log`);
+  if (existsSync(logPath)) {
+    // Re-running into the same --out would put two recorders on one directory.
+    console.log(`capture: ${label} already recorded here, not starting another`);
+    return;
+  }
   const log = openSync(logPath, "w");
   let closed = false;
   const closeLog = (): void => {
