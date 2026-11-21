@@ -63,6 +63,9 @@ interface Options {
   dryRun: boolean;
   interval: number;
   watchTimeout: number;
+  dvrOnly: boolean;
+  dvrRetry: number;
+  dvrWatch: number;
 }
 
 interface Variant {
@@ -118,6 +121,9 @@ const options: Options = {
   dryRun: false,
   interval: 300,
   watchTimeout: 1800,
+  dvrOnly: false,
+  dvrRetry: 30,
+  dvrWatch: 3600,
 };
 for (let index = 2; index < process.argv.length; index += 1) {
   const arg = process.argv[index]!;
@@ -139,6 +145,17 @@ for (let index = 2; index < process.argv.length; index += 1) {
       break;
     case "--watch-timeout":
       options.watchTimeout = Number(value ?? options.watchTimeout);
+      index += 1;
+      break;
+    case "--dvr-only":
+      options.dvrOnly = true;
+      break;
+    case "--dvr-retry":
+      options.dvrRetry = Number(value ?? options.dvrRetry);
+      index += 1;
+      break;
+    case "--dvr-watch":
+      options.dvrWatch = Number(value ?? options.dvrWatch);
       index += 1;
       break;
     case "-n":
@@ -190,6 +207,24 @@ async function streamMetadata(): Promise<StreamMetadataResponse> {
     },
   ]);
   return Array.isArray(raw) ? (raw[0] ?? {}) : raw;
+}
+
+/** The broadcast record, which can lag the master by seconds when it starts. */
+async function waitForStream(
+  timeoutMs: number,
+): Promise<{ id: string; createdAt: string } | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const meta = await streamMetadata();
+      const stream = meta.data?.user?.stream;
+      if (stream?.id && stream.createdAt) return { id: stream.id, createdAt: stream.createdAt };
+    } catch {
+      // transient; retry until the deadline
+    }
+    if (Date.now() >= deadline) return null;
+    await sleep(500);
+  }
 }
 
 async function get(url: string, timeout = 15000): Promise<string> {
@@ -466,7 +501,15 @@ async function hermes(): Promise<void> {
           return;
         }
         if (message.type !== "notification") return;
-        const pubsub = message.notification?.pubsub ?? {};
+        // The payload is a JSON *string*, not an object: hermes.rs parses
+        // message["notification"]["pubsub"].as_str() the same way.
+        let pubsub: { type?: string; viewers?: number } = {};
+        const raw = message.notification?.pubsub as unknown;
+        try {
+          pubsub = typeof raw === "string" ? JSON.parse(raw) : ((raw as typeof pubsub) ?? {});
+        } catch {
+          return;
+        }
         record({
           src: "hermes",
           event: pubsub.type ?? "notification",
@@ -670,81 +713,17 @@ async function main(): Promise<void> {
   const liveLandscape = pick(variants, "landscape");
   const livePortrait = pick(variants, "portrait");
   record({ src: "watch", event: "variants", variants: variants.length });
-
-  const meta = await streamMetadata();
-  const stream = meta.data?.user?.stream ?? null;
-  if (!stream?.id || !stream.createdAt || !channelId) {
-    console.error("capture: no running broadcast to read the DVR from");
-    process.exit(1);
-  }
-  const startSeconds = Math.floor(Date.parse(stream.createdAt) / 1000);
-  console.log(
-    `capture: broadcast ${stream.id} started ${new Date(startSeconds * 1000).toISOString()}`,
-  );
-
-  // DVR, in three steps: the per-variant private path (the only way to reach the
-  // portrait group when the archive master does not list it), the archive
-  // master by resolution, then `chunked/` when neither knows.
-  const choices: DvrChoice[] = [];
-  for (const [kind, live] of [
-    ["landscape", liveLandscape],
-    ["portrait", livePortrait],
-  ] as const) {
-    if (!live) continue;
-    const id = variants.find((variant) => variant.url === live)?.id;
-    if (!id) continue;
-    const url = await probeDvr(stream.id, startSeconds, `${id}/index-dvr.m3u8`);
-    if (url) choices.push({ kind, url });
-  }
-
-  if (choices.length < (liveLandscape ? 1 : 0) + (livePortrait ? 1 : 0)) {
-    try {
-      const archive = await archiveMaster(channelId, startSeconds);
-      if (archive) {
-        writeFileSync(path.join(options.out, "dvr-master.m3u8"), archive);
-        console.log(`capture: DVR master saved to ${path.join(options.out, "dvr-master.m3u8")}`);
-        const archiveVariants = parseMaster(archive);
-        printVariants("archive variants (kind, bandwidth, id, resolution, source)", archiveVariants);
-        for (const kind of ["landscape", "portrait"] as const) {
-          if (choices.some((choice) => choice.kind === kind)) continue;
-          const url = pick(archiveVariants, kind);
-          if (url) choices.push({ kind, url });
-        }
-      } else {
-        console.log("capture: no archive master (nothing published at the VOD endpoint)");
-      }
-    } catch (error) {
-      console.log(`capture: archive master failed: ${String(error)}`);
-    }
-  }
-
-  for (const [kind, live] of [
-    ["landscape", liveLandscape],
-    ["portrait", livePortrait],
-  ] as const) {
-    if (!live || choices.some((choice) => choice.kind === kind)) continue;
-    const chunked = await probeDvr(stream.id, startSeconds, "chunked/index-dvr.m3u8");
-    if (!chunked) continue;
-    const other = kind === "landscape" ? livePortrait : liveLandscape;
-    if (other) {
-      console.log(
-        `capture: both orientations are live but only chunked/ answers; it cannot be attributed`,
-      );
-      continue;
-    }
-    choices.push({ kind, url: chunked });
-  }
-
   console.log(`capture: output ${options.out}`);
-  for (const choice of choices) console.log(`capture: DVR ${choice.kind} ${choice.url}`);
-  record({ src: "watch", event: "dvr", choices });
 
-  // `--live-take-count` is not "how many to download": on the first pass the tool
-  // keeps the LAST N segments of the playlist (FilterUtil.SyncStreams skips
+  // Live first: it is the time-critical half and needs nothing from GQL.
+  // `--live-take-count` is not "how many to download": on the first pass the
+  // tool keeps the LAST N segments of the playlist (FilterUtil.SyncStreams skips
   // everything before the tail), and only later refreshes append. The default
   // 16 happens to cover a 30 s window of 2 s segments, but that is incidental -
   // asking for more makes "start at the first segment" explicit.
-  if (liveLandscape) {
+  if (options.dvrOnly) {
+    console.log("capture: --dvr-only, not starting the live recorders");
+  } else if (liveLandscape) {
     spawnRecorder(`${options.channel}-landscape-live`, liveLandscape, [
       "--live-wait-time",
       "4",
@@ -754,23 +733,104 @@ async function main(): Promise<void> {
   } else {
     console.error("capture: no landscape variant, skipping live landscape");
   }
-  if (livePortrait) {
+  if (!options.dvrOnly && livePortrait) {
     spawnRecorder(`${options.channel}-portrait-live`, livePortrait, [
       "--live-wait-time",
       "4",
       "--live-take-count",
       "100",
     ]);
-  } else {
+  } else if (!options.dvrOnly) {
     console.error("capture: no portrait variant, skipping live portrait");
   }
-  for (const choice of choices) {
-    spawnRecorder(`${options.channel}-${choice.kind}-dvr`, choice.url, [
-      "--live-wait-time",
-      "5",
-      "--live-take-count",
-      "1000000",
-    ]);
+
+  // The DVR needs the broadcast's id and start time, and StreamMetadata lags the
+  // master by seconds on a fresh broadcast. The private DVR object is not
+  // published immediately either (every path 403s for the first minutes), so the
+  // whole resolution retries until each live orientation has a playlist.
+  const wanted: Array<"landscape" | "portrait"> = [];
+  if (liveLandscape) wanted.push("landscape");
+  if (livePortrait) wanted.push("portrait");
+  const spawned = new Set<string>();
+  const dvrDeadline = Date.now() + options.dvrWatch * 1000;
+  for (;;) {
+    const stream = await waitForStream(10000);
+    if (!stream) {
+      console.error("capture: no broadcast metadata yet; will keep trying for the DVR");
+    } else {
+      const startSeconds = Math.floor(Date.parse(stream.createdAt) / 1000);
+      if (spawned.size === 0) {
+        console.log(
+          `capture: broadcast ${stream.id} started ${new Date(startSeconds * 1000).toISOString()}`,
+        );
+      }
+
+      // The per-variant private path is the only way to reach the portrait group
+      // when the archive master does not list it.
+      const choices: DvrChoice[] = [];
+      for (const kind of wanted) {
+        const live = kind === "landscape" ? liveLandscape : livePortrait;
+        const id = variants.find((variant) => variant.url === live)?.id;
+        if (!id) continue;
+        const url = await probeDvr(stream.id, startSeconds, `${id}/index-dvr.m3u8`);
+        if (url) choices.push({ kind, url });
+      }
+
+      if (choices.length < wanted.length) {
+        try {
+          const archive = channelId ? await archiveMaster(channelId, startSeconds) : null;
+          if (archive) {
+            writeFileSync(path.join(options.out, "dvr-master.m3u8"), archive);
+            console.log(`capture: DVR master saved to ${path.join(options.out, "dvr-master.m3u8")}`);
+            const archiveVariants = parseMaster(archive);
+            printVariants(
+              "archive variants (kind, bandwidth, id, resolution, source)",
+              archiveVariants,
+            );
+            for (const kind of wanted) {
+              if (choices.some((choice) => choice.kind === kind)) continue;
+              const url = pick(archiveVariants, kind);
+              if (url) choices.push({ kind, url });
+            }
+          }
+        } catch (error) {
+          record({ src: "watch", event: "archive_failed", error: String(error) });
+        }
+      }
+
+      // `chunked/` is the source group, and on a dual-format broadcast that is
+      // the landscape source (the portrait group lives under its own id).
+      if (!choices.some((choice) => choice.kind === "landscape") && liveLandscape) {
+        const chunked = await probeDvr(stream.id, startSeconds, "chunked/index-dvr.m3u8");
+        if (chunked) {
+          console.log("capture: attributing chunked/ to landscape (the source group)");
+          choices.push({ kind: "landscape", url: chunked });
+        }
+      }
+
+      for (const choice of choices) {
+        if (spawned.has(choice.kind)) continue;
+        spawned.add(choice.kind);
+        console.log(`capture: DVR ${choice.kind} ${choice.url}`);
+        record({ src: "watch", event: "dvr", kind: choice.kind, url: choice.url });
+        spawnRecorder(`${options.channel}-${choice.kind}-dvr`, choice.url, [
+          "--live-wait-time",
+          "5",
+          "--live-take-count",
+          "1000000",
+        ]);
+      }
+    }
+
+    if (spawned.size >= wanted.length || Date.now() >= dvrDeadline) break;
+    console.log(
+      `capture: waiting for the DVR playlist(s) (${spawned.size}/${wanted.length}); retrying in ${options.dvrRetry}s`,
+    );
+    record({ src: "watch", event: "dvr_wait", spawned: spawned.size, wanted: wanted.length });
+    await sleep(options.dvrRetry * 1000);
+  }
+  if (spawned.size === 0) {
+    console.error("capture: no DVR playlist found; the live recorders are unaffected");
   }
 
   console.log(
