@@ -41,6 +41,7 @@ use crate::format::format_count;
 use crate::format::format_duration_ms;
 use crate::format::format_iso_ms;
 use crate::format::format_time_ms;
+use crate::format::format_uptime;
 use crate::rpc::IntentSender;
 use crate::rpc::UiEvent;
 use crate::rpc::UiState;
@@ -166,7 +167,11 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
                         // beside it: its queue reaches callers through the scope
                         // tree, and the row that removes a channel is the one
                         // that has to offer the undo.
-                        Toaster(corner = ToastCorner::BottomRight, limit = 3) {
+                        Toaster(
+                            corner = ToastCorner::BottomRight,
+                            limit = 3,
+                            class = "toast-lift"
+                        ) {
                             App(state = state, intents = intents, events = events, display = display)
                         }
                     }
@@ -396,12 +401,21 @@ fn App(
     let previous_tab = RwSignal::new_local(None::<Tab>);
     let tab_generation = Rc::new(Cell::new(0u64));
     let tab = RwSignal::new_local(Tab::Channels);
-    let tab_click = move |target: Tab| {
-        let generation = Rc::clone(&tab_generation);
-        move |_: &mut EventCx<'_, events::Click>| {
-            previous_tab.set(Some(tab.get_untracked()));
-            tab.set(target);
-            animate_tab_weight(tab_weight, Rc::clone(&generation));
+    // The window clock, captured here so an animation started from a pointer or
+    // click handler is not owned by that handler's scope.
+    let timers = Timers::current();
+    let tab_click = {
+        let timers = timers.clone();
+        move |target: Tab| {
+            let generation = Rc::clone(&tab_generation);
+            let timers = timers.clone();
+            move |_: &mut EventCx<'_, events::Click>| {
+                previous_tab.set(Some(tab.get_untracked()));
+                tab.set(target);
+                if let Some(timers) = timers.as_ref() {
+                    animate_tab_weight(timers, tab_weight, Rc::clone(&generation));
+                }
+            }
         }
     };
     let expanded = RwSignal::new_local(BTreeSet::<u64>::new());
@@ -670,7 +684,7 @@ fn ChannelsTab(
                     }
                 }
                 text(class = "cell cell--record") {"Record"}
-                text(class = "cell cell--viewers") {"Viewers"}
+                text(class = "cell cell--viewers") {"Uptime"}
             }
             ScrollArea(class = "channels") {
                 column(class = "list") {
@@ -761,46 +775,62 @@ fn ChannelRow(
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| "—".to_owned())
     });
-    // Only titles that cannot fit their cell scroll. Three copies keep the
-    // cell filled; the offset is a signal so leaving the row can rewind it.
+    // Only titles that cannot fit their cell scroll. Three copies make the run
+    // periodic over a third of its own width, which is what lets the offset
+    // wrap with no seam and no measurement: `translateX(-33.333%)` lands
+    // exactly on the next copy whatever the glyphs are.
     let title_run = Signal::derive_local(move || {
         let title = title.get();
         if title.chars().count() > TITLE_SCROLL_MIN_CHARS {
-            format!("{title}     │     ").repeat(3)
+            format!("{title}{TITLE_SEPARATOR}").repeat(3)
         } else {
             title
         }
     });
-    let title_limit = Signal::derive_local(move || {
+    // One copy's length in characters, which is the pace's unit: a copy per
+    // `copy_chars / TITLE_SCROLL_CHARS_PER_SEC` seconds, so a long title takes
+    // longer to go round instead of racing.
+    let title_copy_chars = Signal::derive_local(move || {
         let count = u16::try_from(title.get().chars().count()).unwrap_or(u16::MAX);
         if usize::from(count) > TITLE_SCROLL_MIN_CHARS {
-            f32::from(count) * 6.4
+            f32::from(count) + TITLE_SEPARATOR_CHARS as f32
         } else {
             0.0
         }
     });
-    let title_shift = RwSignal::new_local(0.0f32);
+    // A fraction of one copy, not a pixel offset: the wrap is where the run is
+    // identical to itself, so the loop cannot drift against the text's width.
+    let title_progress = RwSignal::new_local(0.0f32);
     let title_gen = Rc::new(Cell::new(0u64));
+    let timers = Timers::current();
     let enter = {
         let token = Rc::clone(&title_gen);
+        let timers = timers.clone();
         move |_: &mut EventCx<'_, events::PointerEnter>| {
-            scroll_title(
-                title_shift,
-                title_limit.get_untracked(),
-                Rc::clone(&token),
-                false,
-            );
+            if let Some(timers) = timers.as_ref() {
+                scroll_title(
+                    timers,
+                    title_progress,
+                    title_copy_chars.get_untracked(),
+                    Rc::clone(&token),
+                    false,
+                );
+            }
         }
     };
     let leave = {
         let token = Rc::clone(&title_gen);
+        let timers = timers.clone();
         move |_: &mut EventCx<'_, events::PointerLeave>| {
-            scroll_title(
-                title_shift,
-                title_limit.get_untracked(),
-                Rc::clone(&token),
-                true,
-            );
+            if let Some(timers) = timers.as_ref() {
+                scroll_title(
+                    timers,
+                    title_progress,
+                    title_copy_chars.get_untracked(),
+                    Rc::clone(&token),
+                    true,
+                );
+            }
         }
     };
 
@@ -815,24 +845,27 @@ fn ChannelRow(
         })
     });
     let error = Signal::derive_local(move || channel.with(|c| channel_error(c, &pipelines.get())));
-    // Live rows show the counter; offline rows show when they were last live,
-    // which is the only useful thing a dead channel has to say. Both are one
-    // right-aligned column, and the dot already carries the live/offline state.
-    let viewers_label = Signal::derive_local(move || {
+    // Live rows show how long the stream has been running; offline rows show
+    // when they were last live, which is the only useful thing a dead channel
+    // has to say. One right-aligned column, and the dot already carries the
+    // live/offline state.
+    let stat_label = Signal::derive_local(move || {
         channel.with(|c| {
             if c.live {
-                return c.viewers.map_or_else(|| "—".to_owned(), format_count);
+                return c
+                    .stream_start_ms
+                    .map_or_else(|| "—".to_owned(), |start| format_uptime(now.get() - start));
             }
             c.last_live_ms
                 .map_or_else(|| "—".to_owned(), |at| format_ago(at, now.get()))
         })
     });
-    let viewers_tip = Signal::derive_local(move || {
+    let stat_tip = Signal::derive_local(move || {
         channel.with(|c| {
             if c.live {
-                return c.viewers.map_or_else(
-                    || "Watching".to_owned(),
-                    |count| format!("{count} watching"),
+                return c.stream_start_ms.map_or_else(
+                    || "Live".to_owned(),
+                    |start| format!("Live for {}", format_uptime(now.get() - start)),
                 );
             }
             c.last_live_ms.map_or_else(
@@ -991,7 +1024,14 @@ fn ChannelRow(
                                         // substitution inside `translateX()` was dropped and
                                         // the title never moved.
                                         style:transform = move || {
-                                            Some(format!("translateX(-{:.1}px)", title_shift.get()))
+                                            // One copy is a third of the run's
+                                            // width, and `%` is the run's own
+                                            // width, so the wrap is exact
+                                            // whatever the glyphs are.
+                                            Some(format!(
+                                                "translateX(-{:.3}%)",
+                                                title_progress.get() * (100.0 / 3.0)
+                                            ))
                                         },
                                     ) {{move || title_run.get()}}
                                 }
@@ -1026,13 +1066,13 @@ fn ChannelRow(
                         )
                     }
                     Tooltip {
-                        TooltipTrigger(class = "cell cell--viewers") {
+                        TooltipTrigger(class = "cell cell--viewers viewers-cell") {
                             text(
                                 class = "viewers__value",
                                 class:stale = move || !live.get(),
-                            ) {{move || viewers_label.get()}}
+                            ) {{move || stat_label.get()}}
                         }
-                        TooltipContent {{move || viewers_tip.get()}}
+                        TooltipContent {{move || stat_tip.get()}}
                     }
                 }
                 if move || open.get() {
@@ -1092,7 +1132,6 @@ fn remove_channel(
     });
     toasts.push(
         Toast::new(format!("Removed {name}"))
-            .description("Its switches and pin come back with it.")
             .duration(Duration::from_secs(8))
             .action("Undo", move || {
                 intents.send(Request::AddLogin {
@@ -1801,19 +1840,30 @@ fn tab_weight_value(
 
 /// Keeps a per-frame callback alive until `step` says it is done. The slot
 /// holds the current frame handle; replacing it drops the one that just fired.
+/// One frame of an animation, re-armed from its own body until `step` says it
+/// is done.
+///
+/// The clock is a `Timers` taken in the component body, not the free
+/// `request_frame`: a free request belongs to the scope that made it, and the
+/// scope a pointer handler runs in goes away when the handler returns, which
+/// stops the chain after its first frame. A `Timers` handle carries the
+/// window's clock into the callback, so the animation survives the handler
+/// that started it.
 fn next_frame(
+    timers: &Timers,
     generation: Rc<Cell<u64>>,
     token: u64,
     slot: &Rc<RefCell<Option<zgui::view::FrameHandle>>>,
     mut step: impl FnMut() -> bool + 'static,
 ) {
     let inner = Rc::clone(slot);
-    let handle = request_frame(move |_| {
+    let timers = timers.clone();
+    let handle = timers.clone().request_frame(move |_| {
         if token != generation.get() {
             return;
         }
         if !step() {
-            next_frame(Rc::clone(&generation), token, &inner, step);
+            next_frame(&timers, Rc::clone(&generation), token, &inner, step);
         }
     });
     *slot.borrow_mut() = Some(handle);
@@ -1822,13 +1872,17 @@ fn next_frame(
 /// Eases the variable weight from the old tab to the new one over 250ms. A
 /// generation counter makes a quick series of tab clicks restart the tween
 /// instead of letting older frames fight over the signal.
-fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u64>>) {
+fn animate_tab_weight(
+    timers: &Timers,
+    weight: RwSignal<f32, LocalStorage>,
+    generation: Rc<Cell<u64>>,
+) {
     weight.set(0.0);
     let token = generation.get() + 1;
     generation.set(token);
     let started = std::time::Instant::now();
     let slot = Rc::new(RefCell::new(None));
-    next_frame(generation, token, &slot, move || {
+    next_frame(timers, generation, token, &slot, move || {
         let t = (started.elapsed().as_secs_f32() / 0.25).min(1.0);
         // Cubic ease-out: the weight lands quickly, then settles into place.
         let eased = 1.0 - (1.0 - t).powi(3);
@@ -1842,12 +1896,19 @@ fn animate_tab_weight(weight: RwSignal<f32, LocalStorage>, generation: Rc<Cell<u
 /// animation) means leaving mid-scroll can smoothly return to zero.
 /// A title that fits its cell does not scroll.
 const TITLE_SCROLL_MIN_CHARS: usize = 55;
-/// Pixels per second the hovered title slides away at. A frame-driven 0.9 px
-/// per 60 Hz frame, expressed as a rate so a 165 Hz window is not 2.75x faster.
-const TITLE_SCROLL_PX_PER_SEC: f32 = 54.0;
-/// Rewind: an exponential pull home at this rate, plus this constant drag.
+/// The gap between two copies of a scrolling title: five spaces, the bar, five
+/// spaces. Counted in characters because the pace is.
+const TITLE_SEPARATOR: &str = "     │     ";
+const TITLE_SEPARATOR_CHARS: usize = 11;
+/// Characters per second the hovered title moves. Expressed per character
+/// rather than per pixel so a long title does not race: one copy takes
+/// `copy_chars / TITLE_SCROLL_CHARS_PER_SEC` seconds, and the per-frame step
+/// is scaled by the frame's own duration, so a 165 Hz window is not faster.
+const TITLE_SCROLL_CHARS_PER_SEC: f32 = 8.5;
+/// Rewind: an exponential pull home at this rate, plus this constant drag, both
+/// in fractions of a copy per second.
 const TITLE_REWIND_RATE: f32 = 8.0;
-const TITLE_REWIND_PX_PER_SEC: f32 = 180.0;
+const TITLE_REWIND_PER_SEC: f32 = 0.6;
 /// A frame this long is a stall (a covered window, a debugger break), not a
 /// frame: clamping it keeps the title from jumping when the window comes back.
 const TITLE_DT_MAX: f32 = 0.1;
@@ -1858,35 +1919,43 @@ const TITLE_DT_MAX: f32 = 0.1;
 const DETAIL_ROLL_MS: u64 = 200;
 
 fn scroll_title(
-    shift: RwSignal<f32, LocalStorage>,
-    limit: f32,
+    timers: &Timers,
+    progress: RwSignal<f32, LocalStorage>,
+    copy_chars: f32,
     generation: Rc<Cell<u64>>,
     rewind: bool,
 ) {
+    // A title that fits its cell does not scroll: there is no copy to advance.
+    if copy_chars <= 0.0 {
+        return;
+    }
     let token = generation.get() + 1;
     generation.set(token);
     let slot = Rc::new(RefCell::new(None));
     // Frame callbacks arrive at the display's rate, so every step is scaled by
     // the time since the last one rather than by a fixed per-frame amount.
     let mut last = std::time::Instant::now();
-    next_frame(generation, token, &slot, move || {
+    next_frame(timers, generation, token, &slot, move || {
         let now_at = std::time::Instant::now();
         let dt = (now_at - last).as_secs_f32().min(TITLE_DT_MAX);
         last = now_at;
 
-        let now = shift.get_untracked();
+        let now = progress.get_untracked();
         let next = if rewind {
-            // Pull home: `now - (now * rate + drag) * dt`, as one FMA each.
-            let pull = now.mul_add(TITLE_REWIND_RATE, TITLE_REWIND_PX_PER_SEC);
+            // Pull home: `now - (now * rate + drag) * dt`, in copies per second.
+            let pull = now.mul_add(TITLE_REWIND_RATE, TITLE_REWIND_PER_SEC);
             pull.mul_add(-dt, now).max(0.0)
         } else {
-            TITLE_SCROLL_PX_PER_SEC.mul_add(dt, now).min(limit)
+            // One copy per `copy_chars / rate` seconds, wrapping at the copy
+            // boundary: the run is three identical copies, so zero shows the
+            // same pixels as one and the loop cannot jump.
+            let rate = TITLE_SCROLL_CHARS_PER_SEC / copy_chars;
+            rate.mul_add(dt, now).fract()
         };
-        shift.set(next);
-        // Stop at the end of the travel, not on a step size: the first callback
-        // of a run arrives within microseconds, so a per-step epsilon reports
-        // "done" before the title has moved at all.
-        if rewind { next <= 0.0 } else { next >= limit }
+        progress.set(next);
+        // Forward never finishes: the marquee loops for as long as the pointer
+        // is on the row. Rewind stops when it is home.
+        rewind && next <= 0.0
     });
 }
 
@@ -2326,6 +2395,12 @@ const SHEET: &str = css!(
     }
 
     .viewers__value.stale { color: oklch(0.60 0.015 240); }
+
+    /* The tooltip trigger is an inline-flex box, so `text-align` on the cell
+       never reaches its text: the value sat at the left of a 92px cell while
+       the header was right-aligned in its own. Push the one child to the end
+       instead. */
+    .viewers-cell { justify-content: flex-end; }
 
     /* The panel is part of the row, not a card under it: no gap, no top
        border, and the open row's channel-coloured edge runs straight through
@@ -2870,6 +2945,10 @@ const SHEET: &str = css!(
     color: oklch(0.68 0.018 240);
     animation: ticker-scroll var(--ticker-duration, 40s) linear infinite;
 }
+/* The toast band is portalled at the window corner, which puts it over the
+   add bar. The region has no transform of its own, so lifting the whole stack
+   clears that row without touching the slots' own transforms. */
+.toast-lift { transform: translateY(-52px); }
 @keyframes ticker-scroll {
     from { transform: translateX(0); }
     to { transform: translateX(-12.5%); }

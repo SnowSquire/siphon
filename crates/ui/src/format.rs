@@ -87,6 +87,28 @@ pub fn format_date_ms(millis: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// How long a live stream has been running, coarsely.
+///
+/// The clock behind the column ticks every 30 seconds, so seconds would be a
+/// lie; minutes are the finest thing it can honestly show. Coarse on purpose,
+/// like [`format_ago`], and the same at both ends of a stream.
+#[must_use]
+pub fn format_uptime(millis: i64) -> String {
+    const MINUTE: i64 = 60_000;
+    let minutes = millis.max(0) / MINUTE;
+    if minutes < 1 {
+        return "<1m".to_owned();
+    }
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h {}m", minutes % 60);
+    }
+    format!("{}d {}h", hours / 24, hours % 24)
+}
+
 /// How long ago an instant was, coarsely.
 ///
 /// The buckets are deliberately wider than the timestamps behind them: the
@@ -167,5 +189,19 @@ mod tests {
         );
         assert_eq!(format_date_ms(0), "1970-01-01");
         assert_eq!(format_date_ms(951_782_400_000), "2000-02-29");
+    }
+
+    /// Uptime is read on the same minute clock as the offline labels, so it
+    /// never claims a precision the tick cannot keep.
+    #[test]
+    fn uptime_rounds_down_to_the_minute() {
+        assert_eq!(format_uptime(0), "<1m");
+        assert_eq!(format_uptime(59_999), "<1m");
+        assert_eq!(format_uptime(MINUTE), "1m");
+        assert_eq!(format_uptime(59 * MINUTE), "59m");
+        assert_eq!(format_uptime(HOUR), "1h 0m");
+        assert_eq!(format_uptime(HOUR + 14 * MINUTE), "1h 14m");
+        assert_eq!(format_uptime(23 * HOUR + 59 * MINUTE), "23h 59m");
+        assert_eq!(format_uptime(DAY + 2 * HOUR), "1d 2h");
     }
 }

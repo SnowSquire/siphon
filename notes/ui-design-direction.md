@@ -167,11 +167,12 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   reached for — and the sort only runs when a row's key changes (a live flip,
   a pin, a new `last live`). Pins are a client preference (`pins.json`), so two
   windows on one daemon may order differently.
-- The `Viewers` column doubles as recency: live rows show the count, offline
-  rows show `2h ago` in muted type, never-live rows `—`. The dot already says
-  live/offline, so repeating the word was the least informative thing in the
-  row. A minute-granular label needs a clock: one shared `now` signal ticks
-  every 30 seconds and every relative label reads it.
+- The `Uptime` column is the row's clock: live rows show how long the stream
+  has been running (`2h 14m`), offline rows show `2h ago` in muted type,
+  never-live rows `—`. The dot already says live/offline, and the viewer
+  count belongs to the expanded detail. It is right-aligned, header included.
+  A minute-granular label needs a clock: one shared `now` signal ticks every
+  30 seconds and every relative label reads it.
 - The row's other states lead the title, not a column of their own: a
   red-outlined `!` for any failure (the channel's own resolve or its
   pipeline/disk), an amber `REC` pill while a recording is writing, and a drawn
@@ -185,7 +186,8 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   accelerator. The menu is never the only home — a row whose actions are only
   reachable by right-click is a row a keyboard cannot use. Removing raises a
   toast with `Undo` for eight seconds; the undo is a real re-add carrying the
-  row's switches (`AddLogin { login, switches }`), not a delayed removal.
+  row's switches (`AddLogin { login, switches }`), and its pin. The stack is
+  lifted clear of the bottom add bar rather than sitting over it.
 - The switch override must select `.zui-switch--sm`: this zgui revision emits
   the class and no `data-size` attribute, so a `[data-size="sm"]` rule silently
   leaves every switch at 40x22.
@@ -197,11 +199,18 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   identity and state. Display names use Chillax (see Typography).
 - Row titles are single-line and truncated to one cell height; the full text
   is also in the top marquee and the expanded detail panel. Titles over 55
-  characters scroll horizontally while the row is hovered and **rewind to the
-  start** on pointer-leave. The offset is driven per frame through zgui's
-  `request_frame` (not compio's timer, which panics outside its runtime), so
-  leaving mid-scroll can return smoothly; a generation counter cancels an
-  older tween when the pointer moves again.
+  characters scroll horizontally **for as long as the row is hovered** and
+  **rewind to the start** on pointer-leave. The run is three copies of
+  `title + "     │     "`, so one copy is a third of its width: the offset is
+  kept as a fraction of a copy and rendered as `translateX(-p * 33.333%)`,
+  which wraps exactly on the copy boundary without measuring the text (emoji
+  would break any per-character width estimate). The pace is characters per
+  second, one copy per `copy_chars / 8.5` seconds, and every frame's step is
+  scaled by that frame's own duration, so the marquee is frame-rate
+  independent and a long title does not race. The offset is a signal driven
+  per frame through zgui's `request_frame` (not compio's timer, which panics
+  outside its runtime), so leaving mid-scroll can return smoothly; a
+  generation counter cancels an older tween when the pointer moves again.
 - Row hover/open/pending states should be subtle background changes, not
   rounded cards.
 
