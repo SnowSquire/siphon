@@ -127,16 +127,19 @@ live_master() {
 		--data-urlencode 'multigroup_video=true'
 }
 
-# `kind bandwidth id resolution url`, one line per video variant.
+# `kind bandwidth id resolution source url`, one line per video variant.
+# `source` is Twitch's `IVS-VARIANT-SOURCE`: `source` for the rendition the
+# encoder sends, `transcode` for one Twitch made (partners only).
 # kind: portrait | landscape | audio, from RESOLUTION (falling back to the id).
 variant_rows() {
 	awk '/^#EXT-X-STREAM-INF:/ { info = $0; next } /^https?:/ { if (info != "") { print info "\t" $0; info = "" } }' |
 		while IFS=$'\t' read -r info url; do
-			local w h bw id kind
+			local w h bw id kind src
 			w=$(sed -nE 's/.*RESOLUTION=([0-9]+)x([0-9]+).*/\1/p' <<<"$info")
 			h=$(sed -nE 's/.*RESOLUTION=([0-9]+)x([0-9]+).*/\2/p' <<<"$info")
 			bw=$(sed -nE 's/.*BANDWIDTH=([0-9]+).*/\1/p' <<<"$info")
 			id=$(sed -nE 's/.*STABLE-VARIANT-ID="([^"]+)".*/\1/p' <<<"$info")
+			src=$(sed -nE 's/.*IVS-VARIANT-SOURCE="([^"]+)".*/\1/p' <<<"$info")
 			if [ -z "$w" ] || [ -z "$h" ]; then
 				kind=audio
 			elif [ "$h" -gt "$w" ]; then
@@ -144,14 +147,14 @@ variant_rows() {
 			else
 				kind=landscape
 			fi
-			printf '%s %s %s %sx%s %s\n' "$kind" "${bw:-0}" "${id:-?}" "${w:-?}" "${h:-?}" "$url"
+			printf '%s %s %s %sx%s %s %s\n' "$kind" "${bw:-0}" "${id:-?}" "${w:-?}" "${h:-?}" "${src:-?}" "$url"
 		done | sort -k1,1 -k2,2nr
 }
 
 # The highest-bandwidth variant of one orientation.
 pick() {
 	local kind=$1 rows=$2
-	awk -v k="$kind" '$1 == k { print $5; exit }' <<<"$rows"
+	awk -v k="$kind" '$1 == k { print $6; exit }' <<<"$rows"
 }
 
 # ------------------------------------------------------------- private DVR paths
@@ -290,8 +293,8 @@ if ! grep -q '^#EXT-X-STREAM-INF' <<<"$master"; then
 fi
 
 rows=$(variant_rows <<<"$master")
-echo "capture: $CHANNEL variants (kind, bandwidth, id, resolution):"
-awk '{ printf "  %-9s %10s  %-12s %s\n", $1, $2, $3, $4 }' <<<"$rows"
+echo "capture: $CHANNEL variants (kind, bandwidth, id, resolution, source):"
+awk '{ printf "  %-9s %10s  %-18s %-10s %s\n", $1, $2, $3, $4, $5 }' <<<"$rows"
 
 live_land=$(pick landscape "$rows")
 live_port=$(pick portrait "$rows")
@@ -328,8 +331,8 @@ if [ -z "$dvr_land" ] || [ -z "$dvr_port" ]; then
 	archive=$(archive_master "$user_id" "$stream_id" "$start" || true)
 	if grep -q '^#EXT-X-STREAM-INF' <<<"$archive"; then
 		arows=$(variant_rows <<<"$archive")
-		echo "capture: archive variants (kind, bandwidth, id, resolution):"
-		awk '{ printf "  %-9s %10s  %-14s %s\n", $1, $2, $3, $4 }' <<<"$arows"
+		echo "capture: archive variants (kind, bandwidth, id, resolution, source):"
+		awk '{ printf "  %-9s %10s  %-18s %-10s %s\n", $1, $2, $3, $4, $5 }' <<<"$arows"
 		[ -z "$dvr_land" ] && dvr_land=$(pick landscape "$arows")
 		[ -z "$dvr_port" ] && dvr_port=$(pick portrait "$arows")
 	else
