@@ -156,6 +156,12 @@ function buildGroup(name: GroupName): GroupFixture {
   const tail = foundLive[foundLive.length - 1];
   const emptyTail = tail.size <= EMPTY_FRAGMENT_MAX_BYTES;
   const live = emptyTail ? foundLive.slice(0, -1) : foundLive;
+  // Twitch closes a live playlist with an entry whose body is just this 8-byte
+  // `skip` box, declaring #EXTINF:1.000 for it and counting that second in its
+  // own TOTAL-SECS - the DVR does not have it. Both captures agree on 1.000 s.
+  const eos = emptyTail
+    ? { pdt: tail.pdt, file: `${name}/eos.m4s`, duration_ms: 1000 }
+    : undefined;
 
   if (live.length % chunks.length !== 0) {
     throw new Error(
@@ -237,6 +243,9 @@ function buildGroup(name: GroupName): GroupFixture {
   mkdirSync(path.join(groupOut, "live"), { recursive: true });
   mkdirSync(path.join(groupOut, "chunks"), { recursive: true });
   linkOrCopy(path.join(liveDir, "_init.mp4"), path.join(groupOut, "init.mp4"));
+  if (eos) {
+    linkOrCopy(path.join(liveDir, tail.name), path.join(OUT, eos.file));
+  }
   live.forEach((fragment, i) =>
     linkOrCopy(
       path.join(liveDir, fragment.name),
@@ -255,7 +264,18 @@ function buildGroup(name: GroupName): GroupFixture {
       `(${(liveSpan / 1000).toFixed(3)} s), ${perChunk} fragments/chunk, ` +
       `init sha256 ${sha256(liveInit).slice(0, 16)}…`,
   );
-  return { init: `${name}/init.mp4`, live: liveFixtures, chunks: chunkFixtures };
+  return {
+    init: `${name}/init.mp4`,
+    ...(eos && {
+      eos: {
+        file: eos.file,
+        start_ms: eos.pdt - live[0].pdt,
+        duration_ms: eos.duration_ms,
+      },
+    }),
+    live: liveFixtures,
+    chunks: chunkFixtures,
+  };
 }
 
 function main(): void {

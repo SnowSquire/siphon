@@ -30,6 +30,8 @@ interface Live {
 interface GroupFixture {
   /** Init segment path, relative to SEGMENTS_DIR. fMP4 only. */
   init?: string;
+  /** Twitch's closing empty entry: no media, but it declares a second. */
+  eos?: { file: string; start_ms: number; duration_ms: number };
   live: Live[];
   chunks: Chunk[];
 }
@@ -69,6 +71,7 @@ interface DvrGroup {
 interface Group {
   fixture: GroupFixture;
   initPath?: string;
+  eosPath?: string;
   realEntries: Entry[];
   adEntries: Entry[];
   adSkipped: Set<number>;
@@ -211,6 +214,7 @@ const groups: Record<string, Group> = {};
 const liveByPath = new Map<string, { group: Group; live: Live }>();
 const chunkByPath = new Map<string, { group: Group; dvr: DvrGroup }>();
 const initByPath = new Map<string, Group>();
+const eosByPath = new Map<string, Group>();
 
 function makeGroup(name: string, fixture: GroupFixture): Group {
   const base = FMP4 ? `/${name}` : "";
@@ -219,6 +223,7 @@ function makeGroup(name: string, fixture: GroupFixture): Group {
   const chunkPath = (index: number): string =>
     FMP4 ? `${base}/chunks/${pad(index, 3)}.m4s` : `/dvr/${index}.ts`;
   const initPath = FMP4 ? `${base}/init.mp4` : undefined;
+  const eosPath = FMP4 && fixture.eos ? `${base}/eos.m4s` : undefined;
   const streamDuration = fixture.live.length
     ? fixture.live[fixture.live.length - 1].start_ms +
       fixture.live[fixture.live.length - 1].duration_ms
@@ -275,6 +280,7 @@ function makeGroup(name: string, fixture: GroupFixture): Group {
   const group: Group = {
     fixture,
     initPath,
+    eosPath,
     realEntries,
     adEntries,
     adSkipped,
@@ -291,6 +297,9 @@ function makeGroup(name: string, fixture: GroupFixture): Group {
   }
   if (initPath) {
     initByPath.set(initPath, group);
+  }
+  if (eosPath) {
+    eosByPath.set(eosPath, group);
   }
   return group;
 }
@@ -368,6 +377,8 @@ function generateLivePlaylist(
     .filter((live) => !group.adSkipped.has(live.index))
     .map(group.livePath);
 
+  const ended = next_segment_index === -1;
+  const eos = group.fixture.eos;
   const sequence = available[0].sequence;
   const session_unix = Math.floor(spark_time_ms / 1000);
   const stream_start = iso(spark_time_ms);
@@ -388,7 +399,7 @@ function generateLivePlaylist(
 #EXT-X-MEDIA-SEQUENCE:${sequence}
 #EXT-X-TWITCH-LIVE-SEQUENCE:${sequence}
 #EXT-X-TWITCH-ELAPSED-SECS:${(available[0].start_ms / 1000).toFixed(3)}
-#EXT-X-TWITCH-TOTAL-SECS:${(content_now / 1000).toFixed(3)}
+#EXT-X-TWITCH-TOTAL-SECS:${((content_now + (ended && eos ? eos.duration_ms : 0)) / 1000).toFixed(3)}
 #EXT-X-DATERANGE:ID="playlist-creation-${session_unix}",CLASS="timestamp",START-DATE="${stream_start}",END-ON-NEXT=YES,X-SERVER-TIME="${(spark_time_ms / 1000).toFixed(2)}"
 #EXT-X-DATERANGE:ID="playlist-session-${session_unix}",CLASS="twitch-session",START-DATE="${stream_start}",END-ON-NEXT=YES,X-TV-TWITCH-SESSIONID="${session_id}"
 #EXT-X-DATERANGE:ID="source-${session_unix}",CLASS="twitch-stream-source",START-DATE="${stream_start}",END-ON-NEXT=YES,X-TV-TWITCH-STREAM-SOURCE="live"
@@ -409,7 +420,17 @@ function generateLivePlaylist(
 ${origin}${segment.url}`;
   }
 
-  if (next_segment_index === -1) {
+  if (ended) {
+    // Twitch closes the playlist with an entry that carries no media at all (an
+    // 8-byte `skip` box) and counts its declared second in TOTAL-SECS; the DVR
+    // does not have it. Reproducing it is what exercises a recorder's
+    // "empty fragment" path.
+    if (eos && group.eosPath) {
+      m3u8 += `
+#EXT-X-PROGRAM-DATE-TIME:${iso(spark_time_ms + eos.start_ms)}
+#EXTINF:${(eos.duration_ms / 1000).toFixed(3)},
+${origin}${group.eosPath}`;
+    }
     m3u8 += `
 #EXT-X-ENDLIST
 `;
@@ -627,6 +648,12 @@ const server = createServer(async (req, res) => {
     const init_group = initByPath.get(url.pathname);
     if (init_group) {
       segment(res, await readFile(path.join(SEGMENTS_DIR, init_group.fixture.init!)));
+      return;
+    }
+
+    const eos_group = eosByPath.get(url.pathname);
+    if (eos_group?.fixture.eos) {
+      segment(res, await readFile(path.join(SEGMENTS_DIR, eos_group.fixture.eos.file)));
       return;
     }
 
