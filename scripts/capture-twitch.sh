@@ -285,11 +285,35 @@ trap cleanup INT TERM EXIT
 
 # ------------------------------------------------------------------------ plan
 
+mkdir -p "$OUT"
+
+# Not live yet: this is the case the whole watch is for. Start the watcher (GQL
+# every --interval, Hermes, and the master itself) and wait for the first
+# variant, so the live recorder starts with the stream's very first segment
+# still inside the 30 s window.
 master=$(live_master)
 if ! grep -q '^#EXT-X-STREAM-INF' <<<"$master"; then
-	echo "capture: $CHANNEL is not live (no variants in the master)" >&2
-	exit 1
+	echo "capture: $CHANNEL is not live yet; watching for the first variant"
+	node "$here/twitch-watch.mjs" --channel "$CHANNEL" --out "$OUT" --interval 300 \
+		>>"$OUT/watch.log" 2>&1 &
+	WATCH_PID=$!
+	PIDS+=("$WATCH_PID")
+	LABELS+=("watch")
+	deadline=$(($(date +%s) + ${WATCH_TIMEOUT:-1800}))
+	while [ ! -e "$OUT/live-master.ready" ]; do
+		if [ "$(date +%s)" -ge "$deadline" ]; then
+			echo "capture: no live variant after ${WATCH_TIMEOUT:-1800}s, giving up" >&2
+			exit 1
+		fi
+		sleep 0.2
+	done
+	master=$(cat "$OUT/live-master.m3u8")
+else
+	printf '%s' "$master" >"$OUT/live-master.m3u8"
 fi
+printf '{"t":%s,"src":"spawn","event":"live-master","variants":%s}\n' \
+	"$(date +%s.%N)" "$(grep -c '^#EXT-X-STREAM-INF' <<<"$master")" >>"$OUT/timeline.jsonl"
+echo "capture: live master saved to $OUT/live-master.m3u8"
 
 # What Twitch says about the account's own processing: `CHANNEL-METADATA` lists
 # the enabled features (multitrack_video, multigroup_video) and `TRANSCODESTACK`
@@ -337,6 +361,8 @@ port_id=$(awk '$1 == "portrait" { print $3; exit }' <<<"$rows")
 if [ -z "$dvr_land" ] || [ -z "$dvr_port" ]; then
 	archive=$(archive_master "$user_id" "$stream_id" "$start" || true)
 	if grep -q '^#EXT-X-STREAM-INF' <<<"$archive"; then
+		printf '%s' "$archive" >"$OUT/dvr-master.m3u8"
+		echo "capture: DVR master saved to $OUT/dvr-master.m3u8"
 		arows=$(variant_rows <<<"$archive")
 		echo "capture: archive variants (kind, bandwidth, id, resolution, source):"
 		awk '{ printf "  %-9s %10s  %-18s %-10s %s\n", $1, $2, $3, $4, $5 }' <<<"$arows"
