@@ -739,13 +739,28 @@ async function main(): Promise<void> {
   for (const choice of choices) console.log(`capture: DVR ${choice.kind} ${choice.url}`);
   record({ src: "watch", event: "dvr", choices });
 
+  // `--live-take-count` is not "how many to download": on the first pass the tool
+  // keeps the LAST N segments of the playlist (FilterUtil.SyncStreams skips
+  // everything before the tail), and only later refreshes append. The default
+  // 16 happens to cover a 30 s window of 2 s segments, but that is incidental -
+  // asking for more makes "start at the first segment" explicit.
   if (liveLandscape) {
-    spawnRecorder(`${options.channel}-landscape-live`, liveLandscape, ["--live-wait-time", "4"]);
+    spawnRecorder(`${options.channel}-landscape-live`, liveLandscape, [
+      "--live-wait-time",
+      "4",
+      "--live-take-count",
+      "100",
+    ]);
   } else {
     console.error("capture: no landscape variant, skipping live landscape");
   }
   if (livePortrait) {
-    spawnRecorder(`${options.channel}-portrait-live`, livePortrait, ["--live-wait-time", "4"]);
+    spawnRecorder(`${options.channel}-portrait-live`, livePortrait, [
+      "--live-wait-time",
+      "4",
+      "--live-take-count",
+      "100",
+    ]);
   } else {
     console.error("capture: no portrait variant, skipping live portrait");
   }
