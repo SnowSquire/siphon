@@ -45,7 +45,7 @@ struct RawConfig {
     sound: Option<bool>,
     filtered_words: Option<Vec<String>>,
     record_dir: Option<String>,
-    record_portrait: Option<bool>,
+    record_dual_format: Option<bool>,
 }
 
 /// The config path under the platform config directory.
@@ -85,8 +85,8 @@ fn load_versioned(path: &Path) -> Result<Config, ConfigError> {
     // defaults it to false (notify-only). v3 -> v4: `Channel::notifyLive` and
     // `notifyTitles` are missing and `Channel::default` has both on, so an
     // existing follow keeps the behaviour the global switches gave it.
-    // v4 -> v5: `recordDir` and `recordPortrait` are new; recording stays off
-    // until a directory is set, and portrait is opt-in.
+    // v4 -> v5: `recordDir` and `recordDualFormat` are new; recording stays off
+    // until a directory is set, and the second orientation is opt-in.
     let config = Config {
         version: Config::VERSION,
         channels: raw.channels.unwrap_or_default(),
@@ -96,7 +96,7 @@ fn load_versioned(path: &Path) -> Result<Config, ConfigError> {
             .filtered_words
             .unwrap_or_else(|| vec![DEFAULT_FILTERED_WORD.to_owned()]),
         record_dir: raw.record_dir,
-        record_portrait: raw.record_portrait.unwrap_or(false),
+        record_dual_format: raw.record_dual_format.unwrap_or(false),
     };
     if from < Config::VERSION {
         tracing::info!(

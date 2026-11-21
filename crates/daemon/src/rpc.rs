@@ -336,7 +336,7 @@ mod tests {
                     max_streams: 4,
                     recording: crate::registry::Recording {
                         output: Some(dir.clone()),
-                        portrait: false,
+                        dual_format: false,
                     },
                     notify: None,
                     keep_runs: false,

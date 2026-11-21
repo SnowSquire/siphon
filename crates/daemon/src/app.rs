@@ -542,9 +542,9 @@ impl App {
                 self.queue_save();
                 Ok(Response::Ack)
             }
-            Request::SetRecordPortrait(value) => {
-                self.config.record_portrait = value;
-                self.registry.set_portrait(value);
+            Request::SetRecordDualFormat(value) => {
+                self.config.record_dual_format = value;
+                self.registry.set_dual_format(value);
                 self.publish_config();
                 self.queue_save();
                 Ok(Response::Ack)

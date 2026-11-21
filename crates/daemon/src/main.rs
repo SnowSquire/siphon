@@ -411,7 +411,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
                     .output
                     .clone()
                     .or_else(|| config.record_dir.as_deref().map(std::path::PathBuf::from)),
-                portrait: config.record_portrait,
+                dual_format: config.record_dual_format,
             },
             notify: notifier,
             keep_runs: args.keep_runs,

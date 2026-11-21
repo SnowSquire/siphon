@@ -145,7 +145,7 @@ and the snapshot still carries the whole history.
 Requests:
 
 - intents: `AddLogin { login, switches }`, `RemoveChannel`, `SetNotifyTitleChanges`, `SetSound`,
-  `SetRecordDir(Option<String>)`, `SetRecordPortrait(bool)`,
+  `SetRecordDir(Option<String>)`, `SetRecordDualFormat(bool)`,
   `AddFilteredWord`, `RemoveFilteredWord`, `SetRecord { channel, record }`,
   `SetNotifyLive { channel, notify }`, `SetNotifyTitles { channel, notify }`,
   `ClearError`, `DismissNotification`, `ApplyUpdate`, `PipelineStop { key,

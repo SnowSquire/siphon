@@ -112,17 +112,17 @@ pub struct Config {
     /// `None` (or empty) disables recording; the daemon otherwise reports that
     /// recording needs a directory.
     pub record_dir: Option<String>,
-    /// Also record the portrait track of a dual-format broadcast. It is a
-    /// global preference, not a per-channel one: it only ever applies to
-    /// broadcasts that carry both orientations, and a channel that streams
-    /// portrait only records it as its primary variant either way.
-    pub record_portrait: bool,
+    /// Record both orientations of a dual-format broadcast. A single-format
+    /// broadcast is always recorded, whichever orientation it carries, so this
+    /// only ever adds a second recording. It is a global preference, not a
+    /// per-channel one: it never changes *what* is recorded as the primary.
+    pub record_dual_format: bool,
 }
 
 impl Config {
     /// Current on-disk schema. `2` is Siphon's last release; `3` adds
     /// `channels[].record`; `4` adds `channels[].notifyLive` and
-    /// `channels[].notifyTitles`; `5` adds `recordDir` and `recordPortrait`.
+    /// `channels[].notifyTitles`; `5` adds `recordDir` and `recordDualFormat`.
     pub const VERSION: u64 = 5;
 }
 
@@ -135,7 +135,7 @@ impl Default for Config {
             sound: true,
             filtered_words: vec!["offline".to_owned()],
             record_dir: None,
-            record_portrait: false,
+            record_dual_format: false,
         }
     }
 }
@@ -441,8 +441,8 @@ pub enum Request {
     /// Point new recordings at this directory; `None` disables recording.
     /// Recordings already running keep writing where they started.
     SetRecordDir(Option<String>),
-    /// Also record the portrait track of dual-format broadcasts.
-    SetRecordPortrait(bool),
+    /// Record both orientations of dual-format broadcasts.
+    SetRecordDualFormat(bool),
     AddFilteredWord(String),
     RemoveFilteredWord(String),
     /// Turn the per-channel recording monitor on or off.

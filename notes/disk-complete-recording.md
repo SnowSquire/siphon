@@ -2,7 +2,7 @@
 
 Status: implemented in `crates/daemon/src/disk/` (v4 index).  The daemon's
 directory is `recordDir` in the config (`--output` is a dev override, and the
-only setting `play` has); `recordPortrait` asks for the second orientation.
+only setting `play` has); `recordDualFormat` asks for the second orientation.
 `index.hexpat` mirrors the format.  `mod.rs` is the
 state machine, `index.rs` the format, `plan.rs` the clock and hole arithmetic,
 `io.rs` the writers and copies, `resume.rs` the open and repair path.
@@ -285,12 +285,14 @@ hash-verified (there are few), so a torn map is detected rather than played.
 - `recordDir` applies to daemon streams: one folder per broadcast, several
   recorders at once.  Changing it affects the next recording only, so one
   broadcast is never split across two directories.
-- `recordPortrait` records the portrait group as well, as a second pipeline
-  keyed by the portrait variant id (`1080p-portrait`). It is global rather than
-  per channel: it only applies to a dual-format broadcast, and a channel that
-  streams portrait only records it as its primary variant either way.  The
-  sibling pipeline is started when the primary recording starts and stopped with
-  it, unless a viewer asked for that quality directly.
+- `recordDualFormat` records *both* orientations of a dual-format broadcast: the
+  primary recording is the best variant as always, and the other orientation is
+  a second pipeline keyed by that variant's id (`1080p-portrait`). It is global
+  rather than per channel, and it only ever adds a recording: a single-format
+  broadcast is recorded whichever orientation it carries, portrait included, so
+  the toggle cannot cause a portrait-only channel to be skipped.  The second
+  pipeline is started when the primary recording starts and stopped with it,
+  unless a viewer asked for that quality directly.
 - A recording keeps the stream entry alive (its URLs stored), and counts toward
   the `--max-streams` accounting, but it does **not** keep the live manifest
   poller alive by itself: the poller may pause once the pre-fill is finished and

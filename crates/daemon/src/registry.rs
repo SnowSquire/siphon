@@ -82,8 +82,8 @@ pub struct Options {
 /// Where complete broadcasts go and whether the second orientation is kept.
 pub struct Recording {
     pub output: Option<PathBuf>,
-    /// Also record the portrait track of dual-format broadcasts.
-    pub portrait: bool,
+    /// Record both orientations of dual-format broadcasts.
+    pub dual_format: bool,
 }
 
 /// Everything the registry shares between streams.
@@ -95,8 +95,8 @@ pub struct Registry {
     /// Disk output root. `None` disables recording. Mutable because the UI can
     /// move it while the daemon runs; a running recording keeps its directory.
     output: RefCell<Option<PathBuf>>,
-    /// Also record the portrait track of a dual-format broadcast.
-    portrait: Cell<bool>,
+    /// Record both orientations of a dual-format broadcast.
+    dual_format: Cell<bool>,
     bus: Rc<Bus>,
     downloader_metrics: Rc<DownloaderMetrics>,
     /// Resolved logins, kept while any stream of that channel exists.
@@ -143,6 +143,9 @@ struct StreamRuntime {
     /// `STABLE-VARIANT-ID` of the variant this runtime serves; names its
     /// recording directory.
     variant: Box<str>,
+    /// That variant's kind, so the second recording can be the other
+    /// orientation.
+    variant_kind: VariantKind,
     debug: bool,
     metrics: Rc<StreamMetrics>,
 }
@@ -204,14 +207,14 @@ impl Registry {
     ) -> Self {
         let (finished_tx, finished_rx) = kanal::unbounded();
         let output = RefCell::new(options.recording.output.clone());
-        let portrait = Cell::new(options.recording.portrait);
+        let dual_format = Cell::new(options.recording.dual_format);
         Self {
             client,
             arena,
             downloaders,
             options,
             output,
-            portrait,
+            dual_format,
             bus,
             downloader_metrics,
             channels: RefCell::new(HashMap::new()),
@@ -251,40 +254,25 @@ impl Registry {
         *self.output.borrow_mut() = output;
     }
 
-    /// Also record the portrait track, applied to what is recording right now
-    /// and to every later start.
-    pub fn set_portrait(&self, portrait: bool) {
-        if self.portrait.replace(portrait) == portrait {
+    /// Record both orientations, applied to what is recording right now and to
+    /// every later start. The primary recording is unaffected either way: a
+    /// single-format broadcast is always recorded, whichever orientation it is.
+    pub fn set_dual_format(&self, dual: bool) {
+        if self.dual_format.replace(dual) == dual {
             return;
         }
-        if portrait {
-            let recording: Vec<Rc<StreamRuntime>> = self
-                .streams
-                .borrow()
-                .values()
-                .filter(|runtime| runtime.recording.get() && runtime.key.quality.is_none())
-                .cloned()
-                .collect();
-            for runtime in recording {
-                self.maybe_record_portrait(&runtime);
-            }
-            return;
-        }
-        let stopped: Vec<Rc<StreamRuntime>> = self
+        let recording: Vec<Rc<StreamRuntime>> = self
             .streams
             .borrow()
             .values()
-            .filter(|runtime| runtime.recording.get() && runtime.key.quality.is_some())
-            .filter(|runtime| {
-                self.portrait_variant_id(&runtime.key.login).as_deref()
-                    == runtime.key.quality.as_deref()
-            })
+            .filter(|runtime| runtime.recording.get() && runtime.key.quality.is_none())
             .cloned()
             .collect();
-        for runtime in stopped {
-            self.stop_recording(&runtime);
-            if !runtime.stream.has_sessions() {
-                self.remove_runtime(&runtime.key);
+        for runtime in recording {
+            if dual {
+                self.maybe_record_second_orientation(&runtime);
+            } else {
+                self.stop_second_orientation(&runtime);
             }
         }
     }
@@ -482,6 +470,7 @@ impl Registry {
             dvr_spawned: Cell::new(false),
             broadcast_id: channel.broadcast_id,
             variant: variant.id.clone(),
+            variant_kind: variant.kind.clone(),
             debug: self.options.debug,
             metrics,
         });
@@ -563,18 +552,25 @@ impl Registry {
             NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
-        self.maybe_record_portrait(runtime);
+        self.maybe_record_second_orientation(runtime);
     }
 
     /// A dual-format broadcast carries a second variant group, and a recorder
-    /// consumes one variant's spool, so the portrait track needs its own
-    /// pipeline. It is keyed by the portrait variant id, which is also what stops
-    /// this recursing: only a `quality: None` runtime ever asks for one.
-    fn maybe_record_portrait(&self, runtime: &Rc<StreamRuntime>) {
-        if !self.portrait.get() || runtime.key.quality.is_some() {
+    /// consumes one variant's spool, so the other orientation needs its own
+    /// pipeline. It is keyed by that variant id, which is also what stops this
+    /// recursing: only a `quality: None` runtime ever asks for one.
+    ///
+    /// The other orientation is the *opposite* of the primary's, so a
+    /// single-format broadcast (portrait included) has none and is simply
+    /// recorded as its primary variant.
+    fn maybe_record_second_orientation(&self, runtime: &Rc<StreamRuntime>) {
+        if !self.dual_format.get() || runtime.key.quality.is_some() {
             return;
         }
-        let Some(portrait) = self.portrait_variant_id(&runtime.key.login) else {
+        let Some(other_kind) = other_orientation(&runtime.variant_kind) else {
+            return;
+        };
+        let Some(portrait) = self.orientation_variant_id(&runtime.key.login, &other_kind) else {
             return;
         };
         let key = StreamKey {
@@ -617,13 +613,13 @@ impl Registry {
         );
     }
 
-    /// The portrait variant's id, when this broadcast carries a second group.
-    fn portrait_variant_id(&self, login: &str) -> Option<String> {
+    /// The id of the variant in `kind`, when this broadcast carries it.
+    fn orientation_variant_id(&self, login: &str, kind: &VariantKind) -> Option<String> {
         let channel = self.channels.borrow().get(login).cloned()?;
         channel
             .variants
             .iter()
-            .find(|variant| variant.kind == VariantKind::Portrait)
+            .find(|variant| &variant.kind == kind)
             .map(|variant| variant.id.to_string())
     }
 
@@ -642,16 +638,19 @@ impl Registry {
             NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
-        self.stop_portrait_sibling(runtime);
+        self.stop_second_orientation(runtime);
     }
 
-    /// The portrait pipeline has no owner of its own: it lives as long as the
+    /// The second orientation has no owner of its own: it lives as long as the
     /// primary recording, unless a viewer asked for that quality directly.
-    fn stop_portrait_sibling(&self, runtime: &Rc<StreamRuntime>) {
+    fn stop_second_orientation(&self, runtime: &Rc<StreamRuntime>) {
         if runtime.key.quality.is_some() {
             return;
         }
-        let Some(portrait) = self.portrait_variant_id(&runtime.key.login) else {
+        let Some(other_kind) = other_orientation(&runtime.variant_kind) else {
+            return;
+        };
+        let Some(portrait) = self.orientation_variant_id(&runtime.key.login, &other_kind) else {
             return;
         };
         let key = StreamKey {
@@ -1018,6 +1017,15 @@ impl Registry {
 
 /// The best variant by Twitch's `SCORE`; the playlist is sorted descending,
 /// but selecting explicitly keeps a monitor off a first-listed audio track.
+/// The orientation the *other* recording would be, if the broadcast has one.
+const fn other_orientation(kind: &VariantKind) -> Option<VariantKind> {
+    match kind {
+        VariantKind::Landscape => Some(VariantKind::Portrait),
+        VariantKind::Portrait => Some(VariantKind::Landscape),
+        VariantKind::Audio | VariantKind::ERmtp => None,
+    }
+}
+
 fn best_variant(variants: &[Variant]) -> Option<&Variant> {
     variants
         .iter()
@@ -1119,6 +1127,28 @@ mod tests {
             let second = gate.acquire("a").await;
             drop(second);
         });
+    }
+
+    #[test]
+    fn the_primary_recording_follows_the_broadcast_orientation() {
+        // Dual format: the landscape source is the primary and portrait is the
+        // second recording. Portrait only: portrait *is* the primary, and there
+        // is no other orientation to add.
+        let dual = vec![debug_variant(), debug_portrait_variant()];
+        assert_eq!(
+            best_variant(&dual).map(|variant| &variant.kind),
+            Some(&VariantKind::Landscape)
+        );
+        let portrait_only = vec![debug_portrait_variant()];
+        assert_eq!(
+            best_variant(&portrait_only).map(|variant| &variant.kind),
+            Some(&VariantKind::Portrait)
+        );
+        assert!(
+            other_orientation(&VariantKind::Portrait)
+                .is_some_and(|kind| kind == VariantKind::Landscape)
+        );
+        assert!(other_orientation(&VariantKind::Audio).is_none());
     }
 
     #[test]
