@@ -434,7 +434,14 @@ async fn resolve_discovery(discovery: Discovery, dvr: &Dvr) -> Option<String> {
         Discovery::Media(url) => Some(url),
         Discovery::Master(variants) => {
             let live = wait_live_variant(dvr).await;
-            let chosen = choose_variant(&variants, live.as_ref())?;
+            let Some(chosen) = choose_variant(&variants, live.as_ref()) else {
+                debug!(
+                    live_variant = live.as_ref().map_or("<unknown>", |live| live.id.as_str()),
+                    live_res = ?live.as_ref().and_then(|live| live.res),
+                    "dvr: archive master has no variant of this orientation; not using it"
+                );
+                return None;
+            };
             debug!(
                 live_variant = live.as_ref().map_or("<unknown>", |live| live.id.as_str()),
                 live_res = ?live.as_ref().and_then(|live| live.res),
@@ -448,8 +455,14 @@ async fn resolve_discovery(discovery: Discovery, dvr: &Dvr) -> Option<String> {
 }
 
 /// Match the live variant in the archive master: by `STABLE-VARIANT-ID` first,
-/// then by `RESOLUTION`, then the first media playlist so the archive stays
-/// usable.
+/// then by `RESOLUTION`. `None` means the master has no variant of this
+/// orientation, and then there is no archive to use.
+///
+/// There is deliberately no "first variant" fallback. On a dual-format
+/// broadcast Twitch filters the whole portrait group out of the archive master
+/// (`com.amazon.ivs.unavailable-media`, `FR_DUALFORMAT_INCOMPATIBLE`), so a
+/// recording of the portrait stream would otherwise be handed the landscape
+/// archive and splice it in.
 ///
 /// The id alone is not enough. For the same broadcast Twitch published
 /// `STABLE-VARIANT-ID="1920p"` (1080x1920) live and `"1080p-portrait"`
@@ -466,14 +479,12 @@ fn choose_variant<'a>(
             .iter()
             .find(|variant| variant.id.as_deref() == Some(live.id.as_str()))
     });
-    by_id
-        .or_else(|| {
-            live.and_then(|live| {
-                live.res
-                    .and_then(|res| variants.iter().find(|variant| variant.res == Some(res)))
-            })
+    by_id.or_else(|| {
+        live.and_then(|live| {
+            live.res
+                .and_then(|res| variants.iter().find(|variant| variant.res == Some(res)))
         })
-        .or_else(|| variants.first())
+    })
 }
 
 /// Wait briefly for the scheduler to finish picking its live variant. The
@@ -787,19 +798,21 @@ https://cdn/audio_only/index-dvr.m3u8
             choose_variant(&variants, Some(&by_id)).map(|variant| variant.url.as_str()),
             Some("https://cdn/720p60/index-dvr.m3u8")
         );
-        // Unknown or unavailable choices keep the archive usable.
+        // No id and no resolution: refuse rather than record another
+        // orientation's archive.
         let unknown = LiveVariant {
             id: "480p30".to_owned(),
             res: None,
         };
-        assert_eq!(
-            choose_variant(&variants, Some(&unknown)).map(|variant| variant.id.as_deref()),
-            Some(Some("1440p60"))
-        );
-        assert_eq!(
-            choose_variant(&variants, None).map(|variant| variant.id.as_deref()),
-            Some(Some("1440p60"))
-        );
+        assert!(choose_variant(&variants, Some(&unknown)).is_none());
+        assert!(choose_variant(&variants, None).is_none());
+
+        // A live resolution the archive does not have is refused the same way.
+        let absent = LiveVariant {
+            id: "1080p60".to_owned(),
+            res: Some((1080, 1920)),
+        };
+        assert!(choose_variant(&variants, Some(&absent)).is_none());
     }
 
     /// Twitch does not keep `STABLE-VARIANT-ID` in sync between the live master
