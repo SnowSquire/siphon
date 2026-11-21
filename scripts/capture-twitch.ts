@@ -184,57 +184,56 @@ interface TimelineEntry extends Observation {
   age: number;
 }
 
-const observed: TimelineEntry[] = [];
-
 /**
- * How each path learnt the stream was up, measured from the *first segment's
- * start*. Process start is whenever the script happened to be launched, so the
- * `age` field in the timeline cannot say how long Twitch took to announce a
- * broadcast - it says how long the script had been watching.
- *
- * The first media playlist's `#EXT-X-PROGRAM-DATE-TIME` is the reference. Rows
- * are printed when they first arrive: the paths that beat the playlist are
- * flushed as soon as the reference is known, and ones that lose the race print
- * when they land.
+ * When each path first said the stream was up, on *our* clock. Process start is
+ * whenever the script was launched, so `age` in the timeline cannot say how long
+ * Twitch took to announce a broadcast; and the manifest's
+ * `#EXT-X-PROGRAM-DATE-TIME` is Twitch's clock, which need not agree with ours.
+ * The reference is therefore the earlier of the two live-state observations:
+ * whoever told us first was told at time zero.
  */
-const latencyRows: Array<{ label: string; match: (o: Observation) => boolean; seen: boolean }> = [
-  { label: "gql live", match: (o) => o.src === "gql" && o.event === "live", seen: false },
-  {
-    label: "hermes stream-up",
-    match: (o) => o.src === "hermes" && o.event === "stream-up",
-    seen: false,
-  },
-  {
-    label: "master first variant",
-    match: (o) => o.src === "master" && o.event === "variants",
-    seen: false,
-  },
-  {
-    label: "master first playlist",
-    match: (o) => o.src === "master" && o.event === "first",
-    seen: false,
-  },
-];
-let latencyReference: number | null = null;
+let firstGqlLive: TimelineEntry | null = null;
+let firstStreamUp: TimelineEntry | null = null;
+let firstVariants: TimelineEntry | null = null;
+let firstPlaylist: TimelineEntry | null = null;
+let latencyPrinted = false;
 
-function reportLatency(entry: TimelineEntry): void {
-  if (latencyReference === null) return;
-  for (const row of latencyRows) {
-    if (row.seen || !row.match(entry)) continue;
-    row.seen = true;
+const signed = (seconds: number): string => `${seconds >= 0 ? "+" : ""}${seconds.toFixed(2)}s`;
+
+function printLatency(): void {
+  const gql = firstGqlLive;
+  const hermes = firstStreamUp;
+  const anchors = [gql, hermes].filter((entry): entry is TimelineEntry => entry !== null);
+  if (anchors.length === 0) return;
+  const reference = Math.min(...anchors.map((entry) => entry.t));
+  console.log("capture: when the live state arrived (our clock, not the manifest's):");
+  const rows: Array<[string, TimelineEntry | null]> = [
+    ["gql live", gql],
+    ["hermes stream-up", hermes],
+    ["master first variant", firstVariants],
+    ["master first playlist", firstPlaylist],
+  ];
+  for (const [label, entry] of rows) {
     console.log(
-      `capture: ${row.label.padEnd(20)} ${(entry.t - latencyReference).toFixed(2)}s after the first segment started`,
+      `  ${label.padEnd(22)} ${entry ? signed(entry.t - reference) : "not seen"}`,
+    );
+  }
+  if (gql && hermes) {
+    console.log(
+      `  ${"hermes - gql".padEnd(22)} ${signed(hermes.t - gql.t)} (${hermes.t < gql.t ? "hermes" : "gql"} first)`,
     );
   }
 }
 
-function anchorLatency(firstPdt: string): void {
-  const parsed = Date.parse(firstPdt);
-  if (latencyReference !== null || Number.isNaN(parsed)) return;
-  latencyReference = parsed / 1000;
-  console.log(`capture: latency against the first segment (${firstPdt}):`);
-  // Paths that announced the stream before the playlist was even fetched.
-  for (const entry of observed) reportLatency(entry);
+/** Print once both halves are in; print what is known if one never arrives. */
+function checkLatency(entry: TimelineEntry): void {
+  if (latencyPrinted) return;
+  const both = firstGqlLive !== null && firstStreamUp !== null;
+  const only = firstGqlLive ?? firstStreamUp;
+  if (both || (only && entry.t - only.t >= 60)) {
+    latencyPrinted = true;
+    printLatency();
+  }
 }
 
 function record(observation: Observation): void {
@@ -243,13 +242,12 @@ function record(observation: Observation): void {
     age: (Date.now() - started) / 1000,
     ...observation,
   };
-  observed.push(entry);
   appendFileSync(timeline, `${JSON.stringify(entry)}\n`);
-  if (latencyReference !== null) {
-    reportLatency(entry);
-  } else if (typeof observation.first_pdt === "string") {
-    anchorLatency(observation.first_pdt);
-  }
+  if (entry.src === "gql" && entry.event === "live") firstGqlLive ??= entry;
+  else if (entry.src === "hermes" && entry.event === "stream-up") firstStreamUp ??= entry;
+  else if (entry.src === "master" && entry.event === "variants") firstVariants ??= entry;
+  else if (entry.src === "master" && entry.event === "first") firstPlaylist ??= entry;
+  checkLatency(entry);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
