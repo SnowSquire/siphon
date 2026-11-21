@@ -63,7 +63,11 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   keeps a fixed-width box, measured once for Chillax at the selected weight, so
   the tween cannot resize the tab or shift the row; the text is centred inside
   that box, which keeps it centred when the font falls back to the system's and
-  the glyphs spill symmetrically rather than hanging off one side. Driven by
+  the glyphs spill symmetrically rather than hanging off one side. The string
+  must be an explicit child of that box: a `text` element styled as a flex
+  container turns its own string into an anonymous flex item, and this zgui
+  revision mis-shapes that item once the variation changes, painting the
+  selected label into another tab and dropping others. Driven by
   `font-variation-settings` and a per-frame signal.
   The switch gets its
   motion from `--zui-motion-duration-normal`: zgui-ui's switch declares its own

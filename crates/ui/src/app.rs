@@ -486,7 +486,9 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Channels),
                     on:click = tab_click(Tab::Channels)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Channels"}
+                    box(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {
+                        text(class = "tab__text") {"Channels"}
+                    }
                     box(class = "tab__count tab__count--error", class:on = move || error_count.get() > 0) {
                         {move || if error_count.get() > 0 { error_count.get().to_string() } else { String::new() }}
                     }
@@ -497,7 +499,9 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Filter),
                     on:click = tab_click(Tab::Filter)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("36px".to_owned())) {"Filter"}
+                    box(class = "tab__label", var:--tab-label-w = Some("36px".to_owned())) {
+                        text(class = "tab__text") {"Filter"}
+                    }
                 }
                 box(
                     class = "tab",
@@ -505,7 +509,9 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Recordings),
                     on:click = tab_click(Tab::Recordings)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("74px".to_owned())) {"Recordings"}
+                    box(class = "tab__label", var:--tab-label-w = Some("74px".to_owned())) {
+                        text(class = "tab__text") {"Recordings"}
+                    }
                     box(class = "tab__count tab__count--rec", class:on = move || rec_count.get() > 0) {
                         {move || if rec_count.get() > 0 { rec_count.get().to_string() } else { String::new() }}
                     }
@@ -516,7 +522,9 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Logs),
                     on:click = tab_click(Tab::Logs)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("32px".to_owned())) {"Logs"}
+                    box(class = "tab__label", var:--tab-label-w = Some("32px".to_owned())) {
+                        text(class = "tab__text") {"Logs"}
+                    }
                 }
                 box(
                     class = "tab",
@@ -524,7 +532,9 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Settings),
                     on:click = tab_click(Tab::Settings)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Settings"}
+                    box(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {
+                        text(class = "tab__text") {"Settings"}
+                    }
                 }
                 // The video surface is the next milestone. A tab that changes
                 // nothing is worse than a tab that says it cannot be used yet,
@@ -2733,16 +2743,19 @@ const SHEET: &str = css!(
 
 /* Each label keeps a fixed box, measured once for Chillax at the selected
    weight so the `wght` tween cannot resize the tab or shift the row. The text
-   is centred by the box rather than by `text-align`: a fallback font measures
-   wider than the box, and flex centring makes that overflow spill equally on
-   both sides instead of hanging off the right. */
+   child is centred by the box, so a fallback font that measures wider spills
+   equally on both sides instead of hanging off the right. The string is an
+   explicit child rather than the box's own text: a flex container's anonymous
+   text item is mis-shaped by this zgui revision once the font variation
+   changes, which painted the wrong label into a tab. */
 .tab__label {
     display: flex;
     align-items: center;
     justify-content: center;
     width: var(--tab-label-w, 60px);
-    white-space: nowrap;
 }
+
+.tab__text { white-space: nowrap; }
 /* A count in the tab's corner. It is out of flow so it can neither widen the
    tab nor push its label off-centre; only its opacity changes with the count. */
 .tab__count {
