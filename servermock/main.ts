@@ -1,32 +1,62 @@
 import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { xxh3 } from "@node-rs/xxhash";
-import segments from "./segments.json" with { type: "json" };
 
-interface Segment {
-  filename: string;
-  length_ms: number;
-  present_time_ms: number;
-  sequence?: number;
-  pdt?: string;
-  label?: string;
-  ad?: boolean;
+// #EXT-X-MAP (fMP4) is out of scope: the capture is MPEG-TS only, so every
+// advertised segment is a .ts file here.
+
+interface Chunk {
+  index: number;
+  file: string;
+  start_ms: number;
+  duration_ms: number;
+  pdt_ms: number;
+}
+
+interface Live {
+  index: number;
+  file: string;
+  start_ms: number;
+  duration_ms: number;
+  sequence: number;
+  chunk: number;
+}
+
+interface Manifest {
+  source: string;
+  pdt_origin_ms: number;
+  chunks: Chunk[];
+  live: Live[];
+}
+
+interface Entry {
+  /** Assigned when the playlist is emitted: ads shift the live sequence. */
+  sequence: number;
+  start_ms: number;
+  duration_ms: number;
+  title: string;
+  url: string;
+  ad: boolean;
+  disc: boolean;
+  live?: Live;
 }
 
 interface DvrGroup {
   index: number;
-  start: number;
-  end: number;
   start_ms: number;
   duration_ms: number;
-  segments: Segment[];
+  pdt_ms: number;
+  disc: boolean;
+  /** Real captured chunk (default), or the live pieces to concatenate. */
+  file?: string;
+  pieces?: Live[];
 }
 
-const segment_list: Segment[] = segments;
-const segment_by_filename = new Map(segment_list.map((s) => [s.filename, s]));
+const SEGMENTS_ROOT = new URL("./segments/", import.meta.url);
+const manifest: Manifest = JSON.parse(
+  await readFile(new URL("manifest.json", SEGMENTS_ROOT), "utf8"),
+) as Manifest;
 
-const LIVE_WINDOW_MS = 30_000;
-const DVR_TARGET_MS = 10_000;
 // Wall-clock multiplier for the simulated broadcast. Set SPEED=1 to replay at
 // real time (the RTSP pacer honors it); the default races ahead.
 const SPEED = Number(process.env.SPEED ?? 8);
@@ -34,60 +64,154 @@ const SPEED = Number(process.env.SPEED ?? 8);
 // joins mid-broadcast and exercises prefill/holes/copies.
 const START_MS = Number(process.env.START_MS ?? 0);
 
-const session_id = String(Math.floor(Date.now() * 1000 + Math.random() * 1000));
-const dvr_groups = buildDvrGroups(segment_list);
-
-function buildDvrGroups(segments: Segment[]): DvrGroup[] {
-  const groups: DvrGroup[] = [];
-  let i = 0;
-
-  while (i < segments.length) {
-    const start = i;
-    let duration = 0;
-    do {
-      duration += segments[i].length_ms;
-      i += 1;
-    } while (i < segments.length && duration < DVR_TARGET_MS);
-
-    groups.push({
-      index: groups.length,
-      start,
-      end: i,
-      start_ms: segments[start].present_time_ms,
-      duration_ms: duration,
-      segments: segments.slice(start, i),
-    });
+function envNumber(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    return undefined;
   }
-
-  return groups;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
 }
 
-function streamDurationMs(segments: Segment[]): number {
-  const last = segments.at(-1);
-  return last ? last.present_time_ms + last.length_ms : 0;
+const LIVE_WINDOW_MS = envNumber("LIVE_WINDOW_MS") ?? 30_000;
+const AD_AT_MS = envNumber("AD_AT_MS");
+const AD_LEN_MS = envNumber("AD_LEN_MS") ?? 30_000;
+const AD_DISC = (process.env.AD_DISC ?? "1") !== "0";
+const DVR_403_BEFORE_MS = envNumber("DVR_403_BEFORE_MS");
+const DISC_AT_MS = envNumber("DISC_AT_MS");
+const CHUNK_SEGS = Math.max(0, Math.floor(envNumber("CHUNK_SEGS") ?? 0));
+
+const session_id = String(Math.floor(Date.now() * 1000 + Math.random() * 1000));
+const streamDuration = manifest.live.length
+  ? manifest.live[manifest.live.length - 1].start_ms +
+    manifest.live[manifest.live.length - 1].duration_ms
+  : 0;
+
+function basename(file: string): string {
+  return file.slice(file.lastIndexOf("/") + 1);
 }
 
 function iso(date_ms: number): string {
   return new Date(date_ms).toISOString();
 }
 
-function mediaSequence(segments: Segment[], index: number): number {
-  return segments[index]?.sequence ?? index;
+function currentContentMs(spark_time_ms: number): number {
+  const now = Date.now();
+  const sim_now = spark_time_ms + (now - spark_time_ms) * SPEED;
+  return Math.min(sim_now - spark_time_ms, streamDuration);
 }
+
+function segmentComplete(segment: Live, content_now: number): boolean {
+  return content_now >= segment.start_ms + segment.duration_ms;
+}
+
+/** All live segments, as playlist entries with a stable absolute timeline. */
+const realEntries: Entry[] = manifest.live.map((live) => ({
+  sequence: live.sequence,
+  start_ms: live.start_ms,
+  duration_ms: live.duration_ms,
+  title: "live",
+  url: `/${basename(live.file)}`,
+  ad: false,
+  disc: false,
+  live,
+}));
+const liveByUrl = new Map(
+  manifest.live.map((live) => [`/${basename(live.file)}`, live]),
+);
+
+// An ad break replaces real content in the live playlist only. The DVR
+// playlist always keeps the real chunks, so a live recorder sees a gap that
+// the DVR side can fill. The timeline keeps advancing during the break.
+const adEntries: Entry[] = [];
+const adSkipped = new Set<number>();
+if (AD_AT_MS !== undefined && AD_LEN_MS > 0) {
+  const ad_end_ms = AD_AT_MS + AD_LEN_MS;
+  for (const live of manifest.live) {
+    if (live.start_ms < ad_end_ms && live.start_ms + live.duration_ms > AD_AT_MS) {
+      adSkipped.add(live.index);
+    }
+  }
+  const ad_count = Math.ceil(AD_LEN_MS / 2000);
+  const ad_base =
+    realEntries.find((entry) => entry.start_ms >= AD_AT_MS)?.sequence ??
+    manifest.live[0].sequence;
+  for (let i = 0; i < ad_count; i++) {
+    const start_ms = AD_AT_MS + i * 2000;
+    adEntries.push({
+      sequence: ad_base + i,
+      start_ms,
+      duration_ms: Math.min(2000, ad_end_ms - start_ms),
+      title: `ad|break|${i}`, // Twitch ad titles contain a literal '|'.
+      url: `/ad/${i}.ts`,
+      ad: true,
+      disc: AD_DISC && i === 0,
+    });
+  }
+  const first_after = realEntries.find((entry) => entry.start_ms >= ad_end_ms);
+  if (first_after && AD_DISC) {
+    first_after.disc = true;
+  }
+}
+
+/** #EXT-X-DISCONTINUITY before the first entry at/after DISC_AT_MS. */
+function markDiscontinuity<T extends { start_ms: number; disc: boolean }>(
+  entries: T[],
+): void {
+  if (DISC_AT_MS === undefined) {
+    return;
+  }
+  const first = entries.find((entry) => entry.start_ms >= DISC_AT_MS);
+  if (first) {
+    first.disc = true;
+  }
+}
+markDiscontinuity([...realEntries, ...adEntries]);
+
+function buildDvrGroups(): DvrGroup[] {
+  if (CHUNK_SEGS > 0) {
+    // Re-chunking after a restart: group live pieces by count, not by the
+    // captured chunk boundaries. Absolute times — not group numbers — line up.
+    const groups: DvrGroup[] = [];
+    for (let i = 0; i < manifest.live.length; i += CHUNK_SEGS) {
+      const pieces = manifest.live.slice(i, i + CHUNK_SEGS);
+      const last = pieces[pieces.length - 1];
+      groups.push({
+        index: groups.length,
+        start_ms: pieces[0].start_ms,
+        duration_ms: last.start_ms + last.duration_ms - pieces[0].start_ms,
+        pdt_ms: manifest.chunks[pieces[0].chunk]?.pdt_ms ?? manifest.pdt_origin_ms,
+        disc: false,
+        pieces,
+      });
+    }
+    markDiscontinuity(groups);
+    return groups;
+  }
+
+  const groups: DvrGroup[] = manifest.chunks.map((chunk) => ({
+    index: chunk.index,
+    start_ms: chunk.start_ms,
+    duration_ms: chunk.duration_ms,
+    pdt_ms: chunk.pdt_ms,
+    disc: false,
+    file: chunk.file,
+  }));
+  markDiscontinuity(groups);
+  return groups;
+}
+
+const dvr_groups = buildDvrGroups();
 
 function generateLivePlaylist(
   spark_time_ms: number,
-  segments: Segment[],
   origin: string,
 ): string | undefined {
-  const now = Date.now();
-  const sim_now = spark_time_ms + (now - spark_time_ms) * SPEED;
-  const content_now = Math.min(sim_now - spark_time_ms, streamDurationMs(segments));
-
+  const content_now = currentContentMs(spark_time_ms);
   // Only fully produced segments belong in the main live list. The segment
   // currently being written (and the next one) are advertised as prefetches.
-  const next_segment_index = segments.findIndex(
-    (seg) => seg.present_time_ms + seg.length_ms > content_now,
+  const next_segment_index = manifest.live.findIndex(
+    (seg) => seg.start_ms + seg.duration_ms > content_now,
   );
 
   if (next_segment_index === 0) {
@@ -95,33 +219,45 @@ function generateLivePlaylist(
   }
 
   const available_end =
-    next_segment_index === -1 ? segments.length : next_segment_index;
+    next_segment_index === -1 ? manifest.live.length : next_segment_index;
   const window_start_ms = Math.max(0, content_now - LIVE_WINDOW_MS);
 
-  let first_sequence = segments.findIndex(
-    (seg) => seg.present_time_ms + seg.length_ms > window_start_ms,
+  let first_sequence = manifest.live.findIndex(
+    (seg) => seg.start_ms + seg.duration_ms > window_start_ms,
   );
-
   if (first_sequence < 0 || first_sequence >= available_end) {
     first_sequence = Math.max(0, available_end - 15);
   }
 
-  const available_segs = segments.slice(first_sequence, available_end);
-  const prefetch_segs =
-    next_segment_index === -1
-      ? []
-      : segments.slice(next_segment_index, next_segment_index + 2);
-
-  if (available_segs.length === 0) {
+  const available: Entry[] = realEntries
+    .slice(first_sequence, available_end)
+    .filter((entry) => !adSkipped.has(entry.live!.index));
+  for (const ad of adEntries) {
+    if (
+      ad.start_ms + ad.duration_ms > window_start_ms &&
+      ad.start_ms + ad.duration_ms <= content_now
+    ) {
+      available.push(ad);
+    }
+  }
+  available.sort((a, b) => a.start_ms - b.start_ms);
+  if (available.length === 0) {
     return undefined;
   }
 
-  const sequence = mediaSequence(segments, first_sequence);
+  const prefetch = (next_segment_index === -1
+    ? []
+    : manifest.live.slice(next_segment_index, next_segment_index + 2)
+  )
+    .filter((live) => !adSkipped.has(live.index))
+    .map((live) => `/${basename(live.file)}`);
+
+  const sequence = available[0].sequence;
   const session_unix = Math.floor(spark_time_ms / 1000);
   const stream_start = iso(spark_time_ms);
   const target_duration = Math.max(
     6,
-    Math.ceil(Math.max(...available_segs.map((seg) => seg.length_ms)) / 1000),
+    Math.ceil(Math.max(...available.map((seg) => seg.duration_ms)) / 1000),
   );
 
   let m3u8 = `#EXTM3U
@@ -129,18 +265,26 @@ function generateLivePlaylist(
 #EXT-X-TARGETDURATION:${target_duration}
 #EXT-X-MEDIA-SEQUENCE:${sequence}
 #EXT-X-TWITCH-LIVE-SEQUENCE:${sequence}
-#EXT-X-TWITCH-ELAPSED-SECS:${(available_segs[0].present_time_ms / 1000).toFixed(3)}
+#EXT-X-TWITCH-ELAPSED-SECS:${(available[0].start_ms / 1000).toFixed(3)}
 #EXT-X-TWITCH-TOTAL-SECS:${(content_now / 1000).toFixed(3)}
 #EXT-X-DATERANGE:ID="playlist-creation-${session_unix}",CLASS="timestamp",START-DATE="${stream_start}",END-ON-NEXT=YES,X-SERVER-TIME="${(spark_time_ms / 1000).toFixed(2)}"
 #EXT-X-DATERANGE:ID="playlist-session-${session_unix}",CLASS="twitch-session",START-DATE="${stream_start}",END-ON-NEXT=YES,X-TV-TWITCH-SESSIONID="${session_id}"
 #EXT-X-DATERANGE:ID="source-${session_unix}",CLASS="twitch-stream-source",START-DATE="${stream_start}",END-ON-NEXT=YES,X-TV-TWITCH-STREAM-SOURCE="live"
 #EXT-X-DATERANGE:ID="trigger-${session_unix}",CLASS="twitch-trigger",START-DATE="${stream_start}",END-ON-NEXT=YES,X-TV-TWITCH-TRIGGER-URL="${origin}/trigger"`;
 
-  for (const segment of available_segs) {
+  let position = 0;
+  for (const segment of available) {
+    // Ads shift the sequence numbers: renumber the emitted window so they
+    // stay strictly increasing even though the ad entries have no source
+    // sequence of their own.
+    segment.sequence = sequence + position++;
+    if (segment.disc) {
+      m3u8 += "\n#EXT-X-DISCONTINUITY";
+    }
     m3u8 += `
-#EXT-X-PROGRAM-DATE-TIME:${iso(spark_time_ms + segment.present_time_ms)}
-#EXTINF:${(segment.length_ms / 1000).toFixed(3)},live
-${origin}/${segment.filename}`;
+#EXT-X-PROGRAM-DATE-TIME:${iso(spark_time_ms + segment.start_ms)}
+#EXTINF:${(segment.duration_ms / 1000).toFixed(3)},${segment.title}
+${origin}${segment.url}`;
   }
 
   if (next_segment_index === -1) {
@@ -150,27 +294,19 @@ ${origin}/${segment.filename}`;
     return m3u8;
   }
 
-  for (const prefetch of prefetch_segs) {
+  for (const prefetch_url of prefetch) {
     m3u8 += `
-#EXT-X-TWITCH-PREFETCH:${origin}/${prefetch.filename}`;
+#EXT-X-TWITCH-PREFETCH:${origin}${prefetch_url}`;
   }
 
   return m3u8;
 }
 
-function generateDvrPlaylist(
-  spark_time_ms: number,
-  segments: Segment[],
-  groups: DvrGroup[],
-  origin: string,
-): string {
-  const now = Date.now();
-  const sim_now = spark_time_ms + (now - spark_time_ms) * SPEED;
-  const content_now = Math.min(sim_now - spark_time_ms, streamDurationMs(segments));
-
+function generateDvrPlaylist(spark_time_ms: number, origin: string): string {
+  const content_now = currentContentMs(spark_time_ms);
   // Only advertise groups that have fully landed. The in-progress group is the
   // DVR/live edge; that is what gives the DVR playlist its natural ~0-10s lag.
-  const available_groups = groups.filter(
+  const available_groups = dvr_groups.filter(
     (group) => group.start_ms + group.duration_ms <= content_now,
   );
   const target_duration = Math.max(
@@ -183,7 +319,7 @@ function generateDvrPlaylist(
   let m3u8 = `#EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-TARGETDURATION:${target_duration}
-#ID3-EQUIV-TDTG:${new Date(now).toISOString().slice(0, 19)}
+#ID3-EQUIV-TDTG:${new Date().toISOString().slice(0, 19)}
 #EXT-X-PLAYLIST-TYPE:EVENT
 #EXT-X-MEDIA-SEQUENCE:0
 #EXT-X-TWITCH-ELAPSED-SECS:0.000
@@ -191,18 +327,18 @@ function generateDvrPlaylist(
 #EXT-X-PROGRAM-DATE-TIME:${iso(spark_time_ms)}`;
 
   for (const group of available_groups) {
+    if (group.disc) {
+      m3u8 += "\n#EXT-X-DISCONTINUITY";
+    }
     // The header PDT above belongs to the first segment. Twitch repeats PDT
     // for every subsequent segment.
-    m3u8 +=
-      group.index === 0
-        ? ""
-        : `\n#EXT-X-PROGRAM-DATE-TIME:${iso(spark_time_ms + group.start_ms)}`;
+    m3u8 += group.index === 0 ? "" : `\n#EXT-X-PROGRAM-DATE-TIME:${iso(spark_time_ms + group.start_ms)}`;
     m3u8 += `
 #EXTINF:${(group.duration_ms / 1000).toFixed(3)},
 ${origin}/dvr/${group.index}.ts`;
   }
 
-  if (content_now >= streamDurationMs(segments)) {
+  if (content_now >= streamDuration) {
     m3u8 += `
 #EXT-X-ENDLIST
 `;
@@ -211,24 +347,17 @@ ${origin}/dvr/${group.index}.ts`;
   return m3u8;
 }
 
-async function concatDvrGroup(group: DvrGroup): Promise<Buffer> {
+async function dvrBytes(group: DvrGroup): Promise<Buffer> {
+  if (group.file) {
+    return readFile(new URL(group.file, SEGMENTS_ROOT));
+  }
   const parts = await Promise.all(
-    group.segments.map((segment) => readFile(`segments/${segment.filename}`)),
+    (group.pieces ?? []).map((piece) => readFile(new URL(piece.file, SEGMENTS_ROOT))),
   );
   return Buffer.concat(parts);
 }
 
 const TS_PACKET_SIZE = 188;
-
-function currentContentMs(spark_time_ms: number, segments: Segment[]): number {
-  const now = Date.now();
-  const sim_now = spark_time_ms + (now - spark_time_ms) * SPEED;
-  return Math.min(sim_now - spark_time_ms, streamDurationMs(segments));
-}
-
-function segmentComplete(segment: Segment, content_now: number): boolean {
-  return content_now >= segment.present_time_ms + segment.length_ms;
-}
 
 /**
  * Twitch serves prefetch segments while they are still being produced. The
@@ -239,7 +368,7 @@ function segmentComplete(segment: Segment, content_now: number): boolean {
 function streamPrefetchSegment(
   res: ServerResponse,
   bytes: Buffer,
-  segment: Segment,
+  segment: Live,
   spark_time_ms: number,
 ): void {
   res.setHeader("content-type", "video/mp2t");
@@ -248,7 +377,7 @@ function streamPrefetchSegment(
   res.flushHeaders();
 
   const total = bytes.length;
-  const segment_start_ms = spark_time_ms + segment.present_time_ms;
+  const segment_start_ms = spark_time_ms + segment.start_ms;
   let sent = 0;
   let closed = false;
 
@@ -260,7 +389,7 @@ function streamPrefetchSegment(
     const sim_now = spark_time_ms + (Date.now() - spark_time_ms) * SPEED;
     const fraction = Math.max(
       0,
-      Math.min(1, (sim_now - segment_start_ms) / segment.length_ms),
+      Math.min(1, (sim_now - segment_start_ms) / segment.duration_ms),
     );
 
     const target =
@@ -293,7 +422,7 @@ function streamPrefetchSegment(
   const sim_now = spark_time_ms + (Date.now() - spark_time_ms) * SPEED;
   const fraction = Math.max(
     0,
-    Math.min(1, (sim_now - segment_start_ms) / segment.length_ms),
+    Math.min(1, (sim_now - segment_start_ms) / segment.duration_ms),
   );
   const target = Math.floor((total * fraction) / TS_PACKET_SIZE) * TS_PACKET_SIZE;
   if (target > 0) {
@@ -328,7 +457,7 @@ const server = createServer(async (req, res) => {
 
   try {
     if (url.pathname === "/index.m3u8") {
-      const body = generateLivePlaylist(spark_time_ms, segment_list, origin);
+      const body = generateLivePlaylist(spark_time_ms, origin);
       if (body === undefined) {
         notFound(res);
         return;
@@ -338,10 +467,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === "/index-dvr.m3u8") {
-      playlist(
-        res,
-        generateDvrPlaylist(spark_time_ms, segment_list, dvr_groups, origin),
-      );
+      playlist(res, generateDvrPlaylist(spark_time_ms, origin));
       return;
     }
 
@@ -352,24 +478,42 @@ const server = createServer(async (req, res) => {
         notFound(res);
         return;
       }
+      if (
+        DVR_403_BEFORE_MS !== undefined &&
+        group.start_ms < DVR_403_BEFORE_MS
+      ) {
+        res.statusCode = 403;
+        res.end("forbidden");
+        return;
+      }
 
-      const bytes = await concatDvrGroup(group);
-      console.log(`/dvr/${group.index}.ts ${group.segments.length} segments`);
+      const bytes = await dvrBytes(group);
+      console.log(
+        `/dvr/${group.index}.ts ${group.file ?? `${group.pieces?.length} live pieces`}`,
+      );
       console.log(xxh3.xxh128(bytes).toString(16).padStart(32, "0"));
+      segment(res, bytes);
+      return;
+    }
+
+    const ad_match = /^\/ad\/(\d+)\.ts$/.exec(url.pathname);
+    if (ad_match) {
+      // The daemon never fetches ad segments; any decodable bytes will do.
+      const bytes = await readFile(new URL(manifest.live[0].file, SEGMENTS_ROOT));
       segment(res, bytes);
       return;
     }
 
     const live_match = /^\/([0-9]{6}\.ts)$/.exec(url.pathname);
     if (live_match) {
-      const found = segment_by_filename.get(live_match[1]);
+      const found = liveByUrl.get(`/${live_match[1]}`);
       if (!found) {
         notFound(res);
         return;
       }
 
-      const bytes = await readFile(`segments/${found.filename}`);
-      const content_now = currentContentMs(spark_time_ms, segment_list);
+      const bytes = await readFile(new URL(found.file, SEGMENTS_ROOT));
+      const content_now = currentContentMs(spark_time_ms);
       console.log(url.pathname);
       console.log(xxh3.xxh128(bytes).toString(16).padStart(32, "0"));
 
@@ -380,11 +524,11 @@ const server = createServer(async (req, res) => {
           0,
           Math.min(
             100,
-            ((content_now - found.present_time_ms) / found.length_ms) * 100,
+            ((content_now - found.start_ms) / found.duration_ms) * 100,
           ),
         );
         console.log(
-          `prefetch ${found.filename} (${produced.toFixed(1)}% produced)`,
+          `prefetch ${found.file} (${produced.toFixed(1)}% produced)`,
         );
         streamPrefetchSegment(res, bytes, found, spark_time_ms);
       }
@@ -403,6 +547,11 @@ const server = createServer(async (req, res) => {
 
 server.listen(8000, () => {
   console.log(
-    `mock server listening on http://127.0.0.1:8000 (speed ${SPEED}x, start ${START_MS} ms in)`,
+    `mock server listening on http://127.0.0.1:8000 (speed ${SPEED}x, start ${START_MS} ms in, ${manifest.live.length} live segments, ${dvr_groups.length} DVR groups)`,
+  );
+  console.log(
+    `knobs: ad=${AD_AT_MS ?? "off"}+${AD_LEN_MS} disc=${AD_DISC} ` +
+      `dvr403=${DVR_403_BEFORE_MS ?? "off"} disc-at=${DISC_AT_MS ?? "off"} ` +
+      `chunk-segs=${CHUNK_SEGS || "captured"} window=${LIVE_WINDOW_MS}`,
   );
 });
