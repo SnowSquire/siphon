@@ -25,7 +25,7 @@
 # Every path is taken from the environment when it is already set, so nothing
 # here is specific to one machine:
 #
-#   LIBPLACEBO_SRC     libplacebo checkout            <checkout>/../balesh/libplacebo
+#   LIBPLACEBO_SRC     libplacebo checkout            required, no default
 #   LIBPLACEBO_PREFIX  install prefix                 ~/.local/libplacebo-shared
 #   VULKAN_SDK         Vulkan SDK root                $SCOOP/apps/vulkan/current
 #   SCOOP              Scoop root                     ~/scoop
@@ -41,10 +41,25 @@ command -v cygpath >/dev/null || {
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(dirname "$here")
 
+# TODO: fix this script so it does not need a hand-placed libplacebo checkout.
+#
+# It used to default to "$root/../balesh/libplacebo", a path an agent guessed
+# with no explanation and nothing guarantees. Rather than silently building from
+# a directory that probably is not there, stop and say so: decide where
+# libplacebo comes from (a pinned clone, a submodule, a tarball) and replace
+# this block, or pass LIBPLACEBO_SRC on the command line.
+if [ -z "${LIBPLACEBO_SRC:-}" ]; then
+	echo "build-libplacebo: LIBPLACEBO_SRC is not set, and the old default was a guess." >&2
+	echo "  It used to fall back to $root/../balesh/libplacebo. Nothing guarantees" >&2
+	echo "  that layout. Fix this script (fetch or pin libplacebo) and delete this" >&2
+	echo "  block, or run with LIBPLACEBO_SRC=<libplacebo checkout>." >&2
+	exit 1
+fi
+lp=$LIBPLACEBO_SRC
+
 scoop=${SCOOP:-$HOME/scoop}
 vulkan=${VULKAN_SDK:-$scoop/apps/vulkan/current}
 splat=${XWIN_SYS_ROOT:-$HOME/.xwin-cache/splat}
-lp=${LIBPLACEBO_SRC:-$root/../balesh/libplacebo}
 prefix=${LIBPLACEBO_PREFIX:-$HOME/.local/libplacebo-shared}
 venv=${LIBPLACEBO_VENV:-${TEMP:-${TMPDIR:-/tmp}}/libplacebo-venv}
 SCRATCH=$(mktemp -d)
@@ -61,7 +76,7 @@ echo "xwin splat: $splat (MSVC ${msvc:-?}, Windows SDK ${sdk:-?})"
 echo "venv:       $venv"
 
 [ -f "$lp/meson.build" ] || {
-	echo "build-libplacebo: no libplacebo checkout at $lp (set LIBPLACEBO_SRC)" >&2
+	echo "build-libplacebo: no libplacebo checkout at $lp (LIBPLACEBO_SRC must point at one)" >&2
 	exit 1
 }
 [ -d "$vulkan/Lib" ] || {
