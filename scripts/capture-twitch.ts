@@ -73,6 +73,7 @@ interface Options {
   dvrOnly: boolean;
   dvrRetry: number;
   dvrWatch: number;
+  endGrace: number;
 }
 
 interface Variant {
@@ -133,6 +134,7 @@ const options: Options = {
   dvrOnly: false,
   dvrRetry: 30,
   dvrWatch: 3600,
+  endGrace: 20,
 };
 for (let index = 2; index < process.argv.length; index += 1) {
   const arg = process.argv[index]!;
@@ -165,6 +167,10 @@ for (let index = 2; index < process.argv.length; index += 1) {
       break;
     case "--dvr-watch":
       options.dvrWatch = Number(value ?? options.dvrWatch);
+      index += 1;
+      break;
+    case "--end-grace":
+      options.endGrace = Number(value ?? options.endGrace);
       index += 1;
       break;
     case "-n":
@@ -257,6 +263,55 @@ function record(observation: Observation): void {
   else if (entry.src === "master" && entry.event === "variants") firstVariants ??= entry;
   else if (entry.src === "master" && entry.event === "first") firstPlaylist ??= entry;
   checkLatency(entry);
+}
+
+/**
+ * The end of the stream is observable three ways, in order of speed: the live
+ * playlist gains `ENDLIST` (within a second, and the only one that is exact),
+ * Hermes sends `stream-down` (~4 s later), and GQL flips to offline (~9 s later).
+ * Whichever arrives first wins; a single observer is not enough because the
+ * playlist poller only runs once the stream is known and Hermes can drop.
+ */
+let ended = false;
+const endWaiters: Array<() => void> = [];
+
+function onEnded(callback: () => void): () => void {
+  if (ended) {
+    callback();
+    return () => {};
+  }
+  endWaiters.push(callback);
+  return () => {
+    const index = endWaiters.indexOf(callback);
+    if (index >= 0) endWaiters.splice(index, 1);
+  };
+}
+
+function markEnded(reason: string): void {
+  if (ended) return;
+  ended = true;
+  record({ src: "watch", event: "stream_ended", reason });
+  console.log(`capture: stream ended (${reason}); ${options.endGrace}s for the tail`);
+  for (const wake of endWaiters.splice(0)) wake();
+}
+
+/** Sleep that returns as soon as the stream ends. */
+function sleepUnlessEnded(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (ended) {
+      resolve();
+      return;
+    }
+    let detach = (): void => {};
+    const timer = setTimeout(() => {
+      detach();
+      resolve();
+    }, ms);
+    detach = onEnded(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -463,6 +518,9 @@ function saveRevision(text: string): void {
   writeFileSync(path.join(revisionsDir, name), text);
   const parsed = parseMedia(text);
   const last = parsed.segments.at(-1);
+  // Segment names are long CDN tokens; the extension is the interesting part
+  // (.mp4 while live, .m4s once the playlist has ended).
+  const lastUri = last ? path.basename(new URL(last.uri, "https://x/").pathname) : null;
   record({
     src: "live",
     event: "revision",
@@ -474,13 +532,13 @@ function saveRevision(text: string): void {
     segments: parsed.segments.length,
     last_extinf: last?.duration ?? null,
     last_pdt: last?.pdt ?? null,
-    last_uri: last ? path.basename(new URL(last.uri, "https://x/").pathname) : null,
+    last_uri: lastUri,
     endlist: parsed.endlist,
     hash: hash.slice(0, 12),
   });
   console.log(
     `capture: live revision ${name} seq=${parsed.sequence} segments=${parsed.segments.length}` +
-      (last ? ` last=${last.duration?.toFixed(3) ?? "?"}s ${path.basename(new URL(last.uri, "https://x/").pathname)}` : "") +
+      (last ? ` last=${last.duration?.toFixed(3) ?? "?"}s ${lastUri ? path.extname(lastUri) : ""}` : "") +
       (parsed.endlist ? " ENDLIST" : ""),
   );
   revision.count += 1;
@@ -497,6 +555,7 @@ async function logRevisions(playlistUrl: string): Promise<void> {
       if (parseMedia(text).endlist) {
         record({ src: "live", event: "endlist" });
         console.log("capture: live playlist reached ENDLIST");
+        markEnded("endlist");
         return;
       }
     } catch (error) {
@@ -504,6 +563,7 @@ async function logRevisions(playlistUrl: string): Promise<void> {
       record({ src: "live", event: "revision_failed", error: String(error) });
       if (failures >= 10) {
         console.log("capture: live playlist stopped answering; revision log closed");
+        markEnded("live playlist gone");
         return;
       }
     }
@@ -725,6 +785,7 @@ async function hermes(): Promise<void> {
           topic: topics.get(message.notification?.subscription?.id ?? "") ?? null,
           viewers: pubsub.viewers ?? null,
         });
+        if (pubsub.type === "stream-down") markEnded("hermes stream-down");
       });
       socket.addEventListener("close", () => {
         record({ src: "hermes", event: "close" });
@@ -746,15 +807,24 @@ async function hermes(): Promise<void> {
 
 const children: Array<{ label: string; process: ChildProcess }> = [];
 
+function runningChildren(): Array<{ label: string; process: ChildProcess }> {
+  return children.filter(
+    (child) => child.process.exitCode === null && child.process.signalCode === null,
+  );
+}
+
 function stopChildren(): void {
-  for (const child of children) {
-    if (child.process.exitCode === null) child.process.kill("SIGTERM");
+  const running = runningChildren();
+  for (const child of running) child.process.kill("SIGTERM");
+  if (running.length === 0) {
+    // Nothing left to wait for, and the GQL poll and Hermes socket would keep
+    // the loop alive forever.
+    process.exit(0);
+    return;
   }
   // Give them a moment to flush, then make sure they are gone.
   setTimeout(() => {
-    for (const child of children) {
-      if (child.process.exitCode === null) child.process.kill("SIGKILL");
-    }
+    for (const child of runningChildren()) child.process.kill("SIGKILL");
     process.exit(0);
   }, 1500);
 }
@@ -846,6 +916,7 @@ async function main(): Promise<void> {
           stream_id: stream?.id ?? null,
           viewers: stream?.viewersCount ?? null,
         });
+        if (!stream && live) markEnded("gql offline");
         live = stream !== null;
       } catch (error) {
         record({ src: "gql", event: "error", error: String(error) });
@@ -853,7 +924,6 @@ async function main(): Promise<void> {
       await sleep(options.interval);
     }
   })();
-
   /** One master fetch. `null` while the channel has no variants. */
   const pollMaster = async (): Promise<{ text: string; variants: Variant[] } | null> => {
     if (!masterUrl) return null;
@@ -1000,15 +1070,26 @@ async function main(): Promise<void> {
   if (livePortrait) wanted.push("portrait");
   const spawned = new Set<string>();
   const dvrDeadline = Date.now() + options.dvrWatch * 1000;
+  // StreamMetadata starts returning null the moment the broadcast ends, but the
+  // DVR object is usually published after that, so the id and start time are
+  // cached and the last probe runs on the cached copy.
+  let broadcast: { id: string; createdAt: string } | null = null;
+  let announced = false;
   for (;;) {
-    const stream = await waitForStream(10000);
-    if (!stream) {
+    const stream = await waitForStream(ended ? 2000 : 10000);
+    if (stream) broadcast = stream;
+    if (!broadcast) {
+      if (ended) {
+        console.log("capture: stream ended with no broadcast metadata; giving up on the DVR");
+        break;
+      }
       console.error("capture: no broadcast metadata yet; will keep trying for the DVR");
     } else {
-      const startSeconds = Math.floor(Date.parse(stream.createdAt) / 1000);
-      if (spawned.size === 0) {
+      const startSeconds = Math.floor(Date.parse(broadcast.createdAt) / 1000);
+      if (!announced) {
+        announced = true;
         console.log(
-          `capture: broadcast ${stream.id} started ${new Date(startSeconds * 1000).toISOString()}`,
+          `capture: broadcast ${broadcast.id} started ${new Date(startSeconds * 1000).toISOString()}`,
         );
       }
 
@@ -1049,14 +1130,14 @@ async function main(): Promise<void> {
         const live = kind === "landscape" ? liveLandscape : livePortrait;
         const id = variants.find((variant) => variant.url === live)?.id;
         if (!id) continue;
-        const url = await probeDvr(stream.id, startSeconds, `${id}/index-dvr.m3u8`);
+        const url = await probeDvr(broadcast.id, startSeconds, `${id}/index-dvr.m3u8`);
         if (url) choices.push({ kind, url, via: `private:${id}` });
       }
 
       // `chunked/` is the source group, and on a dual-format broadcast that is
       // the landscape source (the portrait group lives under its own id).
       if (!choices.some((choice) => choice.kind === "landscape") && liveLandscape) {
-        const chunked = await probeDvr(stream.id, startSeconds, "chunked/index-dvr.m3u8");
+        const chunked = await probeDvr(broadcast.id, startSeconds, "chunked/index-dvr.m3u8");
         if (chunked) {
           console.log("capture: attributing chunked/ to landscape (the source group)");
           choices.push({ kind: "landscape", url: chunked, via: "chunked/" });
@@ -1084,11 +1165,14 @@ async function main(): Promise<void> {
     }
 
     if (spawned.size >= wanted.length || Date.now() >= dvrDeadline) break;
+    // One probe after the stream ends (the object is often published only then),
+    // then stop rather than waiting out --dvr-watch.
+    if (ended) break;
     console.log(
       `capture: waiting for the DVR playlist(s) (${spawned.size}/${wanted.length}); retrying in ${options.dvrRetry}s`,
     );
     record({ src: "watch", event: "dvr_wait", spawned: spawned.size, wanted: wanted.length });
-    await sleep(options.dvrRetry * 1000);
+    await sleepUnlessEnded(options.dvrRetry * 1000);
   }
   if (spawned.size === 0) {
     console.error("capture: no DVR playlist found; the live recorders are unaffected");
@@ -1109,24 +1193,45 @@ async function main(): Promise<void> {
     console.error("capture: nothing to record");
     process.exit(1);
   }
-  console.log(`capture: ${children.length} recorder(s) running; Ctrl-C stops them`);
+  console.log(
+    `capture: ${children.length} recorder(s) running; they stop on ENDLIST, Ctrl-C stops them now`,
+  );
 
+  // The live recorders stop themselves when the playlist ends. The DVR ones sit
+  // on an EVENT playlist that will never grow again and wait forever, so the end
+  // of the stream starts a grace period after which everything is stopped.
   await new Promise<void>((resolve) => {
-    const pending = children.filter(
-      (child) => child.process.exitCode === null && child.process.signalCode === null,
-    );
-    if (pending.length === 0) {
+    let remaining = runningChildren().length;
+    if (remaining === 0) {
       resolve();
       return;
     }
-    let remaining = pending.length;
-    for (const child of pending) {
+    let grace: NodeJS.Timeout | null = null;
+    const detach = onEnded(() => {
+      console.log(
+        `capture: ${remaining} recorder(s) still running; stopping in ${options.endGrace}s`,
+      );
+      grace = setTimeout(() => resolve(), options.endGrace * 1000);
+    });
+    for (const child of children) {
       child.process.once("close", () => {
         remaining -= 1;
-        if (remaining === 0) resolve();
+        if (remaining > 0) return;
+        detach();
+        if (grace) clearTimeout(grace);
+        resolve();
       });
     }
   });
+
+  const running = runningChildren();
+  if (running.length > 0) {
+    console.log(`capture: stopping ${running.length} recorder(s)`);
+    stopChildren();
+    return;
+  }
+  console.log("capture: all recorders finished");
+  process.exit(0);
 }
 
 main().catch((error: unknown) => {
