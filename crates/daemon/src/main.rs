@@ -178,7 +178,7 @@ struct Daemon {
     #[arg(long, default_value_t = crate::constants::MAX_STREAMS)]
     max_streams: usize,
 
-    /// Record monitored streams into this directory
+    /// Record into this directory instead of the configured recordDir (dev override)
     #[arg(long)]
     output: Option<std::path::PathBuf>,
 

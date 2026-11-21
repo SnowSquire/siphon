@@ -132,9 +132,27 @@ impl App {
             return;
         }
         self.connecting = true;
+        // Debug mode has no GQL: the seeded details are the whole truth, and a
+        // stand-in socket only needs the ids to subscribe to.
+        let debug_channels: Vec<ChannelDetail> = if self.debug {
+            self.channels.values().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let debug = self.debug;
         let client = std::rc::Rc::clone(&self.client);
         let client_id = self.client_id.clone();
         self.spawn_job(async move {
+            if debug {
+                let url = url();
+                tracing::info!(target: "hermes", "connecting to {url}");
+                let socket = WsStream::connect(&url).await.ok();
+                return JobDone::ConnectFinished(Box::new(ConnectOutcome {
+                    channels: debug_channels,
+                    missing: Vec::new(),
+                    socket,
+                }));
+            }
             let fetched = gql::fetch_channels(&client, client_id.as_deref(), &ids).await;
             let ok = fetched.is_ok();
             let (channels, missing) = match fetched {
