@@ -370,7 +370,7 @@ impl Registry {
         );
 
         let dvr = Dvr::new(self.options.debug.then(|| DEBUG_DVR_URL.to_owned()));
-        dvr.set_live_variant(&variant.id);
+        dvr.set_live_variant(variant);
 
         let wakes = WakeSet::new();
         let live_window = Rc::new(RefCell::new(Vec::new()));

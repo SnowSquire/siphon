@@ -8,9 +8,10 @@
 //! 2. If the broadcast already has a public archive, `PlaybackAccessToken` plus
 //!    usher's `/vod/v2/` endpoint yields a master playlist. Only its media
 //!    playlist URLs are kept; the master's playback signature does not reach
-//!    them. The variant is chosen later by matching the live
-//!    `STABLE-VARIANT-ID`, so the master is fetched without waiting for the
-//!    live variant resolution to finish.
+//!    them. Which one to use is decided later, from the live variant: the two
+//!    masters do not agree on `STABLE-VARIANT-ID` (a portrait source is `1920p`
+//!    live and `1080p-portrait` archived), so `RESOLUTION` is the key. That
+//!    lets the master be fetched without waiting for the live pick.
 //! 3. Otherwise Twitch's private DVR path is probed on each VOD domain:
 //!    `sha1("{channel}_{stream_id}_{start}")[..20]_…/chunked/index-dvr.m3u8`.
 //!
@@ -41,6 +42,7 @@ use crate::utils::base64_encode;
 use crate::utils::parse_iso8601_millis;
 use crate::utils::query_string;
 use crate::utils::random_id;
+use crate::variant::Variant;
 
 const STREAM_METADATA_HASH: &str =
     "b57f9b910f8cd1a4659d894fe7550ccc81ec9052c01e438b290fd66a040b9b93";
@@ -184,13 +186,26 @@ impl DvrTimeline {
 }
 
 #[derive(Default)]
+/// The live variant the scheduler chose.
+///
+/// Its `STABLE-VARIANT-ID` is *not* what the archive master publishes: the same
+/// portrait source is `1920p` live and `1080p-portrait` in the archive, and a
+/// landscape source can be `chunked` there. `RESOLUTION` is the only field both
+/// masters agree on, so it is what the archive is really matched by.
+#[derive(Clone, Debug)]
+struct LiveVariant {
+    id: String,
+    res: Option<(u16, u16)>,
+}
+
+#[derive(Default)]
 struct DvrState {
     url: Option<String>,
     timeline: Option<Rc<DvrTimeline>>,
-    /// `STABLE-VARIANT-ID` of the variant the live scheduler picked. The public
-    /// archive's master is fetched in parallel, but its media playlist can only
-    /// be chosen once this is known.
-    live_variant: Option<String>,
+    /// The variant the live scheduler picked. The public archive's master is
+    /// fetched in parallel, but its media playlist can only be chosen once this
+    /// is known.
+    live_variant: Option<LiveVariant>,
     /// Broadcast start (`stream.createdAt`) from discovery, in Unix epoch ms.
     broadcast_start_ms: Option<u64>,
 }
@@ -255,13 +270,17 @@ impl Dvr {
         }
     }
 
-    /// Record the live variant selected by the scheduler (its
-    /// `STABLE-VARIANT-ID`).
-    pub fn set_live_variant(&self, id: &str) {
-        self.state.borrow_mut().live_variant = Some(id.to_owned());
+    /// Record the live variant selected by the scheduler.
+    pub fn set_live_variant(&self, variant: &Variant) {
+        self.state.borrow_mut().live_variant = Some(LiveVariant {
+            id: variant.id.to_string(),
+            res: variant
+                .res
+                .map(|(width, height)| (width.get(), height.get())),
+        });
     }
 
-    fn live_variant(&self) -> Option<String> {
+    fn live_variant(&self) -> Option<LiveVariant> {
         self.state.borrow().live_variant.clone()
     }
 
@@ -400,8 +419,11 @@ enum Discovery {
 }
 
 struct DvrVariant {
-    /// The same `STABLE-VARIANT-ID` the live master publishes.
+    /// The archive master's `STABLE-VARIANT-ID`, tried first but often different
+    /// from the live one.
     id: Option<String>,
+    /// `RESOLUTION`, which both masters publish identically.
+    res: Option<(u16, u16)>,
     url: String,
 }
 
@@ -412,10 +434,12 @@ async fn resolve_discovery(discovery: Discovery, dvr: &Dvr) -> Option<String> {
         Discovery::Media(url) => Some(url),
         Discovery::Master(variants) => {
             let live = wait_live_variant(dvr).await;
-            let chosen = choose_variant(&variants, live.as_deref())?;
+            let chosen = choose_variant(&variants, live.as_ref())?;
             debug!(
-                live_variant = live.as_deref().unwrap_or("<unknown>"),
+                live_variant = live.as_ref().map_or("<unknown>", |live| live.id.as_str()),
+                live_res = ?live.as_ref().and_then(|live| live.res),
                 archive_variant = chosen.id.as_deref().unwrap_or("<unknown>"),
+                archive_res = ?chosen.res,
                 "dvr: archive variant selected"
             );
             Some(chosen.url.clone())
@@ -423,20 +447,38 @@ async fn resolve_discovery(discovery: Discovery, dvr: &Dvr) -> Option<String> {
     }
 }
 
-/// Match the live `STABLE-VARIANT-ID` against the archive master, falling back
-/// to the first media playlist when there is no match.
-fn choose_variant<'a>(variants: &'a [DvrVariant], live: Option<&str>) -> Option<&'a DvrVariant> {
-    live.and_then(|id| {
+/// Match the live variant in the archive master: by `STABLE-VARIANT-ID` first,
+/// then by `RESOLUTION`, then the first media playlist so the archive stays
+/// usable.
+///
+/// The id alone is not enough. For the same broadcast Twitch published
+/// `STABLE-VARIANT-ID="1920p"` (1080x1920) live and `"1080p-portrait"`
+/// (1080x1920) in the archive, and the source appears as `"chunked"` there. A
+/// dual-orientation broadcast has both orientations in the archive, so falling
+/// back to the first variant would silently pick the wrong one; the resolution
+/// is what the two masters agree on.
+fn choose_variant<'a>(
+    variants: &'a [DvrVariant],
+    live: Option<&LiveVariant>,
+) -> Option<&'a DvrVariant> {
+    let by_id = live.and_then(|live| {
         variants
             .iter()
-            .find(|variant| variant.id.as_deref() == Some(id))
-    })
-    .or_else(|| variants.first())
+            .find(|variant| variant.id.as_deref() == Some(live.id.as_str()))
+    });
+    by_id
+        .or_else(|| {
+            live.and_then(|live| {
+                live.res
+                    .and_then(|res| variants.iter().find(|variant| variant.res == Some(res)))
+            })
+        })
+        .or_else(|| variants.first())
 }
 
 /// Wait briefly for the scheduler to finish picking its live variant. The
 /// archive master was already fetched in parallel; only this choice is deferred.
-async fn wait_live_variant(dvr: &Dvr) -> Option<String> {
+async fn wait_live_variant(dvr: &Dvr) -> Option<LiveVariant> {
     let deadline = Instant::now() + VARIANT_WAIT;
     loop {
         if let Some(id) = dvr.live_variant() {
@@ -579,9 +621,9 @@ async fn public_vod(
     (!variants.is_empty()).then_some(variants)
 }
 
-/// Parse the media playlists out of a VOD master. The v2 endpoint publishes the
-/// same `STABLE-VARIANT-ID` as the live master, so the archive can be matched
-/// by the scheduler's chosen variant.
+/// Parse the media playlists out of a VOD master. The v2 endpoint publishes
+/// `STABLE-VARIANT-ID` values that do **not** always match the live master's, so
+/// the resolution is kept as the real matching key.
 fn parse_master(text: &str) -> Vec<DvrVariant> {
     let mut variants = Vec::new();
     let mut stream_inf = None;
@@ -596,6 +638,10 @@ fn parse_master(text: &str) -> Vec<DvrVariant> {
         {
             variants.push(DvrVariant {
                 id: attribute(attributes, "STABLE-VARIANT-ID").map(str::to_owned),
+                res: attribute(attributes, "RESOLUTION").and_then(|res| {
+                    let (width, height) = res.split_once('x')?;
+                    Some((width.parse().ok()?, height.parse().ok()?))
+                }),
                 url: line.to_owned(),
             });
         }
@@ -733,18 +779,55 @@ https://cdn/audio_only/index-dvr.m3u8
                 Some("audio_only")
             ]
         );
+        let by_id = LiveVariant {
+            id: "720p60".to_owned(),
+            res: None,
+        };
         assert_eq!(
-            choose_variant(&variants, Some("720p60")).map(|variant| variant.url.as_str()),
+            choose_variant(&variants, Some(&by_id)).map(|variant| variant.url.as_str()),
             Some("https://cdn/720p60/index-dvr.m3u8")
         );
         // Unknown or unavailable choices keep the archive usable.
+        let unknown = LiveVariant {
+            id: "480p30".to_owned(),
+            res: None,
+        };
         assert_eq!(
-            choose_variant(&variants, Some("1080p60")).map(|variant| variant.id.as_deref()),
+            choose_variant(&variants, Some(&unknown)).map(|variant| variant.id.as_deref()),
             Some(Some("1440p60"))
         );
         assert_eq!(
             choose_variant(&variants, None).map(|variant| variant.id.as_deref()),
             Some(Some("1440p60"))
+        );
+    }
+
+    /// Twitch does not keep `STABLE-VARIANT-ID` in sync between the live master
+    /// and the archive master: for the same broadcast the portrait source was
+    /// `1920p` live and `1080p-portrait` in the archive. The archive master a
+    /// dual-orientation broadcast publishes has both, so matching the id alone
+    /// would fall through to the first (landscape) variant and quietly record
+    /// the wrong track.
+    #[test]
+    fn matches_a_renamed_portrait_variant_by_resolution() {
+        const MASTER: &str = "\
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=6389220,RESOLUTION=1920x1080,STABLE-VARIANT-ID=\"chunked\"
+https://cdn/chunked/index-dvr.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3228115,RESOLUTION=1080x1920,STABLE-VARIANT-ID=\"1080p-portrait\"
+https://cdn/1080p-portrait/index-dvr.m3u8
+";
+        let variants = parse_master(MASTER);
+        assert_eq!(variants[0].res, Some((1920, 1080)));
+        assert_eq!(variants[1].res, Some((1080, 1920)));
+
+        let live = LiveVariant {
+            id: "1920p".to_owned(),
+            res: Some((1080, 1920)),
+        };
+        assert_eq!(
+            choose_variant(&variants, Some(&live)).map(|variant| variant.id.as_deref()),
+            Some(Some("1080p-portrait"))
         );
     }
 

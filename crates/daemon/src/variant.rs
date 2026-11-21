@@ -154,7 +154,7 @@ pub async fn fetch_variant_playlist(
     String::from_utf8(body).map_err(|_| VariantPlaylistError::Utf8)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VariantKind {
     Landscape,
     Portrait,
@@ -169,7 +169,21 @@ pub enum Codec {
     Aac,
 }
 
-fn parse_kind(variant_id: &str) -> VariantKind {
+fn parse_kind(
+    variant_id: &str,
+    res: Option<(std::num::NonZeroU16, std::num::NonZeroU16)>,
+) -> VariantKind {
+    // `RESOLUTION` is the only stable signal: Twitch names a portrait source by
+    // its long edge in the live master ("1920p" at 1080x1920) and by its short
+    // edge with a suffix in the archive ("1080p-portrait"), so the id alone
+    // classifies the same track differently on the two sides.
+    if let Some((width, height)) = res {
+        return if height > width {
+            VariantKind::Portrait
+        } else {
+            VariantKind::Landscape
+        };
+    }
     match variant_id {
         "ertmpaudio1" => VariantKind::ERmtp,
         s if s.ends_with("-portrait") => VariantKind::Portrait,
@@ -214,7 +228,7 @@ fn parse_stream_inf(line: &str, url: &str) -> Option<Variant> {
         score,
         url: url.into(),
         id: variant_id.into(),
-        kind: parse_kind(variant_id),
+        kind: parse_kind(variant_id, res),
         codec,
         res,
         frame_rate,
@@ -367,6 +381,31 @@ mod tests {
         );
         assert_eq!(variant.score.map(std::num::NonZeroU16::get), Some(950));
         assert!(matches!(variant.codec, Some(Codec::H264)));
+    }
+
+    /// The same portrait source is named by its long edge live and by its short
+    /// edge with a suffix in the archive; only `RESOLUTION` classifies both.
+    #[test]
+    fn classifies_portrait_by_resolution_not_by_id() {
+        let live = "#EXT-X-STREAM-INF:BANDWIDTH=2691820,RESOLUTION=1080x1920,\
+                    CODECS=\"avc1.4D4028,mp4a.40.2\",FRAME-RATE=30.000,\
+                    STABLE-VARIANT-ID=\"1920p\"";
+        let archive = "#EXT-X-STREAM-INF:BANDWIDTH=3228115,RESOLUTION=1080x1920,\
+                    CODECS=\"avc1.4D4028,mp4a.40.2\",FRAME-RATE=30.000,\
+                    STABLE-VARIANT-ID=\"1080p-portrait\"";
+
+        assert_eq!(
+            parse_stream_inf(live, "https://example/live.m3u8")
+                .unwrap()
+                .kind,
+            VariantKind::Portrait
+        );
+        assert_eq!(
+            parse_stream_inf(archive, "https://example/archive.m3u8")
+                .unwrap()
+                .kind,
+            VariantKind::Portrait
+        );
     }
 
     #[test]

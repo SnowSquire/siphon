@@ -260,7 +260,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     // The public archive's master is fetched in parallel; picking the media
     // playlist with the same stable-variant-id as the live stream is deferred
     // until now.
-    dvr.set_live_variant(&variant.id);
+    dvr.set_live_variant(variant);
 
     let key = rtsp::StreamKey {
         login: args.channel.to_ascii_lowercase(),
