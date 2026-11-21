@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use sonic_rs::JsonContainerTrait;
 use sonic_rs::JsonValueTrait;
 use sonic_rs::PointerTree;
 use sonic_rs::pointer;
@@ -18,6 +19,123 @@ use crate::utils::attributes;
 use crate::utils::float_string_to_centis;
 use crate::utils::query_string;
 use crate::utils::random_id;
+
+/// One variant a master withheld, from `com.amazon.ivs.unavailable-media`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unavailable {
+    pub id: String,
+    pub groups: String,
+    pub resolution: String,
+    pub reasons: String,
+}
+
+impl Unavailable {
+    /// Audio-only renditions are the expected entries: `ertmpaudio1` is
+    /// Twitch's separate muted-audio track and `audio_only` is the one the VOD
+    /// endpoint returns only when asked for. A withheld *video* variant means
+    /// the request did not ask for something it could have had.
+    fn is_audio(&self) -> bool {
+        self.resolution.is_empty() || self.id == "ertmpaudio1" || self.id == "audio_only"
+    }
+}
+
+/// The variants a master withheld. Twitch publishes them as base64 JSON in
+/// `#EXT-X-SESSION-DATA:DATA-ID="com.amazon.ivs.unavailable-media"`:
+///
+/// ```json
+/// [{"STABLE-VARIANT-ID":"1080p60-portrait","IVS-GROUPS":"portrait",
+///   "RESOLUTION":"1080x1920","FILTER_REASONS":["FR_DUALFORMAT_INCOMPATIBLE"]}]
+/// ```
+///
+/// Without `multigroup_video=true` a dual-format archive lists its whole
+/// portrait group here; the live master normally lists only `ertmpaudio1`.
+#[must_use]
+pub fn unavailable_media(master: &str) -> Vec<Unavailable> {
+    let Some(encoded) = master.lines().find_map(|line| {
+        let attributes = line.strip_prefix("#EXT-X-SESSION-DATA:")?;
+        (attribute(attributes, "DATA-ID")? == "com.amazon.ivs.unavailable-media")
+            .then(|| attribute(attributes, "VALUE"))?
+    }) else {
+        return Vec::new();
+    };
+    let Some(json) =
+        crate::utils::base64_decode(encoded).and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return Vec::new();
+    };
+    let Ok(value) = sonic_rs::from_str::<sonic_rs::Value>(&json) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let text = |key: &str| {
+                entry
+                    .pointer([key])
+                    .and_then(JsonValueTrait::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let id = text("STABLE-VARIANT-ID");
+            if id.is_empty() {
+                return None;
+            }
+            let reasons = entry
+                .pointer(["FILTER_REASONS"])
+                .and_then(|reasons| reasons.as_array())
+                .map_or_else(String::new, |reasons| {
+                    reasons
+                        .iter()
+                        .filter_map(JsonValueTrait::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                });
+            Some(Unavailable {
+                id,
+                groups: text("IVS-GROUPS"),
+                resolution: text("RESOLUTION"),
+                reasons,
+            })
+        })
+        .collect()
+}
+
+/// Log what a master withheld. Only video variants are reported: a withheld
+/// audio rendition is normal and would otherwise repeat on every fetch.
+pub fn log_unavailable_media(master: &str, source: &str) {
+    let entries = unavailable_media(master);
+    if entries.is_empty() {
+        return;
+    }
+    let unexpected: Vec<&Unavailable> = entries.iter().filter(|entry| !entry.is_audio()).collect();
+    if unexpected.is_empty() {
+        tracing::debug!(
+            source,
+            withheld = entries.len(),
+            "master withheld audio-only variants"
+        );
+        return;
+    }
+    let listed = unexpected
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} ({} [{}] groups={})",
+                entry.id, entry.resolution, entry.reasons, entry.groups
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    tracing::warn!(
+        source,
+        withheld = %listed,
+        "master withheld video variants; the request did not ask for them"
+    );
+}
 
 #[derive(Debug, Error)]
 pub enum VariantPlaylistError {
@@ -274,6 +392,8 @@ pub fn debug_variant() -> Variant {
 }
 
 fn parse_variant_playlist(buffer: &str) -> (Vec<Variant>, Option<u64>) {
+    log_unavailable_media(buffer, "live");
+
     let mut stream_inf: Option<&str> = None;
 
     let mut var_vec = Vec::with_capacity(2); // always at least 2 tracks (source and audio_only)
@@ -381,6 +501,56 @@ mod tests {
         );
         assert_eq!(variant.score.map(std::num::NonZeroU16::get), Some(950));
         assert!(matches!(variant.codec, Some(Codec::H264)));
+    }
+
+    #[test]
+    fn reads_the_withheld_variants_tag() {
+        use crate::utils::base64_encode;
+
+        let json = r#"[{"STABLE-VARIANT-ID":"ertmpaudio1","IVS-GROUPS":"landscape,portrait","RESOLUTION":"","FILTER_REASONS":["FR_AUDIO_DISALLOWED"]},{"STABLE-VARIANT-ID":"1080p60-portrait","IVS-GROUPS":"portrait","RESOLUTION":"1080x1920","FILTER_REASONS":["FR_DUALFORMAT_INCOMPATIBLE"]}]"#;
+        let master = format!(
+            "#EXTM3U\n#EXT-X-SESSION-DATA:DATA-ID=\"com.amazon.ivs.unavailable-media\",VALUE=\"{}\"\n#EXT-X-STREAM-INF:BANDWIDTH=1,STABLE-VARIANT-ID=\"720p\"\nhttps://example/720p.m3u8\n",
+            base64_encode(json.as_bytes())
+        );
+
+        let entries = unavailable_media(&master);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "ertmpaudio1");
+        assert_eq!(entries[0].reasons, "FR_AUDIO_DISALLOWED");
+        assert!(entries[0].is_audio());
+        // The archive's usual entry is `audio_only` (FR_AUDIO_DISALLOWED), which
+        // must not warn either.
+        assert!(
+            Unavailable {
+                id: "audio_only".to_owned(),
+                groups: String::new(),
+                resolution: String::new(),
+                reasons: "FR_AUDIO_DISALLOWED".to_owned(),
+            }
+            .is_audio()
+        );
+        assert!(!entries[1].is_audio());
+        assert_eq!(entries[1].id, "1080p60-portrait");
+        assert_eq!(entries[1].groups, "portrait");
+        assert_eq!(entries[1].resolution, "1080x1920");
+        assert_eq!(entries[1].reasons, "FR_DUALFORMAT_INCOMPATIBLE");
+    }
+
+    #[test]
+    fn tolerates_a_missing_or_broken_withheld_tag() {
+        assert_eq!(unavailable_media("#EXTM3U\n"), []);
+        assert_eq!(
+            unavailable_media(
+                "#EXTM3U\n#EXT-X-SESSION-DATA:DATA-ID=\"com.amazon.ivs.unavailable-media\",VALUE=\"!!!\"\n"
+            ),
+            []
+        );
+        assert_eq!(
+            unavailable_media(
+                "#EXTM3U\n#EXT-X-SESSION-DATA:DATA-ID=\"com.amazon.ivs.unavailable-media\",VALUE=\"bm90IGpzb24=\"\n"
+            ),
+            []
+        );
     }
 
     /// The same portrait source is named by its long edge live and by its short

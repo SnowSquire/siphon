@@ -642,6 +642,8 @@ async fn public_vod(
 /// `STABLE-VARIANT-ID` values that do **not** always match the live master's, so
 /// the resolution is kept as the real matching key.
 fn parse_master(text: &str) -> Vec<DvrVariant> {
+    crate::variant::log_unavailable_media(text, "archive");
+
     let mut variants = Vec::new();
     let mut stream_inf = None;
 

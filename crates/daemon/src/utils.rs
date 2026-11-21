@@ -38,6 +38,33 @@ impl<T> RetainUnordered<T> for Vec<T> {
     }
 }
 
+/// Decode standard-alphabet base64 (padding optional, whitespace ignored).
+/// `None` on any character outside the alphabet.
+#[must_use]
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut accumulator = 0u32;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from((accumulator >> bits) & 0xff).ok()?);
+        }
+    }
+    Some(out)
+}
+
 pub fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -266,6 +293,19 @@ pub fn attribute<'a>(value: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_base64_and_round_trips() {
+        for case in [&b""[..], b"f", b"fo", b"foo", b"foob", b"foo\r\nbar"] {
+            assert_eq!(base64_decode(&base64_encode(case)).as_deref(), Some(case));
+        }
+        assert_eq!(base64_decode("Zm9v"), Some(b"foo".to_vec()));
+        assert_eq!(base64_decode("Zm9v\n"), Some(b"foo".to_vec()));
+        assert_eq!(base64_decode("Zm9v!"), None);
+        // Truncated input decodes what it can rather than failing: a master with
+        // a clipped VALUE should still yield the readable prefix.
+        assert!(base64_decode("Zm9").is_some());
+    }
 
     #[test]
     fn encodes_base64_with_padding() {
