@@ -22,7 +22,10 @@
 //            trigger to start the recorders.
 //
 // It also saves the multivariant playlists it sees (live-master.m3u8 and
-// dvr-master.m3u8) and the first variant playlist (live-first-media.m3u8).
+// dvr-master.m3u8), the first variant playlist (live-first-media.m3u8) with the
+// first segment and its init in first/, and every distinct revision of that
+// variant playlist in live-media/ (hashed, so only changes are written): the
+// end-of-stream shape is only visible in the live playlist.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -43,6 +46,9 @@ const VOD_USHER = "https://usher.ttvnw.net/vod/v2";
 const STREAM_METADATA = "b57f9b910f8cd1a4659d894fe7550ccc81ec9052c01e438b290fd66a040b9b93";
 const PLAYBACK_TOKEN = "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9";
 const RECENT_BROADCASTS = "a92c0ad34fdba9b3f5e6125dce4b0acc9373f2b2c06c74c92187749d12f73d4c";
+/// The live playlist only advances when a segment closes, so 1 s is enough to
+/// see every revision without the 300 ms master-poll cadence.
+const REVISION_INTERVAL = 1000;
 const VOD_DOMAINS = [
   "https://ds0h3roq6wcgc.cloudfront.net",
   "https://d2nvs31859zcd8.cloudfront.net",
@@ -85,7 +91,7 @@ interface DvrChoice {
   url: string;
 }
 
-type Source = "watch" | "gql" | "hermes" | "master" | "spawn";
+type Source = "watch" | "gql" | "hermes" | "master" | "live" | "spawn";
 
 interface Observation {
   src: Source;
@@ -179,6 +185,7 @@ options.out ||= `captures/${options.channel}-${new Date()
 mkdirSync(options.out, { recursive: true });
 
 const timeline = path.join(options.out, "timeline.jsonl");
+const revisionsDir = path.join(options.out, "live-media");
 const started = Date.now();
 
 interface TimelineEntry extends Observation {
@@ -299,7 +306,21 @@ async function get(url: string, timeout = 15000): Promise<string> {
     headers: { "User-Agent": "siphon-capture" },
     signal: AbortSignal.timeout(timeout),
   });
+  // A 403 from an unpublished DVR object and a 404 from an expired playlist
+  // both read as bodies if this is skipped, and a playlist-shaped parser would
+  // happily save "Forbidden" as a revision.
+  if (!response.ok) throw new Error(`HTTP ${response.status} ${url.slice(0, 80)}`);
   return response.text();
+}
+
+/** GET for bytes: the init segment and the first media fragment. */
+async function getBytes(url: string, timeout = 30000): Promise<Buffer> {
+  const response = await fetch(url, {
+    headers: { "User-Agent": "siphon-capture" },
+    signal: AbortSignal.timeout(timeout),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return Buffer.from(await response.arrayBuffer());
 }
 
 async function head(url: string): Promise<number> {
@@ -367,6 +388,127 @@ function pick(variants: Variant[], kind: "landscape" | "portrait"): string | nul
 function sessionData(master: string, id: string): string | null {
   const match = master.match(new RegExp(`DATA-ID="${id}",VALUE="([^"]*)"`));
   return match?.[1] ?? null;
+}
+
+// ------------------------------------------------------------ live revisions
+
+interface MediaSegment {
+  duration: number | null;
+  pdt: string | null;
+  uri: string;
+}
+
+interface MediaPlaylist {
+  sequence: number | null;
+  targetDuration: number | null;
+  elapsed: number | null;
+  total: number | null;
+  endlist: boolean;
+  segments: MediaSegment[];
+}
+
+function parseMedia(text: string): MediaPlaylist {
+  const playlist: MediaPlaylist = {
+    sequence: null,
+    targetDuration: null,
+    elapsed: null,
+    total: null,
+    endlist: false,
+    segments: [],
+  };
+  let duration: number | null = null;
+  let pdt: string | null = null;
+  const value = (line: string, tag: string): string => line.slice(tag.length).trim();
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("#EXTINF:")) {
+      duration = Number.parseFloat(value(line, "#EXTINF:"));
+    } else if (line.startsWith("#EXT-X-PROGRAM-DATE-TIME:")) {
+      pdt = value(line, "#EXT-X-PROGRAM-DATE-TIME:");
+    } else if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+      playlist.sequence = Number(value(line, "#EXT-X-MEDIA-SEQUENCE:"));
+    } else if (line.startsWith("#EXT-X-TARGETDURATION:")) {
+      playlist.targetDuration = Number(value(line, "#EXT-X-TARGETDURATION:"));
+    } else if (line.startsWith("#EXT-X-TWITCH-ELAPSED-SECS:")) {
+      playlist.elapsed = Number.parseFloat(value(line, "#EXT-X-TWITCH-ELAPSED-SECS:"));
+    } else if (line.startsWith("#EXT-X-TWITCH-TOTAL-SECS:")) {
+      playlist.total = Number.parseFloat(value(line, "#EXT-X-TWITCH-TOTAL-SECS:"));
+    } else if (line === "#EXT-X-ENDLIST") {
+      playlist.endlist = true;
+    } else if (line && !line.startsWith("#")) {
+      playlist.segments.push({ duration, pdt, uri: line });
+      duration = null;
+      pdt = null;
+    }
+  }
+  return playlist;
+}
+
+/**
+ * Every distinct state of the live media playlist, hashed so an unchanged
+ * playlist is not rewritten. The live playlist is the only place the
+ * end-of-stream shape is visible: the trailing entry Twitch appends after the
+ * last real segment, its `EXTINF`, and whether Twitch emits `ENDLIST` at all or
+ * the URLs simply start 404ing. The DVR playlist is append-only, so it does not
+ * need this.
+ */
+const revision = { hash: "", count: 0 };
+
+function saveRevision(text: string): void {
+  const hash = createHash("sha1").update(text).digest("hex");
+  if (hash === revision.hash) return;
+  revision.hash = hash;
+  const name = `${String(revision.count).padStart(4, "0")}.m3u8`;
+  mkdirSync(revisionsDir, { recursive: true });
+  writeFileSync(path.join(revisionsDir, name), text);
+  const parsed = parseMedia(text);
+  const last = parsed.segments.at(-1);
+  record({
+    src: "live",
+    event: "revision",
+    file: `live-media/${name}`,
+    media_sequence: parsed.sequence,
+    target_duration: parsed.targetDuration,
+    elapsed: parsed.elapsed,
+    total: parsed.total,
+    segments: parsed.segments.length,
+    last_extinf: last?.duration ?? null,
+    last_pdt: last?.pdt ?? null,
+    last_uri: last ? path.basename(new URL(last.uri, "https://x/").pathname) : null,
+    endlist: parsed.endlist,
+    hash: hash.slice(0, 12),
+  });
+  console.log(
+    `capture: live revision ${name} seq=${parsed.sequence} segments=${parsed.segments.length}` +
+      (last ? ` last=${last.duration?.toFixed(3) ?? "?"}s ${path.basename(new URL(last.uri, "https://x/").pathname)}` : "") +
+      (parsed.endlist ? " ENDLIST" : ""),
+  );
+  revision.count += 1;
+}
+
+/** Poll one live media playlist until ENDLIST, or until it stops answering. */
+async function logRevisions(playlistUrl: string): Promise<void> {
+  let failures = 0;
+  for (;;) {
+    try {
+      const text = await get(playlistUrl);
+      failures = 0;
+      saveRevision(text);
+      if (parseMedia(text).endlist) {
+        record({ src: "live", event: "endlist" });
+        console.log("capture: live playlist reached ENDLIST");
+        return;
+      }
+    } catch (error) {
+      failures += 1;
+      record({ src: "live", event: "revision_failed", error: String(error) });
+      if (failures >= 10) {
+        console.log("capture: live playlist stopped answering; revision log closed");
+        return;
+      }
+    }
+    await sleep(REVISION_INTERVAL);
+  }
 }
 
 // ---------------------------------------------------------------- live master
@@ -763,19 +905,51 @@ async function main(): Promise<void> {
     try {
       const media = await get(first.url);
       writeFileSync(path.join(options.out, "live-first-media.m3u8"), media);
-      const firstPdt = media.match(/^#EXT-X-PROGRAM-DATE-TIME:(.*)$/m)?.[1]?.trim() ?? null;
+      saveRevision(media);
+      const parsed = parseMedia(media);
       record({
         src: "master",
         event: "first",
         variant: first.id,
-        media_sequence: media.match(/^#EXT-X-MEDIA-SEQUENCE:(.*)$/m)?.[1]?.trim() ?? null,
-        first_pdt: firstPdt,
-        segments: media.split("\n").filter((line) => line.startsWith("http")).length,
+        media_sequence: parsed.sequence,
+        first_pdt: parsed.segments[0]?.pdt ?? null,
+        segments: parsed.segments.length,
       });
+      // The segment itself, so the capture does not depend on fetching it by
+      // hand afterwards. `live-first-media.m3u8` above is the evidence that it
+      // is segment 0.
+      const firstDir = path.join(options.out, "first");
+      mkdirSync(firstDir, { recursive: true });
+      const map = media.match(/^#EXT-X-MAP:URI="([^"]+)"/m)?.[1];
+      if (map) {
+        const bytes = await getBytes(new URL(map, first.url).toString());
+        writeFileSync(path.join(firstDir, "init.mp4"), bytes);
+        record({ src: "live", event: "init_saved", bytes: bytes.length });
+      }
+      const segment = parsed.segments[0];
+      if (segment) {
+        const bytes = await getBytes(new URL(segment.uri, first.url).toString());
+        const name = `${String(parsed.sequence ?? 0).padStart(6, "0")}.seg`;
+        writeFileSync(path.join(firstDir, name), bytes);
+        record({
+          src: "live",
+          event: "segment_saved",
+          file: `first/${name}`,
+          bytes: bytes.length,
+          duration: segment.duration,
+          pdt: segment.pdt,
+        });
+      }
     } catch (error) {
       record({ src: "master", event: "first_failed", error: String(error) });
     }
   }
+
+  // From here the live playlist is polled until ENDLIST: the first revision is
+  // already saved above, and each later one only when it changes.
+  void logRevisions(variants[0]!.url).catch((error: unknown) =>
+    record({ src: "live", event: "revision_failed", error: String(error) }),
+  );
   console.log(`capture: live master saved to ${path.join(options.out, "live-master.m3u8")}`);
   const features = sessionData(master, "CHANNEL-METADATA");
   const stack = sessionData(master, "TRANSCODESTACK");
