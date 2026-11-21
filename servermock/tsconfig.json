@@ -1,5 +1,5 @@
 {
-  "include": ["main.ts", "hermesnotifier.ts"],
+  "include": ["main.ts", "build-fixtures.ts", "hermesnotifier.ts"],
   "exclude": ["segments"],
   "compilerOptions": {
     "target": "esnext",
