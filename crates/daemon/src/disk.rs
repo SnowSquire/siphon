@@ -722,6 +722,32 @@ struct RunRecordMeta {
     record_len: u32,
 }
 
+/// A `#EXT-X-DISCONTINUITY` from the live playlist, not yet placed in the
+/// canonical. Both clocks are kept so it can be ordered against a DVR chunk or a
+/// live record whichever clock the recording settled on.
+#[derive(Clone, Copy, Debug)]
+struct DiscontinuityMark {
+    pdt_ms: u64,
+    elapsed_ms: u64,
+}
+
+impl DiscontinuityMark {
+    fn time(self, clock: Clock, live_origin: Option<i64>) -> u64 {
+        match clock {
+            Clock::Pdt => {
+                if self.pdt_ms != 0 {
+                    self.pdt_ms
+                } else {
+                    live_origin.map_or(self.elapsed_ms, |origin| {
+                        add_signed(self.elapsed_ms, origin)
+                    })
+                }
+            }
+            Clock::Elapsed => self.elapsed_ms,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Disk state
 // ---------------------------------------------------------------------------
@@ -892,6 +918,10 @@ struct Disk {
     live_edge: Option<(u64, u64, bool)>, // (start, end, pdt domain)
     live_origin: Option<i64>,
     live_open: bool,
+    /// Live-playlist discontinuities waiting for the archive to reach them.
+    discontinuities: Vec<DiscontinuityMark>,
+    /// A `Discontinuity` tag arrived; the next live segment supplies its time.
+    pending_discontinuity: bool,
 
     clock: Option<Clock>,
     dvr_origin: Option<i64>,
@@ -954,6 +984,8 @@ async fn run_disk(
         live_edge: None,
         live_origin: None,
         live_open: true,
+        discontinuities: Vec::new(),
+        pending_discontinuity: false,
         clock: None,
         dvr_origin: None,
         dvr_next_start_ms: 0,
@@ -1282,6 +1314,15 @@ impl Disk {
         }
         match message {
             SegmentMessage::Segment(segment) => {
+                if self.pending_discontinuity {
+                    // The tag precedes the segment it applies to, so this
+                    // segment's timestamp is where the new domain starts.
+                    self.pending_discontinuity = false;
+                    self.discontinuities.push(DiscontinuityMark {
+                        pdt_ms: segment.pdt_ms,
+                        elapsed_ms: segment.timestamp_ms,
+                    });
+                }
                 if self.phase.promoted() {
                     self.write_promoted(segment).await
                 } else {
@@ -1331,9 +1372,11 @@ impl Disk {
                 }
                 Ok(())
             }
-            SegmentMessage::Prefetch { .. }
-            | SegmentMessage::Discontinuity()
-            | SegmentMessage::Seek(_) => Ok(()),
+            SegmentMessage::Discontinuity() => {
+                self.pending_discontinuity = true;
+                Ok(())
+            }
+            SegmentMessage::Prefetch { .. } | SegmentMessage::Seek(_) => Ok(()),
         }
     }
 
@@ -1346,6 +1389,17 @@ impl Disk {
         let Some(canonical) = &mut self.canonical else {
             return Ok(());
         };
+        // A promoted archive is written in playlist order, so this segment's own
+        // time is the exact position of any discontinuity announced before it.
+        let clock = if pdt != 0 { Clock::Pdt } else { Clock::Elapsed };
+        write_discontinuities(
+            canonical,
+            &mut self.discontinuities,
+            if pdt != 0 { pdt } else { elapsed },
+            clock,
+            self.live_origin,
+        )
+        .await?;
         let Some(_) = append_live_segment(
             &mut canonical.segs,
             &mut canonical.index,
@@ -1548,6 +1602,15 @@ impl Disk {
     /// jumps; there is no hole to fill.
     async fn promote(&mut self) -> Result<(), DiskOutputError> {
         self.close_current_run().await?;
+        // No DVR ever arrived, so no chunk can place these: run media is
+        // concatenated here and a marker would have to be replayed by hand.
+        if !self.discontinuities.is_empty() {
+            debug!(
+                dropped = self.discontinuities.len(),
+                "disk: dropping unplaceable discontinuity markers"
+            );
+            self.discontinuities.clear();
+        }
         let mut canonical = create_canonical(&self.dir, self.options.stream_id).await?;
         let runs: Vec<RunData> = self.closed_runs.drain(..).collect();
 
@@ -1686,6 +1749,17 @@ impl Disk {
                 .saturating_add(in_flight.chunk.duration_ms);
             return Ok(());
         }
+
+        let clock = self.clock.unwrap_or(Clock::Elapsed);
+        let chunk_time = chunk_time_of(&in_flight.chunk, clock, self.dvr_origin);
+        write_discontinuities(
+            canonical,
+            &mut self.discontinuities,
+            chunk_time,
+            clock,
+            self.live_origin,
+        )
+        .await?;
 
         let record = SegmentRecord {
             source: SOURCE_DVR,
@@ -2581,6 +2655,43 @@ async fn fetch_map(client: &Client, map: &DvrMap) -> Result<Vec<u8>, DiskOutputE
             })
         }
     }
+}
+
+/// Write a `Discontinuity` record for every mark the archive has reached.
+/// The record's position in the index is the information: everything before it
+/// belongs to the old timestamp domain. Its geometry fields are reserved (zero)
+/// until a demuxer has a reason to fill them.
+async fn write_discontinuities(
+    canonical: &mut Canonical,
+    marks: &mut Vec<DiscontinuityMark>,
+    upto: u64,
+    clock: Clock,
+    live_origin: Option<i64>,
+) -> Result<(), DiskOutputError> {
+    let mut placed = 0;
+    while marks
+        .first()
+        .is_some_and(|mark| mark.time(clock, live_origin) <= upto)
+    {
+        write_record(
+            &mut canonical.index,
+            canonical.index_end,
+            &Record::Discontinuity(DiscontinuityRecord {
+                width: 0,
+                height: 0,
+                rate_num: 0,
+                rate_denom: 0,
+            }),
+        )
+        .await?;
+        canonical.index_end += u64::from(1 + DISCONTINUITY_BODY);
+        marks.remove(0);
+        placed += 1;
+    }
+    if placed > 0 {
+        canonical.index.sync_data().await?;
+    }
+    Ok(())
 }
 
 async fn write_record(
@@ -3605,6 +3716,76 @@ mod tests {
                 assert_eq!(inits[1].counter, 1);
                 assert_eq!(inits[1].byte_offset, segs_after_first);
                 assert_eq!(inits[1].hash, xxh3_128(second));
+            });
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn discontinuity_markers_are_written_when_the_archive_reaches_them() {
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "twitch-disk-discontinuity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+
+        compio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let mut canonical = create_canonical(&dir, 0).await.expect("canonical");
+                let mut marks = vec![
+                    DiscontinuityMark {
+                        pdt_ms: 1_000,
+                        elapsed_ms: 500,
+                    },
+                    DiscontinuityMark {
+                        pdt_ms: 9_000,
+                        elapsed_ms: 8_500,
+                    },
+                ];
+
+                // Before the first mark: nothing is placed.
+                write_discontinuities(&mut canonical, &mut marks, 999, Clock::Pdt, None)
+                    .await
+                    .expect("nothing");
+                assert_eq!(canonical.index_end, HEADER_LEN as u64);
+                assert_eq!(marks.len(), 2);
+
+                // Past the first: exactly one record, and the second stays pending.
+                write_discontinuities(&mut canonical, &mut marks, 1_000, Clock::Pdt, None)
+                    .await
+                    .expect("first");
+                assert_eq!(
+                    canonical.index_end,
+                    HEADER_LEN as u64 + u64::from(1 + DISCONTINUITY_BODY)
+                );
+                assert_eq!(marks.len(), 1);
+
+                write_discontinuities(&mut canonical, &mut marks, u64::MAX, Clock::Pdt, None)
+                    .await
+                    .expect("second");
+                assert!(marks.is_empty());
+
+                let index = fs::read(dir.join("index")).expect("index");
+                let mut position = HEADER_LEN;
+                let mut tags = Vec::new();
+                while position < index.len() {
+                    let tag = index[position];
+                    let body = body_len(tag).expect("tag");
+                    tags.push((tag, position));
+                    position += 1 + body as usize;
+                }
+                assert_eq!(tags.len(), 2);
+                assert!(tags.iter().all(|(tag, _)| *tag == TAG_DISCONTINUITY));
+                assert!(tags[0].1 < tags[1].1);
+                assert_eq!(position, index.len());
             });
 
         fs::remove_dir_all(&dir).ok();

@@ -39,6 +39,9 @@ struct Init {
     u128 hash;
 } [[packed]];
 
+// A live-playlist #EXT-X-DISCONTINUITY. Its position in the index is the
+// information: everything before it belongs to the previous timestamp domain.
+// The geometry is reserved (zero) until a demuxer has a reason to fill it.
 struct Discontinuity {
     u16 width;
     u16 height;
