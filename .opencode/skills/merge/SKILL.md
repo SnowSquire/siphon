@@ -60,8 +60,9 @@ reviewed or squashed later with `jj squash --from <id>`.
 
 ## 3. Rescue anything the worktree *created* that git ignores
 
-The startup hook hardlinks `captures/` from this repo *into* the worktree, so
-those files already exist here. But anything the worktree **generated** —
+The startup step clones `captures/` from this repo *into* the worktree (reflink
+on btrfs, hardlink on Windows), so those files already exist here. But anything
+the worktree **generated** —
 `servermock/segments/`, a fresh `captures/<name>/`, build output — exists only
 in that directory and dies with it. Copy it out first, hardlinked:
 
@@ -135,13 +136,15 @@ ls <worktree-parent>    # the directory is gone
   command — which is why the worktree then reads "no changes" instead of showing
   the diff you just committed. `jj status` in the worktree after the merge is
   not evidence of anything.
-- **Ignored media is per-directory.** Hardlinks into the worktree point *at* this
-  repo's files; files the worktree generated point nowhere else. Rescue those
-  before removing it.
+- **Ignored media is per-directory.** The clone the setup script made is just a
+  copy; files the worktree generated point nowhere else. Rescue those before
+  removing it.
 - **`git` is a trap**: detached HEAD, stale index, reports merged files as
   modified. Use `jj diff --git` / `jj log`, and only use git for
   `git worktree list`.
 - **`rm -rf` only after `jj workspace forget`**. Deleting a registered workspace
   leaves a stale entry and jj errors on every command in the repo.
-- The startup hook (`scripts/worktree-setup.sh`) hardlinks `captures/` from this
-  checkout; deleting the worktree never touches the originals.
+- `scripts/worktree-setup.sh` clones `captures/` from this checkout (reflink on
+  btrfs, hardlink on Windows). OpenCode does **not** run it: v2 has no worktree
+  setup hook, so it must be run by hand after `worktree_create`. Deleting the
+  worktree never touches the originals.

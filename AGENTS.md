@@ -55,11 +55,26 @@ only sink; disk output is disabled and being rebuilt from
 
 `--debug` bypasses Twitch and fetches `http://127.0.0.2:8000/index.m3u8`.
 
-1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere); the worktree hook hardlinks `captures/` from the base checkout. `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
+1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere). `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
 2. `cargo run -p daemon -- play -c anything -d` — `-c` is required even in debug mode; broadcast id `0`.
 3. `play` serves `rtsp://127.0.0.1:7417/` and `rtsp://[::1]:7417/`; `daemon` binds `--bind` (default `127.0.0.1:7417`) and serves `rtsp://host/<channel>/<quality>/`; DESCRIBE creates the stream.
 4. `ffplay -nodisp rtsp://127.0.0.1:7417/` and `ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:7417/` are the end-to-end checks (`.../sunnys/1080p/` under `daemon -d`).
 5. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
+
+## Worktrees
+
+OpenCode v2 has no worktree setup hook (`worktree.directory` is the only
+setting), so a fresh worktree has no media and no node deps. Run the script
+once, by hand, right after `worktree_create`:
+
+```
+OPENCODE_WORKTREE_BASE=<main checkout> OPENCODE_WORKTREE_PATH=<new worktree> \
+  bash <new worktree>/scripts/worktree-setup.sh
+```
+
+It clones `captures/` copy-on-write with `--reflink=auto` (btrfs: no extra
+blocks, and writes stay private), hardlinks it on Windows, and runs
+`pnpm install`.
 
 ## Architecture
 

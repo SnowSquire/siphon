@@ -9,11 +9,7 @@ captures/
 *.log
 
 # servermock (Node mock Twitch edge). Its fixtures live under captures/servermock.
-servermock/output/
 servermock/node_modules/
-servermock/unused/
-servermock/config.json
-servermock/twitch-gql-queries/
 
 # OS junk
 Thumbs.db

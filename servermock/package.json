@@ -6,8 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch main.ts",
-    "build:fixtures": "node build-fixtures.ts",
-    "build:notifier": "cargo build --release --manifest-path notifier-rs/Cargo.toml && node -e \"require('node:fs').copyFileSync('notifier-rs/target/release/notifier_rs.dll', 'notifier-rs/notifier_rs.node')\""
+    "build:fixtures": "node build-fixtures.ts"
   },
   "dependencies": {
     "@node-rs/xxhash": "^1.7.7"

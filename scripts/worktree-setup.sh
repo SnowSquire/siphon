@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# OpenCode "Worktree startup script" for this repo:
+# Populate a fresh worktree with the media and dependencies git cannot give it.
 #
-#   bash "$OPENCODE_WORKTREE_PATH/scripts/worktree-setup.sh"
+# This is NOT wired into OpenCode. v2's worktree config has exactly one field,
+# `worktree.directory`; there is no setup-script hook, and nothing exports
+# OPENCODE_WORKTREE_BASE/PATH. Run it yourself right after `worktree_create`:
 #
-# Captured media (the natemek capture plus the mock's built fixtures at
-# captures/servermock/) is several GB. Copying it into every worktree is what
-# .worktreeinclude used to do and it is far too slow, so hardlink it from the
-# main checkout instead: same inode, no extra disk, and `cp -al` is a few
-# milliseconds. The files are read-only test data; nothing writes to a segment
-# in place.
+#   OPENCODE_WORKTREE_BASE=<main checkout> \
+#   OPENCODE_WORKTREE_PATH=<new worktree>  \
+#   bash <new worktree>/scripts/worktree-setup.sh
 #
-# `cp -al` only works within one filesystem. If a worktree lives on another
-# drive it falls back to a real copy.
+# `captures/` (the natemek capture plus the mock's built fixtures at
+# captures/servermock/) is several GB. On Linux it is cloned with
+# `--reflink=auto`: on btrfs/xfs that allocates no blocks, the two copies share
+# extents copy-on-write, and a worktree that writes to a segment cannot touch
+# the main checkout's copy. On a filesystem without reflink `cp` falls back to a
+# real copy (slow but safe). On Windows (and anything else) it hardlinks with
+# `cp -al`, which shares the inode instead: the files are read-only test data,
+# so nothing may write to a segment in place.
 set -euo pipefail
 
-base=${OPENCODE_WORKTREE_BASE:?run from the OpenCode worktree startup hook}
-new=${OPENCODE_WORKTREE_PATH:?run from the OpenCode worktree startup hook}
+base=${OPENCODE_WORKTREE_BASE:?run from the worktree startup step}
+new=${OPENCODE_WORKTREE_PATH:?run from the worktree startup step}
 
 for path in captures; do
 	src="$base/$path"
@@ -25,10 +30,15 @@ for path in captures; do
 	[ -e "$dst" ] && continue
 
 	mkdir -p "$(dirname "$dst")"
-	cp -al "$src" "$dst" 2>/dev/null || {
-		rm -rf "$dst"
-		cp -a "$src" "$dst"
-	}
+	case "$(uname -s)" in
+		Linux) cp -a --reflink=auto "$src" "$dst" ;;
+		*)
+			cp -al "$src" "$dst" 2>/dev/null || {
+				rm -rf "$dst"
+				cp -a "$src" "$dst"
+			}
+			;;
+	esac
 done
 
 pnpm -C "$new/servermock" install
