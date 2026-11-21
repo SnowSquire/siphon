@@ -72,7 +72,10 @@ struct FrameLog {
 impl zgui::runtime::FrameProbe for FrameLog {
     fn frame_ended(&self, window: &zgui::runtime::Window) {
         let now = std::time::Instant::now();
-        let gap = self.last.get().map_or(0.0, |last| (now - last).as_secs_f64() * 1000.0);
+        let gap = self
+            .last
+            .get()
+            .map_or(0.0, |last| (now - last).as_secs_f64() * 1000.0);
         self.last.set(Some(now));
         let Some(report) = window.last_frame_report() else {
             return;
