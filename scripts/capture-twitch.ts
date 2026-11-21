@@ -179,11 +179,77 @@ mkdirSync(options.out, { recursive: true });
 const timeline = path.join(options.out, "timeline.jsonl");
 const started = Date.now();
 
+interface TimelineEntry extends Observation {
+  t: number;
+  age: number;
+}
+
+const observed: TimelineEntry[] = [];
+
+/**
+ * How each path learnt the stream was up, measured from the *first segment's
+ * start*. Process start is whenever the script happened to be launched, so the
+ * `age` field in the timeline cannot say how long Twitch took to announce a
+ * broadcast - it says how long the script had been watching.
+ *
+ * The first media playlist's `#EXT-X-PROGRAM-DATE-TIME` is the reference. Rows
+ * are printed when they first arrive: the paths that beat the playlist are
+ * flushed as soon as the reference is known, and ones that lose the race print
+ * when they land.
+ */
+const latencyRows: Array<{ label: string; match: (o: Observation) => boolean; seen: boolean }> = [
+  { label: "gql live", match: (o) => o.src === "gql" && o.event === "live", seen: false },
+  {
+    label: "hermes stream-up",
+    match: (o) => o.src === "hermes" && o.event === "stream-up",
+    seen: false,
+  },
+  {
+    label: "master first variant",
+    match: (o) => o.src === "master" && o.event === "variants",
+    seen: false,
+  },
+  {
+    label: "master first playlist",
+    match: (o) => o.src === "master" && o.event === "first",
+    seen: false,
+  },
+];
+let latencyReference: number | null = null;
+
+function reportLatency(entry: TimelineEntry): void {
+  if (latencyReference === null) return;
+  for (const row of latencyRows) {
+    if (row.seen || !row.match(entry)) continue;
+    row.seen = true;
+    console.log(
+      `capture: ${row.label.padEnd(20)} ${(entry.t - latencyReference).toFixed(2)}s after the first segment started`,
+    );
+  }
+}
+
+function anchorLatency(firstPdt: string): void {
+  const parsed = Date.parse(firstPdt);
+  if (latencyReference !== null || Number.isNaN(parsed)) return;
+  latencyReference = parsed / 1000;
+  console.log(`capture: latency against the first segment (${firstPdt}):`);
+  // Paths that announced the stream before the playlist was even fetched.
+  for (const entry of observed) reportLatency(entry);
+}
+
 function record(observation: Observation): void {
-  appendFileSync(
-    timeline,
-    `${JSON.stringify({ t: Date.now() / 1000, age: (Date.now() - started) / 1000, ...observation })}\n`,
-  );
+  const entry: TimelineEntry = {
+    t: Date.now() / 1000,
+    age: (Date.now() - started) / 1000,
+    ...observation,
+  };
+  observed.push(entry);
+  appendFileSync(timeline, `${JSON.stringify(entry)}\n`);
+  if (latencyReference !== null) {
+    reportLatency(entry);
+  } else if (typeof observation.first_pdt === "string") {
+    anchorLatency(observation.first_pdt);
+  }
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -697,12 +763,13 @@ async function main(): Promise<void> {
     try {
       const media = await get(first.url);
       writeFileSync(path.join(options.out, "live-first-media.m3u8"), media);
+      const firstPdt = media.match(/^#EXT-X-PROGRAM-DATE-TIME:(.*)$/m)?.[1]?.trim() ?? null;
       record({
         src: "master",
         event: "first",
         variant: first.id,
         media_sequence: media.match(/^#EXT-X-MEDIA-SEQUENCE:(.*)$/m)?.[1]?.trim() ?? null,
-        first_pdt: media.match(/^#EXT-X-PROGRAM-DATE-TIME:(.*)$/m)?.[1]?.trim() ?? null,
+        first_pdt: firstPdt,
         segments: media.split("\n").filter((line) => line.startsWith("http")).length,
       });
     } catch (error) {
