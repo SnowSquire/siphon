@@ -156,7 +156,6 @@ function buildGroup(name: GroupName): GroupFixture {
   const tail = foundLive[foundLive.length - 1];
   const emptyTail = tail.size <= EMPTY_FRAGMENT_MAX_BYTES;
   const live = emptyTail ? foundLive.slice(0, -1) : foundLive;
-  const timelineEndPdt = emptyTail ? tail.pdt : undefined;
 
   if (live.length % chunks.length !== 0) {
     throw new Error(
@@ -170,11 +169,16 @@ function buildGroup(name: GroupName): GroupFixture {
     }
   }
 
+  // The DVR playlist's total is the broadcast's true end: the live playlist's own
+  // total is inflated by the empty EOS entry, and the EOS fragment's PDT can be a
+  // millisecond off the chunk boundary. Both views must end on the same instant or
+  // the mock never advertises the final chunk (it only lists chunks that have
+  // fully landed) and the recording is silently one chunk short.
+  const total = playlistTotalMs(name);
+  const liveEndPdt = live[0].pdt + total;
+
   const liveFixtures: LiveFixture[] = live.map((fragment, i) => {
-    const nextPdt =
-      i + 1 < live.length
-        ? live[i + 1].pdt
-        : (timelineEndPdt ?? fragment.pdt + 2000);
+    const nextPdt = i + 1 < live.length ? live[i + 1].pdt : liveEndPdt;
     const duration_ms = nextPdt - fragment.pdt;
     if (duration_ms <= 0) {
       throw new Error(`${name}: fragment ${fragment.name} has a bad PDT gap`);
@@ -189,7 +193,6 @@ function buildGroup(name: GroupName): GroupFixture {
     };
   });
 
-  const total = playlistTotalMs(name);
   const chunkDurations = chunks.map((chunk, i) =>
     i + 1 < chunks.length ? chunks[i + 1].pdt - chunk.pdt : 0,
   );
@@ -221,7 +224,7 @@ function buildGroup(name: GroupName): GroupFixture {
 
   const liveSpan = liveFixtures.reduce((sum, seg) => sum + seg.duration_ms, 0);
   const dvrSpan = chunkFixtures.reduce((sum, seg) => sum + seg.duration_ms, 0);
-  if (Math.abs(liveSpan - dvrSpan) > 50) {
+  if (liveSpan !== dvrSpan) {
     throw new Error(
       `${name}: live (${liveSpan} ms) and DVR (${dvrSpan} ms) spans differ`,
     );
