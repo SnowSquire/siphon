@@ -234,7 +234,6 @@ pub async fn fetch_variant_playlist(
     let params = [
         ("allow_source", "true"),
         ("allow_audio_only", "true"),
-        ("allow_spectre", "true"), // idk what this adds but twtich-dlp has it, to inspect, maybe the fabled ertmpaudio1?
         ("browser_family", "chrome"),
         ("browser_version", "151.0"),
         ("cdm", "wv"),

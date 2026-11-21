@@ -105,7 +105,6 @@ live_master() {
 		--data-urlencode "token=$value" \
 		--data-urlencode 'allow_source=true' \
 		--data-urlencode 'allow_audio_only=true' \
-		--data-urlencode 'allow_spectre=true' \
 		--data-urlencode 'browser_family=chrome' \
 		--data-urlencode 'browser_version=151.0' \
 		--data-urlencode 'cdm=wv' \
