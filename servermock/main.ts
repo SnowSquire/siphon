@@ -3,6 +3,7 @@ import { createServer, type ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { xxh3 } from "@node-rs/xxhash";
+import { startHermes } from "./hermes.ts";
 
 // #EXT-X-MAP (fMP4) is out of scope: the capture is MPEG-TS only, so every
 // advertised segment is a .ts file here.
@@ -87,6 +88,23 @@ const AD_DISC = (process.env.AD_DISC ?? "1") !== "0";
 const DVR_403_BEFORE_MS = envNumber("DVR_403_BEFORE_MS");
 const DISC_AT_MS = envNumber("DISC_AT_MS");
 const CHUNK_SEGS = Math.max(0, Math.floor(envNumber("CHUNK_SEGS") ?? 0));
+
+// Both groups share one simulated timeline and one set of segment URLs, so the
+// same generators serve both; only the advertised paths differ. The extra
+// aliases are the per-variant URLs the daemon derives from STABLE-VARIANT-ID
+// when it walks the master playlist (`chunked` is the debug landscape id).
+const LIVE_PATHS = new Set([
+  "/index.m3u8",
+  "/chunked.m3u8",
+  "/portrait.m3u8",
+  "/1080p60-portrait.m3u8",
+]);
+const DVR_PATHS = new Set([
+  "/index-dvr.m3u8",
+  "/chunked-dvr.m3u8",
+  "/portrait-dvr.m3u8",
+  "/1080p60-portrait-dvr.m3u8",
+]);
 
 const session_id = String(Math.floor(Date.now() * 1000 + Math.random() * 1000));
 const streamDuration = manifest.live.length
@@ -445,6 +463,21 @@ function playlist(res: ServerResponse, body: string): void {
   res.end(body);
 }
 
+/**
+ * A two-group live master, for exercising dual-format resolution. Twitch uses
+ * absolute CDN URLs here; the daemon's live-master parser also ignores lines
+ * that do not start with `http`, so relative paths would drop both variants.
+ */
+function masterPlaylist(origin: string): string {
+  return `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080,STABLE-VARIANT-ID="chunked",IVS-NAME="1080p60",IVS-GROUPS="landscape",IVS-VARIANT-SOURCE="source"
+${origin}/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1080x1920,STABLE-VARIANT-ID="1080p60-portrait",IVS-NAME="1080p60",IVS-GROUPS="portrait",IVS-VARIANT-SOURCE="source"
+${origin}/portrait.m3u8
+`;
+}
+
 function segment(res: ServerResponse, bytes: Buffer): void {
   res.setHeader("content-type", "video/mp2t");
   res.setHeader("access-control-allow-origin", "*");
@@ -463,7 +496,12 @@ const server = createServer(async (req, res) => {
   const origin = `http://${url.host}`;
 
   try {
-    if (url.pathname === "/index.m3u8") {
+    if (url.pathname === "/master.m3u8") {
+      playlist(res, masterPlaylist(origin));
+      return;
+    }
+
+    if (LIVE_PATHS.has(url.pathname)) {
       const body = generateLivePlaylist(spark_time_ms, origin);
       if (body === undefined) {
         notFound(res);
@@ -473,7 +511,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (url.pathname === "/index-dvr.m3u8") {
+    if (DVR_PATHS.has(url.pathname)) {
       playlist(res, generateDvrPlaylist(spark_time_ms, origin));
       return;
     }
@@ -562,3 +600,5 @@ server.listen(8000, () => {
       `chunk-segs=${CHUNK_SEGS || "captured"} window=${LIVE_WINDOW_MS}`,
   );
 });
+
+startHermes(() => currentContentMs(spark_time_ms) >= streamDuration);

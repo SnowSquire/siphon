@@ -1,5 +1,5 @@
 {
-  "include": ["main.ts", "build-fixtures.ts"],
+  "include": ["main.ts", "hermes.ts", "hermes-check.ts", "build-fixtures.ts"],
   "compilerOptions": {
     "target": "esnext",
     "module": "ESNext",

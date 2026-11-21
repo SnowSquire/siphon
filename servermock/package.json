@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch main.ts",
-    "build:fixtures": "node build-fixtures.ts"
+    "build:fixtures": "node build-fixtures.ts",
+    "check:hermes": "node hermes-check.ts"
   },
   "dependencies": {
     "@node-rs/xxhash": "^1.7.7"
