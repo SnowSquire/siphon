@@ -2107,6 +2107,7 @@ const SHEET: &str = css!(
     .error__text { flex-grow: 1; }
 
     .tabs {
+        flex-shrink: 0;
         gap: 0;
         align-items: center;
         /* Full-bleed rule under the tabs: the chrome above is inset, the
@@ -2154,6 +2155,9 @@ const SHEET: &str = css!(
 
     .tabbody {
         flex-grow: 1;
+        /* Let the body shrink below its content: the tab's own scroll area is
+           the thing that gives, not the header and the tab row above it. */
+        min-height: 0;
         gap: 10px;
         padding: 12px;
         border-radius: 12px;
@@ -2942,6 +2946,8 @@ const SHEET: &str = css!(
 .app { padding: 14px 12px 10px; gap: 6px; }
 .header {
     height: 30px;
+    /* Chrome does not give way to content: the body's scroll area does. */
+    flex-shrink: 0;
     min-height: 0;
     padding: 0 10px;
     background-color: oklch(0.12 0.010 240);
