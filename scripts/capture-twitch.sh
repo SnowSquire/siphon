@@ -24,7 +24,7 @@ shopt -s inherit_errexit || {
 	exit 1
 }
 
-CHANNEL=snyozeniken
+CHANNEL=ozeniken
 OUT=""
 DRY_RUN=0
 CLIENT_ID=${TWITCH_CLIENT_ID:-kimne78kx3ncx6brgo4mv6wki5h1ko}
@@ -291,6 +291,14 @@ if ! grep -q '^#EXT-X-STREAM-INF' <<<"$master"; then
 	exit 1
 fi
 
+# What Twitch says about the account's own processing: `CHANNEL-METADATA` lists
+# the enabled features (multitrack_video, multigroup_video) and `TRANSCODESTACK`
+# the ladder it plans, as `N_Source...:M_Transcode...`.
+features=$(grep -o 'DATA-ID="CHANNEL-METADATA",VALUE="[^"]*"' <<<"$master" | sed -E 's/.*VALUE="([^"]*)"/\1/' || true)
+stack=$(grep -o 'DATA-ID="TRANSCODESTACK",VALUE="[^"]*"' <<<"$master" | sed -E 's/.*VALUE="([^"]*)"/\1/' || true)
+[ -n "$features" ] && echo "capture: channel features: $features"
+[ -n "$stack" ] && echo "capture: transcode stack:  $stack"
+
 rows=$(variant_rows <<<"$master")
 echo "capture: $CHANNEL variants (kind, bandwidth, id, resolution, source):"
 awk '{ printf "  %-9s %10s  %-18s %-10s %s\n", $1, $2, $3, $4, $5 }' <<<"$rows"
@@ -359,11 +367,18 @@ echo "capture: DVR portrait  ${dvr_port:-<none found>}"
 
 # ----------------------------------------------------------------------- spawn
 
-[ -n "$live_land" ] && spawn "$CHANNEL-landscape-live" "$live_land" || echo "capture: no landscape variant, skipping live landscape" >&2
-[ -n "$live_port" ] && spawn "$CHANNEL-portrait-live" "$live_port" || echo "capture: no portrait variant, skipping live portrait" >&2
-[ -n "$dvr_land" ] && spawn "$CHANNEL-landscape-dvr" "$dvr_land" --live-take-count 1000000 ||
+# The refresh interval has to be explicit. Left to itself the tool derives it
+# from the playlist's duration, which on an EVENT playlist is the whole
+# broadcast: a 10 h archive gave "set refresh interval to 19258 seconds", so the
+# DVR recording would stop following after its first pass. Live playlists are
+# 2 s segments and archives are ~10 s chunks.
+[ -n "$live_land" ] && spawn "$CHANNEL-landscape-live" "$live_land" --live-wait-time 4 ||
+	echo "capture: no landscape variant, skipping live landscape" >&2
+[ -n "$live_port" ] && spawn "$CHANNEL-portrait-live" "$live_port" --live-wait-time 4 ||
+	echo "capture: no portrait variant, skipping live portrait" >&2
+[ -n "$dvr_land" ] && spawn "$CHANNEL-landscape-dvr" "$dvr_land" --live-wait-time 5 --live-take-count 1000000 ||
 	echo "capture: no landscape DVR playlist, skipping" >&2
-[ -n "$dvr_port" ] && spawn "$CHANNEL-portrait-dvr" "$dvr_port" --live-take-count 1000000 ||
+[ -n "$dvr_port" ] && spawn "$CHANNEL-portrait-dvr" "$dvr_port" --live-wait-time 5 --live-take-count 1000000 ||
 	echo "capture: no portrait DVR playlist, skipping" >&2
 
 if [ "$DRY_RUN" = 1 ]; then
