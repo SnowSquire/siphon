@@ -8,8 +8,7 @@ captures/
 # Player-side repro artefacts
 *.log
 
-# servermock (Node mock Twitch edge + captured data)
-servermock/segments/
+# servermock (Node mock Twitch edge). Its fixtures live under captures/servermock.
 servermock/output/
 servermock/node_modules/
 servermock/unused/

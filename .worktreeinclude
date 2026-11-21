@@ -10,8 +10,9 @@
 # unconditionally.
 servermock/config.json
 
-# Captured media (servermock/segments and captures/) is NOT copied. The project's
-# worktree startup script hardlinks it from $OPENCODE_WORKTREE_BASE instead; the
-# script is tracked at scripts/worktree-setup.sh.
+# Captured media (captures/, which also holds the mock's built fixtures at
+# captures/servermock/) is NOT copied. The project's worktree startup script
+# hardlinks it from $OPENCODE_WORKTREE_BASE instead; the script is tracked at
+# scripts/worktree-setup.sh.
 
 

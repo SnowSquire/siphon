@@ -1,7 +1,12 @@
 /**
- * Build the offline fixtures in `segments/` from the read-only natemek capture.
+ * Build the offline fixtures in `captures/servermock/` (gitignored) from the
+ * read-only natemek capture.
  *
  *   pnpm exec node build-fixtures.ts [chunk-count]   (default: 200)
+ *
+ * Output: `$SEGMENTS_DIR`, or `../captures/servermock/`. The directory is
+ * self-contained (`manifest.json`, `segments.json`, `chunks/`, `live/`), so the
+ * mock and the Rust benchmark both take it as their only input.
  *
  * The source chunks are copied with a hardlink and never modified. Each chunk
  * is split into ~2 s live pieces at IDR boundaries. We split at TS packet
@@ -37,7 +42,9 @@ const CAPTURE_DIR = path.resolve(
   "../captures/natemek-20261121-1706/tmp/natemek-dvr",
 );
 const CAPTURE = path.join(CAPTURE_DIR, "0____");
-const OUT = path.join(ROOT, "segments");
+const OUT = process.env.SEGMENTS_DIR
+  ? path.resolve(process.env.SEGMENTS_DIR)
+  : path.resolve(ROOT, "../captures/servermock");
 const VIDEO_PID = 0x101;
 const TS_PACKET = 188;
 const DEFAULT_CHUNKS = 200;
@@ -400,11 +407,11 @@ async function main(): Promise<void> {
     path.join(OUT, "manifest.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,
   );
-  // The benchmark reads servermock/segments.json; the fixture copy next to
-  // the media keeps the two together. Both use paths relative to segments/.
+  // `segments.json` is the Rust benchmark's index, in its old flat schema, with
+  // `filename` relative to this directory. Nothing about the fixtures is
+  // tracked: the whole directory is ignored under `captures/`.
   const json = `${JSON.stringify(legacy, null, 2)}\n`;
   writeFileSync(path.join(OUT, "segments.json"), json);
-  writeFileSync(path.join(ROOT, "segments.json"), json);
 
   console.log(verified.join("\n"));
   console.log(

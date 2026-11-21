@@ -23,8 +23,10 @@
 //! ssh host 'cd ~/bench && taskset -c 2 ./daemon-* throughput --ignored --nocapture'
 //! ```
 //!
-//! Run it from a directory that holds `servermock/` (the binary carries the
-//! build host's paths), or point `TWITCH_BENCH_SEGMENTS` at one.
+//! Run it from a directory that holds `captures/servermock/` (the binary carries
+//! the build host's paths), or point `TWITCH_BENCH_SEGMENTS` at the fixture
+//! directory. The fixtures are built, never committed:
+//! `pnpm -C servermock run build:fixtures`.
 //!
 //! `media_seconds / wall_seconds` is the number of 1x streams one core can
 //! carry, i.e. the per-stream CPU share is `1 / that`.
@@ -51,28 +53,30 @@ use crate::rtsp::sdp;
 use crate::rtsp::ts::Sample;
 use crate::rtsp::ts::TsDemuxer;
 
-/// `servermock/` next to the crate, in the worktree or in the main checkout.
+/// The self-contained fixture directory: `manifest.json`, `segments.json`,
+/// `chunks/`, `live/`.
 ///
 /// A cross-compiled binary carries the *host's* `CARGO_MANIFEST_DIR`, so the
 /// directory is resolved at run time: `TWITCH_BENCH_SEGMENTS` first, then the
-/// checkout the binary was built in, then `./servermock` (running from a copy
-/// of the repo, e.g. the remote test box).
+/// checkout the binary was built in, then `./captures/servermock` (running from
+/// a copy of the repo, e.g. the remote test box).
 fn mock_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TWITCH_BENCH_SEGMENTS") {
         return Some(PathBuf::from(dir));
     }
 
     [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../servermock"),
-        PathBuf::from("servermock"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../captures/servermock"),
+        PathBuf::from("captures/servermock"),
     ]
     .into_iter()
     .find(|dir| dir.join("segments.json").is_file())
 }
 
-/// `(filename, length_ms)` in playlist order.
+/// `(filename, length_ms)` in playlist order, from the fixture directory's own
+/// `segments.json`.
 fn segment_list(dir: &Path) -> Option<Vec<(String, f64)>> {
-    let json = fs::read_to_string(dir.join("../segments.json")).ok()?;
+    let json = fs::read_to_string(dir.join("segments.json")).ok()?;
     let value = sonic_rs::from_str::<sonic_rs::Value>(&json).ok()?;
 
     let mut list = Vec::new();
@@ -192,15 +196,15 @@ fn pass(segments: &[Vec<u8>]) -> Timing {
 }
 
 #[test]
-#[ignore = "reads the mock's captured segment set (~556 MB) into memory"]
+#[ignore = "reads the whole fixture set (~3 GB) into memory"]
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
 fn throughput() {
-    let Some(dir) = mock_dir().map(|dir| dir.join("segments")) else {
-        eprintln!("throughput: no servermock/segments.json, skipping");
+    let Some(dir) = mock_dir() else {
+        eprintln!("throughput: no captures/servermock/segments.json, skipping");
         return;
     };
     let Some(list) = segment_list(&dir) else {
@@ -209,7 +213,7 @@ fn throughput() {
     };
     if !dir.join(&list[0].0).exists() {
         eprintln!(
-            "throughput: segments missing in {} (copy them from the main checkout), skipping",
+            "throughput: segments missing in {} (build them with `pnpm -C servermock run build:fixtures`), skipping",
             dir.display()
         );
         return;

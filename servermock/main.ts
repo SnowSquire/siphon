@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { xxh3 } from "@node-rs/xxhash";
 
 // #EXT-X-MAP (fMP4) is out of scope: the capture is MPEG-TS only, so every
@@ -52,9 +54,14 @@ interface DvrGroup {
   pieces?: Live[];
 }
 
-const SEGMENTS_ROOT = new URL("./segments/", import.meta.url);
+// Fixtures are never committed. The capture-derived segments live under
+// `captures/servermock/` (gitignored); `SEGMENTS_DIR` points the mock at any
+// other build of them.
+const SEGMENTS_DIR =
+  process.env.SEGMENTS_DIR ??
+  fileURLToPath(new URL("../captures/servermock", import.meta.url));
 const manifest: Manifest = JSON.parse(
-  await readFile(new URL("manifest.json", SEGMENTS_ROOT), "utf8"),
+  await readFile(path.join(SEGMENTS_DIR, "manifest.json"), "utf8"),
 ) as Manifest;
 
 // Wall-clock multiplier for the simulated broadcast. Set SPEED=1 to replay at
@@ -349,10 +356,10 @@ ${origin}/dvr/${group.index}.ts`;
 
 async function dvrBytes(group: DvrGroup): Promise<Buffer> {
   if (group.file) {
-    return readFile(new URL(group.file, SEGMENTS_ROOT));
+    return readFile(path.join(SEGMENTS_DIR, group.file));
   }
   const parts = await Promise.all(
-    (group.pieces ?? []).map((piece) => readFile(new URL(piece.file, SEGMENTS_ROOT))),
+    (group.pieces ?? []).map((piece) => readFile(path.join(SEGMENTS_DIR, piece.file))),
   );
   return Buffer.concat(parts);
 }
@@ -499,7 +506,7 @@ const server = createServer(async (req, res) => {
     const ad_match = /^\/ad\/(\d+)\.ts$/.exec(url.pathname);
     if (ad_match) {
       // The daemon never fetches ad segments; any decodable bytes will do.
-      const bytes = await readFile(new URL(manifest.live[0].file, SEGMENTS_ROOT));
+      const bytes = await readFile(path.join(SEGMENTS_DIR, manifest.live[0].file));
       segment(res, bytes);
       return;
     }
@@ -512,7 +519,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const bytes = await readFile(new URL(found.file, SEGMENTS_ROOT));
+      const bytes = await readFile(path.join(SEGMENTS_DIR, found.file));
       const content_now = currentContentMs(spark_time_ms);
       console.log(url.pathname);
       console.log(xxh3.xxh128(bytes).toString(16).padStart(32, "0"));
