@@ -113,6 +113,7 @@ live_master() {
 		--data-urlencode 'fast_bread=false' \
 		--data-urlencode 'include_unavailable=true' \
 		--data-urlencode 'lang=en' \
+		--data-urlencode 'multigroup_video=true' \
 		--data-urlencode 'os_name=Windows' \
 		--data-urlencode 'os_version=NT 10.0' \
 		--data-urlencode "p=$p" \
@@ -231,6 +232,7 @@ archive_master() {
 		--data-urlencode 'enable_score=true' \
 		--data-urlencode 'include_unavailable=true' \
 		--data-urlencode 'lang=en' \
+		--data-urlencode 'multigroup_video=true' \
 		--data-urlencode 'os_name=Windows' \
 		--data-urlencode 'os_version=NT 10.0' \
 		--data-urlencode 'platform=web' \

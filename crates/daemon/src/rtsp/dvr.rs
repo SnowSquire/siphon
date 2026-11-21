@@ -608,6 +608,12 @@ async fn public_vod(
         ("enable_score", "true"),
         ("include_unavailable", "true"),
         ("lang", "en"),
+        // Without this the archive master hides every second orientation: on a
+        // dual-format broadcast the portrait variants are listed in
+        // `com.amazon.ivs.unavailable-media` as `FR_DUALFORMAT_INCOMPATIBLE` and
+        // nothing else in the master refers to them. With it the master is the
+        // same set the live one publishes.
+        ("multigroup_video", "true"),
         ("os_name", "Windows"),
         ("os_version", "NT 10.0"),
         ("p", "3642389"),
