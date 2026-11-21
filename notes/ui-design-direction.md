@@ -33,7 +33,9 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 - Every neutral surface and text colour is written in OKLCH at the same hue
   (240): the empty table, odd/even rows, hover, the details panel and borders
   differ only in lightness and chroma, so they cannot drift into different
-  hues. Semantic reds and per-channel colours are the only other hues.
+  hues. Semantic reds and per-channel colours are the only other hues. Each
+  value repeated in `SHEET` is declared once in its `:root` palette and used
+  through `var()`; the widget palette lives in `THEME_CSS`.
 - The channels scrollbar lives in a permanent right strip (`--zui-scrollbar-width`
   is 8px; the engine reserves about 16px of gutter for its bar, and
   `scrollbar-gutter` is unsupported in ZGUI). The rows and the panel paint

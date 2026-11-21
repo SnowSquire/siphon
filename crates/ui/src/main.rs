@@ -24,6 +24,7 @@
 
 mod app;
 mod chain;
+mod css;
 mod format;
 mod gpu;
 mod hdr;

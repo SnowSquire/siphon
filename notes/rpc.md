@@ -322,7 +322,8 @@ recorders plus the one-off `RecordOnce` form), **Logs** (connection, arena and
 downloader counters, pipeline state, notifications and the event ring), and
 **Watch**, which is drawn with a `not-allowed` cursor until the video surface
 exists. zgui-ui controls are themed through one `ThemeProvider` token block in
-`THEME_CSS`, so switches, inputs and tooltips share the hand-written palette.
+`css.rs`'s `THEME_CSS`, so switches, inputs and tooltips share the hand-written
+palette.
 Hovering a row's name, title or game shows its channel id, broadcast id and
 game id; the expanded panel shows those and the stream's start time as fields.
 
