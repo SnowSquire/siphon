@@ -302,36 +302,49 @@ stream_id=${meta[1]}
 start=${meta[2]}
 echo "capture: broadcast $stream_id started $(date -u -d "@$start" +%Y-%m-%dT%H:%M:%SZ)"
 
-# The archive master is the authority: it lists every DVR media playlist, with
-# the RESOLUTION that tells the orientations apart. A private DVR directory has
-# no listing (the root 403s) and only `chunked/` (the source group) and
-# `audio_only/` answer, so the master is the only way to know whether a
-# dual-source broadcast puts the portrait group somewhere else.
+# The DVR side, in three steps.
+#
+# 1. The private DVR has one directory per variant id, so probe the id the live
+#    master gave us. This is the only way to reach the portrait group on a
+#    dual-format broadcast: the archive master hides it (see step 2).
+# 2. The archive master is the only listing a DVR directory has (the root 403s),
+#    and it is authoritative for ids that get renamed (live 1920p -> archive
+#    1080p-portrait) and for the landscape source, which lives under chunked/
+#    rather than under its own id.
+# 3. chunked/ as a last resort, when neither found anything. It is the source
+#    group and names no orientation, so only a single-orientation stream can use
+#    it unambiguously.
 dvr_land=""
 dvr_port=""
-archive=$(archive_master "$user_id" "$stream_id" "$start" || true)
-if grep -q '^#EXT-X-STREAM-INF' <<<"$archive"; then
-	arows=$(variant_rows <<<"$archive")
-	echo "capture: archive variants (kind, bandwidth, id, resolution):"
-	awk '{ printf "  %-9s %10s  %-14s %s\n", $1, $2, $3, $4 }' <<<"$arows"
-	dvr_land=$(pick landscape "$arows")
-	dvr_port=$(pick portrait "$arows")
-else
-	echo "capture: no archive master (nothing published at the VOD endpoint);" >&2
-	echo "capture: falling back to the private DVR, which cannot name orientations" >&2
+land_id=$(awk '$1 == "landscape" { print $3; exit }' <<<"$rows")
+port_id=$(awk '$1 == "portrait" { print $3; exit }' <<<"$rows")
+[ -n "$land_id" ] && dvr_land=$(probe_dvr "$land_id/index-dvr.m3u8" "$stream_id" "$start" || true)
+[ -n "$port_id" ] && dvr_port=$(probe_dvr "$port_id/index-dvr.m3u8" "$stream_id" "$start" || true)
+
+if [ -z "$dvr_land" ] || [ -z "$dvr_port" ]; then
+	archive=$(archive_master "$user_id" "$stream_id" "$start" || true)
+	if grep -q '^#EXT-X-STREAM-INF' <<<"$archive"; then
+		arows=$(variant_rows <<<"$archive")
+		echo "capture: archive variants (kind, bandwidth, id, resolution):"
+		awk '{ printf "  %-9s %10s  %-14s %s\n", $1, $2, $3, $4 }' <<<"$arows"
+		[ -z "$dvr_land" ] && dvr_land=$(pick landscape "$arows")
+		[ -z "$dvr_port" ] && dvr_port=$(pick portrait "$arows")
+	else
+		echo "capture: no archive master (nothing published at the VOD endpoint)" >&2
+	fi
+fi
+
+if [ -z "$dvr_land" ] || [ -z "$dvr_port" ]; then
 	chunked=$(probe_dvr chunked/index-dvr.m3u8 "$stream_id" "$start" || true)
-	if [ -z "$chunked" ]; then
-		echo "capture: no private DVR either" >&2
-	elif [ -n "$live_land" ] && [ -z "$live_port" ]; then
-		dvr_land=$chunked
-	elif [ -n "$live_port" ] && [ -z "$live_land" ]; then
-		dvr_port=$chunked
-	elif [ -n "$live_land" ] && [ -n "$live_port" ]; then
-		# Two live groups, one unattributable media playlist: `chunked` is the
-		# source group, and historically the landscape one.
-		echo "capture: both orientations are live but the private DVR is one" >&2
-		echo "capture: playlist; assigning chunked/ to landscape as a guess" >&2
-		dvr_land=$chunked
+	if [ -n "$chunked" ]; then
+		if [ -n "$live_land" ] && [ -z "$live_port" ]; then
+			dvr_land=$chunked
+		elif [ -n "$live_port" ] && [ -z "$live_land" ]; then
+			dvr_port=$chunked
+		elif [ -n "$live_land" ] && [ -n "$live_port" ]; then
+			echo "capture: both orientations are live but only chunked/ answers;" >&2
+			echo "capture: it is the source group and cannot be attributed, skipping it" >&2
+		fi
 	fi
 fi
 
