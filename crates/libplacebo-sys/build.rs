@@ -22,14 +22,39 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// `meson install`'s prefix for the libplacebo this repo builds.
-const DEFAULT_PLACEBO: &str = "C:/Users/alex/.local/libplacebo-shared";
+/// The user's home directory, as the scoop/splat/vulkan defaults are relative to
+/// it. Windows always sets `USERPROFILE`; `HOME` covers the MSYS shell.
+fn home() -> PathBuf {
+    env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+/// `meson install`'s prefix, matching `scripts/build-libplacebo.sh`.
+fn default_placebo() -> PathBuf {
+    home().join(".local/libplacebo-shared")
+}
+
+/// Scoop's root: `%SCOOP%`, else `~/scoop` (scoop's own default).
+fn scoop() -> PathBuf {
+    env::var_os("SCOOP").map_or_else(|| home().join("scoop"), PathBuf::from)
+}
+
 /// The scoop `FFmpeg` package.
-const DEFAULT_FFMPEG: &str = "C:/Users/alex/scoop/apps/ffmpeg-shared/current";
+fn default_ffmpeg() -> PathBuf {
+    scoop().join("apps/ffmpeg-shared/current")
+}
+
 /// The Vulkan SDK, for `vulkan/vulkan.h`.
-const DEFAULT_VULKAN: &str = "C:/Users/alex/scoop/apps/vulkan/current";
-/// The xwin splat holding the MSVC CRT and Windows SDK.
-const DEFAULT_SPLAT: &str = "C:/Users/alex/Projects/Code/Libs/Windows/splat";
+fn default_vulkan() -> PathBuf {
+    scoop().join("apps/vulkan/current")
+}
+
+/// The xwin splat holding the MSVC CRT and Windows SDK: `%XWIN_SYS_ROOT%`, else
+/// xwin's own cache default.
+fn default_splat() -> PathBuf {
+    env::var_os("XWIN_SYS_ROOT").map_or_else(|| home().join(".xwin-cache/splat"), PathBuf::from)
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -53,14 +78,19 @@ fn windows() {
         "VULKAN_SDK",
         "LIBPLACEBO_SPLAT",
         "LIBCLANG_PATH",
+        // The defaults below are relative to these.
+        "SCOOP",
+        "XWIN_SYS_ROOT",
+        "USERPROFILE",
+        "HOME",
     ] {
         println!("cargo:rerun-if-env-changed={knob}");
     }
 
-    let placebo = prefix("LIBPLACEBO_PREFIX", DEFAULT_PLACEBO);
-    let ffmpeg = prefix("FFMPEG_DIR", DEFAULT_FFMPEG);
-    let vulkan = prefix("VULKAN_SDK", DEFAULT_VULKAN);
-    let splat = prefix("LIBPLACEBO_SPLAT", DEFAULT_SPLAT);
+    let placebo = prefix("LIBPLACEBO_PREFIX", default_placebo());
+    let ffmpeg = prefix("FFMPEG_DIR", default_ffmpeg());
+    let vulkan = prefix("VULKAN_SDK", default_vulkan());
+    let splat = prefix("LIBPLACEBO_SPLAT", default_splat());
 
     let includes = Includes {
         placebo: placebo.join("include"),
@@ -326,8 +356,8 @@ fn feature(name: &str) -> bool {
 }
 
 /// A path from `knob`, or `default` when it is not set.
-fn prefix(knob: &str, default: &str) -> PathBuf {
-    let value = env::var_os(knob).map_or_else(|| PathBuf::from(default), PathBuf::from);
+fn prefix(knob: &str, default: PathBuf) -> PathBuf {
+    let value = env::var_os(knob).map_or(default, PathBuf::from);
     assert!(
         value.is_dir(),
         "{knob} points at {}, which is not a directory",

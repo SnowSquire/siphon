@@ -16,27 +16,72 @@
 #   dovi, libdovi   Dolby Vision reshaping; the sources are HDR10
 #   xxhash          only accelerates libplacebo's internal hashing
 #
-# This machine has no Visual Studio, so the CRT and Windows SDK come from the
-# xwin splat and clang-cl is the compiler. `INCLUDE` there must not contain the
-# Vulkan SDK: meson drops a pkg-config include directory that is already in the
-# environment, which silently loses shaderc/shaderc.h.
+# Runs in git-bash (MSYS) on Windows, which is where cygpath and the MSVC-layout
+# paths come from. It assumes there is no Visual Studio: the CRT and the Windows
+# SDK come from an xwin splat and clang-cl is the compiler. INCLUDE must not
+# contain the Vulkan SDK: meson drops a pkg-config include directory that is
+# already in the environment, which silently loses shaderc/shaderc.h.
+#
+# Every path is taken from the environment when it is already set, so nothing
+# here is specific to one machine:
+#
+#   LIBPLACEBO_SRC     libplacebo checkout            <checkout>/../balesh/libplacebo
+#   LIBPLACEBO_PREFIX  install prefix                 ~/.local/libplacebo-shared
+#   VULKAN_SDK         Vulkan SDK root                $SCOOP/apps/vulkan/current
+#   SCOOP              Scoop root                     ~/scoop
+#   XWIN_SYS_ROOT      xwin splat (CRT + Win SDK)     ~/.xwin-cache/splat
+#   LIBPLACEBO_VENV    venv holding meson + ninja     $TEMP/libplacebo-venv
 set -euo pipefail
 
-LP=${LIBPLACEBO_SRC:-C:/Users/alex/Projects/Code/twitch-siphon/balesh/libplacebo}
-PREFIX=${LIBPLACEBO_PREFIX:-C:/Users/alex/.local/libplacebo-shared}
-VULKAN=${VULKAN_SDK:-C:/Users/alex/scoop/apps/vulkan/current}
-SPLAT=${XWIN_SPLAT:-C:/Users/alex/.xwin-cache/splat}
-VENV=${LIBPLACEBO_VENV:-${TEMP:-/tmp}/libplacebo-venv}
+command -v cygpath >/dev/null || {
+	echo "build-libplacebo: needs git-bash/MSYS on Windows (no cygpath)" >&2
+	exit 1
+}
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(dirname "$here")
+
+scoop=${SCOOP:-$HOME/scoop}
+vulkan=${VULKAN_SDK:-$scoop/apps/vulkan/current}
+splat=${XWIN_SYS_ROOT:-$HOME/.xwin-cache/splat}
+lp=${LIBPLACEBO_SRC:-$root/../balesh/libplacebo}
+prefix=${LIBPLACEBO_PREFIX:-$HOME/.local/libplacebo-shared}
+venv=${LIBPLACEBO_VENV:-${TEMP:-${TMPDIR:-/tmp}}/libplacebo-venv}
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 
-[ -f "$LP/meson.build" ] || { echo "no libplacebo checkout at $LP" >&2; exit 1; }
-[ -d "$VULKAN/Lib" ] || { echo "no Vulkan SDK at $VULKAN" >&2; exit 1; }
+# Highest version wins; the directory names are versions, so sort -V not ls.
+msvc=$(ls "$splat/VC/Tools/MSVC" 2>/dev/null | sort -V | tail -1 || true)
+sdk=$(ls "$splat/Windows Kits/10/Include" 2>/dev/null | sort -V | tail -1 || true)
 
-source "$VENV/Scripts/activate"
+echo "libplacebo: $lp"
+echo "prefix:     $prefix"
+echo "vulkan sdk: $vulkan"
+echo "xwin splat: $splat (MSVC ${msvc:-?}, Windows SDK ${sdk:-?})"
+echo "venv:       $venv"
+
+[ -f "$lp/meson.build" ] || {
+	echo "build-libplacebo: no libplacebo checkout at $lp (set LIBPLACEBO_SRC)" >&2
+	exit 1
+}
+[ -d "$vulkan/Lib" ] || {
+	echo "build-libplacebo: no Vulkan SDK at $vulkan (set VULKAN_SDK)" >&2
+	exit 1
+}
+[ -n "$msvc" ] && [ -n "$sdk" ] || {
+	echo "build-libplacebo: no xwin splat at $splat (set XWIN_SYS_ROOT)" >&2
+	exit 1
+}
+[ -f "$venv/Scripts/activate" ] || {
+	echo "build-libplacebo: no venv at $venv (set LIBPLACEBO_VENV; create it with" >&2
+	echo "  python -m venv <path> && <path>/Scripts/pip install meson ninja)" >&2
+	exit 1
+}
+
+source "$venv/Scripts/activate"
 
 cat > "$SCRATCH/shaderc.pc" <<EOF
-prefix=$(cygpath -m "$VULKAN")
+prefix=$(cygpath -m "$vulkan")
 includedir=\${prefix}/Include
 libdir=\${prefix}/Lib
 
@@ -46,16 +91,15 @@ Version: 2025.1
 Cflags: -I\${includedir}
 Libs: -L\${libdir} -lshaderc_combined
 EOF
-export PKG_CONFIG_PATH=$(cygpath -m "$SCRATCH")
+# Prepend, so anything else the environment brought still resolves.
+export PKG_CONFIG_PATH="$(cygpath -m "$SCRATCH")${PKG_CONFIG_PATH:+;$PKG_CONFIG_PATH}"
 # Windows pkgconf rewrites a .pc's prefix from the file's own location otherwise.
 export PKG_CONFIG_DONT_DEFINE_PREFIX=1
 
-msvc=$(ls "$SPLAT/VC/Tools/MSVC" | tail -1)
-sdk=$(ls "$SPLAT/Windows Kits/10/Include" | tail -1)
-splat=$(cygpath -m "$SPLAT")
-export INCLUDE="$splat/VC/Tools/MSVC/$msvc/include;$splat/Windows Kits/10/Include/$sdk/ucrt;$splat/Windows Kits/10/Include/$sdk/um;$splat/Windows Kits/10/Include/$sdk/shared"
-export LIB="$splat/VC/Tools/MSVC/$msvc/lib/x86_64;$splat/Windows Kits/10/Lib/$sdk/ucrt/x86_64;$splat/Windows Kits/10/Lib/$sdk/um/x86_64"
-export PATH="$(dirname "$(command -v meson)"):$(cygpath -m "$VULKAN")/Bin:$PATH"
+splat_m=$(cygpath -m "$splat")
+export INCLUDE="$splat_m/VC/Tools/MSVC/$msvc/include;$splat_m/Windows Kits/10/Include/$sdk/ucrt;$splat_m/Windows Kits/10/Include/$sdk/um;$splat_m/Windows Kits/10/Include/$sdk/shared"
+export LIB="$splat_m/VC/Tools/MSVC/$msvc/lib/x86_64;$splat_m/Windows Kits/10/Lib/$sdk/ucrt/x86_64;$splat_m/Windows Kits/10/Lib/$sdk/um/x86_64"
+export PATH="$(dirname "$(command -v meson)"):$(cygpath -m "$vulkan")/Bin:$PATH"
 
 cat > "$SCRATCH/native.ini" <<EOF
 [binaries]
@@ -66,17 +110,17 @@ strip = 'llvm-strip'
 pkg-config = '$(cygpath -m "$(command -v pkg-config)")'
 EOF
 
-cd "$LP"
+cd "$lp"
 meson setup --wipe build-clang-shared \
 	--native-file "$SCRATCH/native.ini" \
 	--buildtype=release \
 	--default-library=shared \
-	--prefix="$PREFIX" \
+	--prefix="$prefix" \
 	-Dvulkan=enabled -Dopengl=disabled -Dd3d11=disabled \
 	-Dshaderc=enabled -Dglslang=disabled \
 	-Ddovi=disabled -Dlibdovi=disabled -Dlcms=disabled -Dxxhash=disabled \
 	-Ddemos=false -Dtests=false -Dbench=false -Dfuzz=false \
-	-Dvulkan-registry="$LP/3rdparty/Vulkan-Headers/registry/vk.xml" \
-	-Dvulkan-sdk="$VULKAN"
+	-Dvulkan-registry="$lp/3rdparty/Vulkan-Headers/registry/vk.xml" \
+	-Dvulkan-sdk="$vulkan"
 ninja -C build-clang-shared -j "${BUILD_JOBS:-10}"
 meson install -C build-clang-shared
