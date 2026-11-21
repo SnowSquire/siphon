@@ -486,7 +486,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Channels),
                     on:click = tab_click(Tab::Channels)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Channels"}
+                    text(class = "tab__label", var:--tab-label-w = Some("60px".to_owned())) {"Channels"}
                     box(class = "tab__count tab__count--error", class:on = move || error_count.get() > 0) {
                         {move || if error_count.get() > 0 { error_count.get().to_string() } else { String::new() }}
                     }
@@ -497,7 +497,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Filter),
                     on:click = tab_click(Tab::Filter)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("36px".to_owned())) {"Filter"}
+                    text(class = "tab__label", var:--tab-label-w = Some("34px".to_owned())) {"Filter"}
                 }
                 box(
                     class = "tab",
@@ -505,7 +505,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Recordings),
                     on:click = tab_click(Tab::Recordings)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("74px".to_owned())) {"Recordings"}
+                    text(class = "tab__label", var:--tab-label-w = Some("70px".to_owned())) {"Recordings"}
                     box(class = "tab__count tab__count--rec", class:on = move || rec_count.get() > 0) {
                         {move || if rec_count.get() > 0 { rec_count.get().to_string() } else { String::new() }}
                     }
@@ -516,7 +516,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Logs),
                     on:click = tab_click(Tab::Logs)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("32px".to_owned())) {"Logs"}
+                    text(class = "tab__label", var:--tab-label-w = Some("30px".to_owned())) {"Logs"}
                 }
                 box(
                     class = "tab",
@@ -524,7 +524,7 @@ fn App(
                     var:--tab-wght = tab_weight_value(tab, previous_tab, tab_weight, Tab::Settings),
                     on:click = tab_click(Tab::Settings)
                 ) {
-                    text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Settings"}
+                    text(class = "tab__label", var:--tab-label-w = Some("60px".to_owned())) {"Settings"}
                 }
                 // The video surface is the next milestone. A tab that changes
                 // nothing is worse than a tab that says it cannot be used yet,
@@ -2107,7 +2107,10 @@ const SHEET: &str = css!(
     }
 
     .tab {
-        padding: 5px 14px;
+        padding: 5px 10px;
+        /* The count is placed against the tab's corner rather than in its
+           flow, so it cannot push the label off-centre or widen the tab. */
+        position: relative;
         border-radius: 10px 10px 0 0;
         font-family: BrandFont, Chillax, sans-serif;
         font-variation-settings: "wght" var(--tab-wght, 200), "wdth" 92;
@@ -2739,12 +2742,14 @@ const SHEET: &str = css!(
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 14px;
-    height: 14px;
-    margin-left: 6px;
-    padding: 0 3px;
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    min-width: 12px;
+    height: 12px;
+    padding: 0 2px;
     font-family: UIFont, Archivo, SiphonEmoji, sans-serif;
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
     line-height: 1;
     opacity: 0;
