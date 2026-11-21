@@ -601,6 +601,10 @@ async fn public_vod(
 
     let params = [
         ("acmb", acmb.as_str()),
+        // Without this the audio-only DVR is withheld (`FR_AUDIO_DISALLOWED` in
+        // com.amazon.ivs.unavailable-media), so a recording of `-q audio_only`
+        // would have no archive to fill from.
+        ("allow_audio_only", "true"),
         ("allow_source", "true"),
         ("browser_family", "chrome"),
         ("browser_version", "157.0"),

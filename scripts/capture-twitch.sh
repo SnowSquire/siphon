@@ -226,6 +226,7 @@ archive_master() {
 		--data-urlencode "sig=$sig" \
 		--data-urlencode "token=$value" \
 		--data-urlencode 'allow_source=true' \
+		--data-urlencode 'allow_audio_only=true' \
 		--data-urlencode 'browser_family=chrome' \
 		--data-urlencode 'browser_version=157.0' \
 		--data-urlencode 'cdm=wv' \
