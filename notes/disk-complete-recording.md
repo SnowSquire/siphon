@@ -1,8 +1,9 @@
 # Disk output: complete-broadcast recording
 
-Status: implemented in `crates/daemon/src/disk.rs` (v4 index).  `--output` on
-both `play` and `daemon`; `index.hexpat` mirrors the format.  `disk.rs` replaces
-the disabled v3 implementation wholesale.
+Status: implemented in `crates/daemon/src/disk/` (v4 index).  `--output` on
+both `play` and `daemon`; `index.hexpat` mirrors the format.  `mod.rs` is the
+state machine, `index.rs` the format, `plan.rs` the clock and hole arithmetic,
+`io.rs` the writers and copies, `resume.rs` the open and repair path.
 
 Goal: with `--output <dir>`, produce one **contiguous, ad-free archive** of a
 broadcast at `<dir>/<stream_id>/segs` + `<dir>/<stream_id>/index` (debug uses
@@ -16,7 +17,7 @@ timestamp jumps when the DVR is available.
   client starts.  It is the safety net: if no DVR URL ever appears, the live
   recording *is* the archive.  It is split into **runs** (`live.NNN`) at every
   gap in the live playlist (ads, reconnects).
-- **DVR** — the archive playlist (`rtsp/vod.rs`, to be renamed `rtsp/dvr.rs`),
+- **DVR** — the archive playlist (`rtsp/dvr.rs`),
   which chunks the *source* stream: it has content for ad spans the live
   playlist replaced with ads.  The DVR owns the canonical file: it writes every
   span the live path cannot record and leaves a **hole** where each live run
@@ -44,11 +45,13 @@ pairs instead of deleting them.
    is no discovery wait, no in-memory hold and no arena reservation.
 2. **Discovery in parallel.** A DVR URL is looked for until
    `max(now + 15 s, broadcast_start + 30 s)`.
-   - No URL: close run 0, **promote** it to `segs`/`index` (close, rename,
-     reopen) and write the live stream directly into the canonical from then on.
-     No assembly happens in this mode, so a gap (an ad, a long reconnect) cannot
-     be filled: the index simply has no records for it.  A DVR URL appearing
-     after the promotion is an anomaly: notify.
+   - No URL: close the current run, **promote** every run into a fresh
+     canonical (init, media, then its records rebased) and write the live stream
+     directly into the canonical from then on.  A rename only works for a single
+     run; a promotion after an ad has several to concatenate, so the general path
+     is a copy.  No assembly happens in this mode, so a gap (an ad, a long
+     reconnect) cannot be filled: the index simply has no records for it.  A DVR
+     URL appearing after the promotion is an anomaly: notify.
    - URL found: the canonical is the DVR file from now on.
 3. **Pre-fill.** The DVR downloader writes `[0, chunk boundary covering
    live_start)` into the canonical, keeping the chunk that crosses `live_start`
@@ -103,7 +106,7 @@ Header { magic: "OZENIKEN", version: u32 = 4, stream_id: u64 }
 | --- | --- |
 | 0 | `Segment { source: u8, sequence: u64, elapsed_ms: u32, pdt_ms: u64, duration_ms: u32, byte_offset: u64, byte_length: u32, hash: u128, flags: u8 }` |
 | 1 | `Init { source: u8, counter: u64, byte_offset: u64, byte_length: u32, hash: u128 }` |
-| 2 | `Discontinuity { width: u16, height: u16, rate_num: u16, rate_denom: u16 }` |
+| 2 | `Discontinuity { width: u16, height: u16, rate_num: u16, rate_denom: u16 }` — a boundary marker; its position is the information |
 | 3 | `Run { run: u32, dst_segs_offset: u64, segs_len: u64, source_segs_offset: u64, source_index_offset: u64, record_len: u32, complete: u8 }` |
 
 `Run.run` is the one field beyond the original table: without it a resume has no
@@ -126,6 +129,17 @@ after the tag, so the rest of the layout is unchanged.
   skip it.  Detecting it is a TODO; the bit is clear until then).
 - No `Gap` record: a successful run/hole leaves no gap, and an unfilled hole is
   visible as a timestamp jump in the index (no records) with zeros in `segs`.
+- A run that lies entirely inside one DVR chunk, or one that is abandoned, still
+  gets a `Run` marker: zero bytes and zero reserved records in the first case, the
+  abandoned run's planned length in the second.  It is `complete`, so it is final,
+  and the index stays self-describing about a span it will not fill.
+- `Discontinuity` is written when the archive reaches the time of a live
+  `#EXT-X-DISCONTINUITY` — before the promoted segment itself, or before the first
+  DVR chunk at or past it.  The tag carries no payload, so the time comes from the
+  segment that follows it.  Its geometry fields are reserved (zero): the record's
+  position says "the timestamp domain restarts here", and a reader rebuilds codec
+  config from the media.  Promotion drops marks it cannot place, because
+  concatenating runs has no position to put them at.
 - No live↔DVR sequence field: nothing can populate it and nothing consumes it.
 
 DVR records are ~10 s chunks, live records ~2 s segments; mixed granularity is
@@ -166,7 +180,10 @@ when it differs:
   init.  If its hash differs from the active hash, the init is written first;
   the run's `dst_segs_offset` is after it, and the DVR restart becomes
   `init_len + segs_len`.
-- **Promoted live:** the same check before appending a run's media.
+- **Promoted live:** the check runs when the `Init` message arrives, which the
+  scheduler sends only when the map *URI* changes.  That is the correct trigger:
+  HLS requires a map URI's bytes to be stable (a player caches the object and
+  never refetches it), so different bytes always come with a different URI.
 
 `Run.segs_len` remains the media middle; the inserted init sits outside the
 reserved hole and outside the copied records.  Dedupe is by hash, never by URI:
@@ -193,8 +210,9 @@ hash-verified (there are few), so a torn map is detected rather than played.
 
 1. Parse the header.  Magic/version/stream_id mismatch → fatal, exit.
 2. Repair a torn tail: truncate the index to the last complete record, truncate
-   `segs` to `max(byte_offset + byte_length)` over the surviving records (not to
-   the file length, which runs past hole reservations), then read the last
+   `segs` to `max(byte_offset + byte_length)` over the surviving records *and*
+   `max(dst_segs_offset + segs_len)` over surviving `Run` markers (not to the file
+   length, which also holds bytes no record points at yet), then read the last
    record's bytes back and verify its xxh3; walk back while it fails.
 3. Pending `Run` → redo it in place: write the rebased records into the index
    hole and the middle bytes into the segs hole, fsync, flip `complete`, delete
@@ -210,9 +228,12 @@ hash-verified (there are few), so a torn map is detected rather than played.
      the canonical pair to a run** (`live.NNN`), start a fresh canonical, prefill
      `[0, live_start)`, and treat the renamed pair as that run: this is the
      live → DVR switch.
-   - DVR records and no DVR URL → stop and notify.  DVR → live is not automatic:
-     that would mean a wrong assumption about Twitch, and the files are merged
-     by hand.
+   - DVR records and no DVR URL → keep the canonical and wait for the discovery
+     deadline.  In a real run the URL is found by a separate task, so it is
+     *never* present when the recorder starts; stopping on load would kill every
+     honest resume.  If the deadline passes, notify and stop.  DVR → live is still
+     not automatic: that would mean a wrong assumption about Twitch, and the
+     files are merged by hand.
    - Only live records and no DVR URL → continue recording live (new run, or the
      canonical directly if this run was already promoted).
 
@@ -230,8 +251,9 @@ hash-verified (there are few), so a torn map is detected rather than played.
 - `notify()` is for anything that contradicts the assumptions about Twitch:
   skipped 403s, a PDT/elapsed mismatch, a DVR URL after promotion, a DVR failure
   mid-pre-fill, a DVR gone on resume, and the disk subsystem stopping.  It must
-  not block the reactor: hand it to a channel/task.  `--notify <url>` on `play`;
-  daemon reads it from its config.
+  not block the reactor: hand it to a channel/task.  `--notify <url>` is a flag
+  on both `play` and `daemon`, not a config field, and the recorder notifies
+  whenever it stops for any reason other than being finished.
 
 ## Daemon
 
@@ -250,7 +272,8 @@ hash-verified (there are few), so a torn map is detected rather than played.
 
 - Unit: v4 round-trip; the hole arithmetic (`run_len - leading - trailing`), the
   trim by `pdt_ms`, the copy transform (rebase `byte_offset`, renumber `Init`
-  counters), `Run` recovery.
+  counters), `Run` recovery, discontinuity placement (a mark is written only once
+  the archive's time reaches it).
 - **Mock integration:** `SPEED=1`, join at a non-zero offset (`START_MS`),
   kill and restart the client; assert the canonical index is contiguous and
   monotonic, every pending `Run` was completed, and the run pairs are gone (or
