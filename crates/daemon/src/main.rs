@@ -85,14 +85,17 @@ use crate::arena::ArenaSet;
 use crate::bus::Bus;
 use crate::constants::DEBUG_CHANNEL_TITLE;
 use crate::constants::DEBUG_DVR_URL;
+use crate::constants::DEBUG_PORTRAIT_DVR_URL;
 use crate::constants::DEFAULT_RTSP_PORT;
 use crate::http::Client;
 use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::registry::Options as RegistryOptions;
+use crate::registry::Recording as RegistryRecording;
 use crate::registry::Registry;
 use crate::spool::ConsumerWake;
 use crate::spool::WakeSet;
+use crate::variant::VariantKind;
 use crate::variant::VariantPlaylistError;
 use crate::variant::choose_variant;
 use crate::variant::get_variants;
@@ -217,20 +220,11 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     let arena = Rc::new(ArenaSet::new());
     let wakes = WakeSet::new();
 
-    // Debug mode replays the mock's DVR playlist. Otherwise discovery (GQL plus
-    // domain probing) and the periodic playlist refresh run in the background,
-    // concurrently with the live variant and manifest fetches. `NO_DVR` turns
-    // the mock's DVR playlist off so the no-URL promotion path can be tested.
-    let debug_dvr = (std::env::var_os("NO_DVR").is_none()).then(|| DEBUG_DVR_URL.to_owned());
-    let dvr = rtsp::dvr::Dvr::new(if cfg.debug { debug_dvr } else { None });
-    rtsp::dvr::spawn(
-        Rc::clone(&client),
-        (!cfg.debug).then(|| args.channel.clone()),
-        Rc::clone(&dvr),
-    );
-
     let (variants, broadcast_id) = if cfg.debug {
-        (vec![variant::debug_variant()], 0)
+        (
+            vec![variant::debug_variant(), variant::debug_portrait_variant()],
+            0,
+        )
     } else {
         // A manifest failure is reported and turned into a non-zero exit; it is
         // not a reason to kill the process from deep inside the request path.
@@ -257,6 +251,24 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
             quality: args.quality.clone().unwrap_or_default(),
         }
     })?;
+    // Debug mode replays the mock's DVR playlist, which is per variant group.
+    // Otherwise discovery (GQL plus domain probing) and the periodic playlist
+    // refresh run in the background, concurrently with the live variant and
+    // manifest fetches. `NO_DVR` turns the mock's DVR playlist off so the no-URL
+    // promotion path can be tested.
+    let debug_dvr = (std::env::var_os("NO_DVR").is_none()).then(|| {
+        if variant.kind == VariantKind::Portrait {
+            DEBUG_PORTRAIT_DVR_URL.to_owned()
+        } else {
+            DEBUG_DVR_URL.to_owned()
+        }
+    });
+    let dvr = rtsp::dvr::Dvr::new(if cfg.debug { debug_dvr } else { None });
+    rtsp::dvr::spawn(
+        Rc::clone(&client),
+        (!cfg.debug).then(|| args.channel.clone()),
+        Rc::clone(&dvr),
+    );
     // The public archive's master is fetched in parallel; picking the media
     // playlist with the same stable-variant-id as the live stream is deferred
     // until now.
@@ -286,6 +298,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
             disk::DiskOptions {
                 output: output.clone(),
                 stream_id: if cfg.debug { 0 } else { broadcast_id },
+                variant: variant.id.clone(),
                 keep_runs: args.keep_runs,
                 notifier,
                 dvr: Rc::clone(&dvr),
@@ -378,6 +391,10 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
 
     let bus = Bus::new();
+    // Loaded before the registry because the recording settings live in the
+    // persisted config: a `--output` on the command line is a dev override only.
+    let config_path = config::default_path(config::APP_ID);
+    let config = config::load(&config_path);
     let registry = Rc::new(Registry::new(
         Rc::clone(&client),
         arena,
@@ -389,7 +406,13 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             low_latency: cfg.low_latency,
             debug: cfg.debug,
             max_streams: args.max_streams,
-            output: args.output.clone(),
+            recording: RegistryRecording {
+                output: args
+                    .output
+                    .clone()
+                    .or_else(|| config.record_dir.as_deref().map(std::path::PathBuf::from)),
+                portrait: config.record_portrait,
+            },
             notify: notifier,
             keep_runs: args.keep_runs,
         },
@@ -397,8 +420,6 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     ));
     registry.watch_finished();
 
-    let config_path = config::default_path(config::APP_ID);
-    let config = config::load(&config_path);
     if let Err(error) = pid::write(config::APP_ID) {
         error!(%error, "failed to write the daemon pid file");
     }

@@ -70,8 +70,18 @@ const VOD_DOMAINS: [&str; 12] = [
 /// How often the DVR playlist is re-fetched once its URL is known. New segments
 /// are published about every ten seconds, so refreshing faster only adds load.
 const REFRESH: Duration = Duration::from_secs(10);
-/// How long to wait before probing again when discovery found nothing.
-const DISCOVERY_RETRY: Duration = Duration::from_secs(10);
+/// When to look for the DVR playlist, from the moment the DVR is spawned. The
+/// object is not ephemeral - it stays up after the broadcast, and the archive
+/// master points at it - so there is nothing to poll: a broadcast that was
+/// already live answers at once, and a fresh one needs its first chunk to close.
+/// Chunks are whole live segments and at least `TARGETDURATION` long, so nothing
+/// can exist for ~10 s; measured on a fresh broadcast, the playlist was
+/// published 26.7 s after the broadcast started, hence 30 s and a 45 s retry.
+const DISCOVERY_PROBES: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_secs(30),
+    Duration::from_secs(45),
+];
 /// How long the public archive's master may wait for the live variant choice.
 /// The master itself is fetched in parallel; only picking one of its media
 /// playlists depends on the scheduler's variant.
@@ -206,8 +216,6 @@ struct DvrState {
     /// fetched in parallel, but its media playlist can only be chosen once this
     /// is known.
     live_variant: Option<LiveVariant>,
-    /// Broadcast start (`stream.createdAt`) from discovery, in Unix epoch ms.
-    broadcast_start_ms: Option<u64>,
 }
 
 /// The discovered DVR playlist shared by the refresh task, the RTSP output and
@@ -233,7 +241,6 @@ impl Dvr {
                 url,
                 timeline: None,
                 live_variant: None,
-                broadcast_start_ms: None,
             }),
             stop: Cell::new(false),
             generation: Cell::new(0),
@@ -293,16 +300,6 @@ impl Dvr {
     fn set_url(&self, url: String) {
         self.state.borrow_mut().url = Some(url);
         self.changed();
-    }
-
-    /// Broadcast start (Unix epoch ms) from discovery.
-    #[must_use]
-    pub fn broadcast_start_ms(&self) -> Option<u64> {
-        self.state.borrow().broadcast_start_ms
-    }
-
-    fn set_broadcast_start(&self, start_ms: u64) {
-        self.state.borrow_mut().broadcast_start_ms = Some(start_ms);
     }
 
     /// The current timeline snapshot. The refresh task replaces the `Rc` instead
@@ -371,6 +368,8 @@ impl Dvr {
 pub fn spawn(client: Rc<Client>, channel: Option<String>, dvr: Rc<Dvr>) {
     compio::runtime::spawn(async move {
         let mut url = dvr.url();
+        let spawned = Instant::now();
+        let mut probes = DISCOVERY_PROBES.into_iter();
         loop {
             if dvr.stopped() {
                 debug!("dvr: stopped");
@@ -380,14 +379,21 @@ pub fn spawn(client: Rc<Client>, channel: Option<String>, dvr: Rc<Dvr>) {
                 let Some(channel) = channel.as_deref() else {
                     return;
                 };
-                let Some(discovered) = discover(&client, channel, &dvr).await else {
-                    debug!("dvr: no playlist found, retrying");
-                    compio::time::sleep(DISCOVERY_RETRY).await;
+                let Some(probe) = probes.next() else {
+                    debug!("dvr: no playlist after the last probe; giving up");
+                    return;
+                };
+                // Waiting for a probe is not a retry: the outcome cannot change
+                // before the DVR's first chunk exists.
+                if let Some(wait) = (spawned + probe).checked_duration_since(Instant::now()) {
+                    compio::time::sleep(wait).await;
+                }
+                let Some(discovered) = discover(&client, channel).await else {
+                    debug!(?probe, "dvr: no playlist found");
                     continue;
                 };
                 let Some(discovered) = resolve_discovery(discovered, &dvr).await else {
-                    debug!("dvr: no matching variant in the archive, retrying");
-                    compio::time::sleep(DISCOVERY_RETRY).await;
+                    debug!(?probe, "dvr: no matching variant in the archive");
                     continue;
                 };
                 debug!("dvr: playlist discovered");
@@ -502,7 +508,7 @@ async fn wait_live_variant(dvr: &Dvr) -> Option<LiveVariant> {
     }
 }
 
-async fn discover(client: &Client, channel: &str, dvr: &Dvr) -> Option<Discovery> {
+async fn discover(client: &Client, channel: &str) -> Option<Discovery> {
     let data = gql(
         client,
         sonic_rs::json!({
@@ -524,9 +530,6 @@ async fn discover(client: &Client, channel: &str, dvr: &Dvr) -> Option<Discovery
     let stream_id = stream.pointer(pointer!["id"])?.as_str()?.to_owned();
     let created_at = stream.pointer(pointer!["createdAt"])?.as_str()?;
     let created_ms = parse_iso8601_millis(created_at)?;
-    if let Ok(created_ms) = u64::try_from(created_ms) {
-        dvr.set_broadcast_start(created_ms);
-    }
 
     if let Some(master) = public_vod(client, channel, &user_id, created_ms).await {
         return Some(Discovery::Master(master));

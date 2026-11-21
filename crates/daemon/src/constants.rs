@@ -25,10 +25,14 @@ pub const MAX_STREAMS: usize = 8;
 /// Debug mode replays the mock server's playlists instead of Twitch's.
 pub const DEBUG_MANIFEST_URL: &str = "http://127.0.0.2:8000/index.m3u8";
 pub const DEBUG_DVR_URL: &str = "http://127.0.0.2:8000/index-dvr.m3u8";
+/// The portrait group the mock offers alongside it.
+pub const DEBUG_PORTRAIT_MANIFEST_URL: &str = "http://127.0.0.2:8000/portrait.m3u8";
+pub const DEBUG_PORTRAIT_DVR_URL: &str = "http://127.0.0.2:8000/portrait-dvr.m3u8";
 /// The mock's segments were captured from this channel.
 pub const DEBUG_CHANNEL_TITLE: &str = "sunnys";
-/// The single variant the debug master playlist pretends to offer.
+/// The variants the debug channel pretends the mock offers.
 pub const DEBUG_VARIANT_ID: &str = "1080p";
+pub const DEBUG_PORTRAIT_VARIANT_ID: &str = "1080p-portrait";
 
 /// RTP payload budget, matching gortsplib's default:
 /// 1500 (UDP MTU) - 20 (IP) - 8 (UDP) - 12 (RTP) - 10 (SRTP headroom).

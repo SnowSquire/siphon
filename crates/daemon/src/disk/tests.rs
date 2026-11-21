@@ -1,5 +1,8 @@
 //! Unit tests for the index format, the hole arithmetic and the repair path.
 
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
 use super::index::*;
 use super::plan::*;
 use super::*;

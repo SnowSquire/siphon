@@ -334,7 +334,10 @@ mod tests {
                     low_latency: true,
                     debug: true,
                     max_streams: 4,
-                    output: Some(dir.clone()),
+                    recording: crate::registry::Recording {
+                        output: Some(dir.clone()),
+                        portrait: false,
+                    },
                     notify: None,
                     keep_runs: false,
                 },

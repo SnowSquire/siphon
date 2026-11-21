@@ -376,16 +376,35 @@ pub fn choose_variant<'a>(variants: &'a [Variant], quality: Option<&str>) -> Opt
     )
 }
 
-/// The single variant debug mode pretends the mock server offers.
+/// The landscape variant debug mode pretends the mock server offers.
+///
+/// The score is what `best_variant` ranks monitors by, and it must beat the
+/// portrait track: a channel's primary recording is the landscape source, the
+/// portrait one is the optional second recording.
 #[must_use]
 pub fn debug_variant() -> Variant {
     Variant {
-        score: None,
+        score: std::num::NonZeroU16::new(6),
         url: crate::constants::DEBUG_MANIFEST_URL.into(),
         id: crate::constants::DEBUG_VARIANT_ID.into(),
         kind: VariantKind::Landscape,
         codec: None,
-        res: None,
+        res: std::num::NonZeroU16::new(1920).zip(std::num::NonZeroU16::new(1080)),
+        frame_rate: None,
+    }
+}
+
+/// The portrait track of a dual-format broadcast, which the mock offers as a
+/// second group (`IVS-GROUPS="portrait"`).
+#[must_use]
+pub fn debug_portrait_variant() -> Variant {
+    Variant {
+        score: std::num::NonZeroU16::new(5),
+        url: crate::constants::DEBUG_PORTRAIT_MANIFEST_URL.into(),
+        id: crate::constants::DEBUG_PORTRAIT_VARIANT_ID.into(),
+        kind: VariantKind::Portrait,
+        codec: None,
+        res: std::num::NonZeroU16::new(1080).zip(std::num::NonZeroU16::new(1920)),
         frame_rate: None,
     }
 }

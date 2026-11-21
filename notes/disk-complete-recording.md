@@ -1,13 +1,16 @@
 # Disk output: complete-broadcast recording
 
-Status: implemented in `crates/daemon/src/disk/` (v4 index).  `--output` on
-both `play` and `daemon`; `index.hexpat` mirrors the format.  `mod.rs` is the
+Status: implemented in `crates/daemon/src/disk/` (v4 index).  The daemon's
+directory is `recordDir` in the config (`--output` is a dev override, and the
+only setting `play` has); `recordPortrait` asks for the second orientation.
+`index.hexpat` mirrors the format.  `mod.rs` is the
 state machine, `index.rs` the format, `plan.rs` the clock and hole arithmetic,
 `io.rs` the writers and copies, `resume.rs` the open and repair path.
 
-Goal: with `--output <dir>`, produce one **contiguous, ad-free archive** of a
-broadcast at `<dir>/<stream_id>/segs` + `<dir>/<stream_id>/index` (debug uses
-stream id `0`): the part before the client joined, every ad break, and any live
+Goal: with a recording directory set, produce one **contiguous, ad-free archive** of a
+broadcast at `<dir>/<stream_id>/<variant>/segs` + `.../index` (debug uses stream
+id `0`); the variant is a directory because one broadcast can be recorded in both
+orientations: the part before the client joined, every ad break, and any live
 downtime are all filled from the DVR playlist.  The recording has no gaps and no
 timestamp jumps when the DVR is available.
 
@@ -19,7 +22,11 @@ timestamp jumps when the DVR is available.
   gap in the live playlist (ads, reconnects).
 - **DVR** — the archive playlist (`rtsp/dvr.rs`),
   which chunks the *source* stream: it has content for ad spans the live
-  playlist replaced with ads.  The DVR owns the canonical file: it writes every
+  playlist replaced with ads.  A chunk is whole live segments grouped until it
+  reaches `#EXT-X-TARGETDURATION`, so it is a multiple of the live segment's
+  length and at least target duration long (10 s for 2 s segments, 12 s for 3 s
+  or 6 s segments); only the last chunk is shorter.  The two orientations chunk
+  independently and can end a few tens of milliseconds apart.  The DVR owns the canonical file: it writes every
   span the live path cannot record and leaves a **hole** where each live run
   sits; each run is copied into its hole in the background.
 
@@ -43,8 +50,12 @@ pairs instead of deleting them.
 1. **Live first.** The disk consumer registers immediately with `backlog: true`
    (the last 18 segments, ~36 s) and records **run 0** from `live_start`.  There
    is no discovery wait, no in-memory hold and no arena reservation.
-2. **Discovery in parallel.** A DVR URL is looked for until
-   `max(now + 15 s, broadcast_start + 30 s)`.
+2. **Discovery in parallel.** A DVR URL is probed once immediately, then 30 s
+   and 45 s after the recorder starts, and not after that (`dvr.rs`): the object
+   is not ephemeral, so there is nothing to poll for.  The first chunk cannot
+   exist before ~10 s and the measured publication on a fresh broadcast was
+   26.7 s; the disk gives the DVR until 50 s before it promotes the live
+   recording.
    - No URL: close the current run, **promote** every run into a fresh
      canonical (init, media, then its records rebased) and write the live stream
      directly into the canonical from then on.  A rename only works for a single
@@ -255,10 +266,31 @@ hash-verified (there are few), so a torn map is detected rather than played.
   on both `play` and `daemon`, not a config field, and the recorder notifies
   whenever it stops for any reason other than being finished.
 
+## Twitch quirks the format has to absorb
+
+- **The trailing live entry claims a second that has no media.** When Twitch
+  closes a live playlist it appends an entry with `#EXTINF:1.000` whose body is a
+  single 8-byte `skip` box, and it adds that second to its own
+  `#EXT-X-TWITCH-TOTAL-SECS`.  The DVR does not: measured on a 45.301 s
+  broadcast, the closing live playlist said 46.301 s.  `MIN_FRAGMENT_BYTES`
+  drops a fragment smaller than a `moof`/`mdat` pair, so the index never claims
+  time the DVR cannot fill.
+- **`pdt - elapsed` is the only clock to trust.** The manifest's PDT is on
+  Twitch's clock and the box was within a second of it, but the PDT appears on a
+  segment up to seconds before the notification; `pdt - elapsed` is
+  broadcast-relative and agrees between live and DVR to the millisecond.
+
 ## Daemon
 
-- `--output` applies to daemon streams: one folder per broadcast, several
-  recorders at once.
+- `recordDir` applies to daemon streams: one folder per broadcast, several
+  recorders at once.  Changing it affects the next recording only, so one
+  broadcast is never split across two directories.
+- `recordPortrait` records the portrait group as well, as a second pipeline
+  keyed by the portrait variant id (`1080p-portrait`). It is global rather than
+  per channel: it only applies to a dual-format broadcast, and a channel that
+  streams portrait only records it as its primary variant either way.  The
+  sibling pipeline is started when the primary recording starts and stopped with
+  it, unless a viewer asked for that quality directly.
 - A recording keeps the stream entry alive (its URLs stored), and counts toward
   the `--max-streams` accounting, but it does **not** keep the live manifest
   poller alive by itself: the poller may pause once the pre-fill is finished and

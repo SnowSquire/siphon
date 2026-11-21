@@ -10,6 +10,7 @@ use compio::io::AsyncReadAtExt;
 use compio::io::AsyncWriteAtExt;
 use kanal::AsyncSender;
 use kanal::Sender;
+use tracing::debug;
 use tracing::debug_span;
 use tracing::warn;
 use xxhash_rust::xxh3::Xxh3;
@@ -48,9 +49,16 @@ use crate::spool::WakeSet;
 
 // Live writes and copying
 
+/// The smallest possible media fragment: a `moof` box header plus the `mdat`
+/// header is 24 bytes (a TS packet is 188). Twitch closes a live playlist with a
+/// `#EXTINF:1.000` entry whose body is a single 8-byte `skip` box carrying no
+/// media at all, and it counts that second in its own `TOTAL-SECS` - the DVR does
+/// not. Writing it would put a second in the index that no source can fill.
+const MIN_FRAGMENT_BYTES: u64 = 24;
+
 /// Append one live segment's bytes and its `Segment` record at the cursor.
-/// Returns `None` when the segment produced no bytes (a failed download); the
-/// next timestamp gap then closes the run and the DVR fills the span.
+/// Returns `None` when the segment is a failed download or an empty placeholder;
+/// the next timestamp gap then closes the run and the DVR fills the span.
 pub(super) async fn append_live_segment(
     segs: &mut File,
     index: &mut File,
@@ -64,7 +72,10 @@ pub(super) async fn append_live_segment(
     let start = *segs_end;
     let mut reader = segment.reader;
     let written = write_segment_body(segs, start, &mut reader, &mut hasher, wake).await?;
-    if written == 0 {
+    if written < MIN_FRAGMENT_BYTES {
+        // The bytes were written past `segs_end` and are simply not indexed, so
+        // the next segment overwrites them.
+        debug!(bytes = written, "disk: fragment carries no media, skipping");
         return Ok(None);
     }
     let record = SegmentRecord {

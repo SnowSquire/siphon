@@ -25,6 +25,13 @@ use crate::matcher::Matcher;
 use crate::time::now_iso;
 
 const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
+
+/// The endpoint to connect to. `SIPHON_HERMES_URL` points the daemon at the mock
+/// server (or any other stand-in) without a rebuild; it is also what makes debug
+/// mode connect at all, since debug normally pretends the socket is healthy.
+fn url() -> String {
+    std::env::var("SIPHON_HERMES_URL").unwrap_or_else(|_| HERMES_URL.to_owned())
+}
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const KEEPALIVE_MISSED_LIMIT: u64 = 2;
@@ -155,8 +162,9 @@ impl App {
                 }));
             }
 
-            tracing::info!(target: "hermes", "connecting to {HERMES_URL}");
-            let socket = match WsStream::connect(HERMES_URL).await {
+            let url = url();
+            tracing::info!(target: "hermes", "connecting to {url}");
+            let socket = match WsStream::connect(&url).await {
                 Ok(socket) => {
                     tracing::info!(target: "hermes", "connected, waiting for welcome");
                     Some(socket)
@@ -775,12 +783,17 @@ impl App {
                 if channel.as_ref().is_some_and(|channel| channel.record) {
                     self.registry.monitor_set(&login);
                 }
-                let client = std::rc::Rc::clone(&self.client);
-                let client_id = self.client_id.clone();
-                self.spawn_job(async move {
-                    let result = gql::fetch_channels(&client, client_id.as_deref(), &[id]).await;
-                    JobDone::LiveRefreshed(id, result)
-                });
+                // Debug mode has no GQL to refresh from; the seeded detail is
+                // all there is (and a stand-in socket is what drives it).
+                if !self.debug {
+                    let client = std::rc::Rc::clone(&self.client);
+                    let client_id = self.client_id.clone();
+                    self.spawn_job(async move {
+                        let result =
+                            gql::fetch_channels(&client, client_id.as_deref(), &[id]).await;
+                        JobDone::LiveRefreshed(id, result)
+                    });
+                }
             }
             Some("stream-down") => {
                 let channel = self.channel_config(id);

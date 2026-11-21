@@ -38,6 +38,7 @@ use crate::arena::ArenaSet;
 use crate::bus::Bus;
 use crate::constants::DEBUG_CHANNEL_TITLE;
 use crate::constants::DEBUG_DVR_URL;
+use crate::constants::DEBUG_PORTRAIT_DVR_URL;
 use crate::disk::DiskOptions;
 use crate::disk::DiskOutput;
 use crate::downloader::ToDownloader;
@@ -57,8 +58,10 @@ use crate::scheduler::StreamScheduler;
 use crate::spool::ConsumerWake;
 use crate::spool::WakeSet;
 use crate::variant::Variant;
+use crate::variant::VariantKind;
 use crate::variant::VariantPlaylistError;
 use crate::variant::choose_variant;
+use crate::variant::debug_portrait_variant;
 use crate::variant::debug_variant;
 use crate::variant::get_variants;
 
@@ -69,9 +72,18 @@ pub struct Options {
     pub low_latency: bool,
     pub debug: bool,
     pub max_streams: usize,
-    pub output: Option<PathBuf>,
+    /// Recording settings at startup. The live values are on the registry,
+    /// because the UI can change them while the daemon runs.
+    pub recording: Recording,
     pub notify: Option<Notifier>,
     pub keep_runs: bool,
+}
+
+/// Where complete broadcasts go and whether the second orientation is kept.
+pub struct Recording {
+    pub output: Option<PathBuf>,
+    /// Also record the portrait track of dual-format broadcasts.
+    pub portrait: bool,
 }
 
 /// Everything the registry shares between streams.
@@ -80,6 +92,11 @@ pub struct Registry {
     arena: Rc<ArenaSet>,
     downloaders: AsyncSender<ToDownloader>,
     options: Options,
+    /// Disk output root. `None` disables recording. Mutable because the UI can
+    /// move it while the daemon runs; a running recording keeps its directory.
+    output: RefCell<Option<PathBuf>>,
+    /// Also record the portrait track of a dual-format broadcast.
+    portrait: Cell<bool>,
     bus: Rc<Bus>,
     downloader_metrics: Rc<DownloaderMetrics>,
     /// Resolved logins, kept while any stream of that channel exists.
@@ -123,6 +140,9 @@ struct StreamRuntime {
     media_spawned: Cell<bool>,
     dvr_spawned: Cell<bool>,
     broadcast_id: u64,
+    /// `STABLE-VARIANT-ID` of the variant this runtime serves; names its
+    /// recording directory.
+    variant: Box<str>,
     debug: bool,
     metrics: Rc<StreamMetrics>,
 }
@@ -183,11 +203,15 @@ impl Registry {
         bus: Rc<Bus>,
     ) -> Self {
         let (finished_tx, finished_rx) = kanal::unbounded();
+        let output = RefCell::new(options.recording.output.clone());
+        let portrait = Cell::new(options.recording.portrait);
         Self {
             client,
             arena,
             downloaders,
             options,
+            output,
+            portrait,
             bus,
             downloader_metrics,
             channels: RefCell::new(HashMap::new()),
@@ -217,8 +241,52 @@ impl Registry {
     }
 
     #[must_use]
-    pub const fn can_record(&self) -> bool {
-        self.options.output.is_some()
+    pub fn can_record(&self) -> bool {
+        self.output.borrow().is_some()
+    }
+
+    /// Point new recordings at another directory. A running recording keeps the
+    /// directory it opened, so a change never splits one broadcast across two.
+    pub fn set_output(&self, output: Option<PathBuf>) {
+        *self.output.borrow_mut() = output;
+    }
+
+    /// Also record the portrait track, applied to what is recording right now
+    /// and to every later start.
+    pub fn set_portrait(&self, portrait: bool) {
+        if self.portrait.replace(portrait) == portrait {
+            return;
+        }
+        if portrait {
+            let recording: Vec<Rc<StreamRuntime>> = self
+                .streams
+                .borrow()
+                .values()
+                .filter(|runtime| runtime.recording.get() && runtime.key.quality.is_none())
+                .cloned()
+                .collect();
+            for runtime in recording {
+                self.maybe_record_portrait(&runtime);
+            }
+            return;
+        }
+        let stopped: Vec<Rc<StreamRuntime>> = self
+            .streams
+            .borrow()
+            .values()
+            .filter(|runtime| runtime.recording.get() && runtime.key.quality.is_some())
+            .filter(|runtime| {
+                self.portrait_variant_id(&runtime.key.login).as_deref()
+                    == runtime.key.quality.as_deref()
+            })
+            .cloned()
+            .collect();
+        for runtime in stopped {
+            self.stop_recording(&runtime);
+            if !runtime.stream.has_sessions() {
+                self.remove_runtime(&runtime.key);
+            }
+        }
     }
 
     async fn resolve_uri(&self, uri: &str) -> Result<Rc<Stream>, ResolveError> {
@@ -281,7 +349,7 @@ impl Registry {
         let channel = if self.options.debug {
             Rc::new(Channel {
                 title: DEBUG_CHANNEL_TITLE.to_owned(),
-                variants: vec![debug_variant()],
+                variants: vec![debug_variant(), debug_portrait_variant()],
                 broadcast_id: 0,
             })
         } else {
@@ -369,7 +437,14 @@ impl Registry {
             Rc::clone(&self.bus),
         );
 
-        let dvr = Dvr::new(self.options.debug.then(|| DEBUG_DVR_URL.to_owned()));
+        let debug_dvr = self.options.debug.then(|| {
+            if variant.kind == VariantKind::Portrait {
+                DEBUG_PORTRAIT_DVR_URL.to_owned()
+            } else {
+                DEBUG_DVR_URL.to_owned()
+            }
+        });
+        let dvr = Dvr::new(debug_dvr);
         dvr.set_live_variant(variant);
 
         let wakes = WakeSet::new();
@@ -406,6 +481,7 @@ impl Registry {
             media_spawned: Cell::new(false),
             dvr_spawned: Cell::new(false),
             broadcast_id: channel.broadcast_id,
+            variant: variant.id.clone(),
             debug: self.options.debug,
             metrics,
         });
@@ -428,10 +504,11 @@ impl Registry {
         if runtime.recording.replace(true) {
             return;
         }
-        let Some(output) = self.options.output.clone() else {
+        let Some(output) = self.output.borrow().clone() else {
             runtime.recording.set(false);
-            self.bus
-                .publish(Update::Error(Some("recording needs --output".to_owned())));
+            self.bus.publish(Update::Error(Some(
+                "recording needs an output directory".to_owned(),
+            )));
             return;
         };
         runtime.ensure_dvr();
@@ -445,6 +522,7 @@ impl Registry {
             DiskOptions {
                 output,
                 stream_id: runtime.broadcast_id,
+                variant: runtime.variant.clone(),
                 keep_runs: self.options.keep_runs,
                 notifier: self.options.notify.clone(),
                 dvr: Rc::clone(&runtime.dvr),
@@ -485,6 +563,68 @@ impl Registry {
             NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
+        self.maybe_record_portrait(runtime);
+    }
+
+    /// A dual-format broadcast carries a second variant group, and a recorder
+    /// consumes one variant's spool, so the portrait track needs its own
+    /// pipeline. It is keyed by the portrait variant id, which is also what stops
+    /// this recursing: only a `quality: None` runtime ever asks for one.
+    fn maybe_record_portrait(&self, runtime: &Rc<StreamRuntime>) {
+        if !self.portrait.get() || runtime.key.quality.is_some() {
+            return;
+        }
+        let Some(portrait) = self.portrait_variant_id(&runtime.key.login) else {
+            return;
+        };
+        let key = StreamKey {
+            login: runtime.key.login.clone(),
+            quality: Some(portrait.clone()),
+        };
+        let existing = self.streams.borrow().get(&key).cloned();
+        if let Some(existing) = existing {
+            // Already serving that quality for a viewer; record it as well.
+            self.start_recording(&existing);
+            return;
+        }
+        let channel = self.channels.borrow().get(&runtime.key.login).cloned();
+        let Some(channel) = channel else {
+            return;
+        };
+        let Some(variant) = channel
+            .variants
+            .iter()
+            .find(|variant| variant.id.as_ref() == portrait)
+        else {
+            return;
+        };
+        if self.ensure_capacity().is_err() {
+            warn!(
+                login = %runtime.key.login,
+                "daemon: no room for the portrait pipeline"
+            );
+            return;
+        }
+        let sibling = self.spawn_runtime(&key, &channel, variant, true);
+        self.streams
+            .borrow_mut()
+            .insert(key.clone(), Rc::clone(&sibling));
+        self.publish_pipeline(&sibling);
+        info!(
+            login = %key.login,
+            quality = portrait,
+            "daemon: portrait pipeline started"
+        );
+    }
+
+    /// The portrait variant's id, when this broadcast carries a second group.
+    fn portrait_variant_id(&self, login: &str) -> Option<String> {
+        let channel = self.channels.borrow().get(login).cloned()?;
+        channel
+            .variants
+            .iter()
+            .find(|variant| variant.kind == VariantKind::Portrait)
+            .map(|variant| variant.id.to_string())
     }
 
     fn stop_recording(&self, runtime: &Rc<StreamRuntime>) {
@@ -502,6 +642,31 @@ impl Registry {
             NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
+        self.stop_portrait_sibling(runtime);
+    }
+
+    /// The portrait pipeline has no owner of its own: it lives as long as the
+    /// primary recording, unless a viewer asked for that quality directly.
+    fn stop_portrait_sibling(&self, runtime: &Rc<StreamRuntime>) {
+        if runtime.key.quality.is_some() {
+            return;
+        }
+        let Some(portrait) = self.portrait_variant_id(&runtime.key.login) else {
+            return;
+        };
+        let key = StreamKey {
+            login: runtime.key.login.clone(),
+            quality: Some(portrait),
+        };
+        let sibling = self.streams.borrow().get(&key).cloned();
+        if let Some(sibling) = sibling {
+            self.stop_recording(&sibling);
+            // Nobody owns it but the primary recording; a viewer of that quality
+            // keeps its pipeline alive.
+            if !sibling.stream.has_sessions() {
+                self.remove_runtime(&key);
+            }
+        }
     }
 
     fn wanted(&self, key: &StreamKey) -> bool {
@@ -552,9 +717,10 @@ impl Registry {
         {
             return;
         }
-        if self.options.output.is_none() {
-            self.bus
-                .publish(Update::Error(Some("recording needs --output".to_owned())));
+        if self.output.borrow().is_none() {
+            self.bus.publish(Update::Error(Some(
+                "recording needs an output directory".to_owned(),
+            )));
             return;
         }
         let Ok(channel) = self.channel(&key.login).await else {

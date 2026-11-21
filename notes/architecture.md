@@ -59,14 +59,17 @@ The registry behind `daemon` mode; `daemon-mode.md` has the lifecycle, URI,
 capacity and resolver. In short: one global `Client`, `ArenaSet` and downloader
 queue; `(channel, quality)` maps to a `Stream`; DESCRIBE resolves the channel,
 picks the variant and builds the pipeline; the last viewer leaving stops it;
-`--max-streams` refuses rather than evicting.  With `--output` a recording keeps
-its stream entry (and counts against the limit) after the last viewer leaves;
-the registry releases it when the disk recorder finishes.
+`--max-streams` refuses rather than evicting.  With a recording directory set a
+recording keeps its stream entry (and counts against the limit) after the last
+viewer leaves; the registry releases it when the disk recorder finishes.
+`recordPortrait` adds a second pipeline for the portrait group, keyed by its
+variant id, started and stopped with the primary recording.
 
 ## `disk.rs`
 
-`--output <dir>` records one complete, ad-free archive per broadcast:
-`<dir>/<stream_id>/{segs,index}`.  Live segments are recorded immediately into
+A recording directory records one complete, ad-free archive per broadcast:
+`<dir>/<stream_id>/<variant>/{segs,index}` — the variant is a directory because a
+dual-format broadcast can be recorded in both orientations.  Live segments are recorded immediately into
 numbered runs, the DVR playlist fills the pre-join span and every ad gap, and
 each run's uncovered middle is copied into a reserved hole; see
 `disk-complete-recording.md` for the file format, the hole arithmetic and the

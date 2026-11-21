@@ -4,7 +4,7 @@ Turning Twitch's containers into the elementary stream a sink consumes: access-u
 boundaries, codec configuration, timestamps and seek points. Implemented for the TS
 source (H.264 + AAC) in `crates/daemon/src/rtsp/{ts,h264,aac}.rs`. This is not
 RTSP-specific — `media-transport.md` plans to reuse `ts.rs` and the H.264/AAC
-splitters for the UI media channel. fMP4 (HEVC / AV1) is design-only. RTP/RTCP, SDP
+splitters for the UI media channel. fMP4 is design-only. RTP/RTCP, SDP
 and RTSP sessions are `notes/rtsp-output.md`.
 
 ## Access units
@@ -84,8 +84,11 @@ looked up when seeking.
 - **No FFmpeg.** Codec config and SPS/sequence-header parsing replace the probe.
 - **Containers cannot cross disconnect protection.** mpegts ↔ fmp4 is not
   upgradable or downgradable mid-stream (`notes.txt`).
-- **Sources stay as they are:** TS = H.264 + AAC (Twitch only puts these in TS),
-  fMP4 = HEVC / AV1 + AAC.
+- **Sources stay as they are:** TS carries H.264 + AAC. fMP4 carries anything:
+  H.264 (a multigroup/multitrack transmux, which is what a non-partner stream is
+  served as today), HEVC (the portrait 1080p60 track on a dual-format broadcast),
+  AV1 later. The container is chosen by the feature that needs it, not by the
+  partnership: disable multigroup and the same channel is MPEG-TS.
 
 ## Code to adapt (MIT)
 

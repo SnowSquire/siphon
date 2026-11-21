@@ -53,8 +53,6 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use compio::buf::IoBuf;
 use compio::fs::File;
@@ -137,10 +135,11 @@ const GAP_TOLERANCE_MS: u64 = 250;
 /// The broadcast's `pdt - elapsed` origin must agree within this tolerance, or
 /// the two sources are not talking about the same content.
 const ORIGIN_TOLERANCE_MS: i64 = 1_000;
-/// How long discovery may take, and how long after the broadcast start it may
-/// keep looking (a DVR playlist is not published immediately).
-const DISCOVERY_WAIT: Duration = Duration::from_secs(15);
-const DISCOVERY_AFTER_START: Duration = Duration::from_secs(30);
+/// How long the DVR gets to produce a playlist before the live recording is
+/// promoted. `dvr::DISCOVERY_PROBES` stops at 45 s, so this is that plus a
+/// margin for the probe itself; the DVR object is not ephemeral, so there is
+/// nothing to gain by waiting longer.
+const DISCOVERY_WAIT: Duration = Duration::from_secs(50);
 /// No DVR progress for this long means the recording cannot advance.
 const DVR_STALL: Duration = Duration::from_secs(60);
 /// Bytes read/written per copy block.
@@ -186,6 +185,10 @@ enum DiskOutcome {
 pub struct DiskOptions {
     pub output: PathBuf,
     pub stream_id: u64,
+    /// The variant being recorded, and the last path component: one broadcast
+    /// can be recorded in both orientations, so the broadcast directory alone is
+    /// not unique.
+    pub variant: Box<str>,
     pub keep_runs: bool,
     pub notifier: Option<Notifier>,
     pub dvr: Rc<Dvr>,
@@ -486,7 +489,10 @@ async fn run_disk(
     downloaders: &AsyncSender<ToDownloader>,
     live_wake: Rc<ConsumerWake>,
 ) -> Result<(), DiskOutputError> {
-    let dir = options.output.join(options.stream_id.to_string());
+    let dir = options
+        .output
+        .join(options.stream_id.to_string())
+        .join(&*options.variant);
     compio::fs::create_dir_all(&dir).await?;
 
     let (events_tx, events_rx) = kanal::unbounded();
@@ -596,36 +602,12 @@ fn spawn_discovery_timer(dvr: &Rc<Dvr>, events: Sender<Event>) {
     if dvr.url().is_some() {
         return;
     }
-    let wait = discovery_wait(dvr);
+    let wait = DISCOVERY_WAIT;
     compio::runtime::spawn(async move {
         compio::time::sleep(wait).await;
         let _ = events.send(Event::DiscoveryDeadline);
     })
     .detach();
-}
-
-fn discovery_wait(dvr: &Dvr) -> Duration {
-    let now = now_ms();
-    let mut wait = DISCOVERY_WAIT;
-    if let Some(start) = dvr.broadcast_start_ms() {
-        let after_start = start
-            .saturating_add(millis_u64(DISCOVERY_AFTER_START))
-            .saturating_sub(now);
-        wait = wait.max(Duration::from_millis(after_start));
-    }
-    wait
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
-fn millis_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn block_take(remaining: u64) -> usize {
@@ -808,20 +790,6 @@ impl Disk {
     async fn on_discovery_deadline(&mut self) -> Result<(), DiskOutputError> {
         if self.dvr.url().is_some() {
             return Ok(());
-        }
-        // A broadcast that started less than 30 s ago gets 30 s from its start.
-        if let Some(start) = self.dvr.broadcast_start_ms() {
-            let deadline = start.saturating_add(millis_u64(DISCOVERY_AFTER_START));
-            if now_ms() < deadline {
-                let wait = Duration::from_millis(deadline.saturating_sub(now_ms()));
-                let events = self.events_tx.clone();
-                compio::runtime::spawn(async move {
-                    compio::time::sleep(wait).await;
-                    let _ = events.send(Event::DiscoveryDeadline);
-                })
-                .detach();
-                return Ok(());
-            }
         }
         if matches!(self.phase, Phase::Discovering) {
             self.notify(

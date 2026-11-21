@@ -19,6 +19,7 @@ use futures_util::FutureExt as _;
 use siphon_shared::rpc::ArenaSummary;
 use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
+use siphon_shared::rpc::ChatColor;
 use siphon_shared::rpc::Config;
 use siphon_shared::rpc::ConnHealth;
 use siphon_shared::rpc::DownloaderSummary;
@@ -207,6 +208,9 @@ pub struct App {
     pub(crate) avatars_pending: HashSet<u64>,
     pub(crate) pending: Vec<String>,
     pub(crate) conn: ConnHealth,
+    /// Whether the Hermes socket should connect (off in debug unless a stand-in
+    /// endpoint is configured).
+    pub(crate) hermes_enabled: bool,
     pub(crate) error: Option<String>,
 
     pub(crate) matcher: Matcher,
@@ -255,12 +259,51 @@ impl App {
             debug,
         } = init;
         let matcher = crate::hermes::build_matcher(&config.filtered_words);
-        let conn = if debug {
+        // Debug mode normally pretends the socket is healthy; pointing it at a
+        // stand-in with `SIPHON_HERMES_URL` makes it connect for real.
+        let hermes_enabled = !debug || std::env::var_os("SIPHON_HERMES_URL").is_some();
+        let conn = if debug && !hermes_enabled {
             ConnHealth::Connected
         } else if config.channels.is_empty() {
             ConnHealth::NoChannels
         } else {
             ConnHealth::Connecting
+        };
+        // Debug mode never talks to GQL, so a configured channel would have no
+        // detail for the Hermes path to update and `stream-up` would be dropped.
+        // Seed them from the config so a stand-in socket can drive a broadcast.
+        let channels: HashMap<u64, ChannelDetail> = if debug {
+            config
+                .channels
+                .iter()
+                .map(|channel| {
+                    (
+                        channel.id,
+                        ChannelDetail {
+                            id: channel.id,
+                            login: channel.login.clone(),
+                            display_name: channel
+                                .display_name
+                                .clone()
+                                .unwrap_or_else(|| channel.login.clone()),
+                            chat_color: ChatColor::Twitch(0x0091_46ff),
+                            profile_image_url: String::new(),
+                            avatar_path: None,
+                            stream_id: None,
+                            stream_title: None,
+                            stream_start: None,
+                            last_live: None,
+                            viewers: None,
+                            collaboration_viewers: None,
+                            game: None,
+                            live: false,
+                            error: None,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
         };
         Self {
             config,
@@ -273,10 +316,11 @@ impl App {
             wake,
             client_id,
             debug,
-            channels: HashMap::new(),
+            channels,
             avatars_pending: HashSet::new(),
             pending: Vec::new(),
             conn,
+            hermes_enabled,
             error: None,
             matcher,
             socket: None,
@@ -313,7 +357,7 @@ impl App {
     pub async fn run(mut self) {
         let mut tick = compio::time::interval(Duration::from_secs(1));
         loop {
-            if !self.debug
+            if self.hermes_enabled
                 && self.socket.is_none()
                 && !self.connecting
                 && !self.config.channels.is_empty()
@@ -485,6 +529,22 @@ impl App {
             }
             Request::SetSound(value) => {
                 self.config.sound = value;
+                self.publish_config();
+                self.queue_save();
+                Ok(Response::Ack)
+            }
+            Request::SetRecordDir(dir) => {
+                // An empty path is how a settings field clears itself.
+                let dir = dir.filter(|dir| !dir.trim().is_empty());
+                self.config.record_dir.clone_from(&dir);
+                self.registry.set_output(dir.map(PathBuf::from));
+                self.publish_config();
+                self.queue_save();
+                Ok(Response::Ack)
+            }
+            Request::SetRecordPortrait(value) => {
+                self.config.record_portrait = value;
+                self.registry.set_portrait(value);
                 self.publish_config();
                 self.queue_save();
                 Ok(Response::Ack)
@@ -965,7 +1025,9 @@ impl App {
         quality: Option<String>,
     ) -> Result<Response, RpcError> {
         if !self.registry.can_record() {
-            return Err(RpcError::Failed("recording needs --output".to_owned()));
+            return Err(RpcError::Failed(
+                "recording needs an output directory".to_owned(),
+            ));
         }
         let login = login.trim().to_lowercase();
         if login.is_empty() {
@@ -1002,7 +1064,7 @@ impl App {
             if self.registry.can_record() {
                 self.registry.monitor_set(&login);
             } else {
-                self.set_error("recording needs --output");
+                self.set_error("recording needs an output directory");
             }
         } else {
             self.registry.monitor_clear(&login);

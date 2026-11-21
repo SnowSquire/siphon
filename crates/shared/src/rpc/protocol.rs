@@ -108,13 +108,22 @@ pub struct Config {
     pub notify_title_changes: bool,
     pub sound: bool,
     pub filtered_words: Vec<String>,
+    /// Where complete broadcasts are recorded, one directory per broadcast.
+    /// `None` (or empty) disables recording; the daemon otherwise reports that
+    /// recording needs a directory.
+    pub record_dir: Option<String>,
+    /// Also record the portrait track of a dual-format broadcast. It is a
+    /// global preference, not a per-channel one: it only ever applies to
+    /// broadcasts that carry both orientations, and a channel that streams
+    /// portrait only records it as its primary variant either way.
+    pub record_portrait: bool,
 }
 
 impl Config {
     /// Current on-disk schema. `2` is Siphon's last release; `3` adds
     /// `channels[].record`; `4` adds `channels[].notifyLive` and
-    /// `channels[].notifyTitles`.
-    pub const VERSION: u64 = 4;
+    /// `channels[].notifyTitles`; `5` adds `recordDir` and `recordPortrait`.
+    pub const VERSION: u64 = 5;
 }
 
 impl Default for Config {
@@ -125,6 +134,8 @@ impl Default for Config {
             notify_title_changes: true,
             sound: true,
             filtered_words: vec!["offline".to_owned()],
+            record_dir: None,
+            record_portrait: false,
         }
     }
 }
@@ -427,6 +438,11 @@ pub enum Request {
     RemoveChannel(u64),
     SetNotifyTitleChanges(bool),
     SetSound(bool),
+    /// Point new recordings at this directory; `None` disables recording.
+    /// Recordings already running keep writing where they started.
+    SetRecordDir(Option<String>),
+    /// Also record the portrait track of dual-format broadcasts.
+    SetRecordPortrait(bool),
     AddFilteredWord(String),
     RemoveFilteredWord(String),
     /// Turn the per-channel recording monitor on or off.
