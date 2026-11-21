@@ -2,9 +2,10 @@
 
 Status: implemented. This is the detail behind `AGENTS.md`'s one-line module
 list: the pipeline, the scheduler, the downloader, the daemon and the
-listeners. The arena/spool, HTTP, RTSP and disk details have their own notes
-(`slot-arena-rework.md`, `tls-client-api.md`, `es-rtp-rtsp.md` +
-`rtsp-daemon.md`, `disk-complete-recording.md`).
+listeners. The arena/spool rationale is in the `arena.rs`/`spool.rs` module
+docs; the HTTP, RTSP and disk details have their own notes
+(`tls-client-api.md`, `rtsp-output.md` + `ts-demux.md` / `daemon-mode.md`,
+`disk-complete-recording.md`).
 
 ## One thread
 
@@ -54,7 +55,7 @@ append a second copy onto the same segment.
 
 ## `registry.rs`
 
-The registry behind `daemon` mode; `rtsp-daemon.md` has the lifecycle, URI,
+The registry behind `daemon` mode; `daemon-mode.md` has the lifecycle, URI,
 capacity and resolver. In short: one global `Client`, `ArenaSet` and downloader
 queue; `(channel, quality)` maps to a `Stream`; DESCRIBE resolves the channel,
 picks the variant and builds the pipeline; the last viewer leaving stops it;

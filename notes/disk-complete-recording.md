@@ -246,34 +246,6 @@ hash-verified (there are few), so a torn map is detected rather than played.
 - After the handoff the recording is DVR-only, so a paused poller costs the
   archive nothing.
 
-## Supporting changes
-
-- `playlist.rs`: `Event::ProgramDateTime(u64)` (RFC 3339 → epoch ms, hand-rolled,
-  no new dependency); a pending PDT is applied to the next media item.  Prefetch
-  tags carry no PDT.  `Event::Init(InitSegment)` carries the `EXT-X-MAP` URI and
-  optional `BYTERANGE`.
-- `scheduler.rs`: `Segment.pdt_ms` and `Segment.duration_ms`; the disk writer
-  detects a gap from the timestamp jump (no `Ad` message: an ad is just a gap
-  with content in the DVR).  A map change is fetched and broadcast to existing
-  consumers before the next media, so the disk can close the run.
-- `spool.rs`/`arena.rs`: the per-spool slot cap (`SEGMENT_SLOTS_MAX = 64` ≈
-  12.3 MB) is below a 12 Mbps 10 s DVR chunk (~15 MB); give the DVR spool its own
-  cap (~96 slots) and its own `ArenaSet` for the reorder buffer.  Arenas are not
-  globally capped, so nothing else changes.
-- `disk.rs`: re-enabled and rewritten around the two sources, runs, holes, the
-  `Run` marker, init hashing/insertion, the copies and the resume repair.
-- `main.rs`/`registry.rs`: `--output`, `--notify`, `--keep-runs`; the disk handle
-  and the daemon wiring.
-- `rtsp/vod.rs` → `rtsp/dvr.rs`; `VodTimeline`/`VodSegment` renamed, and the
-  timeline now carries the `EXT-X-MAP` objects per segment.  The refresh loop
-  keeps running (the RTSP seek path still uses it until the disk-backed reader
-  exists).
-- `index.hexpat`: v4.
-- `servermock`: a `START_MS` knob so the debug loop can join mid-broadcast and
-  exercise prefill/holes/copies; `NO_DVR=1` on the client exercises promotion.
-  The mock (Node) sets `Content-Length`; Twitch's live CDN mostly does not, so
-  tests must not depend on it.
-
 ## Testing
 
 - Unit: v4 round-trip; the hole arithmetic (`run_len - leading - trailing`), the
@@ -282,11 +254,9 @@ hash-verified (there are few), so a torn map is detected rather than played.
 - **Mock integration:** `SPEED=1`, join at a non-zero offset (`START_MS`),
   kill and restart the client; assert the canonical index is contiguous and
   monotonic, every pending `Run` was completed, and the run pairs are gone (or
-  kept with `--keep-runs`).  `NO_DVR=1` exercises the promotion path.  The
-  implementation was checked with `START_MS=120000` / `SPEED=16` for prefill +
-  hole copies, a mid-prefill kill + restart, a promoted-live kill + restart
-  with the DVR back on (the live → DVR switch), and daemon mode through
-  `ffprobe`.
+  kept with `--keep-runs`).  `NO_DVR=1` exercises the promotion path.  Checked
+  with prefill + hole copies, a mid-prefill kill + restart, and a promoted-live
+  restart with the DVR back on.
 - **fMP4 maps:** a local mock serving an `EXT-X-MAP` live playlist and a DVR
   playlist with a different map produced the expected canonical order: DVR init
   A at 0, live init B before the `Run` marker (`Run.dst = B.offset + B.len`),

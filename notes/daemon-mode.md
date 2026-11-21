@@ -1,7 +1,6 @@
-# RTSP daemon mode
+# Daemon mode
 
-Status: implemented (`registry.rs`, `rtsp::StreamResolver`). The arena rework it
-depended on landed first.
+Status: implemented (`registry.rs`, `rtsp::StreamResolver`).
 
 ## Goal
 
@@ -12,11 +11,10 @@ workers, the listeners.
 
 ## CLI
 
-`daemon daemon [--bind <addr>] [--max-streams N] [--admin <endpoint>]`. The old
-behaviour moved under an explicit `play` subcommand (`-c/--channel` and
-`-q/--quality` live there). `--bind` defaults to `127.0.0.1:7417`; `daemon`
-binds exactly that address, so the dual-loopback-family fallback is only in
-`play`. `--max-streams` defaults to `constants::MAX_STREAMS` (8).
+`daemon daemon [--bind <addr>] [--max-streams N] [--admin <endpoint>]`.
+`--bind` defaults to `127.0.0.1:7417`; `daemon` binds exactly that address, so
+the dual-loopback-family fallback is only in `play`. `--max-streams` defaults to
+`constants::MAX_STREAMS` (8). `play` keeps `-c/--channel` and `-q/--quality`.
 
 ## URI
 
@@ -79,15 +77,14 @@ resolves that variant's archive media playlist.
 
 ## Naming
 
-`Hub` became `Stream` (one variant's RTSP presentation). "Broadcast" keeps its
-meaning from `AGENTS.md`: one channel's live stream. There was no
-`MAX_BROADCASTS` left to rename; the new cap is `MAX_STREAMS`.
+`Stream` is one variant's RTSP presentation; "broadcast" keeps its meaning from
+`AGENTS.md`: one channel's live stream. The cap is `MAX_STREAMS`.
 
 ## Gotchas
 
 Most of the protocol-level traps (RTP-Info on seek, the SR media-clock anchor,
 the seek epoch, the 16x queue, the handover, the lossy consumer) are in
-`es-rtp-rtsp.md`; these are the ones that live in this layer.
+`rtsp-output.md`; these are the ones that live in this layer.
 
 - A joining session must wait for its first video IDR on **every** track, not
   just video (`Stream::send`). ffmpeg copies the first sender report's

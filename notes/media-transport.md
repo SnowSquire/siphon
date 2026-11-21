@@ -1,8 +1,7 @@
 # Media transport: the UI does not use RTSP
 
-Status: idea. The only trace so far is one bullet in `notes/linux-port.md:133` —
-"transport is not settled and RTSP is probably not it". Nothing is designed or
-built; `play` still serves RTSP and the UI still has no video path.
+Status: idea, nothing built. `play` still serves RTSP and the UI still has no
+video path.
 
 ## Why RTSP goes
 
@@ -14,11 +13,10 @@ wants one thing: the next access unit, or a keyframe if it fell behind.
 
 The daemon already holds the truth in exactly that form. `rtsp/h264.rs` splits
 Annex-B NALs and knows keyframes; `rtsp/ts.rs` demuxes the transport stream and
-splits at AUD boundaries (PES is *not* an AU boundary — see
-`notes/es-rtp-rtsp.md`). RTSP then shatters each AU into STAP-A/FU-A datagrams
-under a 1450-byte budget and the UI puts them back together. That round trip
-exists only to satisfy RTSP, and `notes/es-rtp-rtsp.md` spends a page and a half
-on the consequences.
+splits at AUD boundaries (PES is *not* an AU boundary — see `notes/ts-demux.md`).
+RTSP then shatters each AU into STAP-A/FU-A datagrams under a 1450-byte budget and
+the UI puts them back together. That round trip exists only to satisfy RTSP, and
+`notes/rtsp-output.md` has the whole of it.
 
 ## What replaces it
 
@@ -50,7 +48,7 @@ Three semantics that RTSP fights and this expresses directly:
 ## Zero copy is the real prize
 
 The spool is already a chain of fixed 192 KiB slots in an arena with cursor
-readers (`notes/slot-arena-rework.md`). A UI on the same machine can map those
+readers (`arena.rs`, `spool.rs`). A UI on the same machine can map those
 slots instead of receiving copies, so a `AccessUnit` message could carry a slot
 range rather than bytes, and the media path copies nothing at all. RTSP can
 never do this — everything becomes a datagram.

@@ -13,8 +13,8 @@ first says it did not take a fortnight of calendar, and most of it went on
 theories held without measurement rather than on the work itself.
 
 The working version of the conclusion lives on the jj bookmark **`blit-path`**
-(`244bd6aa`); the tree it was developed against is `f2c68bfe`, which is now part
-of `main`.
+(`244bd6aa`), which is on the GitHub remote and not in a local checkout; the tree
+it was developed against is `f2c68bfe`, which is now part of `main`.
 
 ## The shape of the problem
 

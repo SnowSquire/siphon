@@ -198,8 +198,6 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 - The switch override must select `.zui-switch--sm`: this zgui revision emits
   the class and no `data-size` attribute, so a `[data-size="sm"]` rule silently
   leaves every switch at 40x22.
-- Row actions stay out of the row: `Remove channel` lives in the expanded
-  detail, where an undo toast can follow it (pinning is planned next).
 - Empty and pending states are explicit: a list with no channels says how to
   add one, and a resolving login keeps every column aligned.
 - Keep the row's avatar/display name and the live dot; those are the primary

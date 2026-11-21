@@ -16,15 +16,21 @@ only sink; disk output is disabled and being rebuilt from
 ## Notes
 
 - `architecture.md` — pipeline, scheduler, downloader, daemon, listeners.
-- `slot-arena-rework.md` — slots, arenas, refcounts, spools, wakeups.
-- `es-rtp-rtsp.md` — TS demux, packetizers, SDP, timestamps, seeking.
-- `rtsp-daemon.md` — daemon registry, sessions, queues, SR/epoch, handover.
+- `ts-demux.md` — access units, codec config, timestamps, seek points.
+- `rtsp-output.md` — RTP packetization, RTCP, SDP, sessions, DVR seeking.
+- `daemon-mode.md` — daemon registry, capacity, stream lifecycle, session gotchas.
 - `tls-client-api.md` — the HTTP/1.1 + rustls client (and why it is unbuffered).
 - `hls-transport-probe.md` — measurements of how Twitch actually delivers.
 - `disk-complete-recording.md` — the disk-recording design.
 - `rpc.md` — the daemon RPC, Siphon backend/UI split, state updates and monitor lifecycle.
+- `ui-design-direction.md` — the ZGUI surface: tokens, density, marquees, row states.
 - `linux-port.md` — the UI on Linux: present path, buffer counts, build constraints,
   and what the hardware on the dev box can and cannot do.
+- `dxgi-hell.md` — the Windows DXGI band that is still open: the share-vs-blit
+  seam, the measurements, the experiments already ruled out, and the rules.
+- `video-decode.md` — the planned UI video path: VA-API / D3D12 Video, libav.
+- `media-transport.md` — the planned replacement for RTSP between daemon and UI
+  (idea only; nothing built).
 
 ## Commands
 
@@ -62,7 +68,7 @@ thread, so there are no locks, atomics or `Send` bounds. `!Send` tasks are
 deliberate — do not "fix" `clippy::future_not_send`. Pipeline and listener
 detail: `notes/architecture.md`.
 
-- `arena.rs`, `spool.rs` — slots and spools, intrusive refcounts, zero-copy `IoBuf` views (`notes/slot-arena-rework.md`).
+- `arena.rs`, `spool.rs` — slots and spools, intrusive refcounts, zero-copy `IoBuf` views; the design rationale is in the module docs.
 - `http/` — hand-rolled HTTP/1.1 over `rustls::unbuffered` (`notes/tls-client-api.md`); `http/ws.rs` is the RFC 6455 client Hermes uses.
 - `scheduler.rs` — manifest poll, Twitch tags, fetch dispatch, consumer fan-out; the `#EXT-X-TWITCH-*` quirks are in `notes.txt`.
 - `variant.rs` — master-playlist resolution through Twitch GQL + usher.
@@ -70,14 +76,14 @@ detail: `notes/architecture.md`.
 - `logging.rs` — the daemon's stdout/stderr, appended to `daemon.log` in the
   per-user state dir (`%LOCALAPPDATA%`, `~/.local/state`) and rotated at 4 MiB.
 - `app.rs`, `bus.rs`, `rpc.rs`, `metrics.rs` — the backend app loop, entity update bus, admin RPC server and telemetry.
-- `registry.rs` — the stream registry and monitors behind `daemon` mode (`notes/rtsp-daemon.md`).
+- `registry.rs` — the stream registry and monitors behind `daemon` mode (`notes/daemon-mode.md`).
 - `downloader.rs` — bounded fetch workers streaming into spools.
-- `rtsp/` — RTSP server and ES over RTP (`notes/es-rtp-rtsp.md`). Sink only, and slated to become a compile-time optional feature: keep it correct, but do not invest in its hot path.
+- `rtsp/` — RTSP server and ES over RTP (`notes/rtsp-output.md`; demux is `notes/ts-demux.md`). Sink only, and slated to become a compile-time optional feature: keep it correct, but do not invest in its hot path.
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/shared` (`siphon-shared`) — what both sides agree on: `rpc/` (the
   typed protocol, postcard framing, the UI-side client), `settings/` (the
   per-client settings schema) and `store/` (the JSON file layer).
-- `crates/ui` (`siphon-ui`, binary `siphon`) — the ZGUI window presented through the video spike's DXGI flip chain and libplacebo pass, the native tray, the RPC client worker, and the daemon lifecycle (auto-start, PID-file restart). Windows-only; `notes/rpc.md` has the split and the SDR/HDR state.
+- `crates/ui` (`siphon-ui`, binary `siphon`) — the ZGUI window presented through the DXGI flip chain ported from the video spike, the native tray, the RPC client worker, and the daemon lifecycle (auto-start, PID-file restart). Windows-only; `notes/rpc.md` has the split and the SDR/HDR state.
 
 ## Rules (do not "simplify")
 

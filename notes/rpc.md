@@ -1,15 +1,15 @@
 # Daemon RPC and the Siphon backend/UI split
 
-Status: phases 0–2 backend landed. `crates/shared` (`siphon-shared`) owns the
-typed protocol, postcard framing and client in its `rpc` module, the per-client
-settings schema in `settings`, and the JSON file layer in `store`;
-`crates/daemon` owns config, GQL,
-Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI is
-now `crates/ui` (ZGUI, binary `siphon`) and talks only over the RPC. It presents
-through the video spike's DXGI flip chain and libplacebo pass (SDR unless the
-client's HDR setting asks otherwise), starts the daemon when the admin port is idle and
-restarts it at the process level (PID file + terminate), never through the
-socket: a frozen daemon must still be restartable from the tray.
+Status: implemented. `crates/shared` (`siphon-shared`) owns the typed protocol,
+postcard framing and client in its `rpc` module, the per-client settings schema
+in `settings`, and the JSON file layer in `store`; `crates/daemon` owns config,
+GQL, Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI
+is `crates/ui` (ZGUI, binary `siphon`) and talks only over the RPC. It presents
+through the DXGI flip chain extracted from the video spike and the libplacebo
+pass (SDR unless the client's HDR setting asks otherwise), starts the daemon
+when the admin port is idle and restarts it at the process level (PID file +
+terminate), never through the socket: a frozen daemon must still be restartable
+from the tray.
 
 ## Goal
 
@@ -271,25 +271,6 @@ like `StreamKey`; changing quality is remove + add.
   `taskkill` fallback).
 - `play` keeps its current pipeline and needs no protocol types.
 
-## Phases
-
-0. **Protocol crate**: messages, postcard codec, incremental decoder, frame
-   limits, Hello/Welcome, named-pipe/socket client/server tests. **Done.**
-1. **Backend state**: config load/save/migrate, GQL, Hermes, matcher,
-   notifications; snapshot and entity updates. **Done** (the UI is still
-   external, so it does not render them yet).
-2. **Pipelines**: monitor-only runtimes, upgrade on DESCRIBE, capacity rules,
-   segment ring, arena/downloader telemetry, `ListSegments`/`GetStreamDetail`.
-   **Done**, except `GetDisk` (returns `Unsupported`).
-3. **Full lifecycle**: monitor add/remove/update, stop/restart, forced viewer
-   disconnect, per-monitor record start/stop. **Done**, including one-shot
-   `RecordOnce` and `PipelineStop { force }`; the per-channel `record` flag
-   starts and stops the disk on a live runtime.
-4. **Disk and polish**: run introspection/release, update ownership,
-   multi-client behavior, update throttling/coalescing. **Mostly done**:
-   `GetDisk` reports live recorder counters and an endpoint test covers two UI
-   clients; releasing finished runs by hand and per-run history are open.
-
 ## Tests
 
 - Codec: roundtrip, partial header/payload, oversized frame, bad version,
@@ -311,7 +292,7 @@ like `StreamKey`; changing quality is remove + add.
 - Multiple UI clients: the protocol supports it, but only one tray/window is
   expected; decide whether to enforce single-instance at the RPC layer.
 - Disk API shape: run listing, release semantics and canonical progress.
-- Per-stream slot reservation (already open in `rtsp-daemon.md`).
+- Per-stream slot reservation (already open in `daemon-mode.md`).
 - Video/HDR: separate note; see below.
 
 ## Gotchas
@@ -525,4 +506,4 @@ libplacebo pass. libplacebo imports the same Vulkan device via
 `pl_vulkan_import`; it requires `hostQueryReset` and `timelineSemaphore`, which
 wgpu 29.0.4 does not enable by default. ZGUI pins wgpu 29.0.4/ash 0.38, so the
 existing video plan's wgpu 30.0.1 patch must be rebased. Write this up in a
-separate `notes/video.md` when the player work starts.
+separate `notes/video-decode.md` when the player work starts.

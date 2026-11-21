@@ -9,8 +9,7 @@
 - [ ] some protocol to monitor and control daemon mode. obvious is a rest api but that's not realtime, and also shitty
 - [ ] move from clap to bpaf (evaluate first)
 - [ ] Hermes WebSocket listener to automatically start recording
-- [ ] include hermes updates in index, possibly even chat and other stuff (redeems, bits, the horse animation)
-- [ ] get back on the gui grind https://blog.zortax.de/posts/a-critique-of-gpui this guy's framework looks cool and he has all the same problems I have with the state of rust gui frameworks
+- [ ] include hermes updates in recorded index, possibly even chat and other stuff (redeems, bits, the horse animation)
 - [ ] disk-backed RTSP seeking (read index/segs; stop the DVR refresh when disk is on)
 - [ ] fMP4 / HEVC / AV1 RTP output
 - [ ] Discord webhook sender behind notify()
@@ -21,12 +20,4 @@
   - [ ] file (disk output)
   - [ ] MoQ
   
-## Done
 
-- [x] move to https://github.com/mcmah309/eros
-- [x] add vod support
-- [x] rtsp/rtp/rtcp server
-- [x] compio runtime (https://github.com/compio-rs/compio)
-- [x] rip out the tcp sender, RTSP is the only sink
-- [x] arena/slotmap allocator instead of the generic allocator (intrusive refcounts)
-- [x] miri as the unsafe verifier (`cargo +nightly miri test`)

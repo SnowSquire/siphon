@@ -4,7 +4,6 @@ members = [
   "crates/libplacebo-sys",
   "crates/shared",
   "crates/ui",
-  "crates/video",
 ]
 resolver = "2"
 

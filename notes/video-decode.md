@@ -2,8 +2,8 @@
 
 Where decoded frames come from, per OS, and how they reach libplacebo without a
 copy. The renderer does not change: `pl_render_image` still draws one `pl_frame`
-per video frame into the swapchain (`notes/video-player.md` for the Windows
-prototype, `notes/linux-port.md` for the Wayland chain).
+per video frame into the swapchain (`notes/linux-port.md` for the Windows and
+Wayland chains).
 
 **Decision: VA-API on Linux, D3D12 Video on Windows. Vulkan Video and D3D11VA
 are not used.**
@@ -25,8 +25,8 @@ That alone rules it out here. The wider argument holds too: Vulkan Video decode
 would be a third backend to keep working per driver and per codec, on top of the
 two the OS vendors already ship and test. Twitch is H.264, which both VA-API and
 D3D11VA have covered since forever. The Vulkan decode path in the spike
-(`crates/video/src/gpu.rs`, `hw.rs`, `AV_PIX_FMT_VULKAN`) goes away with the
-spike.
+(`crates/video/src/gpu.rs`, `hw.rs`, `AV_PIX_FMT_VULKAN`) went away with the
+crate.
 
 ## The box decodes; Fedora's driver build does not
 
@@ -150,9 +150,9 @@ software fallback.
 
 ## Shape in the code
 
-Not in `crates/video`: that crate is a spike and is deleted once the UI plays
-video (`notes/linux-port.md`). It lands in `crates/ui` as `decode/`, picked by
-`#[cfg]` like `Chain`, not a trait object (only one backend is ever linked):
+Not in a separate crate: the spike is gone (`notes/linux-port.md`). It lands in
+`crates/ui` as `decode/`, picked by `#[cfg]` like `Chain`, not a trait object
+(only one backend is ever linked):
 
 | item | linux | windows |
 |---|---|---|
@@ -173,10 +173,10 @@ that says nothing while the container says BT.2020/PQ). Audio stays out of scope
 2. Startup capability probe: VA-API profiles from FFmpeg plus libplacebo's
    `PL_HANDLE_DMA_BUF` import cap, with the RPM Fusion hint on failure.
 3. Linux zero-copy path end to end: a captured TS file first, then a live channel
-   once the transport question (`notes/architecture.md`) is settled.
+   once the transport question (`notes/media-transport.md`) is settled.
 4. Windows D3D12 Video on the existing device and import path, verified on the
    desktop against the Vulkan Video path it replaces.
-5. Delete `crates/video`.
+5. Delete `crates/video`. (Done; the crate is gone.)
 
 ## Open
 
