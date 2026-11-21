@@ -93,7 +93,7 @@ struct Snapshot {
 enum Update {
     Config(Config),
     Conn(ConnHealth),
-    ChannelUpsert(ChannelView),
+    ChannelUpsert(Box<ChannelView>),
     ChannelRemove(u64),
     Pending(Vec<String>),
     PipelineUpsert(PipelineView),
@@ -110,10 +110,19 @@ enum Update {
 ```
 
 `ChannelView` carries what the UI renders: id, login, display name, the resolved
-switch colour (`chatColor`, or a generated `oklch(...)` fallback), the remote
-avatar URL and the local `avatarPath` the daemon cached, live, title, game, the
-game id, viewers, stream start as milliseconds, Twitch's `BROADCAST-ID`, and
-the per-channel `notifyLive` / `notifyTitles` / `record` switches. ZGUI's
+switch colour (`chatColor`, or a generated `oklch(...)` fallback), the local
+`avatarPath` the daemon cached, live, title, game, the
+game id, viewers, stream start as milliseconds, when it was last live
+(`last_live_ms`), Twitch's `BROADCAST-ID`, the last per-channel failure
+(`error`), and the per-channel `notifyLive` / `notifyTitles` / `record`
+switches. `last_live_ms` is Twitch's `lastBroadcast.startedAt`, which is the
+current broadcast's start while live and the *end* of the last one while
+offline; `stream-down` writes the current time first so the row never shows the
+start of a stream that just ended, and the next baseline poll overwrites it
+(they differ by seconds, which the UI's minute-granular relative text hides).
+`error` is the channel's own resolve failure, cleared by the next successful
+refresh; pipeline and disk failures stay on their own entities and the UI
+merges them by login. ZGUI's
 image element reads files, not URLs, so `avatar::ensure` downloads each picture
 once into the app data directory and the row is re-published when the path
 exists. The workspace version (`0.5.0`) is shared by `daemon`, `siphon-shared` and
@@ -123,15 +132,19 @@ pinned, recording, sessions, position, live edge, segment tail, window size,
 counters, last error and the attached recorder's `disk` counters. `SegmentRecord`
 is only scalars; the segment ring is queryable and updates append to it.
 
+Pins are the one ordering fact the daemon never sees: `pins.json` next to
+`ui.json` (`siphon_shared::settings::{load_pins, save_pins}`) holds the channel
+ids a client keeps at the top, and the UI prunes ids that a snapshot no longer
+contains. Ordering therefore differs per window, which is the point.
+
 `LogEntry` is the daemon's bounded event ring (`LOG_CAP`, 512): `seq`, `at_ms`,
 level, subsystem target, message, and the stream identity beside it (`login`,
-`stream_id`) so the Logs tab can correlate a line with the recording on disk. `Update::Log` is append-only and never coalesced. The ring
-lives on the bus, not the app, so the registry can log a recording start/stop
+`stream_id`) so the Logs tab can correlate a line with the recording on disk. `Update::Log` is append-only and never coalesced. The ringlives on the bus, not the app, so the registry can log a recording start/stop
 and the snapshot still carries the whole history.
 
 Requests:
 
-- intents: `AddLogin`, `RemoveChannel`, `SetNotifyTitleChanges`, `SetSound`,
+- intents: `AddLogin { login, switches }`, `RemoveChannel`, `SetNotifyTitleChanges`, `SetSound`,
   `AddFilteredWord`, `RemoveFilteredWord`, `SetRecord { channel, record }`,
   `SetNotifyLive { channel, notify }`, `SetNotifyTitles { channel, notify }`,
   `ClearError`, `DismissNotification`, `ApplyUpdate`, `PipelineStop { key,

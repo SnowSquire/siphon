@@ -1,5 +1,14 @@
 //! Small UTC and size formatters for the UI, without a formatting crate.
 
+/// Milliseconds since the unix epoch, for the relative labels.
+#[must_use]
+pub fn now_ms() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+}
+
 /// Millis-since-epoch to `HH:MM:SS` UTC, for log lines.
 #[must_use]
 pub fn format_time_ms(millis: i64) -> String {
@@ -71,6 +80,42 @@ pub fn format_iso_ms(millis: i64) -> String {
     )
 }
 
+/// Millis-since-epoch to a bare `YYYY-MM-DD` date.
+#[must_use]
+pub fn format_date_ms(millis: i64) -> String {
+    let (year, month, day) = civil_from_days(millis.div_euclid(1000).div_euclid(86_400));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// How long ago an instant was, coarsely.
+///
+/// The buckets are deliberately wider than the timestamps behind them: the
+/// end of a broadcast arrives twice, once from `stream-down` (the moment the
+/// event landed) and once from Twitch's `lastBroadcast.startedAt` (the
+/// server's idea of the end). They disagree by seconds, and minute-granular
+/// text never shows it. A future instant, which is clock skew rather than
+/// information, reads as `now`.
+#[must_use]
+pub fn format_ago(at_ms: i64, now_ms: i64) -> String {
+    const MINUTE: i64 = 60_000;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let delta = now_ms.saturating_sub(at_ms);
+    if delta < 2 * MINUTE {
+        return "now".to_owned();
+    }
+    if delta < HOUR {
+        return format!("{}m ago", delta / MINUTE);
+    }
+    if delta < DAY {
+        return format!("{}h ago", delta / HOUR);
+    }
+    if delta < 7 * DAY {
+        return format!("{}d ago", delta / DAY);
+    }
+    format_date_ms(at_ms)
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -87,4 +132,40 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let year = yoe + era * 400 + i64::from(month <= 2);
     (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINUTE: i64 = 60_000;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+
+    /// The two sources of a broadcast's end disagree by seconds, so the
+    /// buckets must not: anything under two minutes is simply "now".
+    #[test]
+    fn the_fresh_end_of_a_broadcast_is_now_not_a_minute_ago() {
+        let now = 1_700_000_000_000;
+        assert_eq!(format_ago(now, now), "now");
+        assert_eq!(format_ago(now - 119_000, now), "now");
+        assert_eq!(format_ago(now - 2 * MINUTE, now), "2m ago");
+        assert_eq!(format_ago(now - 59 * MINUTE, now), "59m ago");
+        assert_eq!(format_ago(now - HOUR, now), "1h ago");
+        assert_eq!(format_ago(now - 23 * HOUR, now), "23h ago");
+        assert_eq!(format_ago(now - DAY, now), "1d ago");
+        assert_eq!(format_ago(now - 6 * DAY, now), "6d ago");
+    }
+
+    #[test]
+    fn older_than_a_week_is_a_date_and_a_future_instant_is_now() {
+        let now = 1_700_000_000_000;
+        assert_eq!(format_ago(now + MINUTE, now), "now");
+        assert_eq!(
+            format_ago(now - 7 * DAY, now),
+            format_date_ms(now - 7 * DAY)
+        );
+        assert_eq!(format_date_ms(0), "1970-01-01");
+        assert_eq!(format_date_ms(951_782_400_000), "2000-02-29");
+    }
 }

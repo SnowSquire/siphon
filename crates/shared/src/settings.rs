@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
-use serde::Serialize;
+use sonic_rs::Deserialize;
+use sonic_rs::Serialize;
 
 use crate::store;
 
@@ -101,6 +101,71 @@ pub fn save(app_id: &str, settings: &UiSettings) -> Result<(), store::StoreError
     store::write(&path(app_id), settings)
 }
 
+/// The channels a client keeps at the top of the list.
+///
+/// A pin is an ordering preference, not something the daemon acts on, so it
+/// lives with the client's display settings rather than in the daemon's config.
+/// Keyed by channel id, which is Twitch's and survives a rename; a snapshot
+/// prunes ids that are no longer followed. A separate document from
+/// [`UiSettings`] because that one is `Copy` and travels to the renderer, while
+/// this is a list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Pins {
+    pub version: u64,
+    pub ids: Vec<u64>,
+}
+
+impl Pins {
+    /// Current on-disk schema.
+    pub const VERSION: u64 = 1;
+
+    /// The file this client's pins live in.
+    #[must_use]
+    pub fn path(app_id: &str) -> PathBuf {
+        store::path(app_id, "pins.json")
+    }
+}
+
+impl Default for Pins {
+    fn default() -> Self {
+        Self {
+            version: Self::VERSION,
+            ids: Vec::new(),
+        }
+    }
+}
+
+/// Reads a client's pins.
+///
+/// Missing, unreadable or newer than this build means no pins: an ordering
+/// preference must never keep the window from opening.
+#[must_use]
+pub fn load_pins(app_id: &str) -> Pins {
+    let path = Pins::path(app_id);
+    match store::read::<Pins>(&path) {
+        Ok(Some(pins)) if pins.version <= Pins::VERSION => pins,
+        Ok(Some(pins)) => {
+            tracing::info!(
+                target: "settings",
+                "ignoring pins version {} at {path:?}",
+                pins.version
+            );
+            Pins::default()
+        }
+        Ok(None) => Pins::default(),
+        Err(error) => {
+            tracing::info!(target: "settings", "starting without pins: {error}");
+            Pins::default()
+        }
+    }
+}
+
+/// Writes a client's pins, replacing the file.
+pub fn save_pins(app_id: &str, pins: &Pins) -> Result<(), store::StoreError> {
+    store::write(&Pins::path(app_id), pins)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +188,12 @@ mod tests {
         let json = sonic_rs::to_string(&written).expect("serialise");
         let read_back: UiSettings = sonic_rs::from_slice(json.as_bytes()).expect("parse");
         assert_eq!(read_back, written);
+    }
+
+    #[test]
+    fn pins_without_a_version_are_v1_with_no_ids() {
+        let pins: Pins = sonic_rs::from_slice(br#"{}"#).expect("parse");
+        assert_eq!(pins.version, Pins::VERSION);
+        assert!(pins.ids.is_empty());
     }
 }

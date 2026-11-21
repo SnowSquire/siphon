@@ -325,7 +325,7 @@ impl App {
         let avatar_url = user.profile_image_url.clone();
         let needs_avatar = user.avatar_path.is_none();
         self.bus
-            .publish(Update::ChannelUpsert(user.view(config.as_ref())));
+            .publish(Update::ChannelUpsert(Box::new(user.view(config.as_ref()))));
         self.channels.insert(id, user);
         if needs_avatar {
             self.ensure_avatar(id, &avatar_url);
@@ -690,7 +690,7 @@ impl App {
                 display_name: game_display_name.unwrap_or_default(),
             });
         let view = user.view(channel.as_ref());
-        self.bus.publish(Update::ChannelUpsert(view));
+        self.bus.publish(Update::ChannelUpsert(Box::new(view)));
         if !changes.is_empty() {
             self.bus.log_channel(
                 LogLevel::Info,
@@ -728,7 +728,7 @@ impl App {
                         .and_then(|count| u32::try_from(count).ok());
                 }
                 let view = user.view(channel.as_ref());
-                self.bus.publish(Update::ChannelUpsert(view));
+                self.bus.publish(Update::ChannelUpsert(Box::new(view)));
             }
             Some("stream-up") => {
                 let quiet = self.quiet(id);
@@ -747,7 +747,7 @@ impl App {
                 };
                 user.live = true;
                 let view = user.view(channel.as_ref());
-                self.bus.publish(Update::ChannelUpsert(view));
+                self.bus.publish(Update::ChannelUpsert(Box::new(view)));
                 self.publish_conn_health();
                 self.bus.log_channel(
                     LogLevel::Info,
@@ -794,8 +794,15 @@ impl App {
                     user.live = false;
                     user.collaboration_viewers = None;
                     user.viewers = None;
+                    // Provisional, and within seconds of right: Twitch's
+                    // `lastBroadcast.startedAt` for an offline channel is the
+                    // end of the broadcast, but the detail still carries the
+                    // *start* of the one that just ended until the next poll.
+                    // Writing the end now keeps the row from reading "last
+                    // live 6h ago" for a stream that just stopped.
+                    user.last_live = Some(crate::time::now_ms());
                     let view = user.view(channel.as_ref());
-                    self.bus.publish(Update::ChannelUpsert(view));
+                    self.bus.publish(Update::ChannelUpsert(Box::new(view)));
                 }
                 self.bus.log_channel(
                     LogLevel::Info,
@@ -845,6 +852,15 @@ impl App {
             }
             Err(error) => {
                 tracing::info!(target: "hermes", "stream-up refresh failed: {error}");
+                // The row keeps the previous detail and gains a warning; the
+                // next successful refresh clears it (the GQL detail carries
+                // no error of its own).
+                let config = self.channel_config(id);
+                if let Some(user) = self.channels.get_mut(&id) {
+                    user.error = Some(format!("refresh failed: {error}"));
+                    let view = user.view(config.as_ref());
+                    self.bus.publish(Update::ChannelUpsert(Box::new(view)));
+                }
             }
         }
     }

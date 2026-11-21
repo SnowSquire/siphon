@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use siphon_shared::rpc::ArenaSummary;
+use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
 use siphon_shared::rpc::ConnHealth;
 use siphon_shared::rpc::DownloaderSummary;
@@ -34,6 +35,7 @@ use zgui::vocab::NamedKey;
 use zgui_ui::prelude::*;
 use zgui_ui_tokens::prelude::*;
 
+use crate::format::format_ago;
 use crate::format::format_bytes;
 use crate::format::format_count;
 use crate::format::format_duration_ms;
@@ -90,6 +92,7 @@ impl zgui::runtime::FrameProbe for FrameLog {
 
 pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Result<()> {
     let state = UiState::new();
+    state.set_pins(siphon_shared::settings::load_pins(crate::service::APP_ID).ids);
     // The preset dark scheme is close, but the window has its own ink. The
     // token block is what makes every zgui-ui control (switches, inputs,
     // tooltips, buttons) use the same palette as the hand-written classes.
@@ -156,7 +159,13 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
             view! {
                 TooltipProvider(delay = Duration::from_millis(400)) {
                     ThemeProvider(scheme = ColorScheme::Dark, dark = dark) {
-                        App(state = state, intents = intents, events = events, display = display)
+                        // The toaster wraps the interface rather than sitting
+                        // beside it: its queue reaches callers through the scope
+                        // tree, and the row that removes a channel is the one
+                        // that has to offer the undo.
+                        Toaster(corner = ToastCorner::BottomRight, limit = 3) {
+                            App(state = state, intents = intents, events = events, display = display)
+                        }
                     }
                 }
             }
@@ -254,6 +263,7 @@ fn App(
     let error_sig = state.error;
     let offer = state.update;
     let channels_sig = state.channels;
+    let pins_sig = state.pins;
     let pending_sig = state.pending;
     let pipelines_sig = state.pipelines;
     let arena_sig = state.arena;
@@ -339,6 +349,46 @@ fn App(
 
     let ticker =
         Signal::derive_local(move || ticker_text(&channels_sig.get(), &notifications_sig.get()));
+    // Relative labels ("2h ago") age on their own clock. Once a minute is
+    // enough for the buckets `format_ago` uses; the timer re-arms itself, and
+    // nothing else in the interface ticks. The handle has to outlive the call:
+    // dropping it is what cancels the timer.
+    let now = RwSignal::new_local(crate::format::now_ms());
+    {
+        fn arm(
+            now: RwSignal<i64, LocalStorage>,
+            slot: Rc<RefCell<Option<zgui::view::TimeoutHandle>>>,
+        ) {
+            let next = Rc::clone(&slot);
+            let handle = set_timeout(Duration::from_secs(30), move || {
+                now.set(crate::format::now_ms());
+                arm(now, next);
+            });
+            *slot.borrow_mut() = Some(handle);
+        }
+        arm(now, Rc::new(RefCell::new(None)));
+    }
+    let toggle_pin = {
+        let state = state.clone();
+        UnsyncCallback::new(move |id: u64| state.toggle_pin(id))
+    };
+    // A running recording and a channel in trouble are the two things worth
+    // seeing without opening the tab that holds them.
+    let rec_count = Signal::derive_local(move || {
+        pipelines_sig
+            .get()
+            .iter()
+            .filter(|pipeline| pipeline.with(is_recorded))
+            .count()
+    });
+    let error_count = Signal::derive_local(move || {
+        let pipelines = pipelines_sig.get();
+        channels_sig
+            .get()
+            .iter()
+            .filter(|channel| channel.with_untracked(|c| channel_error(c, &pipelines).is_some()))
+            .count()
+    });
     let tab_weight = RwSignal::new_local(1.0f32);
     let previous_tab = RwSignal::new_local(None::<Tab>);
     let tab_generation = Rc::new(Cell::new(0u64));
@@ -420,6 +470,9 @@ fn App(
                     on:click = tab_click(Tab::Channels)
                 ) {
                     text(class = "tab__label", var:--tab-label-w = Some("66px".to_owned())) {"Channels"}
+                    box(class = "tab__count tab__count--error", class:on = move || error_count.get() > 0) {
+                        {move || if error_count.get() > 0 { error_count.get().to_string() } else { String::new() }}
+                    }
                 }
                 box(
                     class = "tab",
@@ -436,6 +489,9 @@ fn App(
                     on:click = tab_click(Tab::Recordings)
                 ) {
                     text(class = "tab__label", var:--tab-label-w = Some("74px".to_owned())) {"Recordings"}
+                    box(class = "tab__count tab__count--rec", class:on = move || rec_count.get() > 0) {
+                        {move || if rec_count.get() > 0 { rec_count.get().to_string() } else { String::new() }}
+                    }
                 }
                 box(
                     class = "tab",
@@ -468,11 +524,15 @@ fn App(
             if move || tab.get() == Tab::Channels {
                 ChannelsTab(
                     channels = channels_sig,
+                    pins = pins_sig,
+                    pipelines = pipelines_sig,
+                    now = now,
                     pending = pending_sig,
                     expanded = expanded,
                     closing = closing,
                     draft = draft,
                     intents = Rc::clone(&channels_intents),
+                    toggle_pin = toggle_pin,
                 )
             }
             if move || tab.get() == Tab::Filter {
@@ -551,14 +611,23 @@ fn ListThumb() -> impl IntoView {
 }
 
 #[component]
-#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone,
+    clippy::too_many_arguments,
+    reason = "every argument is one reactive handle the view reads"
+)]
 fn ChannelsTab(
     channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
+    pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
+    pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
+    now: RwSignal<i64, LocalStorage>,
     pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
     closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
+    toggle_pin: UnsyncCallback<u64>,
 ) -> impl IntoView {
     let add_login: Rc<dyn Fn()> = {
         let intents = Rc::clone(&intents);
@@ -567,7 +636,10 @@ fn ChannelsTab(
             if login.is_empty() {
                 return;
             }
-            intents.send(Request::AddLogin(login));
+            intents.send(Request::AddLogin {
+                login,
+                switches: None,
+            });
             draft.set(String::new());
         })
     };
@@ -602,9 +674,13 @@ fn ChannelsTab(
                     for channel in move || (*channels.get()).clone(), key = |channel: &RwSignal<ChannelView, LocalStorage>| channel.get_untracked().id {
                         ChannelRow(
                             channel = channel,
+                            pins = pins,
+                            pipelines = pipelines,
+                            now = now,
                             expanded = expanded,
                             closing = closing,
                             intents = Rc::clone(&rows),
+                            toggle_pin = toggle_pin,
                         )
                     }
                     for login in move || (*pending.get()).clone(), key = |login: &String| login.clone() {
@@ -641,17 +717,27 @@ fn ChannelsTab(
 }
 
 #[component]
-#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone,
+    clippy::too_many_arguments,
+    reason = "every argument is one reactive handle the row reads"
+)]
 fn ChannelRow(
     channel: RwSignal<ChannelView, LocalStorage>,
+    pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
+    pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
+    now: RwSignal<i64, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
     closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     intents: Rc<IntentSender>,
+    toggle_pin: UnsyncCallback<u64>,
 ) -> impl IntoView {
     // Nothing below reads `channel` directly: the component body runs once, so
     // every value that has to follow the daemon is a derived signal read by the
     // hole that draws it.
     let id = channel.get_untracked().id;
+    let login = channel.get_untracked().login.clone();
     // A panel that is on its way out is still drawn, and the row keeps its
     // open styling until it has gone.
     let open =
@@ -659,13 +745,12 @@ fn ChannelRow(
     let closing_this = Signal::derive_local(move || closing.get().contains(&id));
     // The pending exit timeout, so re-opening cancels it instead of letting it
     // unmount a panel the user just asked for.
-    let close_timer: Rc<RefCell<Option<zgui::view::TimeoutHandle>>> =
-        Rc::new(RefCell::new(None));
+    let close_timer: Rc<RefCell<Option<zgui::view::TimeoutHandle>>> = Rc::new(RefCell::new(None));
     let display_name = Signal::derive_local(move || channel.with(|c| c.display_name.clone()));
     let initials =
         Signal::derive_local(move || initials(&channel.with(|c| c.display_name.clone())));
     let avatar_path = Signal::derive_local(move || channel.with(|c| c.avatar_path.clone()));
-    let color = Signal::derive_local(move || channel.with(|c| c.chat_color.clone()));
+    let color = Signal::derive_local(move || channel.with(|c| c.chat_color));
     let live = Signal::derive_local(move || channel.with(|c| c.live));
     let title = Signal::derive_local(move || {
         channel
@@ -716,6 +801,47 @@ fn ChannelRow(
         }
     };
 
+    let pinned = Signal::derive_local(move || pins.get().contains(&id));
+    // A recording is claimed by the login, not the row: the pipeline key is
+    // the monitor's (login, quality), while the row knows the channel.
+    let recording = Signal::derive_local(move || {
+        pipelines.get().iter().any(|pipeline| {
+            pipeline.with(|pipeline| {
+                pipeline.key.login.eq_ignore_ascii_case(&login) && is_recorded(pipeline)
+            })
+        })
+    });
+    let error = Signal::derive_local(move || channel.with(|c| channel_error(c, &pipelines.get())));
+    // Live rows show the counter; offline rows show when they were last live,
+    // which is the only useful thing a dead channel has to say. Both are one
+    // right-aligned column, and the dot already carries the live/offline state.
+    let viewers_label = Signal::derive_local(move || {
+        channel.with(|c| {
+            if c.live {
+                return c.viewers.map_or_else(|| "—".to_owned(), format_count);
+            }
+            c.last_live_ms
+                .map_or_else(|| "—".to_owned(), |at| format_ago(at, now.get()))
+        })
+    });
+    let viewers_tip = Signal::derive_local(move || {
+        channel.with(|c| {
+            if c.live {
+                return c.viewers.map_or_else(
+                    || "Watching".to_owned(),
+                    |count| format!("{count} watching"),
+                );
+            }
+            c.last_live_ms.map_or_else(
+                || "Has not been live yet".to_owned(),
+                |at| format!("Last live {}", format_iso_ms(at)),
+            )
+        })
+    });
+    // In the component body, not in the click: the queue is reached through
+    // the scope tree, and a handler runs outside it.
+    let toasts = use_toaster();
+
     let live_intents = Rc::clone(&intents);
     let title_intents = Rc::clone(&intents);
     let record_intents = Rc::clone(&intents);
@@ -752,128 +878,231 @@ fn ChannelRow(
         },
     );
 
+    let pin_select = UnsyncCallback::new(move |()| toggle_pin.run(id));
+    let remove_select = UnsyncCallback::new({
+        let intents = Rc::clone(&intents);
+        move |()| {
+            remove_channel(
+                Rc::clone(&intents),
+                &channel.get_untracked(),
+                toasts,
+                pinned.get_untracked(),
+                toggle_pin,
+            );
+        }
+    });
+
     view! {
-        column(
-            class = "channel",
-            // The row, the switch and the expanded panel all read this, so it
-            // lives on the wrapper rather than on the row alone.
-            var:--channel-color = move || Some(color.get())
-        ) {
-            row(
-                class = "channel-row",
-                class:open = open,
-                class:offline = move || !live.get(),
-                on:pointer_enter = enter,
-                on:pointer_leave = leave,
-                on:click = {
-                    let close_timer = Rc::clone(&close_timer);
-                    move |_| {
-                        if closing.get_untracked().contains(&id) {
-                            // Re-opened while rolling away: keep it mounted and
-                            // cancel the unmount.
-                            closing.update(|set| {
-                                set.remove(&id);
-                            });
-                            *close_timer.borrow_mut() = None;
-                        } else if expanded.get_untracked().contains(&id) {
-                            closing.update(|set| {
-                                set.insert(id);
-                            });
-                            *close_timer.borrow_mut() =
-                                Some(set_timeout(
-                                    Duration::from_millis(DETAIL_ROLL_MS),
-                                    move || {
-                                        closing.update(|set| {
-                                            set.remove(&id);
-                                        });
-                                        expanded.update(|set| {
-                                            set.remove(&id);
-                                        });
-                                    },
-                                ));
-                        } else {
-                            expanded.update(|set| {
-                                set.insert(id);
-                            });
-                        }
-                    }
-                }
-            ) {
-                box(class = "live-dot", class:live = live) {box(class = "live-dot__lamp")}
-                box(class = "chevron", class:open = open) {
-                    box(class = "chevron__tip")
-                }
-                Tooltip {
-                    TooltipTrigger(class = "cell cell--channel") {
-                        row(class = "identity") {
-                            Avatar(
-                                size = AvatarSize::Sm,
-                                src = avatar_path,
-                                label = Some(display_name.get_untracked()),
-                            ) {
-                                text {{move || initials.get()}}
+        ContextMenu {
+            ContextMenuTrigger(class = "channel") {
+                row(
+                    class = "channel-row",
+                    class:open = open,
+                    class:offline = move || !live.get(),
+                    // The row, the switches and the chevron read this; the
+                    // panel sets it again on its own box, because a component
+                    // boundary is not a place to rely on inheritance.
+                    var:--channel-color = move || Some(color.get().to_string()),
+                    on:pointer_enter = enter,
+                    on:pointer_leave = leave,
+                    on:click = {
+                        let close_timer = Rc::clone(&close_timer);
+                        move |_| {
+                            if closing.get_untracked().contains(&id) {
+                                // Re-opened while rolling away: keep it mounted
+                                // and cancel the unmount.
+                                closing.update(|set| {
+                                    set.remove(&id);
+                                });
+                                *close_timer.borrow_mut() = None;
+                            } else if expanded.get_untracked().contains(&id) {
+                                closing.update(|set| {
+                                    set.insert(id);
+                                });
+                                *close_timer.borrow_mut() =
+                                    Some(set_timeout(
+                                        Duration::from_millis(DETAIL_ROLL_MS),
+                                        move || {
+                                            closing.update(|set| {
+                                                set.remove(&id);
+                                            });
+                                            expanded.update(|set| {
+                                                set.remove(&id);
+                                            });
+                                        },
+                                    ));
+                            } else {
+                                expanded.update(|set| {
+                                    set.insert(id);
+                                });
                             }
-                            text(class = "channel-name") {{move || display_name.get()}}
                         }
                     }
-                    TooltipContent {{format!("Channel ID {id}")}}
-                }
-                Tooltip {
-                    TooltipTrigger(class = "cell cell--title") {
-                        box(class = "channel-title") {
-                            text(
-                                class = "channel-title__run",
-                                // An inline transform rather than a custom property
-                                // read back from the stylesheet: a bare `var()` value
-                                // works (the channel accents prove it), but the same
-                                // substitution inside `translateX()` was dropped and
-                                // the title never moved.
-                                style:transform = move || {
-                                    Some(format!("translateX(-{:.1}px)", title_shift.get()))
-                                },
-                            ) {{move || title_run.get()}}
-                        }
-                    }
-                    TooltipContent {{move || stream_tooltip(&channel.get())}}
-                }
-                box(class = "cell cell--notify", on:click:stop = |_| {}) {
-                    Tooltip {
-                        TooltipTrigger {
-                            Switch(
-                                size = SwitchSize::Sm,
-                                checked = notify_live,
-                            )
-                        }
-                        TooltipContent {"Notify when this channel goes live"}
-                    }
-                    Tooltip {
-                        TooltipTrigger {
-                            Switch(
-                                size = SwitchSize::Sm,
-                                checked = notify_titles,
-                            )
-                        }
-                        TooltipContent {"Notify when the title or game changes"}
-                    }
-                }
-                box(class = "cell cell--record", on:click:stop = |_| {}) {
-                    Switch(
-                        size = SwitchSize::Sm,
-                        checked = record,
-                    )
-                }
-                text(class = "cell cell--viewers") {{move || viewers(&channel.get())}}
-            }
-            if move || open.get() {
-                box(
-                    class = "detail-clip",
-                    class:closing = closing_this
                 ) {
-                    {channel_detail(channel, &detail_intents)}
+                    box(class = "live-dot", class:live = live) {box(class = "live-dot__lamp")}
+                    box(class = "chevron", class:open = open) {
+                        box(class = "chevron__tip")
+                    }
+                    Tooltip {
+                        TooltipTrigger(class = "cell cell--channel") {
+                            row(class = "identity") {
+                                Avatar(
+                                    size = AvatarSize::Sm,
+                                    src = avatar_path,
+                                    label = Some(display_name.get_untracked()),
+                                ) {
+                                    text {{move || initials.get()}}
+                                }
+                                text(class = "channel-name") {{move || display_name.get()}}
+                            }
+                        }
+                        TooltipContent {{format!("Channel ID {id}")}}
+                    }
+                    Tooltip {
+                        TooltipTrigger(class = "cell cell--title") {
+                            row(class = "title-cell") {
+                                // The row's state marks lead the title: a
+                                // failure, a recording, and a pin all describe
+                                // the row as a whole, and none of them is worth
+                                // a column of its own.
+                                if move || error.get().is_some() {
+                                    box(class = "mark mark--error") {
+                                        text(class = "mark__glyph") {"!"}
+                                    }
+                                }
+                                if move || recording.get() {
+                                    box(class = "rec-pill") {text {"REC"}}
+                                }
+                                if move || pinned.get() {
+                                    box(class = "pin") {
+                                        box(class = "pin__head")
+                                        box(class = "pin__stem")
+                                    }
+                                }
+                                box(class = "channel-title") {
+                                    text(
+                                        class = "channel-title__run",
+                                        // An inline transform rather than a custom property
+                                        // read back from the stylesheet: a bare `var()` value
+                                        // works (the channel accents prove it), but the same
+                                        // substitution inside `translateX()` was dropped and
+                                        // the title never moved.
+                                        style:transform = move || {
+                                            Some(format!("translateX(-{:.1}px)", title_shift.get()))
+                                        },
+                                    ) {{move || title_run.get()}}
+                                }
+                            }
+                        }
+                        TooltipContent {{move || error.get().unwrap_or_else(|| stream_tooltip(&channel.get()))}}
+                    }
+                    box(class = "cell cell--notify", on:click:stop = |_| {}) {
+                        Tooltip {
+                            TooltipTrigger {
+                                Switch(
+                                    size = SwitchSize::Sm,
+                                    checked = notify_live,
+                                )
+                            }
+                            TooltipContent {"Notify when this channel goes live"}
+                        }
+                        Tooltip {
+                            TooltipTrigger {
+                                Switch(
+                                    size = SwitchSize::Sm,
+                                    checked = notify_titles,
+                                )
+                            }
+                            TooltipContent {"Notify when the title or game changes"}
+                        }
+                    }
+                    box(class = "cell cell--record", on:click:stop = |_| {}) {
+                        Switch(
+                            size = SwitchSize::Sm,
+                            checked = record,
+                        )
+                    }
+                    Tooltip {
+                        TooltipTrigger(class = "cell cell--viewers") {
+                            text(
+                                class = "viewers__value",
+                                class:stale = move || !live.get(),
+                            ) {{move || viewers_label.get()}}
+                        }
+                        TooltipContent {{move || viewers_tip.get()}}
+                    }
+                }
+                if move || open.get() {
+                    box(
+                        class = "detail-clip",
+                        class:closing = closing_this
+                    ) {
+                        {channel_detail(channel, &detail_intents, pins, toggle_pin, toasts)}
+                    }
+                }
+            }
+            // The menu is the accelerator; every one of these actions is also
+            // in the expanded panel. A row whose only way to do something is a
+            // right-click is a row a keyboard cannot use.
+            ContextMenuContent {
+                if move || pinned.get() {
+                    MenuItem(on_select = pin_select) {"Unpin"}
+                } else {
+                    MenuItem(on_select = pin_select) {"Pin to top"}
+                }
+                MenuSeparator()
+                MenuItem(destructive = true, on_select = remove_select) {
+                    "Remove channel"
                 }
             }
         }
     }
+}
+
+/// Removes a channel and offers the undo that makes it safe.
+///
+/// The daemon's removal is immediate (its monitors and topics go with it), so
+/// the undo is a real re-add carrying the switches the row had. `AddLogin`
+/// applies them when the resolve lands, so the row never shows the defaults.
+fn remove_channel(
+    intents: Rc<IntentSender>,
+    view: &ChannelView,
+    toasts: Option<ToastQueue>,
+    pinned: bool,
+    toggle_pin: UnsyncCallback<u64>,
+) {
+    let id = view.id;
+    let name = if view.display_name.is_empty() {
+        view.login.clone()
+    } else {
+        view.display_name.clone()
+    };
+    intents.send(Request::RemoveChannel(id));
+    let Some(toasts) = toasts else {
+        return;
+    };
+    let login = view.login.clone();
+    let switches = Some(ChannelSwitches {
+        notify_live: view.notify_live,
+        notify_titles: view.notify_titles,
+        record: view.record,
+    });
+    toasts.push(
+        Toast::new(format!("Removed {name}"))
+            .description("Its switches and pin come back with it.")
+            .duration(Duration::from_secs(8))
+            .action("Undo", move || {
+                intents.send(Request::AddLogin {
+                    login: login.clone(),
+                    switches,
+                });
+                // The config prune drops the pin the moment the channel
+                // leaves, so the undo has to put it back explicitly.
+                if pinned {
+                    toggle_pin.run(id);
+                }
+            }),
+    );
 }
 
 /// The expanded body, with its own handle on the intents.
@@ -883,17 +1112,27 @@ fn ChannelRow(
 fn channel_detail(
     channel: RwSignal<ChannelView, LocalStorage>,
     intents: &Rc<IntentSender>,
+    pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
+    toggle_pin: UnsyncCallback<u64>,
+    toasts: Option<ToastQueue>,
 ) -> impl IntoView {
     let intents = Rc::clone(intents);
-    move || channel_detail_view(channel.get(), intents.clone())
+    move || channel_detail_view(channel.get(), intents.clone(), pins, toggle_pin, toasts)
 }
 
 #[allow(
     clippy::needless_pass_by_value,
     reason = "the returned view borrows the reference it is given"
 )]
-fn channel_detail_view(channel: ChannelView, intents: Rc<IntentSender>) -> impl IntoView {
+fn channel_detail_view(
+    channel: ChannelView,
+    intents: Rc<IntentSender>,
+    pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
+    toggle_pin: UnsyncCallback<u64>,
+    toasts: Option<ToastQueue>,
+) -> impl IntoView {
     let id = channel.id;
+    let pinned = Signal::derive_local(move || pins.get().contains(&id));
     let login = channel.login.clone();
     let title = channel
         .title
@@ -921,14 +1160,25 @@ fn channel_detail_view(channel: ChannelView, intents: Rc<IntentSender>) -> impl 
     let started = channel
         .stream_start_ms
         .map_or_else(|| "—".to_owned(), format_iso_ms);
+    let last_live = channel
+        .last_live_ms
+        .map_or_else(|| "—".to_owned(), format_iso_ms);
     let viewers = channel.viewers.map_or_else(|| "—".to_owned(), format_count);
+    let error = channel.error.clone();
+    let error_line = error.clone();
+    let remove_view = channel.clone();
+    let remove_intents = Rc::clone(&intents);
+    let channel_color = channel.chat_color.to_string();
 
     view! {
-        column(class = "detail") {
+        column(class = "detail", var:--channel-color = Some(channel_color)) {
             row(class = "detail-head") {
                 text(class = "detail-login") {{format!("@{login}")}}
             }
             text(class = "detail-title") {{title}}
+            if move || error.is_some() {
+                text(class = "detail-error") {{error_line.clone().unwrap_or_default()}}
+            }
             row(class = "detail-grid") {
                 column(class = "detail-col") {
                     {detail_item("Channel ID", channel.id.to_string())}
@@ -940,16 +1190,30 @@ fn channel_detail_view(channel: ChannelView, intents: Rc<IntentSender>) -> impl 
                     {detail_item("Viewers", viewers)}
                     {detail_item("Collab", collab)}
                     {detail_item("Started", started)}
+                    {detail_item("Last live", last_live)}
                 }
             }
             row(class = "detail-foot") {
+                Button(
+                    size = ButtonSize::Sm,
+                    variant = ButtonVariant::Ghost,
+                    on:click = move |_| toggle_pin.run(id)
+                ) {
+                    {move || if pinned.get() { "Unpin" } else { "Pin to top" }}
+                }
                 spacer()
                 Button(
                     size = ButtonSize::Sm,
                     variant = ButtonVariant::Outline,
                     class = "detail-remove",
                     on:click = move |_| {
-                        intents.send(Request::RemoveChannel(id));
+                        remove_channel(
+                            Rc::clone(&remove_intents),
+                            &remove_view,
+                            toasts,
+                            pinned.get_untracked(),
+                            toggle_pin,
+                        );
                     }
                 ) {"Remove"}
             }
@@ -1633,11 +1897,36 @@ const fn state_label(state: PipelineState) -> &'static str {
     }
 }
 
-fn viewers(channel: &ChannelView) -> String {
-    if !channel.live {
-        return "offline".to_owned();
+/// The first failure that belongs to a pipeline: the disk recorder's, the
+/// stream's, or a scheduler that gave up.
+fn pipeline_error(pipeline: &PipelineView) -> Option<String> {
+    pipeline
+        .disk
+        .as_ref()
+        .and_then(|disk| disk.last_error.clone())
+        .or_else(|| pipeline.last_error.clone())
+        .or_else(|| (pipeline.state == PipelineState::Failed).then(|| "pipeline failed".to_owned()))
+}
+
+/// Every failure the row knows about: the channel's own refresh and whatever
+/// its pipelines say. The tab badge, the row mark and the detail all read this,
+/// so they cannot disagree about whether something is wrong.
+fn channel_error(
+    channel: &ChannelView,
+    pipelines: &[RwSignal<PipelineView, LocalStorage>],
+) -> Option<String> {
+    if let Some(error) = &channel.error {
+        return Some(error.clone());
     }
-    channel.viewers.map_or_else(|| "—".to_owned(), format_count)
+    pipelines.iter().find_map(|pipeline| {
+        pipeline.with(|pipeline| {
+            if pipeline.key.login.eq_ignore_ascii_case(&channel.login) {
+                pipeline_error(pipeline)
+            } else {
+                None
+            }
+        })
+    })
 }
 
 fn stream_tooltip(channel: &ChannelView) -> String {
@@ -1866,7 +2155,7 @@ const SHEET: &str = css!(
         display: flex;
         align-items: center;
     }
-    .cell--viewers { width: 82px; text-align: right; }
+    .cell--viewers { width: 92px; text-align: right; }
     .cell--action { width: 34px; }
     .cell--quality { width: 90px; }
     .cell--state { width: 82px; }
@@ -1965,6 +2254,75 @@ const SHEET: &str = css!(
         text-overflow: ellipsis;
         white-space: nowrap;
     }
+
+    /* The title cell carries the row's state marks in front of the text: a
+       failure, a recording, and a pin. They are small enough to read as part
+       of the title rather than as extra columns. */
+    .title-cell {
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+        min-width: 0;
+    }
+
+    .mark {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 12px;
+        height: 12px;
+        flex-shrink: 0;
+        border: 1px solid oklch(0.55 0.14 20);
+    }
+
+    .mark__glyph {
+        font-size: 9px;
+        font-weight: 700;
+        line-height: 1;
+        color: #ff9aa8;
+    }
+
+    .rec-pill {
+        flex-shrink: 0;
+        padding: 0 4px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        line-height: 13px;
+        color: oklch(0.86 0.13 75);
+        border: 1px solid oklch(0.45 0.08 75);
+        background-color: oklch(0.22 0.04 70);
+    }
+
+    /* A pushpin drawn as a head and a stem: a glyph would need a font that
+       has one, and this stays crisp at 8px. */
+    .pin {
+        display: inline-flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1px;
+        width: 8px;
+        flex-shrink: 0;
+    }
+
+    .pin__head {
+        width: 8px;
+        height: 3px;
+        background-color: var(--zui-color-primary);
+    }
+
+    .pin__stem {
+        width: 2px;
+        height: 4px;
+        background-color: var(--zui-color-primary);
+    }
+
+    .viewers__value {
+        font-size: 12px;
+        color: oklch(0.88 0.010 240);
+    }
+
+    .viewers__value.stale { color: oklch(0.60 0.015 240); }
 
     /* The panel is part of the row, not a card under it: no gap, no top
        border, and the open row's channel-coloured edge runs straight through
@@ -2297,6 +2655,25 @@ const SHEET: &str = css!(
     width: var(--tab-label-w, 60px);
     text-align: center;
 }
+/* A count beside the tab's name. The slot is always there so the row does not
+   shift when a recording starts; only its opacity changes with the count. */
+.tab__count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 14px;
+    height: 14px;
+    margin-left: 6px;
+    padding: 0 3px;
+    font-family: UIFont, Archivo, SiphonEmoji, sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    opacity: 0;
+}
+.tab__count.on { opacity: 1; }
+.tab__count--error { background-color: oklch(0.45 0.16 20); color: #ffffff; }
+.tab__count--rec { background-color: oklch(0.58 0.13 75); color: oklch(0.18 0.03 70); }
 .tabbody {
     min-height: 0;
     gap: 0;
@@ -2368,6 +2745,14 @@ const SHEET: &str = css!(
     font-size: 13px;
     line-height: 1.4;
     color: oklch(0.95 0.008 240);
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.detail-error {
+    width: 100%;
+    font-size: 12px;
+    line-height: 1.4;
+    color: #ff9aa8;
     white-space: normal;
     overflow-wrap: anywhere;
 }

@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::de::Visitor;
 use siphon_shared::rpc::ChannelView;
+use siphon_shared::rpc::ChatColor;
 use thiserror::Error;
 
 use crate::constants::DEFAULT_CLIENT_ID;
@@ -23,8 +24,8 @@ use crate::time::parse_iso_ms;
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 
-const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login chatColor displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
-const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login chatColor displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}}}";
+const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login chatColor displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}lastBroadcast{startedAt}}}";
+const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login chatColor displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}lastBroadcast{startedAt}}}";
 
 #[derive(Debug, Error)]
 pub enum GqlError {
@@ -48,7 +49,7 @@ pub struct ChannelDetail {
     pub display_name: String,
     /// CSS colour for this channel's switches: Twitch's chat colour, or a
     /// stable generated one when the user has not picked a chat colour.
-    pub chat_color: String,
+    pub chat_color: ChatColor,
     pub profile_image_url: String,
     /// Local avatar file, once the app has cached the remote picture.
     pub avatar_path: Option<String>,
@@ -57,10 +58,19 @@ pub struct ChannelDetail {
     pub stream_title: Option<String>,
     /// Milliseconds since the unix epoch; `None` when offline.
     pub stream_start: Option<i64>,
+    /// The `startedAt` of the channel's most recent broadcast. While live that
+    /// is the current broadcast's start; while offline Twitch reports the
+    /// *end* of the last one under the same field. `stream-down` writes the
+    /// current time first so the row is right before the next poll corrects it.
+    pub last_live: Option<i64>,
     pub viewers: Option<u32>,
     pub collaboration_viewers: Option<u32>,
     pub game: Option<StreamGame>,
     pub live: bool,
+    /// The last per-channel failure this detail carries, cleared by the next
+    /// successful refresh. Not part of the GQL payload: it is set by the app
+    /// when a refresh for this id fails.
+    pub error: Option<String>,
 }
 
 /// The game a broadcast is categorised under.
@@ -85,8 +95,7 @@ impl ChannelDetail {
             id: self.id,
             login: self.login.clone(),
             display_name: self.display_name.clone(),
-            chat_color: self.chat_color.clone(),
-            profile_image_url: self.profile_image_url.clone(),
+            chat_color: self.chat_color,
             avatar_path: self.avatar_path.clone(),
             live: self.live,
             title: self.stream_title.clone(),
@@ -95,7 +104,9 @@ impl ChannelDetail {
             viewers: self.viewers,
             collaboration_viewers: self.collaboration_viewers,
             stream_start_ms: self.stream_start,
+            last_live_ms: self.last_live,
             stream_id: self.stream_id,
+            error: self.error.clone(),
             notify_live: channel.is_none_or(|channel| channel.notify_live),
             notify_titles: channel.is_none_or(|channel| channel.notify_titles),
             record: channel.is_some_and(|channel| channel.record),
@@ -143,6 +154,16 @@ struct GqlUser {
     #[serde(rename = "broadcastSettings")]
     broadcast_settings: Option<GqlBroadcastSettings>,
     stream: Option<GqlStream>,
+    /// The most recent broadcast. Twitch calls its `startedAt` a start time,
+    /// but while the channel is offline it is the end of that broadcast.
+    #[serde(rename = "lastBroadcast")]
+    last_broadcast: Option<GqlLastBroadcast>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlLastBroadcast {
+    #[serde(rename = "startedAt")]
+    started_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,7 +245,7 @@ where
 /// they pick one). The channel id walked by the golden angle spreads hues
 /// across the wheel while keeping each channel's colour the same across
 /// refreshes and restarts, rather than flickering on every snapshot.
-pub fn fallback_color(id: u64) -> String {
+pub fn fallback_color(id: u64) -> ChatColor {
     const GOLDEN_ANGLE: f64 = 137.507_764_050_918;
     // Ids are only a hue seed here: the high bits survive, and a collision in
     // the low 12 would pick the same colour anyway after `% 360`.
@@ -236,7 +257,25 @@ pub fn fallback_color(id: u64) -> String {
     let hue = (seed * GOLDEN_ANGLE) % 360.0;
     let lightness = f64::from((id % 2) as u8).mul_add(0.03, 0.70);
     let chroma = f64::from((id % 3) as u8).mul_add(0.01, 0.13);
-    format!("oklch({lightness:.2} {chroma:.2} {hue:.0})")
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "0..=360 degrees and 0.70..=0.73 / 0.13..=0.15 in thousandths all fit u16"
+    )]
+    ChatColor::Generated {
+        lightness_milli: (lightness * 1000.0).round() as u16,
+        chroma_milli: (chroma * 1000.0).round() as u16,
+        hue: hue.round() as u16,
+    }
+}
+/// Twitch's `chatColor` is `#RRGGBB`; anything else is not a colour and gets
+/// the generated fallback rather than a style property with junk in it.
+fn parse_twitch_color(raw: &str) -> Option<ChatColor> {
+    let hex = raw.strip_prefix('#').unwrap_or(raw);
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok().map(ChatColor::Twitch)
 }
 
 impl GqlUser {
@@ -245,7 +284,8 @@ impl GqlUser {
         let id = self.id?;
         let chat_color = self
             .chat_color
-            .filter(|color| !color.is_empty())
+            .as_deref()
+            .and_then(parse_twitch_color)
             .unwrap_or_else(|| fallback_color(id));
         // `stream` is the single source of truth for liveness and the broadcast
         // identity: it is non-null only while the channel is live, and its `id`
@@ -278,6 +318,19 @@ impl GqlUser {
                 "could not parse Twitch stream createdAt"
             );
         }
+        let last_at = self
+            .last_broadcast
+            .as_ref()
+            .and_then(|broadcast| broadcast.started_at.as_deref());
+        let last_live = last_at.and_then(parse_iso_ms);
+        if last_at.is_some() && last_live.is_none() {
+            tracing::warn!(
+                target: "gql",
+                login = %self.login.as_deref().unwrap_or(""),
+                started_at = %last_at.unwrap_or(""),
+                "could not parse Twitch lastBroadcast startedAt"
+            );
+        }
         Some(ChannelDetail {
             id,
             chat_color,
@@ -288,6 +341,7 @@ impl GqlUser {
             stream_id,
             stream_title: settings.title.filter(|title| !title.is_empty()),
             stream_start,
+            last_live,
             game: settings.game.and_then(|game| {
                 Some(StreamGame {
                     id: game.id?,
@@ -298,6 +352,7 @@ impl GqlUser {
             collaboration_viewers,
             viewers,
             live,
+            error: None,
         })
     }
 }
@@ -500,6 +555,34 @@ mod tests {
     }
 
     #[test]
+    fn typed_decode_carries_the_last_broadcast_time() {
+        let body = br#"{"data": {"users": [
+                {"id": "1", "login": "alice", "displayName": "Alice",
+                 "profileImageURL": "http://x/y.png",
+                 "broadcastSettings": {"title": "last night", "game": null},
+                 "stream": null,
+                 "lastBroadcast": {"startedAt": "2026-11-20T13:41:07.123Z"}}
+            ]}}"#;
+        let users = decode_users(body);
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert_eq!(users[0].last_live, parse_iso_ms("2026-11-20T13:41:07.123Z"));
+        assert!(!users[0].live);
+    }
+
+    #[test]
+    fn typed_decode_without_a_last_broadcast_has_no_last_live() {
+        let body = br#"{"data": {"users": [
+                {"id": "1", "login": "alice", "displayName": "Alice",
+                 "profileImageURL": "http://x/y.png",
+                 "broadcastSettings": {"title": "t", "game": null},
+                 "stream": null}
+            ]}}"#;
+        let users = decode_users(body);
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert!(users[0].last_live.is_none());
+    }
+
+    #[test]
     fn typed_decode_skips_bad_entries_but_keeps_batch() {
         let body = br#"{"data": {"users": [
                 null,
@@ -534,7 +617,9 @@ mod tests {
              "profileImageURL": "http://x/y.png",
              "broadcastSettings": {"title": "hi", "game": null}, "stream": null}
         ]}}"##;
-        assert_eq!(decode_users(with)[0].chat_color, "#FF0000");
+        let user = &decode_users(with)[0];
+        assert_eq!(user.chat_color, ChatColor::Twitch(0x00ff_0000));
+        assert_eq!(user.chat_color.to_string(), "#ff0000");
 
         let without = br#"{"data": {"users": [
             {"id": "123", "login": "alice", "chatColor": null, "displayName": "Alice",
@@ -542,10 +627,26 @@ mod tests {
              "broadcastSettings": {"title": "hi", "game": null}, "stream": null}
         ]}}"#;
         let user = &decode_users(without)[0];
-        assert!(user.chat_color.starts_with("oklch("), "{user:?}");
+        assert!(matches!(user.chat_color, ChatColor::Generated { .. }));
         assert_eq!(user.chat_color, fallback_color(123));
         assert_eq!(fallback_color(123), fallback_color(123));
         assert_ne!(fallback_color(123), fallback_color(456));
+        assert!(fallback_color(123).to_string().starts_with("oklch("));
+    }
+
+    #[test]
+    fn a_malformed_chat_color_falls_back_instead_of_reaching_css() {
+        assert_eq!(
+            parse_twitch_color("#ff0000"),
+            Some(ChatColor::Twitch(0x00ff_0000))
+        );
+        assert_eq!(
+            parse_twitch_color("9146ff"),
+            Some(ChatColor::Twitch(0x0091_46ff))
+        );
+        assert_eq!(parse_twitch_color("#ff000"), None);
+        assert_eq!(parse_twitch_color("#zzzzzz"), None);
+        assert_eq!(parse_twitch_color(""), None);
     }
 
     #[test]

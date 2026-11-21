@@ -178,7 +178,10 @@ mod tests {
     fn roundtrip_preserves_the_message() {
         let message = ClientMessage::Request {
             id: 7,
-            request: Request::AddLogin("alice".to_owned()),
+            request: Request::AddLogin {
+                login: "alice".to_owned(),
+                switches: None,
+            },
         };
         let mut frame = Vec::new();
         encode(&message, &mut frame).unwrap();
@@ -193,7 +196,7 @@ mod tests {
         let message: ClientMessage = decode(&payload).unwrap();
         assert!(matches!(
             message,
-            ClientMessage::Request { id: 7, request: Request::AddLogin(login) } if login == "alice"
+            ClientMessage::Request { id: 7, request: Request::AddLogin { login, switches: None } } if login == "alice"
         ));
     }
 

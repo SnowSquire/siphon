@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -74,6 +74,31 @@ impl Default for Channel {
     }
 }
 
+/// The three switches a follow carries, as a caller may want them set when the
+/// channel is added.
+///
+/// This is what makes removing a channel undoable: deleting it drops the entry
+/// and its switches, and re-adding it with these restores both. `None` in
+/// [`Request::AddLogin`] means the ordinary defaults (both notifications on,
+/// recording off), which is what adding a channel by hand means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSwitches {
+    pub notify_live: bool,
+    pub notify_titles: bool,
+    pub record: bool,
+}
+
+impl Default for ChannelSwitches {
+    fn default() -> Self {
+        Self {
+            notify_live: true,
+            notify_titles: true,
+            record: false,
+        }
+    }
+}
+
 /// The persisted app configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -115,6 +140,44 @@ pub enum ConnHealth {
     NoChannels,
 }
 
+/// The colour a channel's switches and chevron take.
+///
+/// Two producers, one value: Twitch's `chatColor` is `#RRGGBB`, and a channel
+/// that never picked one gets a generated colour. The generated one is authored
+/// in OKLCH because the palette is — its chromas reach outside sRGB, so packing
+/// it down to RGB would change the colour the design asks for. Either way the
+/// UI only needs the CSS text, which `Display` is; a string on the wire would
+/// put an unvalidated value straight into a style property, and cost more than
+/// this does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatColor {
+    /// Twitch's `chatColor`, packed as `0xRRGGBB`.
+    Twitch(u32),
+    /// The generated fallback, in thousandths so the type stays `Eq`.
+    Generated {
+        lightness_milli: u16,
+        chroma_milli: u16,
+        hue: u16,
+    },
+}
+
+impl std::fmt::Display for ChatColor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Twitch(rgb) => write!(formatter, "#{:06x}", rgb & 0x00ff_ffff),
+            Self::Generated {
+                lightness_milli,
+                chroma_milli,
+                hue,
+            } => write!(
+                formatter,
+                "oklch(0.{lightness_milli:03} 0.{chroma_milli:03} {hue})"
+            ),
+        }
+    }
+}
+
 /// One channel row, as the UI renders it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,8 +191,7 @@ pub struct ChannelView {
     pub display_name: String,
     /// Twitch's chat colour for the channel's switches, with a generated
     /// fallback when Twitch reports none.
-    pub chat_color: String,
-    pub profile_image_url: String,
+    pub chat_color: ChatColor,
     /// A local file the daemon cached for the avatar; `None` until it exists.
     pub avatar_path: Option<String>,
     pub live: bool,
@@ -141,8 +203,16 @@ pub struct ChannelView {
     pub collaboration_viewers: Option<u32>,
     /// Milliseconds since the unix epoch; `None` while offline.
     pub stream_start_ms: Option<i64>,
+    /// When this channel was last seen live: Twitch's `lastBroadcast`
+    /// `startedAt` while offline (which is the *end* of that broadcast), or
+    /// the moment `stream-down` landed until that poll corrects it.
+    pub last_live_ms: Option<i64>,
     /// Twitch's `BROADCAST-ID` for the active stream; `None` while offline.
     pub stream_id: Option<NonZeroU64>,
+    /// The last failure this channel itself hit (a GQL refresh, not the
+    /// connection): the row draws a warning when it is set. Pipeline and disk
+    /// failures are carried by their own entities and merged in the UI.
+    pub error: Option<String>,
     pub notify_live: bool,
     pub notify_titles: bool,
     pub record: bool,
@@ -317,7 +387,7 @@ pub struct Snapshot {
 pub enum Update {
     Config(Config),
     Conn(ConnHealth),
-    ChannelUpsert(ChannelView),
+    ChannelUpsert(Box<ChannelView>),
     ChannelRemove(u64),
     Pending(Vec<String>),
     PipelineUpsert(PipelineView),
@@ -348,7 +418,12 @@ pub struct StreamDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Request {
-    AddLogin(String),
+    /// Follow a login. `switches` restores the per-channel settings of a
+    /// channel that was just removed; `None` is a fresh follow with defaults.
+    AddLogin {
+        login: String,
+        switches: Option<ChannelSwitches>,
+    },
     RemoveChannel(u64),
     SetNotifyTitleChanges(bool),
     SetSound(bool),

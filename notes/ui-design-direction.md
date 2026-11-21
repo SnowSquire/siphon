@@ -161,6 +161,31 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   row carries a transparent 2px left edge that an open row paints in its
   channel colour; the cells line up with the header because the edge is
   reserved on both.
+- Order is meaning: pinned rows first, then live, then the channel that was
+  most recently live, with ties keeping config order. Live rows are never
+  ranked by viewers — a list that reshuffles every counter tick cannot be
+  reached for — and the sort only runs when a row's key changes (a live flip,
+  a pin, a new `last live`). Pins are a client preference (`pins.json`), so two
+  windows on one daemon may order differently.
+- The `Viewers` column doubles as recency: live rows show the count, offline
+  rows show `2h ago` in muted type, never-live rows `—`. The dot already says
+  live/offline, so repeating the word was the least informative thing in the
+  row. A minute-granular label needs a clock: one shared `now` signal ticks
+  every 30 seconds and every relative label reads it.
+- The row's other states lead the title, not a column of their own: a
+  red-outlined `!` for any failure (the channel's own resolve or its
+  pipeline/disk), an amber `REC` pill while a recording is writing, and a drawn
+  pin for a pinned row. The title cell's tooltip is the failure message when
+  there is one and the stream id otherwise.
+- Tab badges carry what is worth seeing from another tab: the error count on
+  `Channels` and the recording count on `Recordings`. The badge's slot is
+  always reserved, so a count appearing cannot widen the tab row.
+- Row actions stay out of the row: `Pin`/`Unpin` and `Remove` live in the
+  expanded detail, and the same two are in a right-click context menu as an
+  accelerator. The menu is never the only home — a row whose actions are only
+  reachable by right-click is a row a keyboard cannot use. Removing raises a
+  toast with `Undo` for eight seconds; the undo is a real re-add carrying the
+  row's switches (`AddLogin { login, switches }`), not a delayed removal.
 - The switch override must select `.zui-switch--sm`: this zgui revision emits
   the class and no `data-size` attribute, so a `[data-size="sm"]` rule silently
   leaves every switch at 40x22.
@@ -210,8 +235,9 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   scrollbar is that one.
 - `Remove` is a bordered destructive button in a footer at the bottom of the
   panel, behind a hairline, not a floating red label at the top: the top-right
-  corner already means "collapse" to anyone who reads an X there. It is not an
-  icon yet because zgui-ui has no icon set wired into this crate.
+  corner already means "collapse" to anyone who reads an X there. `Pin`/`Unpin`
+  sits at the other end of the same footer. Neither is an icon yet because
+  zgui-ui has no icon set wired into this crate.
 
 ## Reference points
 

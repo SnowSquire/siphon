@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use futures_util::FutureExt as _;
 use siphon_shared::rpc::ArenaSummary;
+use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
 use siphon_shared::rpc::Config;
 use siphon_shared::rpc::ConnHealth;
@@ -172,7 +173,11 @@ pub struct AppInit {
 
 /// One finished background job.
 pub enum JobDone {
-    AddResolved(String, Box<Result<Option<ChannelDetail>, GqlError>>),
+    AddResolved(
+        String,
+        Option<ChannelSwitches>,
+        Box<Result<Option<ChannelDetail>, GqlError>>,
+    ),
     LiveRefreshed(u64, Result<Vec<ChannelDetail>, GqlError>),
     SaveFinished(Result<(), ConfigError>),
     ToastShown,
@@ -386,8 +391,8 @@ impl App {
 
     async fn handle_job(&mut self, done: JobDone) {
         match done {
-            JobDone::AddResolved(login, result) => {
-                self.complete_add_login(login, *result).await;
+            JobDone::AddResolved(login, switches, result) => {
+                self.complete_add_login(login, switches, *result).await;
             }
             JobDone::LiveRefreshed(id, result) => {
                 self.complete_live_refresh(id, result);
@@ -459,7 +464,7 @@ impl App {
                 if let Some(user) = self.channels.get_mut(&id) {
                     user.avatar_path = Some(path);
                     let view = user.view(flags.as_ref());
-                    self.bus.publish(Update::ChannelUpsert(view));
+                    self.bus.publish(Update::ChannelUpsert(Box::new(view)));
                 }
             }
         }
@@ -467,8 +472,8 @@ impl App {
 
     fn handle_request(&mut self, id: u64, request: Request, control: &Rc<Subscriber>) {
         let result = match request {
-            Request::AddLogin(login) => {
-                self.request_add_login(&login);
+            Request::AddLogin { login, switches } => {
+                self.request_add_login(&login, switches);
                 Ok(Response::Ack)
             }
             Request::RemoveChannel(channel) => self.apply_remove_channel(channel),
@@ -552,7 +557,6 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| channel.login.clone()),
                     chat_color: gql::fallback_color(channel.id),
-                    profile_image_url: String::new(),
                     avatar_path: None,
                     live: false,
                     title: None,
@@ -561,7 +565,9 @@ impl App {
                     viewers: None,
                     collaboration_viewers: None,
                     stream_start_ms: None,
+                    last_live_ms: None,
                     stream_id: None,
+                    error: None,
                     notify_live: channel.notify_live,
                     notify_titles: channel.notify_titles,
                     record: channel.record,
@@ -740,7 +746,15 @@ impl App {
 
     /// Validates an add request and queues the single resolve. Duplicates,
     /// in-flight resolves and empty input are ignored without touching disk.
-    pub fn request_add_login(&mut self, login: &str) -> Option<String> {
+    ///
+    /// `switches` is how an undone removal comes back with the settings it
+    /// had: the daemon applies them when the resolve lands, so the row never
+    /// shows the defaults for a frame.
+    pub fn request_add_login(
+        &mut self,
+        login: &str,
+        switches: Option<ChannelSwitches>,
+    ) -> Option<String> {
         let login = login.trim().to_lowercase();
         if login.chars().count() > 25 {
             self.set_error("a Twitch login is at most 25 characters");
@@ -767,7 +781,7 @@ impl App {
         let job_login = login.clone();
         self.spawn_job(async move {
             let result = gql::fetch_channel(&client, client_id.as_deref(), &job_login).await;
-            JobDone::AddResolved(job_login, Box::new(result))
+            JobDone::AddResolved(job_login, switches, Box::new(result))
         });
         Some(login)
     }
@@ -775,6 +789,7 @@ impl App {
     pub(crate) async fn complete_add_login(
         &mut self,
         login: String,
+        switches: Option<ChannelSwitches>,
         result: Result<Option<ChannelDetail>, GqlError>,
     ) {
         if !self
@@ -805,6 +820,7 @@ impl App {
                     return;
                 }
                 let id = user.id;
+                let switches = switches.unwrap_or_default();
                 self.bus.log(
                     LogLevel::Info,
                     "channel",
@@ -814,14 +830,17 @@ impl App {
                     login: user.login.clone(),
                     id,
                     display_name: Some(user.display_name.clone()),
-                    record: false,
-                    notify_live: true,
-                    notify_titles: true,
+                    record: switches.record,
+                    notify_live: switches.notify_live,
+                    notify_titles: switches.notify_titles,
                 });
                 self.publish_config();
                 self.track_channel(user);
                 self.queue_save();
                 self.ensure_subs(id);
+                if switches.record && self.registry.can_record() {
+                    self.registry.monitor_set(&login);
+                }
                 if self.welcomed {
                     self.subscribe_channel(id).await;
                 }
@@ -1034,7 +1053,7 @@ impl App {
     fn publish_channel_flags(&self, flags: &siphon_shared::rpc::Channel) {
         if let Some(detail) = self.channels.get(&flags.id) {
             self.bus
-                .publish(Update::ChannelUpsert(detail.view(Some(flags))));
+                .publish(Update::ChannelUpsert(Box::new(detail.view(Some(flags)))));
         }
     }
 

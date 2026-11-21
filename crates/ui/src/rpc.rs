@@ -282,6 +282,9 @@ pub struct UiState {
     pub error: RwSignal<Option<String>, LocalStorage>,
     pub update: RwSignal<Option<UpdateView>, LocalStorage>,
     pub channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
+    /// Channel ids this client keeps at the top of the list. Not the daemon's:
+    /// ordering is a preference of the window, and two windows may disagree.
+    pub pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
     pub pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
     pub pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
     pub arena: RwSignal<ArenaSummary, LocalStorage>,
@@ -366,6 +369,58 @@ where
     list.set(Rc::new(next));
 }
 
+/// The order the channel list is drawn in: pinned first, then live, then the
+/// channel that was most recently live.
+///
+/// Live rows keep their relative order instead of being ranked by viewers: a
+/// list that reshuffles every time a counter ticks is a list you cannot reach
+/// for. The sort is stable, so everything the key does not name keeps the
+/// order it arrived in (config order, until something has to move).
+fn order_key(channel: &ChannelView, pins: &[u64]) -> (bool, bool, i64) {
+    (
+        pins.contains(&channel.id),
+        channel.live,
+        channel.last_live_ms.unwrap_or(i64::MIN),
+    )
+}
+
+/// Whether two keys are already in display order (pinned, live, recency, all
+/// descending). `reorder` checks this before sorting, so an upsert that only
+/// changed a viewer count does not allocate or rebuild the key list.
+fn in_order(earlier: (bool, bool, i64), later: (bool, bool, i64)) -> bool {
+    (earlier.0, earlier.1, earlier.2) >= (later.0, later.1, later.2)
+}
+
+fn order_channels(
+    rows: &[RwSignal<ChannelView, LocalStorage>],
+    pins: &[u64],
+) -> Vec<RwSignal<ChannelView, LocalStorage>> {
+    let mut ordered: Vec<_> = rows
+        .iter()
+        .map(|row| (row.with_untracked(|channel| order_key(channel, pins)), *row))
+        .collect();
+    ordered.sort_by(|(left, _), (right, _)| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| right.2.cmp(&left.2))
+    });
+    ordered.into_iter().map(|(_, row)| row).collect()
+}
+
+/// Writes the client's pins. A failure is a log line: the order is a
+/// preference, not something worth failing a frame over.
+fn save_pins(ids: &[u64]) {
+    let document = siphon_shared::settings::Pins {
+        version: siphon_shared::settings::Pins::VERSION,
+        ids: ids.to_vec(),
+    };
+    if let Err(error) = siphon_shared::settings::save_pins(crate::service::APP_ID, &document) {
+        tracing::warn!(target: "settings", "could not save pins: {error}");
+    }
+}
+
 impl UiState {
     /// The state a window starts with, before the first snapshot arrives.
     #[must_use]
@@ -376,6 +431,7 @@ impl UiState {
             error: RwSignal::new_local(state.error),
             update: RwSignal::new_local(state.update),
             channels: RwSignal::new_local(Rc::new(Vec::new())),
+            pins: RwSignal::new_local(Rc::new(Vec::new())),
             pending: RwSignal::new_local(Rc::new(state.pending)),
             pipelines: RwSignal::new_local(Rc::new(Vec::new())),
             arena: RwSignal::new_local(state.arena),
@@ -394,6 +450,7 @@ impl UiState {
         self.error.set(state.error);
         self.update.set(state.update);
         sync_rows(&self.channels, state.channels, |channel| channel.id);
+        self.reorder();
         self.pending.set(Rc::new(state.pending));
         sync_rows(&self.pipelines, state.pipelines, |pipeline| {
             pipeline.key.clone()
@@ -407,6 +464,46 @@ impl UiState {
         self.sound.set(state.config.sound);
     }
 
+    /// Loads the pins this client persisted and applies them to the list.
+    pub fn set_pins(&self, ids: Vec<u64>) {
+        self.pins.set(Rc::new(ids));
+        self.reorder();
+    }
+
+    /// Pins a channel to the top, or unpins it, and keeps the file in step.
+    pub fn toggle_pin(&self, id: u64) {
+        let mut pins = (*self.pins.get_untracked()).clone();
+        if let Some(index) = pins.iter().position(|pinned| *pinned == id) {
+            pins.remove(index);
+        } else {
+            pins.push(id);
+        }
+        save_pins(&pins);
+        self.pins.set(Rc::new(pins));
+        self.reorder();
+    }
+
+    /// Puts the rows in display order. The guard matters: an upsert that does
+    /// not change a row's standing must not rewrite the key list, or the whole
+    /// keyed list would be diffed on every viewcount tick.
+    fn reorder(&self) {
+        let rows = self.channels.get_untracked();
+        if rows.len() < 2 {
+            return;
+        }
+        let pins = self.pins.get_untracked();
+        let mut previous = None;
+        for row in rows.iter() {
+            let current = row.with_untracked(|channel| order_key(channel, &pins));
+            if previous.is_some_and(|earlier| !in_order(earlier, current)) {
+                let ordered = order_channels(&rows, &pins);
+                self.channels.set(Rc::new(ordered));
+                return;
+            }
+            previous = Some(current);
+        }
+    }
+
     /// One entity update, applied to the signal it names and nowhere else.
     fn apply(&self, update: Update) {
         match update {
@@ -417,7 +514,12 @@ impl UiState {
             }
             // One row of the list, not the list: the row's own signal carries
             // the change, so the keyed list never re-runs.
-            Update::ChannelUpsert(view) => upsert_row(&self.channels, view, |channel| channel.id),
+            Update::ChannelUpsert(view) => {
+                upsert_row(&self.channels, *view, |channel| channel.id);
+                // A live flip or a new `last live` is the only thing that can
+                // move a row; `reorder` is a no-op when the order holds.
+                self.reorder();
+            }
             Update::ChannelRemove(id) => {
                 retain_rows(&self.channels, |channel| channel.id != id);
             }
@@ -440,6 +542,14 @@ impl UiState {
                 }
                 let ids: Vec<u64> = config.channels.iter().map(|channel| channel.id).collect();
                 retain_rows(&self.channels, |channel| ids.contains(&channel.id));
+                let pins = self.pins.get_untracked();
+                if pins.iter().any(|id| !ids.contains(id)) {
+                    let kept: Vec<u64> =
+                        pins.iter().copied().filter(|id| ids.contains(id)).collect();
+                    save_pins(&kept);
+                    self.pins.set(Rc::new(kept));
+                    self.reorder();
+                }
             }
             Update::PipelineUpsert(view) => {
                 let recorded = view.recording || view.disk.is_some();
@@ -532,6 +642,7 @@ impl Default for UiState {
 
 #[cfg(test)]
 mod tests {
+    use siphon_shared::rpc::ChatColor;
     use zgui::reactive::Mounted;
     use zgui::reactive::install;
 
@@ -542,8 +653,7 @@ mod tests {
             id,
             login: format!("channel{id}"),
             display_name: format!("Channel {id}"),
-            chat_color: "#ffffff".to_owned(),
-            profile_image_url: String::new(),
+            chat_color: ChatColor::Twitch(0x00ff_ffff),
             avatar_path: None,
             live: true,
             title: Some("a title".to_owned()),
@@ -552,7 +662,9 @@ mod tests {
             viewers: Some(viewers),
             collaboration_viewers: None,
             stream_start_ms: None,
+            last_live_ms: None,
             stream_id: None,
+            error: None,
             notify_live: true,
             notify_titles: true,
             record: false,
@@ -575,7 +687,7 @@ mod tests {
 
             let rows = state.channels.get_untracked();
             let row = rows[0];
-            state.apply(Update::ChannelUpsert(view(1, 99)));
+            state.apply(Update::ChannelUpsert(Box::new(view(1, 99))));
 
             assert!(
                 Rc::ptr_eq(&rows, &state.channels.get_untracked()),
@@ -627,6 +739,33 @@ mod tests {
             let rows = state.channels.get_untracked();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get_untracked().id, 2);
+        });
+        scope.unmount();
+    }
+
+    /// A pin outranks liveness, liveness outranks recency, and within the
+    /// offline group the most recently live comes first.
+    #[test]
+    fn the_list_orders_pinned_then_live_then_most_recent() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let row = |id: u64, live: bool, last: Option<i64>| {
+                let mut channel = view(id, 1);
+                channel.live = live;
+                channel.last_live_ms = last;
+                RwSignal::new_local(channel)
+            };
+            let rows = vec![
+                row(1, false, Some(10)),
+                row(2, true, None),
+                row(3, false, Some(30)),
+                row(4, true, None),
+                row(5, false, Some(20)),
+            ];
+            let ordered = order_channels(&rows, &[5]);
+            let ids: Vec<u64> = ordered.iter().map(|row| row.get_untracked().id).collect();
+            assert_eq!(ids, vec![5, 2, 4, 3, 1]);
         });
         scope.unmount();
     }
