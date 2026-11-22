@@ -15,7 +15,6 @@ use sonic_rs::json;
 
 use crate::app::App;
 use crate::app::JobDone;
-use crate::utils::NanoId;
 use crate::gql;
 use crate::gql::ChannelDetail;
 use crate::gql::GqlError;
@@ -23,6 +22,7 @@ use crate::gql::StreamGame;
 use crate::http::ws::WsStream;
 use crate::matcher::Matcher;
 use crate::time::now_iso;
+use crate::utils::NanoId;
 
 /// The endpoint to connect to. `SIPHON_HERMES_URL` points the daemon at the mock
 /// server (or any other stand-in) without a rebuild; it is also what makes debug

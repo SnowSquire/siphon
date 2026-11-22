@@ -17,40 +17,103 @@ const STREAM_TYPE_H264: u8 = 0x1B;
 const STREAM_TYPE_AAC: u8 = 0x0F;
 const PTS_WRAP: i64 = 1 << 33;
 
-#[derive(Debug)]
-pub enum Sample {
-    Video(VideoSample),
-    Audio(AudioSample),
+/// One demuxed sample: a byte range in a [`SampleStore`] plus its timing.
+#[derive(Clone, Copy, Debug)]
+pub struct Sample {
+    pts: i64,
+    dts: i64,
+    video: bool,
+    keyframe: bool,
+    data_start: usize,
+    data_end: usize,
+    nals_start: usize,
+    nals_end: usize,
 }
 
-#[derive(Debug)]
-pub struct VideoSample {
-    pub pts: i64,
+impl Sample {
+    /// Presentation timestamp in 90 kHz units.
+    #[must_use]
+    pub const fn pts(self) -> i64 {
+        self.pts
+    }
+
     /// Decode timestamp in 90 kHz units (equals `pts` when no reordering).
-    pub dts: i64,
-    /// The access unit's Annex B bytes (access unit delimiter included).
-    ///
-    /// One buffer with [`VideoSample::nals`] ranges into it, instead of a `Vec`
-    /// per NAL: copying the units out cost a second pass over the whole
-    /// elementary stream and thirteen allocations per access unit.
-    pub data: Vec<u8>,
-    /// NAL units of the access unit, as ranges into [`VideoSample::data`].
-    pub nals: Vec<(usize, usize)>,
-    pub keyframe: bool,
+    #[must_use]
+    pub const fn dts(self) -> i64 {
+        self.dts
+    }
+
+    #[must_use]
+    pub const fn is_video(self) -> bool {
+        self.video
+    }
+
+    /// Whether this is a video access unit that starts with an IDR picture.
+    #[must_use]
+    pub const fn keyframe(self) -> bool {
+        self.keyframe
+    }
 }
 
-#[derive(Debug)]
-pub struct AudioSample {
-    /// Presentation timestamp of the first frame, in 90 kHz units.
-    pub pts: i64,
-    /// Raw AAC frame without the ADTS header.
-    pub frame: Vec<u8>,
-}
-
-/// Raw PES bytes for one packet, header included.
+/// One segment's samples in three flat buffers.
 ///
-/// The header is parsed only when the packet is flushed: a PES header can be
-/// split across two TS packets (astits handles the same case).
+/// `video` holds access units back to back, `audio` the AAC frames, `nals` every
+/// access unit's NAL ranges (relative to that sample's bytes), and `samples`
+/// indexes them. Video and audio have separate buffers on purpose: Twitch
+/// interleaves the two PES streams, so one shared buffer would put audio bytes
+/// inside the access unit that is still being assembled.
+///
+/// This is one growing allocation per stream per segment, reused, instead of one
+/// `Vec` per access unit, one `Vec` per NAL list and one `Vec` per AAC frame.
+#[derive(Debug, Default)]
+pub struct SampleStore {
+    video: Vec<u8>,
+    audio: Vec<u8>,
+    nals: Vec<(usize, usize)>,
+    samples: Vec<Sample>,
+}
+
+impl SampleStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drops the segment's samples and keeps the capacity for the next one.
+    pub fn clear(&mut self) {
+        self.video.clear();
+        self.audio.clear();
+        self.nals.clear();
+        self.samples.clear();
+    }
+
+    #[must_use]
+    pub fn samples(&self) -> &[Sample] {
+        &self.samples
+    }
+
+    /// The sample's bytes: an Annex B access unit, or one raw AAC frame.
+    #[must_use]
+    pub fn data(&self, sample: Sample) -> &[u8] {
+        let bytes = if sample.video {
+            &self.video
+        } else {
+            &self.audio
+        };
+        &bytes[sample.data_start..sample.data_end]
+    }
+
+    /// The sample's NAL units as ranges into [`SampleStore::data`].
+    #[must_use]
+    pub fn nals(&self, sample: Sample) -> &[(usize, usize)] {
+        &self.nals[sample.nals_start..sample.nals_end]
+    }
+
+    fn push(&mut self, sample: Sample) {
+        self.samples.push(sample);
+    }
+}
+
 #[derive(Default)]
 struct PesBuffer {
     active: bool,
@@ -113,13 +176,13 @@ pub struct TsDemuxer {
     audio_pid: Option<u16>,
     video: PesBuffer,
     audio: PesBuffer,
-    /// Video access unit under assembly.
+    /// Offset in the store where the access unit under assembly starts.
     ///
     /// Twitch's muxer does not align PES boundaries with access-unit boundaries:
     /// a PES can begin with the tail of the previous access unit, followed by
     /// the next access unit's AUD. The elementary stream is therefore a
     /// continuous Annex B byte stream, split at access-unit delimiters.
-    video_au: Vec<u8>,
+    au_start: usize,
     video_au_active: bool,
     video_au_pts: i64,
     video_au_dts: i64,
@@ -144,7 +207,7 @@ impl TsDemuxer {
             audio_pid: None,
             video: PesBuffer::default(),
             audio: PesBuffer::default(),
-            video_au: Vec::new(),
+            au_start: 0,
             video_au_active: false,
             video_au_pts: 0,
             video_au_dts: 0,
@@ -167,16 +230,17 @@ impl TsDemuxer {
 
     /// Forget codec-specific state after a discontinuity. The PMT is kept: the
     /// PIDs of one broadcast do not change across a dropout.
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, store: &mut SampleStore) {
         self.video.reset();
         self.audio.reset();
-        self.video_au.clear();
+        store.clear();
+        self.au_start = 0;
         self.video_au_active = false;
         self.carry.clear();
     }
 
     /// Consume segment bytes, appending completed samples to `out`.
-    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Sample>) {
+    pub fn feed(&mut self, bytes: &[u8], store: &mut SampleStore) {
         let mut data = bytes;
 
         if !self.carry.is_empty() {
@@ -188,12 +252,12 @@ impl TsDemuxer {
                 let mut packet = [0u8; TS_PACKET];
                 packet.copy_from_slice(&self.carry);
                 self.carry.clear();
-                self.packet(&packet, out);
+                self.packet(&packet, store);
             }
         }
 
         while data.len() >= TS_PACKET {
-            self.packet(&data[..TS_PACKET], out);
+            self.packet(&data[..TS_PACKET], store);
             data = &data[TS_PACKET..];
         }
 
@@ -203,13 +267,13 @@ impl TsDemuxer {
     /// Flush the PES packets and the access unit left open at the end of a
     /// segment. HLS segment boundaries are access-unit boundaries, so the last
     /// AU is complete here.
-    pub fn finish_segment(&mut self, out: &mut Vec<Sample>) {
-        self.flush_video_pes(out);
-        self.flush_audio(out);
-        self.flush_video_au(out);
+    pub fn finish_segment(&mut self, store: &mut SampleStore) {
+        self.flush_video_pes(store);
+        self.flush_audio(store);
+        self.flush_video_au(store);
     }
 
-    fn packet(&mut self, packet: &[u8], out: &mut Vec<Sample>) {
+    fn packet(&mut self, packet: &[u8], store: &mut SampleStore) {
         debug_assert_eq!(packet.len(), TS_PACKET);
         if packet[0] != TS_SYNC {
             return;
@@ -251,8 +315,8 @@ impl TsDemuxer {
 
         if payload_unit_start {
             match kind {
-                Kind::Video => self.flush_video_pes(out),
-                Kind::Audio => self.flush_audio(out),
+                Kind::Video => self.flush_video_pes(store),
+                Kind::Audio => self.flush_audio(store),
             }
             match kind {
                 Kind::Video => self.video.start(payload),
@@ -327,7 +391,7 @@ impl TsDemuxer {
         }
     }
 
-    fn flush_video_pes(&mut self, out: &mut Vec<Sample>) {
+    fn flush_video_pes(&mut self, store: &mut SampleStore) {
         let Some((pts, dts, header_end, data)) = self.video.flush() else {
             return;
         };
@@ -336,58 +400,76 @@ impl TsDemuxer {
         if let Some(offset) = find_aud(payload) {
             // Bytes before the AUD finish the previous access unit.
             if self.video_au_active {
-                self.video_au.extend_from_slice(&payload[..offset]);
-                self.flush_video_au(out);
+                store.video.extend_from_slice(&payload[..offset]);
+                self.flush_video_au(store);
             }
-            self.video_au.clear();
-            self.video_au.extend_from_slice(&payload[offset..]);
+            self.au_start = store.video.len();
+            store.video.extend_from_slice(&payload[offset..]);
             self.video_au_pts = pts;
             self.video_au_dts = dts;
             self.video_au_active = true;
         } else {
             if !self.video_au_active {
+                self.au_start = store.video.len();
                 self.video_au_pts = pts;
                 self.video_au_dts = dts;
                 self.video_au_active = true;
             }
-            self.video_au.extend_from_slice(payload);
+            store.video.extend_from_slice(payload);
         }
 
         self.video.recycle(data);
     }
 
-    fn flush_video_au(&mut self, out: &mut Vec<Sample>) {
+    fn flush_video_au(&mut self, store: &mut SampleStore) {
         if !self.video_au_active {
             return;
         }
         self.video_au_active = false;
 
-        let data = std::mem::take(&mut self.video_au);
-        let Some(mut nals) = h264::split_annex_b(&data) else {
+        let start = self.au_start;
+        if start >= store.video.len() {
+            store.video.truncate(start);
             return;
-        };
-
-        let keyframe = h264::is_keyframe(&data, &nals);
-        for &(start, end) in &nals {
-            self.video_config.push(&data[start..end]);
+        }
+        let nals_start = store.nals.len();
+        if !h264::split_annex_b(&store.video[start..], &mut store.nals, 0) {
+            store.video.truncate(start);
+            return;
+        }
+        let nals_end = store.nals.len();
+        let keyframe = h264::is_keyframe(&store.video[start..], &store.nals[nals_start..nals_end]);
+        for &(nal_start, nal_end) in &store.nals[nals_start..nals_end] {
+            self.video_config
+                .push(&store.video[start + nal_start..start + nal_end]);
         }
 
         // mediaconvert drops the access unit delimiter before packetization.
-        h264::strip_aud(&data, &mut nals);
-        if nals.is_empty() {
+        let mut first = nals_start;
+        let (aud_start, aud_end) = store.nals[first];
+        if h264::is_aud(&store.video[start + aud_start..start + aud_end]) {
+            first += 1;
+        }
+        if first == nals_end {
+            store.nals.truncate(nals_start);
+            store.video.truncate(start);
             return;
         }
 
-        out.push(Sample::Video(VideoSample {
+        store.push(Sample {
             pts: self.video_au_pts,
             dts: self.video_au_dts,
-            data,
-            nals,
+            video: true,
             keyframe,
-        }));
+            data_start: start,
+            data_end: store.video.len(),
+            nals_start: first,
+            nals_end,
+        });
+        self.au_start = store.video.len();
     }
 
-    fn flush_audio(&mut self, out: &mut Vec<Sample>) {
+    fn flush_audio(&mut self, store: &mut SampleStore) {
         let Some((pts, _, header_end, data)) = self.audio.flush() else {
             return;
         };
@@ -409,10 +491,18 @@ impl TsDemuxer {
 
             // One AAC frame is 1024 samples; ADTS input always uses short frames.
             let ticks = 1024 * 90_000 / i64::from(frame.config.sample_rate);
-            out.push(Sample::Audio(AudioSample {
+            let start = store.audio.len();
+            store.audio.extend_from_slice(raw);
+            store.push(Sample {
                 pts: pts + index * ticks,
-                frame: raw.to_vec(),
-            }));
+                dts: pts + index * ticks,
+                video: false,
+                keyframe: false,
+                data_start: start,
+                data_end: store.audio.len(),
+                nals_start: 0,
+                nals_end: 0,
+            });
 
             index += 1;
             offset += frame.total_len();
@@ -506,11 +596,12 @@ const fn unwrap_pts(pts: i64) -> i64 {
 mod tests {
     use super::*;
 
-    fn nals_of(sample: &VideoSample) -> Vec<&[u8]> {
-        sample
-            .nals
+    fn nals_of(store: &SampleStore, sample: Sample) -> Vec<&[u8]> {
+        let data = store.data(sample);
+        store
+            .nals(sample)
             .iter()
-            .map(|&(start, end)| &sample.data[start..end])
+            .map(|&(start, end)| &data[start..end])
             .collect()
     }
 
@@ -565,9 +656,15 @@ mod tests {
     #[test]
     fn parses_pat_and_pmt() {
         let mut demuxer = TsDemuxer::new();
-        demuxer.packet(&packet(PID_PAT, true, &pat_section()), &mut Vec::new());
+        demuxer.packet(
+            &packet(PID_PAT, true, &pat_section()),
+            &mut SampleStore::new(),
+        );
         let pmt_pid = demuxer.pmt_pid.expect("pmt pid");
-        demuxer.packet(&packet(pmt_pid, true, &pmt_section()), &mut Vec::new());
+        demuxer.packet(
+            &packet(pmt_pid, true, &pmt_section()),
+            &mut SampleStore::new(),
+        );
 
         assert_eq!(demuxer.video_pid, Some(0x101));
         assert_eq!(demuxer.audio_pid, Some(0x100));
@@ -596,9 +693,15 @@ mod tests {
     }
 
     fn video_pid(demuxer: &mut TsDemuxer) -> u16 {
-        demuxer.packet(&packet(PID_PAT, true, &pat_section()), &mut Vec::new());
+        demuxer.packet(
+            &packet(PID_PAT, true, &pat_section()),
+            &mut SampleStore::new(),
+        );
         let pmt_pid = demuxer.pmt_pid.expect("pmt pid");
-        demuxer.packet(&packet(pmt_pid, true, &pmt_section()), &mut Vec::new());
+        demuxer.packet(
+            &packet(pmt_pid, true, &pmt_section()),
+            &mut SampleStore::new(),
+        );
         demuxer.video_pid.expect("video pid")
     }
 
@@ -616,7 +719,7 @@ mod tests {
         second.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0]); // next AUD
         second.extend_from_slice(&[0, 0, 0, 1, 0x41, 3, 4]); // P slice
 
-        let mut samples = Vec::new();
+        let mut samples = SampleStore::new();
         demuxer.packet(&packet(pid, true, &video_pes(90_000, &first)), &mut samples);
         demuxer.packet(
             &packet(pid, true, &video_pes(91_000, &second)),
@@ -624,17 +727,66 @@ mod tests {
         );
         demuxer.finish_segment(&mut samples);
 
-        assert_eq!(samples.len(), 2);
-        let Sample::Video(a) = &samples[0] else {
-            panic!("first sample is not video");
-        };
-        let Sample::Video(b) = &samples[1] else {
-            panic!("second sample is not video");
-        };
-        assert_eq!(a.pts, 90_000);
-        assert_eq!(nals_of(a), [&[0x65, 1, 2, 0xAA, 0xBB][..]]);
-        assert_eq!(b.pts, 91_000);
-        assert_eq!(nals_of(b), [&[0x41, 3, 4][..]]);
+        assert_eq!(samples.samples().len(), 2);
+        let a = samples.samples()[0];
+        let b = samples.samples()[1];
+        assert!(a.is_video() && b.is_video());
+        assert_eq!(a.pts(), 90_000);
+        assert_eq!(nals_of(&samples, a), [&[0x65, 1, 2, 0xAA, 0xBB][..]]);
+        assert_eq!(b.pts(), 91_000);
+        assert_eq!(nals_of(&samples, b), [&[0x41, 3, 4][..]]);
+    }
+
+    fn adts_header(profile: u8, frequency_index: u8, channels: u8, total_len: usize) -> [u8; 7] {
+        let mut header = [0u8; 7];
+        header[0] = 0xFF;
+        header[1] = 0xF1;
+        header[2] = (profile << 6) | (frequency_index << 2) | (channels >> 2);
+        header[3] = ((channels & 0x03) << 6) | ((total_len >> 11) as u8 & 0x03);
+        header[4] = (total_len >> 3) as u8;
+        header[5] = ((total_len as u8 & 0x07) << 5) | 0x1F;
+        header[6] = 0xFC;
+        header
+    }
+
+    /// Twitch interleaves the audio and video PES streams, so an audio frame can
+    /// land between two PES packets of the access unit still being assembled.
+    /// The audio must never end up inside that access unit.
+    #[test]
+    fn audio_between_pes_packets_stays_out_of_the_access_unit() {
+        let mut demuxer = TsDemuxer::new();
+        let video = video_pid(&mut demuxer);
+        let audio = demuxer.audio_pid.expect("audio pid");
+
+        let head = [0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 1, 2];
+        let tail = [3, 4];
+        let mut frame = adts_header(1, 3, 2, 8).to_vec();
+        frame.push(0xAA);
+
+        let mut store = SampleStore::new();
+        demuxer.packet(&packet(video, true, &video_pes(90_000, &head)), &mut store);
+        demuxer.packet(&packet(audio, true, &video_pes(90_000, &frame)), &mut store);
+        demuxer.packet(&packet(video, true, &video_pes(90_000, &tail)), &mut store);
+        demuxer.finish_segment(&mut store);
+
+        let samples = store.samples();
+        let video_sample = samples
+            .iter()
+            .copied()
+            .find(|sample| sample.is_video())
+            .expect("video sample");
+        assert_eq!(
+            store.data(video_sample),
+            &[0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 1, 2, 3, 4]
+        );
+        assert_eq!(nals_of(&store, video_sample), [&[0x65, 1, 2, 3, 4][..]]);
+
+        let audio_sample = samples
+            .iter()
+            .copied()
+            .find(|sample| !sample.is_video())
+            .expect("audio sample");
+        assert_eq!(store.data(audio_sample), &[0xAA]);
     }
 
     #[test]

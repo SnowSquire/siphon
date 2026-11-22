@@ -61,6 +61,7 @@ use crate::rtsp::aac::AudioConfig;
 use crate::rtsp::dvr::Dvr;
 use crate::rtsp::h264::H264Config;
 use crate::rtsp::ts::Sample;
+use crate::rtsp::ts::SampleStore;
 use crate::rtsp::ts::TsDemuxer;
 use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::Segment;
@@ -2041,7 +2042,9 @@ struct Media {
     demuxer: TsDemuxer,
     pacer: Pacer,
     timeline: Timeline,
-    samples: Vec<Sample>,
+    samples: SampleStore,
+    /// Reused packetization buffer, one per stream.
+    scratch: Vec<u8>,
     last_sequence: u64,
     last_rtcp: Instant,
     pending_live: Option<Segment>,
@@ -2078,7 +2081,8 @@ impl Media {
             demuxer: TsDemuxer::new(),
             pacer: Pacer::new(),
             timeline: Timeline::default(),
-            samples: Vec::new(),
+            samples: SampleStore::new(),
+            scratch: Vec::new(),
             last_sequence: 0,
             last_rtcp: Instant::now(),
             pending_live: None,
@@ -2296,7 +2300,7 @@ impl Media {
             SegmentMessage::Discontinuity() => {
                 debug!("rtsp: discontinuity");
                 self.last_sequence = 0;
-                self.demuxer.reset();
+                self.demuxer.reset(&mut self.samples);
                 self.pacer.reset();
                 None
             }
@@ -2335,7 +2339,7 @@ impl Media {
         self.last_sequence = segment.sequence_num;
         if self.live_discontinuity {
             self.live_discontinuity = false;
-            self.demuxer.reset();
+            self.demuxer.reset(&mut self.samples);
             self.pacer.reset();
         }
         self.timeline.start(segment.timestamp_ms);
@@ -2357,17 +2361,16 @@ impl Media {
             if self.hub.video_base.get().is_none() {
                 let base = self
                     .samples
+                    .samples()
                     .iter()
-                    .map(|sample| match sample {
-                        Sample::Video(video) => video.pts,
-                        Sample::Audio(audio) => audio.pts,
-                    })
+                    .map(|sample| sample.pts())
                     .min();
                 if let Some(base) = base {
                     self.hub.set_media_base(base);
                 }
             }
-            for sample in self.samples.drain(..) {
+            for index in 0..self.samples.samples().len() {
+                let sample = self.samples.samples()[index];
                 if let Some(seek) = drain_messages(
                     &self.rx,
                     &mut self.pending_live,
@@ -2378,14 +2381,24 @@ impl Media {
                 ) {
                     return Some(seek);
                 }
-                emit_sample(&self.hub, &mut self.pacer, &mut self.timeline, sample).await;
+                emit_sample(
+                    &self.hub,
+                    &mut self.pacer,
+                    &mut self.timeline,
+                    &self.samples,
+                    &mut self.scratch,
+                    sample,
+                )
+                .await;
                 maybe_rtcp(&self.hub, &mut self.last_rtcp);
             }
+            self.samples.clear();
         }
 
         self.demuxer.finish_segment(&mut self.samples);
         sync_config(&self.hub, &self.demuxer);
-        for sample in self.samples.drain(..) {
+        for index in 0..self.samples.samples().len() {
+            let sample = self.samples.samples()[index];
             if let Some(seek) = drain_messages(
                 &self.rx,
                 &mut self.pending_live,
@@ -2396,9 +2409,18 @@ impl Media {
             ) {
                 return Some(seek);
             }
-            emit_sample(&self.hub, &mut self.pacer, &mut self.timeline, sample).await;
+            emit_sample(
+                &self.hub,
+                &mut self.pacer,
+                &mut self.timeline,
+                &self.samples,
+                &mut self.scratch,
+                sample,
+            )
+            .await;
             maybe_rtcp(&self.hub, &mut self.last_rtcp);
         }
+        self.samples.clear();
         self.hub.mark_ready();
         None
     }
@@ -2469,7 +2491,7 @@ impl Media {
             sync_config(&self.hub, &self.demuxer);
 
             let start_index = if first {
-                vod_start_index(&self.samples, start_ms, target_ms)
+                vod_start_index(self.samples.samples(), start_ms, target_ms)
             } else {
                 0
             };
@@ -2479,12 +2501,10 @@ impl Media {
                 // and the player sees duplicate or wrapped timestamps.
                 let base = self
                     .samples
+                    .samples()
                     .iter()
                     .skip(start_index)
-                    .map(|sample| match sample {
-                        Sample::Video(video) => video.pts,
-                        Sample::Audio(audio) => audio.pts,
-                    })
+                    .map(|sample| sample.pts())
                     .min();
                 if let Some(base) = base {
                     self.hub.set_media_base(base);
@@ -2495,32 +2515,31 @@ impl Media {
                 // first segment that does carry samples or it stays silent.
                 let base = self
                     .samples
+                    .samples()
                     .iter()
-                    .map(|sample| match sample {
-                        Sample::Video(video) => video.pts,
-                        Sample::Audio(audio) => audio.pts,
-                    })
+                    .map(|sample| sample.pts())
                     .min();
                 if let Some(base) = base {
                     self.hub.set_media_base(base);
                 }
             }
-            let skipped_ms = samples_skipped_ms(&self.samples, start_index);
-            let first_video_pts = self.samples.iter().find_map(|sample| match sample {
-                Sample::Video(video) => Some(video.pts),
-                Sample::Audio(_) => None,
-            });
+            let skipped_ms = samples_skipped_ms(self.samples.samples(), start_index);
+            let first_video_pts = self
+                .samples
+                .samples()
+                .iter()
+                .find_map(|sample| sample.is_video().then(|| sample.pts()));
             let chosen_pts = self
                 .samples
+                .samples()
                 .get(start_index)
-                .and_then(|sample| match sample {
-                    Sample::Video(video) => Some(video.pts),
-                    Sample::Audio(_) => None,
-                });
-            let last_video_pts = self.samples.iter().rev().find_map(|sample| match sample {
-                Sample::Video(video) => Some(video.pts),
-                Sample::Audio(_) => None,
-            });
+                .and_then(|sample| sample.is_video().then(|| sample.pts()));
+            let last_video_pts = self
+                .samples
+                .samples()
+                .iter()
+                .rev()
+                .find_map(|sample| sample.is_video().then(|| sample.pts()));
             debug!(
                 start_ms,
                 target_ms,
@@ -2528,13 +2547,14 @@ impl Media {
                 chosen_pts,
                 last_video_pts,
                 skipped_ms,
-                samples = self.samples.len(),
+                samples = self.samples.samples().len(),
                 "rtsp: VOD segment loaded"
             );
             self.timeline.start(start_ms.saturating_add(skipped_ms));
             first = false;
 
-            for sample in self.samples.drain(start_index..) {
+            for index in start_index..self.samples.samples().len() {
+                let sample = self.samples.samples()[index];
                 if let Some(seek) = drain_messages(
                     &self.rx,
                     &mut self.pending_live,
@@ -2545,7 +2565,15 @@ impl Media {
                 ) {
                     return VodOutcome::Seek(seek);
                 }
-                emit_sample(&self.hub, &mut self.pacer, &mut self.timeline, sample).await;
+                emit_sample(
+                    &self.hub,
+                    &mut self.pacer,
+                    &mut self.timeline,
+                    &self.samples,
+                    &mut self.scratch,
+                    sample,
+                )
+                .await;
                 maybe_rtcp(&self.hub, &mut self.last_rtcp);
             }
             self.hub.mark_ready();
@@ -2670,10 +2698,10 @@ fn maybe_rtcp(hub: &Stream, last_rtcp: &mut Instant) {
 /// Index into a demuxed DVR segment at which playback should start so that the
 /// first video sample is a keyframe at (or as close as possible before) `target`.
 fn vod_start_index(samples: &[Sample], segment_start_ms: u64, target_ms: u64) -> usize {
-    let Some(first_pts) = samples.iter().find_map(|sample| match sample {
-        Sample::Video(video) => Some(video.pts),
-        Sample::Audio(_) => None,
-    }) else {
+    let Some(first_pts) = samples
+        .iter()
+        .find_map(|sample| sample.is_video().then(|| sample.pts()))
+    else {
         return 0;
     };
 
@@ -2683,13 +2711,10 @@ fn vod_start_index(samples: &[Sample], segment_start_ms: u64, target_ms: u64) ->
 
     let mut chosen = None;
     for (index, sample) in samples.iter().enumerate() {
-        let Sample::Video(video) = sample else {
-            continue;
-        };
-        if !video.keyframe {
+        if !sample.is_video() || !sample.keyframe() {
             continue;
         }
-        if video.pts <= target_pts {
+        if sample.pts() <= target_pts {
             chosen = Some(index);
         } else {
             if chosen.is_none() {
@@ -2702,14 +2727,12 @@ fn vod_start_index(samples: &[Sample], segment_start_ms: u64, target_ms: u64) ->
 }
 
 fn samples_skipped_ms(samples: &[Sample], index: usize) -> u64 {
-    let first_pts = samples.iter().find_map(|sample| match sample {
-        Sample::Video(video) => Some(video.pts),
-        Sample::Audio(_) => None,
-    });
-    let chosen_pts = samples.get(index).and_then(|sample| match sample {
-        Sample::Video(video) => Some(video.pts),
-        Sample::Audio(_) => None,
-    });
+    let first_pts = samples
+        .iter()
+        .find_map(|sample| sample.is_video().then(|| sample.pts()));
+    let chosen_pts = samples
+        .get(index)
+        .and_then(|sample| sample.is_video().then(|| sample.pts()));
     match (first_pts, chosen_pts) {
         (Some(first), Some(chosen)) => u64::try_from((chosen - first).max(0) / 90).unwrap_or(0),
         _ => 0,
@@ -2737,61 +2760,68 @@ fn sync_config(hub: &Stream, demuxer: &TsDemuxer) {
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap
 )]
-async fn emit_sample(hub: &Stream, pacer: &mut Pacer, timeline: &mut Timeline, sample: Sample) {
-    match sample {
-        Sample::Video(video) => {
-            if video.keyframe {
-                debug!(pts = video.pts, dts = video.dts, "rtsp: video keyframe");
-            }
-            // Pace on DTS: that is the order the packets leave the decoder.
-            // VOD playback skips the clock and fills the receiver's queue
-            // instead, so it can run ahead of real time.
-            pacer.wait(video.dts).await;
-            let position = timeline.position_ms(video.dts);
-            hub.set_position_ms(position);
-
-            // The media clock is absolute broadcast NPT, not an epoch offset.
-            // The player's start time is the beacon's 0, so the position it
-            // displays is this value directly.
-            let timestamp = position.saturating_mul(90) as u32;
-            let media = position.saturating_mul(90) as i64;
-            hub.wait_out_capacity(TRACK_VIDEO, video_packet_count(&video.nals))
-                .await;
-
-            hub.video_keyframe.set(video.keyframe);
-            let mut scratch = Vec::new();
-            h264::packetize(
-                &video.data,
-                &video.nals,
-                RTP_MAX_PAYLOAD,
-                &mut scratch,
-                |payload, marker| {
-                    let packet = hub
-                        .video
-                        .borrow_mut()
-                        .packet(timestamp, media, marker, payload);
-                    hub.send(TRACK_VIDEO, &packet);
-                },
+async fn emit_sample(
+    hub: &Stream,
+    pacer: &mut Pacer,
+    timeline: &mut Timeline,
+    samples: &SampleStore,
+    scratch: &mut Vec<u8>,
+    sample: Sample,
+) {
+    if sample.is_video() {
+        if sample.keyframe() {
+            debug!(
+                pts = sample.pts(),
+                dts = sample.dts(),
+                "rtsp: video keyframe"
             );
-            hub.video_keyframe.set(false);
         }
-        Sample::Audio(audio) => {
-            let clock_rate = hub.audio.borrow().clock_rate;
-            pacer.wait(audio.pts).await;
-            let position = timeline.position_ms(audio.pts);
-            hub.set_position_ms(position);
+        // Pace on DTS: that is the order the packets leave the decoder.
+        // VOD playback skips the clock and fills the receiver's queue
+        // instead, so it can run ahead of real time.
+        pacer.wait(sample.dts()).await;
+        let position = timeline.position_ms(sample.dts());
+        hub.set_position_ms(position);
 
-            let timestamp = (position.saturating_mul(u64::from(clock_rate)) / 1000) as u32;
-            let media = position.saturating_mul(90) as i64;
-            hub.wait_out_capacity(TRACK_AUDIO, 1).await;
+        // The media clock is absolute broadcast NPT, not an epoch offset.
+        // The player's start time is the beacon's 0, so the position it
+        // displays is this value directly.
+        let timestamp = position.saturating_mul(90) as u32;
+        let media = position.saturating_mul(90) as i64;
+        hub.wait_out_capacity(TRACK_VIDEO, video_packet_count(samples.nals(sample)))
+            .await;
 
-            let payload = aac::packetize(&audio.frame);
-            let packet = hub
-                .audio
-                .borrow_mut()
-                .packet(timestamp, media, true, &payload);
-            hub.send(TRACK_AUDIO, &packet);
-        }
+        hub.video_keyframe.set(sample.keyframe());
+        h264::packetize(
+            samples.data(sample),
+            samples.nals(sample),
+            RTP_MAX_PAYLOAD,
+            scratch,
+            |payload, marker| {
+                let packet = hub
+                    .video
+                    .borrow_mut()
+                    .packet(timestamp, media, marker, payload);
+                hub.send(TRACK_VIDEO, &packet);
+            },
+        );
+        hub.video_keyframe.set(false);
+    } else {
+        let clock_rate = hub.audio.borrow().clock_rate;
+        pacer.wait(sample.pts()).await;
+        let position = timeline.position_ms(sample.pts());
+        hub.set_position_ms(position);
+
+        let timestamp = (position.saturating_mul(u64::from(clock_rate)) / 1000) as u32;
+        let media = position.saturating_mul(90) as i64;
+        hub.wait_out_capacity(TRACK_AUDIO, 1).await;
+
+        let payload = aac::packetize(samples.data(sample));
+        let packet = hub
+            .audio
+            .borrow_mut()
+            .packet(timestamp, media, true, &payload);
+        hub.send(TRACK_AUDIO, &packet);
     }
 }
 

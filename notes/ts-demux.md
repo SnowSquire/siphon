@@ -14,9 +14,26 @@ and RTSP sessions are `notes/rtsp-output.md`.
   concatenates PES payloads and splits at AUD NALs; the PTS/DTS of the PES
   containing the AUD is assigned to that AU. Assuming one AU per PES drops frames
   and corrupts every later reference.
-- H.264 arrives Annex B. NAL units are kept as ranges into the sample's bytes, so a
-  stream allocates once per AU rather than once per NAL; the AUD is included.
-  mediaconvert drops the delimiter before packetization, which is harmless.
+- H.264 arrives Annex B. One segment's samples live in a `SampleStore`: one
+  growing byte buffer for every access unit and AAC frame, one flat list of NAL
+  ranges, and one list of `Sample` records into both. The demuxer appends; a
+  `Sample` is `Copy` and carries `(pts, dts, video, keyframe, byte range, nal
+  range)`. NAL ranges are relative to the sample's bytes, so packetization takes
+  `(data, nals)` unchanged.
+- That is one allocation per segment, reused, instead of one `Vec` per access
+  unit, one `Vec` per NAL list and one `Vec` per AAC frame. Allocating the access
+  unit with `mem::take` also leaked a buffer per AU; the store has no such path.
+- mediaconvert drops the access unit delimiter before packetization. Dropping it
+  from a NAL range is a bump of the range's start, not a `Vec::remove(0)`.
+- Video and audio bytes are kept in separate buffers. Twitch interleaves the two
+  PES streams, so one shared buffer put audio bytes inside the access unit still
+  being assembled; `audio_between_pes_packets_stays_out_of_the_access_unit` is
+  the regression test.
+- Measured on this box (`cargo test -p daemon --release -- --ignored --nocapture
+  throughput`): 2006 s of 1080p60 media went from 0.653 s to 0.485 s
+  (3072x -> 4136x realtime on one core); demux 0.453 s -> 0.343 s. The RTP
+  packet count stayed exactly 1 142 090, which is the identity check that the
+  demuxed bytes did not change.
 - AAC arrives as ADTS frames: strip the header, keep raw frames, capture the
   AudioSpecificConfig.
 

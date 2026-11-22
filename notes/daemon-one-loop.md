@@ -103,9 +103,9 @@ connection health, forced DVR URLs. The mock grows a GQL route for the queries
 - Disk: the live registration already ends at handoff (`drain_live`). The missing
   half was that the live scheduler kept polling and fetching afterwards; the
   scheduler parking above fixes it.
-- Demux: a flat sample store — one byte buffer plus records of ranges, with AU
-  buffers recycled — instead of one `Vec` per access unit, one `Vec` per NAL list
-  and one `Vec` per AAC frame. Not started.
+- Demux: a flat sample store — one byte buffer plus records of ranges, reused
+  across segments — instead of one `Vec` per access unit, one `Vec` per NAL list
+  and one `Vec` per AAC frame. Landed; see `notes/ts-demux.md`.
 
 ## What landed
 
@@ -138,8 +138,8 @@ Demux baseline on this box, for measuring the sample-store work:
 - Stream identity is still `(login, quality)` internally. Keying by channel id
   needs a login→id lookup in the resolve path, which `get_variants` does not
   provide; it is blocked on a GQL query (or usher data) that returns it.
-- Demux sample store (flat buffer + ranges, recycled AU buffers) not started.
-  The existing per-AU allocation and per-AAC-frame `to_vec()` are still there.
+- Demux sample store is implemented (`rtsp/ts.rs`: `SampleStore` + `Sample`
+  ranges), with the media engine and the bench on the new API.
 - `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` still
   describe the old loop, the per-connection queues and the monitor sets.
 - The Windows named-pipe listener path was rewritten by analogy and not built or

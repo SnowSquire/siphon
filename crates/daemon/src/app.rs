@@ -35,8 +35,6 @@ use siphon_shared::rpc::Update;
 use siphon_shared::rpc::UpdateView;
 use tracing::info;
 
-use crate::utils::CheapRng;
-use crate::utils::NanoId;
 use crate::bus::Bus;
 use crate::config;
 use crate::config::ConfigError;
@@ -56,6 +54,8 @@ use crate::registry::Registry;
 use crate::rpc;
 use crate::time::now_ms;
 use crate::update;
+use crate::utils::CheapRng;
+use crate::utils::NanoId;
 
 /// One thing the daemon loop wakes for.
 enum Event {

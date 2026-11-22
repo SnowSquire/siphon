@@ -50,7 +50,7 @@ use crate::rtsp::Track;
 use crate::rtsp::aac;
 use crate::rtsp::h264;
 use crate::rtsp::sdp;
-use crate::rtsp::ts::Sample;
+use crate::rtsp::ts::SampleStore;
 use crate::rtsp::ts::TsDemuxer;
 
 /// The self-contained fixture directory: `manifest.json`, `segments.json`,
@@ -109,7 +109,7 @@ struct Timing {
 /// and the two packetizers, reused across segments like `MediaEngine` does.
 struct Pipeline {
     demuxer: TsDemuxer,
-    samples: Vec<Sample>,
+    samples: SampleStore,
     video: Track,
     audio: Track,
     scratch: Vec<u8>,
@@ -120,7 +120,7 @@ impl Pipeline {
     fn new() -> Self {
         Self {
             demuxer: TsDemuxer::new(),
-            samples: Vec::new(),
+            samples: SampleStore::new(),
             video: Track::new(sdp::VIDEO_PAYLOAD_TYPE, sdp::VIDEO_CLOCK_RATE, 0x1234_5678),
             audio: Track::new(sdp::AUDIO_PAYLOAD_TYPE, 48_000, 0x1234_5679),
             scratch: Vec::new(),
@@ -138,43 +138,42 @@ impl Pipeline {
         *demux += start.elapsed();
 
         let start = Instant::now();
-        for sample in self.samples.drain(..) {
-            match sample {
-                Sample::Video(video_sample) => {
-                    self.totals.access_units += 1;
-                    // The media base would come from the first sample; any
-                    // fixed value keeps the arithmetic identical.
-                    let timestamp = black_box(video_sample.pts) as u32;
-                    let media = black_box(video_sample.dts);
-                    let totals = &mut self.totals;
-                    h264::packetize(
-                        &video_sample.data,
-                        &video_sample.nals,
-                        RTP_MAX_PAYLOAD,
-                        &mut self.scratch,
-                        |payload, marker| {
-                            let packet = self.video.packet(timestamp, media, marker, payload);
-                            totals.packets += 1;
-                            totals.payload += payload.len() as u64;
-                            black_box(&packet);
-                        },
-                    );
-                }
-                Sample::Audio(audio_sample) => {
-                    self.totals.audio_frames += 1;
-                    let payload = aac::packetize(&audio_sample.frame);
-                    let packet = self.audio.packet(
-                        black_box(audio_sample.pts) as u32,
-                        black_box(audio_sample.pts),
-                        true,
-                        &payload,
-                    );
-                    self.totals.packets += 1;
-                    self.totals.payload += payload.len() as u64;
-                    black_box(&packet);
-                }
+        for index in 0..self.samples.samples().len() {
+            let sample = self.samples.samples()[index];
+            if sample.is_video() {
+                self.totals.access_units += 1;
+                // The media base would come from the first sample; any fixed
+                // value keeps the arithmetic identical.
+                let timestamp = black_box(sample.pts()) as u32;
+                let media = black_box(sample.dts());
+                let totals = &mut self.totals;
+                h264::packetize(
+                    self.samples.data(sample),
+                    self.samples.nals(sample),
+                    RTP_MAX_PAYLOAD,
+                    &mut self.scratch,
+                    |payload, marker| {
+                        let packet = self.video.packet(timestamp, media, marker, payload);
+                        totals.packets += 1;
+                        totals.payload += payload.len() as u64;
+                        black_box(&packet);
+                    },
+                );
+            } else {
+                self.totals.audio_frames += 1;
+                let payload = aac::packetize(self.samples.data(sample));
+                let packet = self.audio.packet(
+                    black_box(sample.pts()) as u32,
+                    black_box(sample.pts()),
+                    true,
+                    &payload,
+                );
+                self.totals.packets += 1;
+                self.totals.payload += payload.len() as u64;
+                black_box(&packet);
             }
         }
+        self.samples.clear();
         *packetize += start.elapsed();
     }
 }

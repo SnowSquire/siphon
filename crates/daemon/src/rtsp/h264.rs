@@ -51,7 +51,7 @@ fn insert_unique(sets: &mut Vec<Vec<u8>>, nal: &[u8]) {
     }
 }
 
-/// Split an Annex B byte stream into NAL unit ranges.
+/// Split an Annex B byte stream into NAL unit ranges, appending to `out`.
 ///
 /// Mirrors mediaconvert's `AnnexB.Unmarshal`: an initial start code is required,
 /// a single zero byte preceding a `00 00 01` delimiter is treated as part of a
@@ -60,26 +60,28 @@ fn insert_unique(sets: &mut Vec<Vec<u8>>, nal: &[u8]) {
 ///
 /// The ranges index the caller's buffer instead of copying each NAL out of it:
 /// one access unit is ~13 NAL units, and copying them cost one more pass over
-/// the whole elementary stream (plus an allocation per NAL).
-#[must_use]
-pub fn split_annex_b(buf: &[u8]) -> Option<Vec<(usize, usize)>> {
+/// the whole elementary stream (plus an allocation per NAL). `base` is added to
+/// every range so the caller can keep several access units in one flat buffer.
+///
+/// Returns whether anything was appended.
+pub fn split_annex_b(buf: &[u8], out: &mut Vec<(usize, usize)>, base: usize) -> bool {
+    let start = out.len();
     let mut pos = if buf.len() >= 4 && buf[0..4] == [0, 0, 0, 1] {
         4
     } else if buf.len() >= 3 && buf[0..3] == [0, 0, 1] {
         3
     } else {
-        return None;
+        return false;
     };
 
     if buf.len() == pos {
-        return None;
+        return false;
     }
 
-    let mut positions = Vec::new();
     while pos < buf.len() {
         match find_start_code(buf, pos) {
             None => {
-                positions.push((pos, buf.len()));
+                out.push((base + pos, base + buf.len()));
                 break;
             }
             Some(index) => {
@@ -89,18 +91,14 @@ pub fn split_annex_b(buf: &[u8]) -> Option<Vec<(usize, usize)>> {
                     index
                 };
                 if end > pos {
-                    positions.push((pos, end));
+                    out.push((base + pos, base + end));
                 }
                 pos = index + 3;
             }
         }
     }
 
-    if positions.is_empty() {
-        return None;
-    }
-
-    Some(positions)
+    out.len() > start
 }
 
 /// Offset of the next `00 00 01` start code at or after `from`.
@@ -114,14 +112,13 @@ pub fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
     memchr::memmem::find(tail, &[0, 0, 1]).map(|offset| from + offset)
 }
 
-/// mediaconvert removes the access unit delimiter before packetization.
-pub fn strip_aud(au: &[u8], nals: &mut Vec<(usize, usize)>) {
-    let is_aud = nals
-        .first()
-        .is_some_and(|&(start, _)| au.get(start).is_some_and(|header| header & 0x1F == NAL_AUD));
-    if is_aud {
-        nals.remove(0);
-    }
+/// Whether this NAL unit is an access unit delimiter.
+///
+/// mediaconvert removes the delimiter before packetization; a caller that keeps
+/// NAL units as a range over one flat list just advances the range instead.
+#[must_use]
+pub fn is_aud(nal: &[u8]) -> bool {
+    nal.first().is_some_and(|header| header & 0x1F == NAL_AUD)
 }
 
 /// Whether an access unit (its NAL units) starts with an IDR picture.
@@ -247,7 +244,8 @@ mod tests {
         let data = [
             0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 0, 0, 1, 0x65, 4, 5, 0,
         ];
-        let nals = split_annex_b(&data).expect("annex b");
+        let mut nals = Vec::new();
+        assert!(split_annex_b(&data, &mut nals, 0));
         assert_eq!(nals.len(), 3);
         assert_eq!(units(&data, &nals)[0], [0x67, 1, 2]);
         assert_eq!(units(&data, &nals)[1], [0x68, 3]);
@@ -257,17 +255,30 @@ mod tests {
 
     #[test]
     fn requires_an_initial_start_code() {
-        assert!(split_annex_b(&[0x67, 1, 2]).is_none());
-        assert!(split_annex_b(&[0, 0, 1]).is_none());
+        let mut nals = Vec::new();
+        assert!(!split_annex_b(&[0x67, 1, 2], &mut nals, 0));
+        assert!(!split_annex_b(&[0, 0, 1], &mut nals, 0));
+        assert_eq!(nals.len(), 0);
     }
 
     #[test]
-    fn removes_the_access_unit_delimiter() {
+    fn detects_the_access_unit_delimiter() {
         let au = [0, 0, 1, 0x09, 0xF0, 0, 0, 1, 0x65, 1];
-        let mut nals = split_annex_b(&au).expect("annex b");
+        let mut nals = Vec::new();
+        assert!(split_annex_b(&au, &mut nals, 0));
         assert_eq!(nals.len(), 2);
-        strip_aud(&au, &mut nals);
-        assert_eq!(units(&au, &nals), vec![&[0x65, 1][..]]);
+        assert!(is_aud(&au[nals[0].0..]));
+        assert!(!is_aud(&au[nals[1].0..]));
+        // Dropping the delimiter is a range bump, not a copy.
+        assert_eq!(units(&au, &nals[1..]), vec![&[0x65, 1][..]]);
+    }
+
+    #[test]
+    fn ranges_are_offset_by_the_base() {
+        let au = [0, 0, 1, 0x65, 1];
+        let mut nals = Vec::new();
+        assert!(split_annex_b(&au, &mut nals, 100));
+        assert_eq!(nals, vec![(103, 105)]);
     }
 
     #[test]
