@@ -43,7 +43,7 @@ fn home() -> PathBuf {
 
 /// `meson install`'s prefix for the libplacebo this repo builds.
 fn default_placebo() -> PathBuf {
-    home().join("Projects/Code/Libs/libplacebo-shared")
+    home().join("Projects/Code/Libs/libplacebo/prefix")
 }
 
 /// Scoop's root: `%SCOOP%`, else `~/scoop` (scoop's own default).
@@ -616,6 +616,16 @@ fn build_with_meson(link: Link) -> Result<Installed, String> {
                 .map_err(|error| format!("cannot name {} as a .lib: {error}", archive.display()))?;
         }
     }
+    // Meson's `.pc` says `-lplacebo`, but the MSVC install names the import
+    // library `libplacebo.lib`; provide the alias the `.pc` names.
+    if link == Link::Dynamic && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let library = prefix.join("lib").join("libplacebo.lib");
+        let alias = prefix.join("lib").join("placebo.lib");
+        if library.is_file() {
+            fs::copy(&library, &alias)
+                .map_err(|error| format!("cannot alias {}: {error}", library.display()))?;
+        }
+    }
     fs::write(root.join("link"), link.key())
         .map_err(|error| format!("cannot record the link mode: {error}"))?;
 
@@ -683,7 +693,16 @@ fn windows_meson(
         sdk.join("Lib").join(&sdk_version).join("ucrt/x86_64"),
         sdk.join("Lib").join(&sdk_version).join("um/x86_64"),
     ]);
-    let mut path = vec![vulkan.join("Bin")];
+    // A venv inside the checkout (see the notes) is the supported home for the
+    // meson toolchain: the uv-managed system Python has no jinja2, which
+    // libplacebo's code generators need. Prepending it here means a source
+    // build works without the caller juggling PATH.
+    let mut path = Vec::new();
+    let venv = source.join(".venv").join("Scripts");
+    if venv.is_dir() {
+        path.push(venv);
+    }
+    path.push(vulkan.join("Bin"));
     if let Some(existing) = env::var_os("PATH") {
         path.extend(env::split_paths(&existing));
     }

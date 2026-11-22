@@ -117,9 +117,11 @@ headers) and, behind the `libav` feature, the FFmpeg libraries. Linux uses
 pkg-config; `LIBPLACEBO_PREFIX` selects a prefix instead. Windows names its
 prefix through the same environment-variable override, because the scoop
 packages ship no pkg-config files, and defaults it to
-`~/Projects/Code/Libs/libplacebo-shared` (the checkout itself is
+`~/Projects/Code/Libs/libplacebo/prefix` (the checkout itself is
 `~/Projects/Code/Libs/libplacebo`, named to a source build through
-`LIBPLACEBO_SRC`).
+`LIBPLACEBO_SRC`). The checkout's Windows `.venv` holds meson, ninja and
+jinja2; the build script puts its `Scripts` on `PATH` for the meson run,
+because the uv-managed Python on this machine has no jinja2.
 
 `LIBPLACEBO_SOURCE` picks the origin on either platform: `system` (the default on
 Linux), `prefix` (the default on Windows), `build` (meson compiles
