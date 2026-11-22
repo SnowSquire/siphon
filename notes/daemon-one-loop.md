@@ -1,8 +1,10 @@
 # Daemon: one loop, one owner
 
-Status: implementation in progress in the `daemon-one-loop` worktree. This is the
-plan we settled on in the design conversation, written down so the reasoning
-survives the session that produced it.
+Status: the first two passes are implemented and committed in the
+`daemon-one-loop` worktree (`otwutqxw`, `qullqoys`). `cargo test -p daemon` is
+141 green, clippy is clean, and the mock's new routes were exercised by hand with
+curl. This is the plan we settled on in the design conversation, written down so
+the reasoning survives the session that produced it.
 
 **MORNING: read § "The runtime-struct question" at the end. That is the one you
 said you were too tired to work through, and it is the only open decision left.**
@@ -105,15 +107,29 @@ connection health, forced DVR URLs. The mock grows a GQL route for the queries
   buffers recycled — instead of one `Vec` per access unit, one `Vec` per NAL list
   and one `Vec` per AAC frame. Not started.
 
+## What landed
+
+- `otwutqxw` — one loop owns the backend: connections as slots with one read and
+  one write op each, synchronous snapshot, one coalesced bus queue encoded once
+  per update, registry without the sets/cap, constants moved, no tick.
+- `qullqoys` — the scheduler parks with no consumers and resumes at the live
+  edge; `--debug` is only endpoint selection (GQL, usher, OAuth, Hermes), and
+  servermock answers `UserByLogin`, `UsersByIds`, `PlaybackAccessToken`, the
+  usher master path and an avatar.
+- The RPC round-trip test now drives the real listener, the real daemon loop and
+  the real registry over a Unix socket.
+
 ## What is not decided / not done
 
-- Stream identity is still `(login, quality)`. Keying by channel id needs a
-  login→id lookup in the resolve path, which `get_variants` does not provide.
-  Blocked on a GQL query (or usher data) that returns the channel id.
-- Servermock GQL route not written.
-- Demux sample store not started.
-- Notes `architecture.md` / `rpc.md` / `daemon-mode.md` still describe the old
-  loop and the old registry sets; update them when the code lands.
+- Stream identity is still `(login, quality)` internally. Keying by channel id
+  needs a login→id lookup in the resolve path, which `get_variants` does not
+  provide; it is blocked on a GQL query (or usher data) that returns it.
+- Demux sample store (flat buffer + ranges, recycled AU buffers) not started.
+  The existing per-AU allocation and per-AAC-frame `to_vec()` are still there.
+- `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` still
+  describe the old loop, the per-connection queues and the monitor sets.
+- The Windows named-pipe listener path was rewritten by analogy and not built or
+  run on this box.
 
 ---
 
