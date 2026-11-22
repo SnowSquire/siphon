@@ -1249,15 +1249,17 @@ impl App {
         if self.update_busy {
             return;
         }
-        let installer = matches!(update::install_mode(), update::InstallMode::Msi)
-            .then(|| offer.msi_url.clone())
+        let installer = matches!(update::install_mode(), update::InstallMode::Installed)
+            .then(|| offer.installer_url.clone())
             .flatten();
         if let Some(url) = installer {
             self.update_busy = true;
             let client = Rc::clone(&self.client);
             let version = offer.version;
             self.spawn_job(async move {
-                JobDone::UpdateDownloadFinished(update::download_msi(&client, &url, &version).await)
+                JobDone::UpdateDownloadFinished(
+                    update::download_installer(&client, &url, &version).await,
+                )
             });
         } else {
             update::open_page(&offer.page_url);
@@ -1266,7 +1268,7 @@ impl App {
 
     fn finish_update_download(&mut self, result: Result<PathBuf, update::UpdateError>) {
         match result {
-            Ok(path) => match update::install_msi_and_relaunch(&path) {
+            Ok(path) => match update::install_and_relaunch(&path) {
                 Ok(()) => {
                     tracing::info!(target: "update", "installer launched, stopping for upgrade");
                     // The RTSP listener has no shutdown path; exiting releases
@@ -1302,6 +1304,6 @@ fn update_view(release: &update::Release) -> UpdateView {
     UpdateView {
         version: release.version.to_string(),
         page_url: release.page_url.clone(),
-        installer: release.msi_url.is_some(),
+        installer: release.installer_url.is_some(),
     }
 }

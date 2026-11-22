@@ -1,8 +1,8 @@
 //! Update checking and installer hand-off.
 //!
-//! The backend owns the check and the MSI install; the UI only renders the
-//! offer and sends `ApplyUpdate`. Installing restarts the daemon, and the UI
-//! reconnects when it comes back.
+//! The backend owns the check and the installer run; the UI only renders the
+//! offer and sends `ApplyUpdate`. The installer closes both processes and the
+//! waiter opens the window again, which starts a daemon of its own.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -33,18 +33,18 @@ pub enum UpdateError {
     Invalid(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    /// Only produced on platforms without the MSI hand-off.
+    /// Only produced on platforms without the installer hand-off.
     #[allow(dead_code)]
     #[error("no installer for this build")]
     NoInstaller,
 }
 
 /// A published release worth offering: the version plus where to get it.
-/// `msi_url` is `None` when the release carries no installer asset.
+/// `installer_url` is `None` when the release carries no installer asset.
 #[derive(Clone, Debug)]
 pub struct Release {
     pub version: semver::Version,
-    pub msi_url: Option<String>,
+    pub installer_url: Option<String>,
     pub page_url: String,
 }
 
@@ -64,20 +64,23 @@ struct AssetJson {
 
 /// Decodes one `releases/latest` body. Tags carry a `v` prefix (`v0.1.3`);
 /// anything that is not semver after stripping it is refused.
+///
+/// The installer is the `-setup.exe` asset: a portable build or an archive can
+/// sit in the same release without being mistaken for one.
 pub fn parse_release(body: &[u8]) -> Result<Release, UpdateError> {
     let json: ReleaseJson = sonic_rs::from_slice(body)?;
     let tag = json.tag_name.strip_prefix('v').unwrap_or(&json.tag_name);
     let version = semver::Version::parse(tag).map_err(|error| {
         UpdateError::Invalid(format!("bad release tag {}: {error}", json.tag_name))
     })?;
-    let msi_url = json
+    let installer_url = json
         .assets
         .into_iter()
-        .find(|asset| asset.name.to_lowercase().ends_with(".msi"))
+        .find(|asset| asset.name.to_lowercase().ends_with("-setup.exe"))
         .map(|asset| asset.browser_download_url);
     Ok(Release {
         version,
-        msi_url,
+        installer_url,
         page_url: json.html_url,
     })
 }
@@ -111,16 +114,16 @@ pub async fn fetch_latest(client: &Client) -> Result<Release, UpdateError> {
     parse_release(&body)
 }
 
-/// How this copy was installed: via the per-user MSI or standalone.
+/// How this copy was installed: by the per-user installer or standalone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InstallMode {
     /// Constructed only by the Windows registry check.
     #[allow(dead_code)]
-    Msi,
+    Installed,
     Portable,
 }
 
-/// An MSI install lives under the `InstallDir` the installer recorded;
+/// An installed copy lives under the `InstallDir` the installer recorded;
 /// anything else (portable exe, dev build) is standalone.
 #[cfg(windows)]
 #[must_use]
@@ -134,7 +137,7 @@ pub fn install_mode() -> InstallMode {
         .ok()
         .map(PathBuf::from);
     match (exe_dir, install_dir) {
-        (Some(exe), Some(installed)) if exe.starts_with(&installed) => InstallMode::Msi,
+        (Some(exe), Some(installed)) if exe.starts_with(&installed) => InstallMode::Installed,
         _ => InstallMode::Portable,
     }
 }
@@ -146,8 +149,8 @@ pub const fn install_mode() -> InstallMode {
 }
 
 /// Downloads the installer to the temp dir. The body is read before the file
-/// is written, so a failed download leaves no partial `.msi` behind.
-pub async fn download_msi(
+/// is written, so a failed download leaves no partial `.exe` behind.
+pub async fn download_installer(
     client: &Client,
     url: &str,
     version: &semver::Version,
@@ -161,45 +164,44 @@ pub async fn download_msi(
     let body = crate::http::timeout(UPDATE_TIMEOUT, response.body.read_to_end(MAX_UPDATE))
         .await
         .map_err(|_| UpdateError::Timeout)??;
-    let path = std::env::temp_dir().join(format!("siphon-update-{version}.msi"));
+    let path = std::env::temp_dir().join(format!("siphon-update-{version}.exe"));
     compio::fs::write(&path, body).await.0?;
     Ok(path)
 }
 
-/// Builds the waiter script: installs the MSI, then reopens the daemon.
+/// Builds the waiter script: installs silently, then opens the window.
 /// Single quotes cover spaces in both paths; embedded quotes are doubled.
 #[cfg(any(windows, test))]
-fn relaunch_script(msi: &Path, exe: &Path) -> String {
+fn relaunch_script(installer: &Path, relaunch: &Path) -> String {
     let quote = |path: &Path| path.display().to_string().replace('\'', "''");
     format!(
-        "Start-Process -FilePath 'msiexec.exe' -ArgumentList '/i','{}','/passive' -Wait; Start-Process -FilePath '{}'",
-        quote(msi),
-        quote(exe),
+        "Start-Process -FilePath '{}' -ArgumentList '/S' -Wait; Start-Process -FilePath '{}'",
+        quote(installer),
+        quote(relaunch),
     )
 }
 
 /// Launches the installer and returns immediately. The daemon exits so no
-/// files are locked; the script reopens it after the install.
+/// files are locked; the script reopens the window once the install is done.
 #[cfg(windows)]
-pub fn install_msi_and_relaunch(msi: &Path) -> Result<(), UpdateError> {
+pub fn install_and_relaunch(installer: &Path) -> Result<(), UpdateError> {
     use std::os::windows::process::CommandExt as _;
 
     let exe = std::env::current_exe()?;
+    // The installer closes both processes. Reopening the window also brings
+    // back the daemon it starts; a tree without one falls back to this exe.
+    let window = exe.with_file_name("siphon.exe");
+    let relaunch = if window.is_file() { &window } else { &exe };
+    let script = relaunch_script(installer, relaunch);
     std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &relaunch_script(msi, &exe),
-        ])
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub const fn install_msi_and_relaunch(_msi: &Path) -> Result<(), UpdateError> {
+pub const fn install_and_relaunch(_installer: &Path) -> Result<(), UpdateError> {
     Err(UpdateError::NoInstaller)
 }
 
@@ -227,20 +229,20 @@ mod tests {
         "tag_name": "v0.2.0",
         "html_url": "https://github.com/SnowSquire/twitch-siphon/releases/tag/v0.2.0",
         "assets": [
-            {"name": "Siphon_0.2.0_x64-portable.exe",
-             "browser_download_url": "https://example.com/Siphon_0.2.0_x64-portable.exe"},
-            {"name": "siphon_0.2.0_x64_en-US.msi",
-             "browser_download_url": "https://example.com/siphon.msi"}
+            {"name": "siphon_0.2.0_x64-portable.exe",
+             "browser_download_url": "https://example.com/siphon_0.2.0_x64-portable.exe"},
+            {"name": "siphon-0.2.0-x64-setup.exe",
+             "browser_download_url": "https://example.com/siphon-0.2.0-x64-setup.exe"}
         ]
     }"#;
 
     #[test]
-    fn parse_picks_version_msi_and_page() {
+    fn parse_picks_version_installer_and_page() {
         let release = parse_release(BODY).unwrap();
         assert_eq!(release.version, semver::Version::new(0, 2, 0));
         assert_eq!(
-            release.msi_url.as_deref(),
-            Some("https://example.com/siphon.msi")
+            release.installer_url.as_deref(),
+            Some("https://example.com/siphon-0.2.0-x64-setup.exe")
         );
         assert_eq!(
             release.page_url,
@@ -249,11 +251,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_without_msi_yields_no_installer() {
+    fn parse_ignores_the_portable_exe() {
+        let body = br#"{"tag_name": "v0.2.0", "html_url": "https://example.com/r",
+            "assets": [{"name": "siphon_0.2.0_x64-portable.exe",
+                        "browser_download_url": "https://example.com/siphon-portable.exe"}]}"#;
+        let release = parse_release(body).unwrap();
+        assert!(release.installer_url.is_none());
+    }
+
+    #[test]
+    fn parse_without_installer_yields_none() {
         let body = br#"{"tag_name": "v0.2.0", "html_url": "https://example.com/r",
             "assets": [{"name": "notes.txt", "browser_download_url": "https://example.com/n"}]}"#;
         let release = parse_release(body).unwrap();
-        assert!(release.msi_url.is_none());
+        assert!(release.installer_url.is_none());
     }
 
     #[test]
@@ -265,14 +276,16 @@ mod tests {
     #[test]
     fn relaunch_script_installs_before_reopening_and_quotes_paths() {
         let script = relaunch_script(
-            Path::new("C:\\My Dir\\siphon-update-0.2.0.msi"),
-            Path::new("C:\\App Dir\\siphon-daemon.exe"),
+            Path::new("C:\\My Dir\\siphon-update-0.2.0.exe"),
+            Path::new("C:\\App Dir\\siphon.exe"),
         );
-        let install = script.find("msiexec.exe").expect("installs via msiexec");
-        let open = script.find("siphon-daemon.exe").expect("reopens the app");
+        let install = script.find("/S").expect("installs silently");
+        let open = script
+            .find("C:\\App Dir\\siphon.exe")
+            .expect("reopens the window");
         assert!(install < open, "reopen must wait for the install");
         assert!(script.contains("-Wait"));
-        assert!(script.contains("'C:\\My Dir\\siphon-update-0.2.0.msi'"));
-        assert!(script.contains("'C:\\App Dir\\siphon-daemon.exe'"));
+        assert!(script.contains("'C:\\My Dir\\siphon-update-0.2.0.exe'"));
+        assert!(script.contains("'C:\\App Dir\\siphon.exe'"));
     }
 }

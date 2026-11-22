@@ -289,7 +289,7 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
 
 ## Open questions
 
-- Update checking/applying: daemon or UI? Applying an MSI restarts processes.
+- Update checking/applying: daemon or UI? Applying an installer restarts processes.
 - Launch model: daemon autostart at login (needed for notifications with the UI
   closed) versus the UI starting it on demand.
 - Multiple UI clients: the protocol supports it, but only one tray/window is

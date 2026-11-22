@@ -369,7 +369,7 @@ pub struct UpdateView {
     pub version: String,
     /// Release page, for builds with no installer.
     pub page_url: String,
-    /// True when `ApplyUpdate` downloads and installs an MSI.
+    /// True when `ApplyUpdate` downloads and runs the installer.
     pub installer: bool,
 }
 

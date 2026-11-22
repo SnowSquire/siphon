@@ -26,6 +26,8 @@ only sink; disk output is disabled and being rebuilt from
 - `ui-design-direction.md` — the ZGUI surface: tokens, density, marquees, row states.
 - `linux-port.md` — the UI on Linux: present path, buffer counts, build constraints,
   and what the hardware on the dev box can and cannot do.
+- `windows-installer.md` — the per-user NSIS installer, the update hand-off and
+  the FFmpeg/libplacebo payload the installer has to ship.
 - `dxgi-hell.md` — the Windows DXGI band that is still open: the share-vs-blit
   seam, the measurements, the experiments already ruled out, and the rules.
 - `video-decode.md` — the planned UI video path: VA-API / D3D12 Video, libav.
@@ -55,6 +57,9 @@ only sink; disk output is disabled and being rebuilt from
   `~/.cargo/config.toml`: `clang-cl` + `llvm-lib` compile the C dependencies and
   `lld-link` links. No Windows machine is involved.
 - UI: `cargo run -p siphon-ui` (binary `siphon`, ZGUI + DXGI). It starts `siphon-daemon.exe` next to itself if the admin named pipe is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
+- Installer: `scripts/package-win.sh` — stages the Windows release and runs
+  `makensis` into `dist/` (`--no-build` reuses the current target dir; Fedora
+  needs `mingw32-nsis`). `notes/windows-installer.md` has the contract.
 - UI check (native): `cargo clippy -p siphon-ui --all-targets` — the Linux present path builds against the system libplacebo through pkg-config (`LIBPLACEBO_SOURCE=system` is the default there). Run it for any UI change; it does not need Windows.
 - UI check (Windows target): `scripts/cargo-win.sh clippy -p siphon-ui --all-targets`.
   This box builds a Windows libplacebo itself —

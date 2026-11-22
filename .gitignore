@@ -1,6 +1,9 @@
 # Cargo build output
 target/
 
+# Staged Windows payload and the setup built from it
+dist/
+
 # Downloaded/captured state
 captures/
 
