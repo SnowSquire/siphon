@@ -420,9 +420,11 @@ impl App {
                     conns[id] = None;
                     return;
                 }
-                // `write_all` hands the buffer back untouched: reuse it.
+                // `write_all` hands the buffer back untouched. It is the
+                // *spare*, never `out`: bytes queued while the write was in
+                // flight are still there and must not be replaced.
                 buf.clear();
-                conn.out = buf;
+                conn.spare = buf;
             }
         }
     }
@@ -527,7 +529,8 @@ impl App {
             if conn.ready && !conn.writing && !conn.out.is_empty() {
                 conn.writing = true;
                 let stream = Rc::clone(&conn.stream);
-                let buf = std::mem::take(&mut conn.out);
+                std::mem::swap(&mut conn.out, &mut conn.spare);
+                let buf = std::mem::take(&mut conn.spare);
                 ops.push(write_op(id, stream, buf));
             }
         }

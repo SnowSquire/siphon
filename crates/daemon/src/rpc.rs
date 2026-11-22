@@ -39,6 +39,8 @@ pub struct Conn {
     pub decoder: FrameDecoder,
     /// Encoded frames waiting to be written.
     pub out: Vec<u8>,
+    /// The buffer a completed write hands back, emptied for reuse.
+    pub spare: Vec<u8>,
     /// The handshake completed and the snapshot was queued.
     pub ready: bool,
     /// A write future owns the buffer right now.
@@ -52,6 +54,7 @@ impl Conn {
             stream: Rc::new(stream),
             decoder: FrameDecoder::new(),
             out: Vec::new(),
+            spare: Vec::new(),
             ready: false,
             writing: false,
         }
