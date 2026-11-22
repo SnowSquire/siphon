@@ -39,7 +39,29 @@ jj log -r 'ancestors(@, 10)' --no-graph -T 'change_id.short() ++ " " ++ descript
 Both sides almost always have commits off a common base (you were working in
 parallel), so this is a **rebase**, not a checkout.
 
-## 2. Move the worktree's commits on top of yours
+## 2. Join the two lines: rebase by default, a real merge only on purpose
+
+Two different results, and they are not interchangeable:
+
+- **Rebase** (the default here) replays the worktree's commits on top of yours.
+  The result is one line: the worktree commits get new commit IDs but keep their
+  change IDs, so nothing is lost and `jj show <change>`/`jj squash --from
+  <change>` still work. This is what an agent worktree deserves: it is a
+  short-lived convenience, never published, and its files are usually disjoint
+  from the main line's, so "it happened after" is the honest simplification.
+- **Merge** has the two lines meet in a commit with two parents, and the fork
+  stays visible in the graph. It is the truthful picture when the worktree's line
+  is not a convenience but a branch with independent identity (long-lived,
+  reviewed/tested as its own snapshot, or published), and it preserves the
+  original commit IDs. The cost is that the graph now branches: `jj chain` and
+  `jj log -r '::@'` show a merge node that owns nothing of its own, and anything
+  that later wants the change has to walk two parents.
+
+jj has no `jj merge` command: a merge commit is `jj new <rev-a> <rev-b>`. With
+disjoint files it resolves itself; otherwise resolve the conflicts in that
+commit's working copy, then `jj new` on top.
+
+### Rebase (default)
 
 ```bash
 cd <repo>                                  # @ here is your empty working copy
@@ -50,9 +72,19 @@ jj new                                     # empty @ on top
 jj abandon <the-empty-commit-that-was-your-@>   # leaves no empty commit mid-history
 ```
 
-Verify: `jj log -r 'ancestors(@, 10)'` shows your commits, then the worktree's,
-with `@` empty and undescribed on top. `jj status` must be clean — if it is not,
-the rebase dropped something; inspect with `jj diff --git` before going on.
+### Merge (only when the line should stay visible)
+
+```bash
+cd <repo>
+jj new <your-tip> <worktree-tip>           # the merge commit is now @; resolve here
+jj diff --git                              # a clean merge has an empty diff
+jj new                                     # empty @ on top of the merge
+jj abandon <both-empty-working-copies>     # the two empty tips, if they came along
+```
+
+Either way, verify: `jj log -r '::@'` (or `jj chain`) ends with `@` empty and
+undescribed. `jj status` must be clean — if it is not, something was dropped or a
+conflict is unresolved; inspect with `jj diff --git` before going on.
 
 Do **not** squash the worktree's commits into one, and do not squash them into
 an undescribed parent: keep them as their own described commits so they can be
