@@ -44,12 +44,16 @@ missing_errors_doc = "allow" # Turn off another noisy pedantic lint
 too_many_lines = "allow"
 
 
-# Release artifacts that ship are built elsewhere (the desktop, the Proxmox CI
-# box), so this local profile optimises for compile time: no LTO, the default 16
-# codegen units. A CI run can still ask for the shipped settings with
-# `CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
+# The release profile is the shipped one: fat LTO and a single codegen unit, so
+# the whole program is optimised across crate boundaries. A clean build is slow;
+# a quick local iteration can override the two knobs without editing the file:
+#
+#   CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+#     cargo build --release
 [profile.release]
 opt-level = 3
+lto = "fat"
+codegen-units = 1
 panic = "abort"
 strip = true
 
