@@ -60,5 +60,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+[build-dependencies]
+flate2 = "1"
+ureq = "3"
+
 [lints]
 workspace = true

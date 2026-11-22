@@ -111,15 +111,15 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   supports variable fonts through `font-variation-settings`; `font-weight`
   alone does not drive the axes. The narrow `wdth` axis is useful for dense
   table rows.
-- **Chillax** (Fontshare, ITF Free Font License 2.0) is used for channel names
-  via the `BrandFont` family; download the unmodified variable TTF from
-  `https://api.fontshare.com/v2/fonts/download/chillax` to
-  `/tmp/opencode/fonts/Chillax-Variable.ttf` and pass it as `SIPHON_FONT_BRAND`.
-  The licence allows embedding in the app but explicitly forbids distributing
-  the font file through a repository, so it is **not** in git; release builds
-  need a build-time fetch or a separately licensed asset. `font-family:
-  BrandFont, Chillax, sans-serif` degrades to the system font when the dev
-  override is absent.
+- **Chillax** (Fontshare, ITF Free Font License 2.0) is the brand face behind
+  the `BrandFont` family. `crates/ui/build.rs` downloads the unmodified
+  variable TTF from `https://api.fontshare.com/v2/fonts/download/chillax` and
+  writes it into the profile's `OUT_DIR`, so both profiles embed it and a
+  `cargo clean` makes the next build fetch it again; `SIPHON_CHILLAX_TTF`
+  points the build at a local copy instead, and `SIPHON_FONT_BRAND` still
+  overrides the family at runtime. The licence allows embedding in the app but
+  explicitly forbids distributing the font file through a repository, so it is
+  **not** in git.
 - **Noto Color Emoji** (CBDT build, OFL 1.1) ships in `crates/ui/fonts/` and is
   registered as `SiphonEmoji`. It is both the last entry in the root
   `font-family` stack and bound to fontique's `Emoji` generic. The CBDT build
