@@ -42,7 +42,6 @@ use crate::bus::Bus;
 use crate::disk::DiskOptions;
 use crate::disk::DiskOutput;
 use crate::downloader::ToDownloader;
-use crate::gql;
 use crate::http::Client;
 use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
@@ -482,23 +481,20 @@ impl Registry {
             return Ok(data);
         }
 
-        let row = self.channel_row(login);
-        let mut id = row.as_ref().and_then(|row| row.id);
-        let mut title = row.and_then(|row| row.title);
-        if id.is_none() {
-            match gql::fetch_channel(&self.client, self.options.client_id.as_deref(), login).await {
-                Ok(Some(detail)) => {
-                    id = Some(detail.id);
-                    title = Some(detail.display_name);
-                }
-                Ok(None) => {}
-                Err(error) => warn!(%error, login, "daemon: channel lookup failed"),
-            }
-        }
-        let Some(id) = id else {
-            warn!(login, "daemon: no channel id, cannot key the stream");
-            return Err(ResolveError::UNAVAILABLE);
+        // The daemon owns the login to id mapping: a followed channel arrives
+        // with its id through `sync_channels`. A login it was never told about
+        // is not a channel this registry serves.
+        let Some(row) = self.channel_row(login) else {
+            return Err(ResolveError::NOT_FOUND);
         };
+        let Some(id) = row.id else {
+            debug!(
+                login,
+                "daemon: login is not followed, refusing to invent a stream"
+            );
+            return Err(ResolveError::NOT_FOUND);
+        };
+        let title = row.title.unwrap_or_else(|| login.to_owned());
 
         let resolved = get_variants(
             &self.client,
@@ -511,7 +507,7 @@ impl Registry {
         let data = match resolved {
             Ok((variants, broadcast_id)) => Rc::new(ChannelData {
                 id,
-                title: title.unwrap_or_else(|| login.to_owned()),
+                title,
                 variants,
                 broadcast_id,
             }),
@@ -528,7 +524,6 @@ impl Registry {
         };
 
         self.update_row(login, |row| {
-            row.id = Some(id);
             row.title = Some(data.title.clone());
             row.data = Some(Rc::clone(&data));
         });
