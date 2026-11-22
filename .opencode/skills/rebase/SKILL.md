@@ -117,10 +117,36 @@ If you are sitting in the worktree, `tools.opencode.session_move({ directory:
 `git worktree remove` — it leaves the jj workspace entry and every later jj
 command errors.
 
-## 6. Verify
+## 6. Move main and push
+
+`@` is the empty working-copy commit; the rebased tip is `@-`. Move the bookmark
+and push it. jj's push is force-with-lease: it updates the remote only if the
+remote is still where the last fetch left it.
+
+```bash
+cd <repo>
+jj bookmark set main -r '@-'
+jj git push --bookmark main
+```
+
+**Never use `--allow-empty-description`.** If jj refuses a commit because it has
+no description, describe it and push again:
+
+```bash
+jj describe -r <change>                     # still local
+jj describe -r <change> --ignore-immutable  # already published
+jj git push --bookmark main
+```
+
+The empty `@` is not in the pushed range, so it may stay undescribed. Every
+commit below it must be described. If the remote moved, `jj git fetch`,
+reconcile the bookmark, and push again.
+
+## 7. Verify
 
 ```bash
 jj status               # @ empty, @- is the rebased commit
+jj bookmark list main   # main and main@origin at the rebased tip
 jj workspace list       # only "default (current)" (plus unrelated worktrees)
 git worktree list       # only this repo (plus unrelated worktrees)
 ls <worktree-parent>    # the directory is gone
