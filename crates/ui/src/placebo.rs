@@ -3,7 +3,6 @@
 //! The device is imported, not created: wgpu owns it and libplacebo shares the
 //! instance, physical device, device and graphics queue.
 
-// Ported from the video spike; only the UI overlay pass is used for now.
 #![allow(dead_code)]
 use std::ffi::c_char;
 use std::ptr;

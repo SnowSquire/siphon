@@ -249,9 +249,7 @@ impl Chain {
     ///
     /// SDR is sRGB, not BT.1886: `DxgiSwapchain` hands the buffer to DXGI as
     /// `DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709`, the space every SDR desktop
-    /// application writes and the one Windows treats as sRGB. Encoding the
-    /// interface to γ2.4 and letting the compositor decode it as γ2.2 lifted
-    /// the near-black background and washed the palette out. Declaring the
+    /// application writes and the one Windows treats as sRGB. Declaring the
     /// space the overlay is already in makes the libplacebo pass an identity,
     /// which is also what the Wayland chain gets from its swapchain.
     ///
@@ -464,8 +462,7 @@ impl Chain {
             return;
         }
         // A shrink must not land inside a drag: while the user is sizing the
-        // window the desktop owns its frame, and `ResizeBuffers` there is what
-        // was seen to take the device away. Wait for the drag to end.
+        // window the desktop owns its frame. Wait for the drag to end.
         // SAFETY: `GetCapture` reads the calling thread's capture window.
         if !unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() }.is_invalid() {
             self.canvas.configured();
@@ -486,8 +483,7 @@ impl Chain {
     /// resize, so nothing else would tell the chain that the value it grades
     /// against has changed.
     fn refresh_display(&self, swapchain: &DxgiSwapchain) {
-        // The shell owns the window during a move or a size drag, and DXGI
-        // work in that loop is what was seen to take the device away. The
+        // The shell owns the window during a move or a size drag. The
         // state is re-read the moment the drag ends.
         if in_move_loop() {
             return;

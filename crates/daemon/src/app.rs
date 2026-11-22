@@ -786,8 +786,7 @@ impl App {
         }
     }
 
-    /// Publishes telemetry that only the snapshot used to expose, so a UI
-    /// showing live counters updates without polling.
+    /// Publishes telemetry, so a UI showing live counters updates without polling.
     pub(crate) fn publish_telemetry(&mut self) {
         let arena = self.registry.arena_summary();
         if arena != self.last_arena {

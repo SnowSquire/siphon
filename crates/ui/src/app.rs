@@ -121,7 +121,6 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
         .with_compose_ahead(ComposeAhead::Always)
         .with_stylesheet(sheet);
 
-    // Frame timings for the resize A/B. stderr is what the app log captures.
     let window = if std::env::var_os("SIPHON_FRAME_LOG").is_some() {
         window.with_probe(Rc::new(FrameLog {
             last: Cell::new(None),
@@ -354,8 +353,6 @@ fn App(
                     break;
                 };
                 state.apply_event(event);
-                // Whatever arrived alongside it lands in the same frame: a burst
-                // costs one repaint rather than one per event.
                 while let Ok(Some(event)) = events.try_recv() {
                     state.apply_event(event);
                 }
@@ -544,9 +541,8 @@ fn App(
                         text(class = "tab__text") {"Settings"}
                     }
                 }
-                // The video surface is the next milestone. A tab that changes
-                // nothing is worse than a tab that says it cannot be used yet,
-                // so it is drawn and never selected.
+                // A tab that changes nothing is worse than a tab that says it
+                // cannot be used yet, so it is drawn and never selected.
                 box(class = "tab tab--off", attr:aria-disabled = "true") {
                     text {"Watch"}
                 }
@@ -1034,11 +1030,9 @@ fn ChannelRow(
                                 box(class = "channel-title") {
                                     text(
                                         class = "channel-title__run",
-                                        // An inline transform rather than a custom property
-                                        // read back from the stylesheet: a bare `var()` value
-                                        // works (the channel accents prove it), but the same
-                                        // substitution inside `translateX()` was dropped and
-                                        // the title never moved.
+                                        // Inline, not a custom property: this
+                                        // zgui does not apply `var()` inside
+                                        // `translateX()`.
                                         style:transform = move || {
                                             // One copy is a third of the run's
                                             // width, and `%` is the run's own
@@ -1962,7 +1956,6 @@ fn scroll_title(
     generation: Rc<Cell<u64>>,
     rewind: bool,
 ) {
-    // A title that fits its cell does not scroll: there is no copy to advance.
     if copy_chars <= 0.0 {
         return;
     }

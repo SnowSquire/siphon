@@ -700,9 +700,7 @@ impl Stream {
     /// full. Returns `false` only when the writer is gone.
     ///
     /// A full queue must never unregister the session: `try_send` reports
-    /// "full" separately from "closed", and treating the two the same silently
-    /// removed a live client from the fan-out for good, so playback froze while
-    /// the control plane kept answering until the player was reloaded.
+    /// "full" separately from "closed".
     fn push_out(session: &Session, message: Outbound) -> bool {
         if session.out.is_closed() {
             return false;

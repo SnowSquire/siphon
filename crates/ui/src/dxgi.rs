@@ -4,7 +4,6 @@
 //! into these textures through `renderer_supplied`, and `Present1` hands the filled
 //! backbuffer to DXGI. There is no `VkSurfaceKHR` and no `VkSwapchainKHR`.
 
-// Ported from the video spike: HDR paths stay for later; the UI presents SDR.
 #![allow(dead_code)]
 use std::cell::Cell;
 use std::ffi::c_void;

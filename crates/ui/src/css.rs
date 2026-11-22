@@ -264,8 +264,7 @@ pub const SHEET: &str = css!(
         gap: 10px;
         /* 16px on the right is the scroll gutter the viewport reserves: the
            cells keep clear of it, and `box-shadow` paints that strip in the
-           row's own colour without changing the layout box (a negative margin
-           there made the whole scroll area stop scrolling). */
+           row's own colour without changing the layout box. */
         padding: 6px 16px 6px 10px;
         border-radius: 0;
         /* A transparent 2px edge on every row keeps the cells aligned with the
@@ -288,7 +287,7 @@ pub const SHEET: &str = css!(
     }
 
     /* A drawn box, not a text glyph: in the pinned zgui a scaled glyph drops
-       out except at rest, which made a pulsing "●" disappear. */
+       out except at rest. */
     .live-dot__lamp {
         width: 6px;
         height: 6px;
@@ -312,7 +311,6 @@ pub const SHEET: &str = css!(
         min-width: 0;
     }
 
-    /* The one display face in the table: the old wordmark's Chillax. */
     .channel-name {
         flex-grow: 1;
         min-width: 0;
@@ -406,9 +404,7 @@ pub const SHEET: &str = css!(
     .viewers__value.stale { color: oklch(0.60 0.015 240); }
 
     /* The tooltip trigger is an inline-flex box, so `text-align` on the cell
-       never reaches its text: the value sat at the left of a 92px cell while
-       the header was right-aligned in its own. Push the one child to the end
-       instead. */
+       never reaches its text. Push the one child to the end instead. */
     .viewers-cell { justify-content: flex-end; }
 
     /* The panel is part of the row, not a card under it: no gap, no top
@@ -440,9 +436,8 @@ pub const SHEET: &str = css!(
         /* One step under the rows, close to the table's own surface: the open
            row casts into it, so the panel reads as a well the row opened
            rather than a card laid under it. The gradient is the drop shadow:
-           an inset `box-shadow` would have been the obvious way to draw it,
-           but this engine paints only the first shadow in a list and the
-           wrapper already spends its one on the gutter strip. */
+           this engine paints only the first shadow in a list and the wrapper
+           already spends its one on the gutter strip. */
         background-color: oklch(0.12 0.010 240);
         background-image: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0));
         background-size: 100% 12px;
@@ -731,7 +726,6 @@ pub const SHEET: &str = css!(
         color: var(--fg-faint);
     }
 
-/* ---- first pass: dense desktop tool -------------------------------- */
 :root {
     font-family: UIFont, Archivo, SiphonEmoji, sans-serif;
     font-variation-settings: "wght" 400, "wdth" 92;
@@ -743,7 +737,7 @@ pub const SHEET: &str = css!(
    equally on both sides instead of hanging off the right. The string is an
    explicit child rather than the box's own text: a flex container's anonymous
    text item is mis-shaped by this zgui revision once the font variation
-   changes, which painted the wrong label into a tab. */
+   changes. */
 .tab__label {
     display: flex;
     align-items: center;
@@ -931,8 +925,7 @@ pub const SHEET: &str = css!(
 .app .zui-switch.zui-switch--sm:checked > .zui-switch__thumb {
     transform: translateX(14px);
 }
-/* The old wordmark row is now a news ticker for the daemon's event stream.
-   Only translate is animated: in this pinned zgui, glyphs under a scale
+/* Only translate is animated: in this pinned zgui, glyphs under a scale
    transform are dropped except at the rest keyframe. Eight copies sliding by
    one copy (-12.5%) keep the loop seamless and the window filled. */
 .app { padding: 14px 12px 10px; gap: 6px; }

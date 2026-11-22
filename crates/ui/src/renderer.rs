@@ -49,7 +49,7 @@ pub struct UiRenderer {
     /// The extent the UI texture and inner renderer are built for.
     width: u32,
     height: u32,
-    /// A white texel mask for the diagnostics square, when it was asked for.
+    /// A white texel mask for the diagnostics square.
     nits_mask: Option<pl::pl_tex>,
 }
 
@@ -215,7 +215,7 @@ impl UiRenderer {
         self.gpu.queue().submit(Some(encoder.finish()));
     }
 
-    /// TEMP: looks for the diagnostics fill in the frame and, if it is there,
+    /// Looks for the diagnostics fill in the frame and, if it is there,
     /// writes the frame and the geometry that produced it.
     ///
     /// Magenta is a colour the interface never contains, so a pixel of it can

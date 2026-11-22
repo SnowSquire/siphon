@@ -19,9 +19,8 @@
 //! Discovery is declarative (`[package.metadata.system-deps]` in `Cargo.toml`)
 //! and belongs to `system-deps`: pkg-config, with `LIBPLACEBO_PREFIX` as an
 //! explicit override, and the build-internal hook when the library has to be
-//! compiled. The meson invocation that used to be
-//! `scripts/build-libplacebo.sh` lives in `build_with_meson` below, so a source
-//! build needs no separate shell step and works on both platforms.
+//! compiled. The meson invocation lives in `build_with_meson` below, so a
+//! source build needs no separate shell step and works on both platforms.
 
 use std::collections::HashMap;
 use std::env;

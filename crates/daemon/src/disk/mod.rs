@@ -321,9 +321,9 @@ struct Parked {
     pub(super) crossing: DvrSegment,
 }
 
-/// Where the recording is in its life. Every combination the old flags allowed
-/// but never meant (a handoff with no parked run, a canonical with no DVR) is
-/// unrepresentable here.
+/// Where the recording is in its life. Combinations that would mean nothing (a
+/// handoff with no parked run, a canonical with no DVR) are unrepresentable
+/// here.
 #[derive(Clone, Debug)]
 enum Phase {
     /// Discovery in progress: live segments go into runs and there is no

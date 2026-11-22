@@ -121,9 +121,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Current on-disk schema. `2` is Siphon's last release; `3` adds
-    /// `channels[].record`; `4` adds `channels[].notifyLive` and
-    /// `channels[].notifyTitles`; `5` adds `recordDir` and `recordDualFormat`.
+    /// Current on-disk schema.
     pub const VERSION: u64 = 5;
 }
 

@@ -1,4 +1,4 @@
-// Debug/stat accessors are exercised by the arena tests and future policies.
+// Debug/stat accessors are exercised by the arena tests.
 #[allow(dead_code, clippy::future_not_send)]
 mod app;
 #[allow(dead_code, clippy::future_not_send)]
@@ -311,9 +311,6 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
         (!cfg.debug).then(|| args.channel.clone()),
         Rc::clone(&dvr),
     );
-    // The public archive's master is fetched in parallel; picking the media
-    // playlist with the same stable-variant-id as the live stream is deferred
-    // until now.
     dvr.set_live_variant(variant);
 
     // `play`/`record` are single-stream modes: no registry, so no channel id.

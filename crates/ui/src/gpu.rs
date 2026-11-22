@@ -9,7 +9,6 @@
 //!   FFmpeg's Vulkan decoder submits on (NVIDIA keeps that family separate from
 //!   the graphics one, so wgpu would never create a queue there).
 
-// Ported from the video spike: the video-decode queue is not used by the UI.
 #![allow(dead_code)]
 use std::ffi::CStr;
 use std::ffi::c_void;

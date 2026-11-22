@@ -1,6 +1,6 @@
 //! Twitch GQL: channel resolution, the live-state baseline and avatar fetches.
 //!
-//! This is Siphon's typed decoder, moved onto the daemon's own HTTP client and
+//! This is Siphon's typed decoder on the daemon's own HTTP client and
 //! `sonic_rs`, so the backend keeps one TLS/connection stack.
 
 use std::num::NonZeroU64;

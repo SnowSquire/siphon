@@ -15,11 +15,11 @@ const AVATAR_DIR: &str = "avatars";
 
 /// Delays before the retry attempts of one avatar whose first download failed.
 ///
-/// A connect can lose a race with a slow DNS answer or a CDN edge — the
-/// `http: timed out: io` this was added for is a 5s connect timeout on one
-/// attempt, and the same URL answers in 40ms a moment later. Without this a
-/// channel keeps its initials for the whole session, because the only other
-/// attempt is the next Hermes reconnect.
+/// A connect can lose a race with a slow DNS answer or a CDN edge — a 5s
+/// connect timeout on one attempt reports `http: timed out: io`, and the same
+/// URL answers in 40ms a moment later. Without this a channel keeps its initials
+/// for the whole session, because the only other attempt is the next Hermes
+/// reconnect.
 const AVATAR_RETRIES: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
 
 /// The file an avatar URL is cached as, if the URL has a safe last segment.
