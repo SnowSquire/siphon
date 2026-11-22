@@ -197,6 +197,10 @@ pub struct DiskOptions {
     pub client: Rc<Client>,
     /// Read by `GetDisk`.
     pub metrics: Rc<DiskMetrics>,
+    /// Whether a live consumer feeds this recording. `false` is the DVR-only
+    /// mode: nothing to record live, so the DVR cursor starts at the broadcast
+    /// start and the live side is finished from the outset.
+    pub live: bool,
 }
 
 /// Handle to the recording task. `wait` resolves when the disk subsystem stops;
@@ -224,21 +228,30 @@ pub fn spawn_disk_output(
     options: DiskOptions,
     wakes: &Rc<WakeSet>,
     downloaders: &AsyncSender<ToDownloader>,
-    add_output: &Sender<ConsumerRegistration>,
+    add_output: Option<&Sender<ConsumerRegistration>>,
 ) -> DiskOutput {
     let (live_tx, live_rx) = kanal::unbounded();
     let (stop_tx, stop_rx) = kanal::bounded(1);
     let (done_tx, done_rx) = kanal::bounded(1);
 
-    let registration = ConsumerRegistration {
-        tx: live_tx,
-        // The last ~36 s are the only part of the pre-join broadcast the live
-        // source can still see, so record them before the DVR is known.
-        backlog: true,
-        lossy: false,
-    };
-    if let Err(error) = add_output.send(registration) {
-        error!(%error, "failed to register disk output");
+    if options.live {
+        if let Some(add_output) = add_output {
+            let registration = ConsumerRegistration {
+                tx: live_tx,
+                // The last ~36 s are the only part of the pre-join broadcast the
+                // live source can still see, so record them before the DVR is
+                // known.
+                backlog: true,
+                lossy: false,
+            };
+            if let Err(error) = add_output.send(registration) {
+                error!(%error, "failed to register disk output");
+            }
+        }
+    } else {
+        // No live consumer: closing the channel is what tells the disk there is
+        // no live side to wait for.
+        drop(live_tx);
     }
 
     let live_wake = ConsumerWake::new();
@@ -697,6 +710,15 @@ impl Disk {
     fn enter_dvr(&mut self, canonical: Canonical) {
         self.canonical = Some(canonical);
         self.phase = Phase::following();
+        if !self.options.live {
+            // DVR-only: nothing will ever arrive from a live playlist, and the
+            // cursor starts at the broadcast's first chunk.
+            self.phase = Phase::Dvr {
+                live: Live::Done,
+                parked: None,
+            };
+            self.dvr_next_start_ms = 0;
+        }
         self.dvr_seen_url = true;
     }
 
@@ -1081,6 +1103,10 @@ impl Disk {
 
     async fn on_live_closed(&mut self) -> Result<(), DiskOutputError> {
         self.close_current_run().await?;
+        if !self.options.live {
+            // DVR-only has no live runs to promote or drain.
+            return Ok(());
+        }
         if self.phase.promoted() {
             self.finished = true;
         } else if matches!(self.phase, Phase::Discovering) {

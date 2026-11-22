@@ -72,6 +72,7 @@ use futures_util::future::select;
 use futures_util::pin_mut;
 #[cfg(not(miri))]
 use mimalloc::MiMalloc;
+use sonic_rs::JsonValueTrait as _;
 // Cargo's unused-dependency lint only sees the crate root for target-gated
 // crates; the real use is in `notifier`.
 #[cfg(windows)]
@@ -88,6 +89,7 @@ use crate::constants::DEBUG_DVR_URL;
 use crate::constants::DEBUG_PORTRAIT_DVR_URL;
 use crate::constants::DEFAULT_RTSP_PORT;
 use crate::http::Client;
+use crate::http::ws::WsStream;
 use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::registry::Options as RegistryOptions;
@@ -95,6 +97,7 @@ use crate::registry::Recording as RegistryRecording;
 use crate::registry::Registry;
 use crate::spool::ConsumerWake;
 use crate::spool::WakeSet;
+use crate::variant::Variant;
 use crate::variant::VariantKind;
 use crate::variant::VariantPlaylistError;
 use crate::variant::choose_variant;
@@ -162,20 +165,38 @@ struct Play {
 }
 
 /// One channel, no UI: wait for it to go live, record it, exit when it ends.
+/// Which side of a broadcast a recording takes.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum RecordMode {
+    /// Live and DVR: the complete archive, as the daemon makes it.
+    #[default]
+    Both,
+    /// The live playlist only, with no DVR backfill.
+    Live,
+    /// The DVR playlist only, with no live consumer.
+    Dvr,
+}
+
 #[derive(Args, Debug)]
 struct Record {
     /// Channel login to record
-    #[arg(short, long)]
     channel: String,
 
-    /// Record here instead of the configured recordDir
+    /// STABLE-VARIANT-ID (`720p60`, `chunked`, `1920p`, ...); defaults to the
+    /// highest-scoring variant
+    variant: Option<String>,
+
+    /// live, dvr, or both
+    #[arg(long, value_enum, default_value_t)]
+    mode: RecordMode,
+
+    /// List the channel's variants and exit (the channel must be live)
+    #[arg(long)]
+    list: bool,
+
+    /// Write to <dir>/<broadcast id>/<variant>/
     #[arg(long)]
     output: Option<std::path::PathBuf>,
-
-    /// Record both orientations of a dual-format broadcast, even if the config
-    /// says otherwise
-    #[arg(long)]
-    dual_format: bool,
 
     /// Webhook to notify about skipped DVR chunks and alignment problems
     #[arg(long)]
@@ -332,10 +353,11 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
                 dvr: Rc::clone(&dvr),
                 client: Rc::clone(&client),
                 metrics: Rc::new(DiskMetrics::new()),
+                live: true,
             },
             &wakes,
             &downloaders_tx.clone().to_async(),
-            &registration_tx,
+            Some(&registration_tx),
         )
     });
 
@@ -398,57 +420,66 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
 }
 
 /// A long-lived RTSP server plus the Siphon backend: config, Hermes, monitors,
-/// One channel end to end, without the daemon's UI, RPC or RTSP listener.
+/// Record one channel of one variant, with no UI, RPC, RTSP listener or config.
 ///
-/// Everything that matters is the same code the daemon runs — one Hermes
-/// session, the same monitors, the same registry and disk recorder — so a run of
-/// this is a run of the real path, and it exits by itself when the broadcast
-/// ends. `recordDualFormat` from the config applies as usual.
+/// It is deliberately not the daemon: the variant is chosen here (by id, or the
+/// highest-scoring one), the live and DVR sides can be selected independently,
+/// and the command exits when the recording does. `--list` dumps the live
+/// master. Everything after that is the same scheduler, DVR and disk code the
+/// daemon runs.
 #[allow(clippy::future_not_send)]
 async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::Error>> {
     let login = args.channel.to_ascii_lowercase();
-    let persisted = config::load(&config::default_path(config::APP_ID));
-    let output = args.output.clone().or_else(|| {
-        persisted
-            .record_dir
-            .as_deref()
-            .map(std::path::PathBuf::from)
-    });
-    let Some(output) = output else {
-        return Err("record needs --output or a recordDir in the config".into());
-    };
-
-    let dual_format = args.dual_format || persisted.record_dual_format;
     let client = Rc::new(Client::new());
-    // The channel id keys the Hermes topic, so it is resolved before the app
-    // starts. Debug pretends one: the mock's Hermes accepts any topic.
-    let id = if cfg.debug {
-        7
-    } else {
-        let detail = gql::fetch_channel(&client, cfg.client_id.as_deref(), &login)
-            .await?
-            .ok_or_else(|| format!("no channel named {login}"))?;
-        detail.id
+
+    let Some((variants, broadcast_id)) =
+        resolve_record_variants(cfg, &client, &login, args).await?
+    else {
+        return Ok(());
+    };
+    if args.list {
+        list_variants(&login, &variants);
+        return Ok(());
+    }
+
+    let Some(output) = args.output.clone() else {
+        return Err("record needs --output".into());
+    };
+    let variant = match &args.variant {
+        Some(id) => variants
+            .iter()
+            .find(|variant| variant.id.as_ref() == id.as_str())
+            .ok_or_else(|| format!("no variant {id}; --list shows the live master's"))?,
+        None => variant::best_variant(&variants).ok_or("the live master has no variants")?,
     };
 
-    let config = siphon_shared::rpc::Config {
-        version: siphon_shared::rpc::Config::VERSION,
-        channels: vec![siphon_shared::rpc::Channel {
-            login: login.clone(),
-            id,
-            display_name: Some(login.clone()),
-            record: true,
-            notify_live: false,
-            notify_titles: false,
-        }],
-        notify_title_changes: false,
-        sound: false,
-        filtered_words: Vec::new(),
-        record_dir: Some(output.display().to_string()),
-        record_dual_format: dual_format,
+    let want_live = !matches!(args.mode, RecordMode::Dvr);
+    let want_dvr = !matches!(args.mode, RecordMode::Live);
+
+    // The DVR side: discovery when recording one, otherwise no URL at all (the
+    // disk then promotes the live recording straight into the canonical file).
+    let dvr = if want_dvr {
+        let debug_url = cfg.debug.then(|| {
+            if variant.kind == VariantKind::Portrait {
+                DEBUG_PORTRAIT_DVR_URL.to_owned()
+            } else {
+                DEBUG_DVR_URL.to_owned()
+            }
+        });
+        let dvr = rtsp::dvr::Dvr::new(debug_url);
+        rtsp::dvr::spawn(
+            Rc::clone(&client),
+            (!cfg.debug).then(|| login.clone()),
+            Rc::clone(&dvr),
+        );
+        dvr
+    } else {
+        rtsp::dvr::Dvr::new(None)
     };
+    dvr.set_live_variant(variant);
 
     let arena = Rc::new(ArenaSet::new());
+    let wakes = WakeSet::new();
     let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
     let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
     downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(
@@ -461,75 +492,214 @@ async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::E
         .notify
         .as_ref()
         .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
-    let bus = Bus::new();
-    let registry = Rc::new(Registry::new(
-        Rc::clone(&client),
-        arena,
-        downloaders_tx.to_async(),
-        downloader_metrics,
-        RegistryOptions {
-            client_id: cfg.client_id.clone(),
-            auth_token: cfg.auth_token.clone(),
-            low_latency: cfg.low_latency,
-            debug: cfg.debug,
-            // The primary recording and, with dual format, its sibling.
-            max_streams: 2,
-            recording: RegistryRecording {
-                output: Some(output.clone()),
-                dual_format,
-            },
-            notify: notifier,
+    let (registration_tx, registration_rx) = kanal::unbounded();
+    let dir = output
+        .join(if cfg.debug { 0 } else { broadcast_id }.to_string())
+        .join(&*variant.id);
+    let disk = disk::spawn_disk_output(
+        disk::DiskOptions {
+            output: output.clone(),
+            stream_id: if cfg.debug { 0 } else { broadcast_id },
+            variant: variant.id.clone(),
             keep_runs: args.keep_runs,
+            notifier,
+            dvr,
+            client: Rc::clone(&client),
+            metrics: Rc::new(DiskMetrics::new()),
+            live: want_live,
         },
-        Rc::clone(&bus),
-    ));
-    registry.watch_finished();
-    let (finished_tx, finished_rx) = kanal::unbounded();
-    registry.on_finished(Rc::new(move |key: &rtsp::StreamKey| {
-        let _ = finished_tx.try_send(key.clone());
-    }));
-
-    // The app owns Hermes, the baseline and the monitors. Its config path is
-    // scratch: a one-channel run must never rewrite the real config.
-    let (events_tx, events_rx) = kanal::unbounded();
-    let wake = ConsumerWake::new();
-    let sender = app::EventSender::new(events_tx, Rc::clone(&wake));
-    let app = App::new(AppInit {
-        config,
-        config_path: std::env::temp_dir().join("siphon-record-config.json"),
-        client: Rc::clone(&client),
-        registry: Rc::clone(&registry),
-        bus,
-        events: events_rx,
-        sender,
-        wake,
-        client_id: cfg.client_id.clone(),
-        debug: cfg.debug,
-    });
-    compio::runtime::spawn(app.run()).detach();
-
-    println!(
-        "record: watching {login} (id {id}), output {}",
-        output.display()
+        &wakes,
+        &downloaders_tx.clone().to_async(),
+        want_live.then_some(&registration_tx),
     );
 
-    // A finished recording is the channel ending: the disk stops at the live and
-    // DVR end, and both orientations finish before this returns. A channel that
-    // is already live never waits here at all.
-    let rx = finished_rx.to_async();
-    while let Ok(key) = rx.recv().await {
-        tracing::info!(
-            target: "record",
-            login = %key.login,
-            quality = key.quality.as_deref().unwrap_or("<first>"),
-            "recording finished"
-        );
-        if !registry.is_recording(&login) {
-            println!("record: {login} finished");
-            return Ok(());
+    if want_live {
+        let live_window = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let reader_wake = ConsumerWake::new();
+        let scheduler = scheduler::StreamScheduler::new(
+            Rc::clone(&client),
+            arena,
+            wakes,
+            variant.url.clone(),
+            downloaders_tx.to_async(),
+            registration_rx,
+            reader_wake,
+        )
+        .with_live_window(live_window);
+        compio::runtime::spawn(scheduler.main()).detach();
+    } else {
+        drop(registration_rx);
+    }
+    // The sender stays alive for as long as the recording runs: the scheduler
+    // treats a closed registration channel as "no consumers left". The disk's
+    // live channel closes when the scheduler drops the registration it adopted.
+
+    println!(
+        "record: {login} {} ({}) -> {}",
+        variant.id,
+        match args.mode {
+            RecordMode::Both => "live+dvr",
+            RecordMode::Live => "live",
+            RecordMode::Dvr => "dvr",
+        },
+        dir.display()
+    );
+
+    if let Some(error) = disk.wait().await {
+        return Err(error.into());
+    }
+    // An empty canonical (header only) means the broadcast ended before the
+    // recording could take anything: `--mode live` against an ended playlist.
+    let written = std::fs::metadata(dir.join("index")).map_or(0, |file| file.len());
+    if written <= 20 {
+        return Err(format!("nothing was recorded into {}", dir.display()).into());
+    }
+    println!("record: {login} finished");
+    Ok(())
+}
+
+/// Resolve the live master, waiting for `stream-up` when the channel is offline.
+#[allow(clippy::future_not_send)]
+/// `None` means the caller should stop (`--list` of an offline channel is an
+/// error rather than a wait).
+async fn resolve_record_variants(
+    cfg: &Config,
+    client: &Rc<Client>,
+    login: &str,
+    args: &Record,
+) -> Result<Option<(Vec<Variant>, u64)>, Box<dyn std::error::Error>> {
+    if cfg.debug {
+        return Ok(Some((
+            vec![variant::debug_variant(), variant::debug_portrait_variant()],
+            0,
+        )));
+    }
+    match get_variants(
+        client,
+        cfg.client_id.as_deref(),
+        cfg.auth_token.as_deref(),
+        login,
+        cfg.low_latency,
+    )
+    .await
+    {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(VariantPlaylistError::NoVariants(_)) => {
+            if args.list {
+                return Err(format!("{login} is not live").into());
+            }
+            let detail = gql::fetch_channel(client, cfg.client_id.as_deref(), login)
+                .await?
+                .ok_or_else(|| format!("no channel named {login}"))?;
+            println!("record: waiting for {login} to go live");
+            wait_for_stream_up(login, detail.id).await?;
+            // StreamMetadata lags the notification; retry until the master has
+            // the first variant.
+            for _ in 0..30 {
+                match get_variants(
+                    client,
+                    cfg.client_id.as_deref(),
+                    cfg.auth_token.as_deref(),
+                    login,
+                    cfg.low_latency,
+                )
+                .await
+                {
+                    Ok(resolved) => return Ok(Some(resolved)),
+                    Err(_) => compio::time::sleep(std::time::Duration::from_secs(1)).await,
+                }
+            }
+            Err(format!("{login} went live but its master never resolved").into())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Wait for `stream-up` on the channel's `video-playback-by-id` topic. Only the
+/// notification matters: the master is fetched again afterwards.
+#[allow(clippy::future_not_send)]
+async fn wait_for_stream_up(login: &str, id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let mut socket = WsStream::connect(&hermes::url()).await?;
+    // Welcome first: subscribing before it is accepted would be dropped.
+    loop {
+        let Some(message) = socket.next_text().await? else {
+            return Err("hermes closed before the welcome".into());
+        };
+        if sonic_rs::from_str::<sonic_rs::Value>(&message)?["type"].as_str() == Some("welcome") {
+            break;
         }
     }
-    Ok(())
+    let topic = format!("video-playback-by-id.{id}");
+    let subscription = format!("record-{id}");
+    let subscribe = sonic_rs::json!({
+        "type": "subscribe",
+        "id": subscription,
+        "subscribe": {
+            "id": subscription,
+            "type": "pubsub",
+            "pubsub": { "topic": topic },
+        },
+        "timestamp": "1970-01-01T00:00:00Z",
+    });
+    socket.send_text(&sonic_rs::to_string(&subscribe)?).await?;
+    loop {
+        let Some(message) = socket.next_text().await? else {
+            return Err("hermes closed while waiting for stream-up".into());
+        };
+        let Ok(value) = sonic_rs::from_str::<sonic_rs::Value>(&message) else {
+            continue;
+        };
+        match value["type"].as_str() {
+            Some("notification") => {
+                let Some(pubsub) = value["notification"]["pubsub"].as_str() else {
+                    continue;
+                };
+                let Ok(payload) = sonic_rs::from_str::<sonic_rs::Value>(pubsub) else {
+                    continue;
+                };
+                if payload["type"].as_str() == Some("stream-up") {
+                    tracing::info!(target: "record", %login, "stream-up");
+                    return Ok(());
+                }
+            }
+            Some("subscribeResponse")
+                if value["subscribeResponse"]["result"].as_str() != Some("ok") =>
+            {
+                return Err(format!("hermes refused the {login} subscription").into());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One line per variant: id, what it is, and the score a recording ranks by.
+fn list_variants(login: &str, variants: &[Variant]) {
+    let best = variant::best_variant(variants).map(|variant| variant.id.as_ref());
+    println!("{login}: {} variant(s)", variants.len());
+    for variant in variants {
+        let resolution = variant
+            .res
+            .map_or_else(|| "?".to_owned(), |(w, h)| format!("{w}x{h}"));
+        let score = variant.score.map_or(0, std::num::NonZeroU16::get);
+        let kind = match variant.kind {
+            VariantKind::Landscape => "landscape",
+            VariantKind::Portrait => "portrait",
+            VariantKind::Audio => "audio",
+            VariantKind::ERmtp => "ertmp",
+        };
+        println!(
+            "  {:<20} {:<10} {:<9} score {:>2}{}",
+            variant.id,
+            resolution,
+            kind,
+            score,
+            if Some(variant.id.as_ref()) == best {
+                "  (best)"
+            } else {
+                ""
+            }
+        );
+    }
 }
 
 /// disk, notifications and the admin RPC.

@@ -29,7 +29,7 @@ const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4
 /// The endpoint to connect to. `SIPHON_HERMES_URL` points the daemon at the mock
 /// server (or any other stand-in) without a rebuild; it is also what makes debug
 /// mode connect at all, since debug normally pretends the socket is healthy.
-fn url() -> String {
+pub fn url() -> String {
     std::env::var("SIPHON_HERMES_URL").unwrap_or_else(|_| HERMES_URL.to_owned())
 }
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);

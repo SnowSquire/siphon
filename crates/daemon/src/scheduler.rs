@@ -394,6 +394,14 @@ impl StreamScheduler {
             metrics.polls.set(metrics.polls.get().saturating_add(1));
         }
 
+        // Consumers first: a playlist that ends on this very fetch would
+        // otherwise dispatch its whole window to nobody, and the consumer (a
+        // recorder starting against a broadcast that just ended) would never
+        // see a segment at all.
+        if !self.handle_new_readers() {
+            return Err(Stopped).union();
+        }
+
         let new_segments = self.reload().await?;
 
         self.prefetches
@@ -404,10 +412,6 @@ impl StreamScheduler {
         } else {
             CATCHUP_POLL
         };
-        if !self.handle_new_readers() {
-            return Err(Stopped).union();
-        }
-
         if let Some(sleep_time) = sleep_dur.checked_sub(start.elapsed())
             && !self.idle(sleep_time).await
         {

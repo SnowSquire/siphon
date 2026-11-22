@@ -363,6 +363,16 @@ pub struct Variant {
     pub frame_rate: Option<std::num::NonZeroU16>,
 }
 
+/// The highest-`SCORE` variant, which is what a recording takes when no id is
+/// named. `SCORE` is Twitch's own ranking; `choose_variant` prefers the first
+/// variant instead, which is what an unqualified RTSP request means.
+#[must_use]
+pub fn best_variant(variants: &[Variant]) -> Option<&Variant> {
+    variants
+        .iter()
+        .max_by_key(|variant| variant.score.map_or(0, std::num::NonZeroU16::get))
+}
+
 /// The variant an explicit quality id names, or the first one when `None`.
 #[must_use]
 pub fn choose_variant<'a>(variants: &'a [Variant], quality: Option<&str>) -> Option<&'a Variant> {

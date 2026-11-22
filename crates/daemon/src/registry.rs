@@ -60,6 +60,7 @@ use crate::spool::WakeSet;
 use crate::variant::Variant;
 use crate::variant::VariantKind;
 use crate::variant::VariantPlaylistError;
+use crate::variant::best_variant;
 use crate::variant::choose_variant;
 use crate::variant::debug_portrait_variant;
 use crate::variant::debug_variant;
@@ -78,9 +79,6 @@ pub struct Options {
     pub notify: Option<Notifier>,
     pub keep_runs: bool,
 }
-
-/// Called once per finished recording, after its stream entry is released.
-type FinishedHook = dyn Fn(&StreamKey);
 
 /// Where complete broadcasts go and whether the second orientation is kept.
 pub struct Recording {
@@ -115,9 +113,6 @@ pub struct Registry {
     gate: Gate,
     /// Disk recordings that finished, so the stream entry can be released.
     finished: kanal::Sender<StreamKey>,
-    /// Called after each finished recording is released. The `record`
-    /// subcommand exits on it; the daemon leaves it unset.
-    finished_hook: RefCell<Option<Rc<FinishedHook>>>,
     finished_rx: RefCell<Option<kanal::Receiver<StreamKey>>>,
 }
 
@@ -231,7 +226,6 @@ impl Registry {
             gate: Gate::default(),
             finished: finished_tx,
             finished_rx: RefCell::new(Some(finished_rx)),
-            finished_hook: RefCell::new(None),
         }
     }
 
@@ -245,10 +239,6 @@ impl Registry {
             let rx = rx.to_async();
             while let Ok(key) = rx.recv().await {
                 registry.finish_stream(&key);
-                let hook = registry.finished_hook.borrow().clone();
-                if let Some(hook) = hook {
-                    hook(&key);
-                }
             }
         })
         .detach();
@@ -257,20 +247,6 @@ impl Registry {
     #[must_use]
     pub fn can_record(&self) -> bool {
         self.output.borrow().is_some()
-    }
-
-    /// Observe finished recordings, after their stream entry is released.
-    pub fn on_finished(&self, hook: Rc<FinishedHook>) {
-        *self.finished_hook.borrow_mut() = Some(hook);
-    }
-
-    /// Whether this channel has a recording in flight.
-    #[must_use]
-    pub fn is_recording(&self, login: &str) -> bool {
-        self.streams
-            .borrow()
-            .values()
-            .any(|runtime| runtime.recording.get() && runtime.key.login == login)
     }
 
     /// Point new recordings at another directory. A running recording keeps the
@@ -542,10 +518,11 @@ impl Registry {
                 dvr: Rc::clone(&runtime.dvr),
                 client: Rc::clone(&runtime.client),
                 metrics,
+                live: true,
             },
             &runtime.wakes,
             &self.downloaders,
-            &registration,
+            Some(&registration),
         ));
 
         let finished = self.finished.clone();
@@ -1049,12 +1026,6 @@ const fn other_orientation(kind: &VariantKind) -> Option<VariantKind> {
         VariantKind::Portrait => Some(VariantKind::Landscape),
         VariantKind::Audio | VariantKind::ERmtp => None,
     }
-}
-
-fn best_variant(variants: &[Variant]) -> Option<&Variant> {
-    variants
-        .iter()
-        .max_by_key(|variant| variant.score.map_or(0, std::num::NonZeroU16::get))
 }
 
 impl StreamResolver for Registry {

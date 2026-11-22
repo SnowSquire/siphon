@@ -37,12 +37,12 @@ only sink; disk output is disabled and being rebuilt from
 - Build/check: `cargo clippy -p daemon`, `cargo build -p daemon`
 - Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean.
 - Format: `cargo +nightly fmt` — `crates/daemon/rustfmt.toml` uses unstable options (import grouping/granularity, `reorder_impl_items`, LF) that stable `cargo fmt` silently ignores.
-- One-channel recorder: `siphon-daemon record -c <login> [--output <dir>] [-d]` — the
-  daemon's own Hermes, monitors, registry and disk path with no RPC and no RTSP. It
-  waits for the channel to go live, records it (both orientations when
-  `recordDualFormat` is set or `--dual-format` is passed), and exits when the
-  broadcast ends. In `-d` it needs
-  `SIPHON_HERMES_URL` (the mock's `ws://127.0.0.1:8001/v1`).
+- One-channel recorder: `siphon-daemon record <login> [variant] [--mode live|dvr|both]
+  [--list] --output <dir>` — one variant, no config, no RPC, no RTSP. Without
+  `[variant]` it takes the highest-scoring one; `--list` prints the live master's
+  variants and exits. `--mode` picks the live playlist, the DVR, or both (the
+  default). It waits for the channel to go live and exits when the recording ends.
+  In `-d` it needs `SIPHON_HERMES_URL` (the mock's `ws://127.0.0.1:8001/v1`).
 - Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
 - Benchmark: `cargo test -p daemon --release -- --ignored --nocapture throughput` (demux/packetize over `captures/servermock`, the built fixtures). Cross-compile: `cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl`.
 - Miri: `cargo +nightly miri test -p daemon` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
