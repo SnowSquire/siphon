@@ -6,6 +6,7 @@ version.workspace = true
 edition = "2024"
 description = "Siphon UI: a ZGUI window fed by the daemon RPC, presented through DXGI or a Vulkan swapchain"
 authors = ["Ozeniken"]
+license.workspace = true
 publish = false
 
 [[bin]]

@@ -6,6 +6,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Bindings, link directives, the header-only libav glue and an optional meson build for libplacebo"
 authors = ["Ozeniken"]
+license.workspace = true
 publish = false
 # One of these per native library, so two crates cannot disagree about which
 # libplacebo a binary links.

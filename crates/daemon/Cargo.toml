@@ -6,6 +6,7 @@ version.workspace = true
 edition = "2024"
 description = "Siphon backend: Twitch HLS pipelines over RTSP, with monitors and RPC"
 authors = ["Ozeniken"]
+license.workspace = true
 
 [[bin]]
 name = "siphon-daemon"

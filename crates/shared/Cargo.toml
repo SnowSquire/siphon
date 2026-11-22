@@ -6,6 +6,7 @@ version.workspace = true
 edition = "2024"
 description = "What the Siphon backend and its clients share: the typed RPC, the client settings schema and the file store"
 authors = ["Ozeniken"]
+license.workspace = true
 publish = false
 
 [dependencies]

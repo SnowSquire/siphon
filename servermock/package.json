@@ -2,6 +2,7 @@
   "name": "servermock",
   "version": "1.0.0",
   "description": "Mock Twitch HLS edge server",
+  "license": "MIT OR Apache-2.0",
   "private": true,
   "type": "module",
   "scripts": {
