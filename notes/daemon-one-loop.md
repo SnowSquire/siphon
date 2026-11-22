@@ -146,9 +146,10 @@ Demux baseline on this box, for measuring the sample-store work:
 
 ## What is not decided / not done
 
-- The Windows named-pipe listener path was rewritten by analogy; the Unix path
-  is what the smoke tests exercised. A cross-target `cargo check` is the most
-  that can be done here.
+- The Windows named-pipe listener is typechecked by
+  `cargo check -p daemon --target x86_64-pc-windows-msvc` (xwin CRT/SDK,
+  clang-cl, lld-link), which is as far as this box can go: nothing is executed
+  on Windows.
 - The registry serves only channels the daemon follows. A DESCRIBE for any other
   login is a 404; that is now the contract, not an accident.
 - `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` are updated
