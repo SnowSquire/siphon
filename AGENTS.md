@@ -56,7 +56,16 @@ only sink; disk output is disabled and being rebuilt from
   `lld-link` links. No Windows machine is involved.
 - UI: `cargo run -p siphon-ui` (binary `siphon`, ZGUI + DXGI). It starts `siphon-daemon.exe` next to itself if the admin named pipe is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
 - UI check (native): `cargo clippy -p siphon-ui --all-targets` — the Linux present path builds against the system libplacebo through pkg-config (`LIBPLACEBO_SOURCE=system` is the default there). Run it for any UI change; it does not need Windows.
-  The UI is *not* part of the Windows cross-check: for `x86_64-pc-windows-msvc` the crate takes the `windows()` path, which needs a hand-built Windows libplacebo prefix (`LIBPLACEBO_PREFIX`, or `LIBPLACEBO_SOURCE=build` with `LIBPLACEBO_SRC`), and this box has neither.
+- UI check (Windows target): `scripts/cargo-win.sh clippy -p siphon-ui --all-targets`.
+  This box builds a Windows libplacebo itself —
+  `scripts/build-libplacebo-win.sh` (meson cross build with clang-cl against the
+  xwin CRT/SDK into `~/Projects/Code/Libs/libplacebo/win-prefix`, Vulkan headers
+  copied from `/usr/include`, glslang/shaderc off) — and `cargo-win.sh` exports
+  `LIBPLACEBO_PREFIX`/`VULKAN_SDK` before appending `--target
+  x86_64-pc-windows-msvc`. Cargo has no per-target `env` table and a global
+  `LIBPLACEBO_PREFIX` would misdirect native builds, hence the wrapper. Rebuild
+  the prefix after a libplacebo or Vulkan-headers change; the daemon's plain
+  `cargo check --target` needs none of this.
 
 ## Terminology
 
