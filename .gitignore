@@ -2,8 +2,10 @@
 target/
 
 # Downloaded/captured state
-manifests/
 captures/
+
+# Spike checkouts kept next to the tree, not part of this repository
+vk_dxgi/
 
 # Player-side repro artefacts
 *.log
