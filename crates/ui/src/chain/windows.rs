@@ -509,7 +509,7 @@ impl Chain {
         }
         let white = swapchain.sdr_white();
         if (white - self.sdr_white.get()).abs() > 0.5 {
-            eprintln!("SDR white: {white:.0} nits (level from the display configuration)",);
+            eprintln!("SDR white: {white:.0} nits (level from the display configuration)");
         }
         self.sdr_white.set(white);
         self.hdr.set(swapchain.hdr());
