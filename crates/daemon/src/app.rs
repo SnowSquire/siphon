@@ -345,7 +345,7 @@ impl App {
 
     fn next_deadline(&self, conns: &[Option<rpc::Conn>]) -> Duration {
         let now = Instant::now();
-        let mut at = now + Duration::from_secs(5);
+        let mut at = now + Duration::from_mins(1);
         if self.hermes_enabled
             && self.socket.is_none()
             && !self.connecting
@@ -384,7 +384,8 @@ impl App {
                 }
                 ops.push(accept_op(&self.accept));
             }
-            rpc::ConnEvent::Accepted(Err(_)) => ops.push(accept_op(&self.accept)),
+            // The listener is gone; do not re-arm into a spin.
+            rpc::ConnEvent::Accepted(Err(_)) => {}
             rpc::ConnEvent::Read {
                 conn: id,
                 result,

@@ -161,7 +161,9 @@ pub fn public_endpoint() -> &'static str {
         .map_or(TWITCH_OAUTH_ENDPOINT, String::as_str)
 }
 
-/// Points GQL, usher and OAuth at `base`. Called once, from `main`.
+/// Points GQL, usher, OAuth and Hermes at the mock. Called once, from `main`,
+/// and compiled into dev builds only.
+#[cfg(debug_assertions)]
 pub fn use_edge(base: &str) {
     let _ = GQL_ENDPOINT.set(format!("{base}/gql"));
     let _ = HLS_BASE.set(format!("{base}/api/v2/channel/hls"));
