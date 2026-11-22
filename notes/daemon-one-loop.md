@@ -57,8 +57,9 @@ a separate snapshot-only structure.
   preference, mirrored from config), `stopped: Option<NonZeroU64>` (the broadcast
   id the user stopped) and lazily fetched `data: Option<Rc<ChannelData>>`.
 - `streams: HashMap<StreamId, Rc<StreamRuntime>>` — `StreamId` is
-  `(channel id, quality)`. The login is a display field, never identity; the
-  wire `StreamKey` still carries it and is mapped through the channel row.
+  `(channel id, quality)`. The wire `StreamKey` carries the same pair; the login
+  is a display field on the runtime, and `ChannelUri` (what an RTSP request
+  names) is the only place a channel is addressed by login.
 - Deleted: `monitors`, `once`, `suppressed`, `max_streams`, `ensure_capacity`,
   the capacity eviction, the `debug` flag.
 - `set_record(login, bool)` is the whole monitor concept: the bool is the intent.

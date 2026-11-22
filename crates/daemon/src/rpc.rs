@@ -244,7 +244,11 @@ mod tests {
         panic!("config update did not arrive");
     }
 
-    async fn next_pipeline(events: &kanal::AsyncReceiver<ClientEvent>, login: &str, removed: bool) {
+    async fn next_pipeline(
+        events: &kanal::AsyncReceiver<ClientEvent>,
+        channel: u64,
+        removed: bool,
+    ) {
         for _ in 0..50 {
             let event = compio::time::timeout(Duration::from_millis(200), events.recv())
                 .await
@@ -257,12 +261,12 @@ mod tests {
                 continue;
             };
             match *update {
-                Update::PipelineUpsert(view) if !removed && view.key.login == login => return,
-                Update::PipelineRemove(key) if removed && key.login == login => return,
+                Update::PipelineUpsert(view) if !removed && view.key.channel == channel => return,
+                Update::PipelineRemove(key) if removed && key.channel == channel => return,
                 _ => {}
             }
         }
-        panic!("pipeline update for {login} did not arrive");
+        panic!("pipeline update for channel {channel} did not arrive");
     }
 
     #[test]
@@ -357,10 +361,10 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(events, "sunnys", false).await;
+            next_pipeline(events, 7, false).await;
             next_config(second_events).await;
 
-            let key = siphon_shared::rpc::StreamKey::new("sunnys", None);
+            let key = siphon_shared::rpc::StreamKey::new(7, None);
             let response = client.request(Request::GetDisk(key.clone())).await.unwrap();
             assert!(matches!(response, Response::Disk(_)));
 
@@ -372,7 +376,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(events, "sunnys", true).await;
+            next_pipeline(events, 7, true).await;
 
             // A one-shot recording is a pipeline, not a stored preference.
             let response = client
@@ -383,7 +387,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(events, "sunnys", false).await;
+            next_pipeline(events, 7, false).await;
 
             let response = client
                 .request(Request::DisconnectViewers(key.clone()))
@@ -396,7 +400,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(matches!(response, Response::Ack));
-            next_pipeline(events, "sunnys", true).await;
+            next_pipeline(events, 7, true).await;
         });
         let _ = std::fs::remove_dir_all(dir);
     }

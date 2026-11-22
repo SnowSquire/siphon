@@ -316,10 +316,8 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     // until now.
     dvr.set_live_variant(variant);
 
-    let key = rtsp::StreamKey {
-        login: args.channel.to_ascii_lowercase(),
-        quality: args.quality.clone(),
-    };
+    // `play`/`record` are single-stream modes: no registry, so no channel id.
+    let key = rtsp::StreamKey::new(0, args.quality.clone());
     let stream = Rc::new(rtsp::Stream::new(key, title));
 
     let (downloaders_tx, downloaders_rx) = kanal::bounded(32);

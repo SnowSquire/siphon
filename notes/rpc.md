@@ -209,7 +209,7 @@ listeners are tasks around it.
 
 ### Record state and pipelines
 
-There is no monitor set. The key is `(login, quality)` exactly like `StreamKey`.
+There is no monitor set. The key is `(channel id, quality)`, the same pair `StreamKey` carries.
 
 - A followed channel is a row with `record: bool` (mirrored from config),
   `stopped: Option<NonZeroU64>` (the broadcast id the user stopped) and lazily
@@ -309,6 +309,10 @@ There is no monitor set. The key is `(login, quality)` exactly like `StreamKey`.
   use `Weak` subscribers.
 - `pinned` must be checked in every eviction path, or the first DESCRIBE drops
   every monitor-only runtime.
+- `StreamKey` is `{ channel, quality }`: the channel id is the identity the
+  daemon already holds in `config.channels[].id`. A login appears only where a
+  user or an RTSP URI names one, and the UI resolves it for display from its
+  channel list.
 - Quality is part of `StreamKey`; a quality change is remove + add, with
   `force` if the old viewer must go.
 - The UI never writes config; the daemon acks an intent and publishes the

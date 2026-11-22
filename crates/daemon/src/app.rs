@@ -1148,7 +1148,11 @@ impl App {
         if login.is_empty() {
             return Err(RpcError::BadRequest("empty login".to_owned()));
         }
-        self.registry.record_once(StreamKey::new(login, quality));
+        let Some(channel) = self.config.channels.iter().find(|c| c.login == login) else {
+            return Err(RpcError::NotFound);
+        };
+        self.registry
+            .record_once(StreamKey::new(channel.id, quality));
         Ok(Response::Ack)
     }
 

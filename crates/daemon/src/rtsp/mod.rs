@@ -140,13 +140,25 @@ pub trait StreamResolver {
     fn release(&self, stream: &Rc<Stream>);
 }
 
+/// What an RTSP request URI names: a channel login and an optional variant.
+///
+/// The URI is the one place a channel is addressed by login; the registry maps
+/// it to the channel id before anything is keyed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelUri {
+    /// Twitch login, lowercased.
+    pub login: String,
+    /// `STABLE-VARIANT-ID`, or `None` for the first variant.
+    pub quality: Option<String>,
+}
+
 /// Split `/channel/quality/trackID=0` out of an RTSP request URI.
 ///
 /// Path segments, never query parameters: ffmpeg appends a relative
 /// `a=control:trackID=0` by string concatenation, so a query would swallow the
 /// track fragment.
 #[must_use]
-pub fn parse_stream_key(uri: &str) -> Option<StreamKey> {
+pub fn parse_stream_key(uri: &str) -> Option<ChannelUri> {
     // Both `rtsp://host/path` and an absolute path (`/path`) are accepted.
     let path = uri.split_once("://").map_or(uri, |(_, rest)| {
         rest.find('/').map_or("", |slash| &rest[slash..])
@@ -167,7 +179,7 @@ pub fn parse_stream_key(uri: &str) -> Option<StreamKey> {
         _ => None,
     };
 
-    Some(StreamKey {
+    Some(ChannelUri {
         login: login.to_ascii_lowercase(),
         quality,
     })
@@ -2902,7 +2914,7 @@ mod tests {
         // Absolute paths are accepted too.
         assert_eq!(
             parse_stream_key("/sunnys/audio_only").expect("key"),
-            StreamKey {
+            ChannelUri {
                 login: "sunnys".to_owned(),
                 quality: Some("audio_only".to_owned()),
             }

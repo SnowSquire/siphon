@@ -156,7 +156,7 @@ enum Key {
     Conn,
     Pending,
     Channel(u64),
-    Pipeline(String, Option<String>),
+    Pipeline(u64, Option<String>),
     Arena,
     Downloader,
     Notification(u64),
@@ -173,12 +173,10 @@ impl Key {
             Update::ChannelUpsert(channel) => Some(Self::Channel(channel.id)),
             Update::ChannelRemove(id) => Some(Self::Channel(*id)),
             Update::PipelineUpsert(pipeline) => Some(Self::Pipeline(
-                pipeline.key.login.clone(),
+                pipeline.key.channel,
                 pipeline.key.quality.clone(),
             )),
-            Update::PipelineRemove(key) => {
-                Some(Self::Pipeline(key.login.clone(), key.quality.clone()))
-            }
+            Update::PipelineRemove(key) => Some(Self::Pipeline(key.channel, key.quality.clone())),
             Update::Arena(_) => Some(Self::Arena),
             Update::Downloader(_) => Some(Self::Downloader),
             Update::Notification(notification) => Some(Self::Notification(notification.id)),

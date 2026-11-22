@@ -21,24 +21,25 @@ pub const MAGIC: u32 = 0x5349_5048; // "SIPH"
 /// Largest accepted frame. Rejected before allocating the payload.
 pub const MAX_FRAME: usize = 1024 * 1024;
 
-/// Identity of one pipeline: a channel login and an optional
+/// Identity of one pipeline: a Twitch channel id and an optional
 /// `STABLE-VARIANT-ID`. `None` means the monitor's best variant.
+///
+/// The id, not the login: the daemon already holds `config.channels[].id`, and
+/// a login is a name the RTSP URI and the Channels list can resolve, not an
+/// identity. The UI resolves the login for display from its channel list.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamKey {
-    /// Twitch login, lowercased.
-    pub login: String,
+    /// Twitch channel id.
+    pub channel: u64,
     /// `STABLE-VARIANT-ID` (`chunked`, `720p60`, `audio_only`, ...).
     pub quality: Option<String>,
 }
 
 impl StreamKey {
     #[must_use]
-    pub fn new(login: impl Into<String>, quality: Option<String>) -> Self {
-        Self {
-            login: login.into(),
-            quality,
-        }
+    pub const fn new(channel: u64, quality: Option<String>) -> Self {
+        Self { channel, quality }
     }
 }
 

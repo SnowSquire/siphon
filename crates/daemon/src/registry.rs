@@ -132,6 +132,7 @@ struct Channel {
 /// What one GQL + usher round trip learns about a live channel.
 struct ChannelData {
     id: u64,
+    login: String,
     title: String,
     variants: Vec<Variant>,
     broadcast_id: u64,
@@ -156,6 +157,9 @@ impl StreamId {
 /// One running pipeline.
 struct StreamRuntime {
     key: StreamKey,
+    /// The channel's login: display, logging and the DVR's archive lookup. Not
+    /// identity; `key.channel` is.
+    login: String,
     title: String,
     stream: Rc<Stream>,
     dvr: Rc<Dvr>,
@@ -226,7 +230,7 @@ impl StreamRuntime {
         }
         crate::rtsp::dvr::spawn(
             Rc::clone(&self.client),
-            Some(self.key.login.clone()),
+            Some(self.login.clone()),
             Rc::clone(&self.dvr),
         );
     }
@@ -322,6 +326,7 @@ impl Registry {
             row.followed = true;
             row.data = Some(Rc::new(ChannelData {
                 id,
+                login: login.to_owned(),
                 title: login.to_owned(),
                 variants,
                 broadcast_id,
@@ -379,9 +384,10 @@ impl Registry {
     }
 
     async fn resolve_uri(&self, uri: &str) -> Result<Rc<Stream>, ResolveError> {
-        let key = parse_stream_key(uri).ok_or(ResolveError::BAD_REQUEST)?;
-        let data = self.channel_data(&key.login).await?;
-        let id = StreamId::new(data.id, key.quality.as_deref());
+        let parsed = parse_stream_key(uri).ok_or(ResolveError::BAD_REQUEST)?;
+        let data = self.channel_data(&parsed.login).await?;
+        let key = StreamKey::new(data.id, parsed.quality.clone());
+        let id = Self::stream_id(&key);
 
         if let Some(runtime) = self.streams.borrow().get(&id).cloned() {
             if runtime.upgrade() {
@@ -392,7 +398,7 @@ impl Registry {
 
         let _guard = self
             .gate
-            .acquire(gate_key(&key.login, key.quality.as_deref()))
+            .acquire(gate_key(&parsed.login, key.quality.as_deref()))
             .await;
 
         // Another DESCRIBE may have created it while this one waited.
@@ -405,7 +411,7 @@ impl Registry {
 
         let Some(variant) = choose_variant(&data.variants, key.quality.as_deref()) else {
             debug!(
-                login = %key.login,
+                login = %parsed.login,
                 quality = key.quality.as_deref().unwrap_or("<first>"),
                 "daemon: no such variant"
             );
@@ -457,16 +463,34 @@ impl Registry {
         }
     }
 
-    /// The internal key for a wire key, when the channel id is known.
-    fn stream_id(&self, key: &StreamKey) -> Option<StreamId> {
-        let row = self.channel_row(&key.login)?;
-        Some(StreamId::new(row.id?, key.quality.as_deref()))
+    /// The internal key for a wire key. The wire already carries the channel id.
+    fn stream_id(key: &StreamKey) -> StreamId {
+        StreamId::new(key.channel, key.quality.as_deref())
     }
 
     /// The running pipeline for a wire key.
     fn runtime(&self, key: &StreamKey) -> Option<Rc<StreamRuntime>> {
-        let id = self.stream_id(key)?;
-        self.streams.borrow().get(&id).cloned()
+        self.streams.borrow().get(&Self::stream_id(key)).cloned()
+    }
+
+    /// The login of the channel with this id, from the channel table.
+    fn login_of(&self, channel: u64) -> Option<String> {
+        self.channels
+            .borrow()
+            .iter()
+            .find(|row| row.id == Some(channel))
+            .map(|row| row.login.clone())
+    }
+
+    fn update_row_by_id(&self, channel: u64, f: impl FnOnce(&mut Channel)) {
+        if let Some(row) = self
+            .channels
+            .borrow_mut()
+            .iter_mut()
+            .find(|row| row.id == Some(channel))
+        {
+            f(row);
+        }
     }
 
     /// Get or build the fetched half of a channel entry. One GQL fetch per
@@ -507,6 +531,7 @@ impl Registry {
         let data = match resolved {
             Ok((variants, broadcast_id)) => Rc::new(ChannelData {
                 id,
+                login: login.to_owned(),
                 title,
                 variants,
                 broadcast_id,
@@ -567,6 +592,7 @@ impl Registry {
 
         let runtime = Rc::new(StreamRuntime {
             key: key.clone(),
+            login: data.login.clone(),
             title: data.title.clone(),
             stream,
             dvr,
@@ -589,7 +615,7 @@ impl Registry {
         }
 
         info!(
-            login = %key.login,
+            login = %data.login,
             quality = key.quality.as_deref().unwrap_or("<first>"),
             variant = %variant.id,
             recording = record,
@@ -644,7 +670,7 @@ impl Registry {
 
         *runtime.recording.borrow_mut() = Some(Recorder { disk, metrics });
         info!(
-            login = %runtime.key.login,
+            login = %runtime.login,
             quality = runtime.key.quality.as_deref().unwrap_or("<first>"),
             "daemon: recording started"
         );
@@ -655,7 +681,7 @@ impl Registry {
                 "recording started ({})",
                 runtime.key.quality.as_deref().unwrap_or("best")
             ),
-            Some(runtime.key.login.clone()),
+            Some(runtime.login.clone()),
             NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
@@ -677,14 +703,11 @@ impl Registry {
         let Some(other_kind) = other_orientation(&runtime.variant_kind) else {
             return;
         };
-        let Some((portrait, variant)) = self.orientation_variant(&runtime.key.login, &other_kind)
+        let Some((portrait, variant)) = self.orientation_variant(&runtime.login, &other_kind)
         else {
             return;
         };
-        let Some(data) = self
-            .channel_row(&runtime.key.login)
-            .and_then(|row| row.data)
-        else {
+        let Some(data) = self.channel_row(&runtime.login).and_then(|row| row.data) else {
             return;
         };
         let id = StreamId::new(data.id, Some(portrait.as_str()));
@@ -693,15 +716,12 @@ impl Registry {
             self.start_recording(&existing);
             return;
         }
-        let key = StreamKey {
-            login: runtime.key.login.clone(),
-            quality: Some(portrait),
-        };
+        let key = StreamKey::new(data.id, Some(portrait));
         let sibling = self.spawn_runtime(&key, &data, &variant, true);
         self.streams.borrow_mut().insert(id, Rc::clone(&sibling));
         self.publish_pipeline(&sibling);
         info!(
-            login = %key.login,
+            login = %runtime.login,
             quality = %key.quality.as_deref().unwrap_or("<first>"),
             "daemon: second orientation started"
         );
@@ -725,7 +745,7 @@ impl Registry {
             LogLevel::Info,
             "recording",
             "recording stopped",
-            Some(runtime.key.login.clone()),
+            Some(runtime.login.clone()),
             NonZeroU64::new(runtime.broadcast_id),
         );
         self.publish_pipeline(runtime);
@@ -741,13 +761,10 @@ impl Registry {
         let Some(other_kind) = other_orientation(&runtime.variant_kind) else {
             return;
         };
-        let Some((portrait, _)) = self.orientation_variant(&runtime.key.login, &other_kind) else {
+        let Some((portrait, _)) = self.orientation_variant(&runtime.login, &other_kind) else {
             return;
         };
-        let key = StreamKey {
-            login: runtime.key.login.clone(),
-            quality: Some(portrait),
-        };
+        let key = StreamKey::new(runtime.key.channel, Some(portrait));
         if let Some(sibling) = self.runtime(&key) {
             self.stop_recording(&sibling);
             // Nobody owns it but the primary recording; a viewer of that quality
@@ -785,13 +802,16 @@ impl Registry {
             .streams
             .borrow()
             .values()
-            .find(|runtime| runtime.key.login == login && runtime.key.quality.is_none())
+            .find(|runtime| runtime.login == login && runtime.key.quality.is_none())
             .cloned()
         {
             self.start_recording(&runtime);
             return;
         }
-        let key = StreamKey::new(login, None);
+        let Some(channel) = self.channel_row(login).and_then(|row| row.id) else {
+            return;
+        };
+        let key = StreamKey::new(channel, None);
         let registry = Rc::clone(self);
         compio::runtime::spawn(async move {
             registry.activate(key).await;
@@ -814,17 +834,19 @@ impl Registry {
     }
 
     async fn activate(self: Rc<Self>, key: StreamKey) {
+        let Some(login) = self.login_of(key.channel) else {
+            return;
+        };
         let _guard = self
             .gate
-            .acquire(gate_key(&key.login, key.quality.as_deref()))
+            .acquire(gate_key(&login, key.quality.as_deref()))
             .await;
-        if !self.wanted(&key.login) {
+        if !self.wanted(&login) {
             return;
         }
-        let Ok(data) = self.channel_data(&key.login).await else {
+        let Ok(data) = self.channel_data(&login).await else {
             self.bus.publish(Update::Error(Some(format!(
-                "recording {}: channel is offline",
-                key.login
+                "recording {login}: channel is offline"
             ))));
             return;
         };
@@ -833,15 +855,14 @@ impl Registry {
             return;
         }
         if self
-            .channel_row(&key.login)
+            .channel_row(&login)
             .is_some_and(|row| row.stopped == NonZeroU64::new(data.broadcast_id))
         {
             return;
         }
         let Some(variant) = best_variant(&data.variants) else {
             self.bus.publish(Update::Error(Some(format!(
-                "recording {}: no variant",
-                key.login
+                "recording {login}: no variant"
             ))));
             return;
         };
@@ -851,14 +872,16 @@ impl Registry {
     }
 
     async fn activate_once(self: Rc<Self>, key: StreamKey) {
+        let Some(login) = self.login_of(key.channel) else {
+            return;
+        };
         let _guard = self
             .gate
-            .acquire(gate_key(&key.login, key.quality.as_deref()))
+            .acquire(gate_key(&login, key.quality.as_deref()))
             .await;
-        let Ok(data) = self.channel_data(&key.login).await else {
+        let Ok(data) = self.channel_data(&login).await else {
             self.bus.publish(Update::Error(Some(format!(
-                "recording {}: channel is offline",
-                key.login
+                "recording {login}: channel is offline"
             ))));
             return;
         };
@@ -869,8 +892,7 @@ impl Registry {
         }
         let Some(variant) = choose_variant(&data.variants, key.quality.as_deref()) else {
             self.bus.publish(Update::Error(Some(format!(
-                "recording {}: no such variant",
-                key.login
+                "recording {login}: no such variant"
             ))));
             return;
         };
@@ -885,7 +907,7 @@ impl Registry {
             .streams
             .borrow()
             .iter()
-            .filter(|(_, runtime)| runtime.key.login == login)
+            .filter(|(_, runtime)| runtime.login == login)
             .map(|(id, runtime)| (id.clone(), Rc::clone(runtime)))
             .collect();
         for (id, runtime) in entries {
@@ -911,7 +933,7 @@ impl Registry {
             .streams
             .borrow()
             .iter()
-            .filter(|(_, runtime)| runtime.key.login == login)
+            .filter(|(_, runtime)| runtime.login == login)
             .map(|(id, runtime)| (id.clone(), Rc::clone(runtime)))
             .collect();
         for (id, runtime) in entries {
@@ -928,7 +950,7 @@ impl Registry {
         let runtime = self.runtime(key);
         if let Some(runtime) = &runtime {
             let stopped = NonZeroU64::new(runtime.broadcast_id);
-            self.update_row(&key.login, |row| row.stopped = stopped);
+            self.update_row_by_id(key.channel, |row| row.stopped = stopped);
         }
         let Some(runtime) = runtime else {
             return;
@@ -944,9 +966,12 @@ impl Registry {
     }
 
     pub fn restart_pipeline(self: &Rc<Self>, key: &StreamKey) {
-        self.update_row(&key.login, |row| row.stopped = None);
+        self.update_row_by_id(key.channel, |row| row.stopped = None);
         self.remove_runtime(key);
-        if self.wanted(&key.login) {
+        let wanted = self
+            .login_of(key.channel)
+            .is_some_and(|login| self.wanted(&login));
+        if wanted {
             let registry = Rc::clone(self);
             let key = key.clone();
             compio::runtime::spawn(async move {
@@ -974,7 +999,7 @@ impl Registry {
             return;
         }
         info!(
-            login = %key.login,
+            login = %runtime.login,
             quality = key.quality.as_deref().unwrap_or("<first>"),
             "daemon: recording finished, stream stopped"
         );
@@ -986,11 +1011,11 @@ impl Registry {
         let Some(runtime) = self.runtime(key) else {
             return;
         };
-        if runtime.stream.has_sessions() || runtime.is_recording() || self.wanted(&key.login) {
+        if runtime.stream.has_sessions() || runtime.is_recording() || self.wanted(&runtime.login) {
             return;
         }
         info!(
-            login = %key.login,
+            login = %runtime.login,
             quality = key.quality.as_deref().unwrap_or("<first>"),
             "daemon: stream stopped, last viewer left"
         );
@@ -998,9 +1023,7 @@ impl Registry {
     }
 
     fn remove_runtime(&self, key: &StreamKey) {
-        let Some(id) = self.stream_id(key) else {
-            return;
-        };
+        let id = Self::stream_id(key);
         self.remove_runtime_id(&id, key);
     }
 
@@ -1009,9 +1032,10 @@ impl Registry {
         let Some(runtime) = removed else {
             return;
         };
+        let login = runtime.login.clone();
         runtime.stop();
         self.publish_removed(key);
-        self.prune_channel(&key.login);
+        self.prune_channel(&login);
     }
 
     fn prune_channel(&self, login: &str) {
@@ -1019,7 +1043,7 @@ impl Registry {
             .streams
             .borrow()
             .values()
-            .any(|runtime| runtime.key.login == login)
+            .any(|runtime| runtime.login == login)
         {
             return;
         }
@@ -1071,7 +1095,7 @@ impl Registry {
             title: runtime.title.clone(),
             variant: metrics.variant(),
             state,
-            pinned: recording.is_some() || self.wanted(&runtime.key.login),
+            pinned: recording.is_some() || self.wanted(&runtime.login),
             recording: recording.is_some(),
             sessions: runtime.stream.session_count(),
             position_ms: runtime.stream.position_ms(),
@@ -1321,7 +1345,7 @@ mod tests {
             assert!(
                 pending.iter().any(|broadcast| matches!(
                     &broadcast.update,
-                    Update::PipelineUpsert(view) if view.key.login == "sunnys"
+                    Update::PipelineUpsert(view) if view.key.channel == 7
                 )),
                 "no pipeline update in {pending:?}"
             );

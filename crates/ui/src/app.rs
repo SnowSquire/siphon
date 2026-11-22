@@ -580,6 +580,7 @@ fn App(
             if move || tab.get() == Tab::Recordings {
                 RecordingsTab(
                     pipelines = pipelines_sig,
+                    channels = channels_sig,
                     draft = once_login,
                     quality = once_quality,
                     intents = Rc::clone(&recordings_intents),
@@ -772,7 +773,6 @@ fn ChannelRow(
     // every value that has to follow the daemon is a derived signal read by the
     // hole that draws it.
     let id = channel.get_untracked().id;
-    let login = channel.get_untracked().login.clone();
     // A panel that is on its way out is still drawn, and the row keeps its
     // open styling until it has gone.
     let open =
@@ -853,13 +853,11 @@ fn ChannelRow(
     };
 
     let pinned = Signal::derive_local(move || pins.get().contains(&id));
-    // A recording is claimed by the login, not the row: the pipeline key is
-    // the monitor's (login, quality), while the row knows the channel.
+    // The pipeline key is the channel id and a quality, so a row claims its
+    // recording by id.
     let recording = Signal::derive_local(move || {
         pipelines.get().iter().any(|pipeline| {
-            pipeline.with(|pipeline| {
-                pipeline.key.login.eq_ignore_ascii_case(&login) && is_recorded(pipeline)
-            })
+            pipeline.with(|pipeline| pipeline.key.channel == id && is_recorded(pipeline))
         })
     });
     let error = Signal::derive_local(move || channel.with(|c| channel_error(c, &pipelines.get())));
@@ -1482,6 +1480,7 @@ fn WordRowView(word: String, intents: Rc<IntentSender>) -> impl IntoView {
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn RecordingsTab(
     pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
+    channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
     quality: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
@@ -1519,9 +1518,13 @@ fn RecordingsTab(
                 column(class = "list") {
                     for pipeline in move || recordings(&pipelines.get()), key = |pipeline: &RwSignal<PipelineView, LocalStorage>| {
                         let key = pipeline.get_untracked().key;
-                        (key.login, key.quality)
+                        (key.channel, key.quality)
                     } {
-                        RecordingRow(pipeline = pipeline, intents = Rc::clone(&rows))
+                        RecordingRow(
+                            pipeline = pipeline,
+                            channels = channels,
+                            intents = Rc::clone(&rows),
+                        )
                     }
                     if move || recordings(&pipelines.get()).is_empty() {
                         text(class = "empty") {"No recording is running. Pick a channel above and press Record once, or turn Record on in Channels."}
@@ -1559,6 +1562,18 @@ const fn is_recorded(pipeline: &PipelineView) -> bool {
 
 /// The rows the Recordings tab draws. Membership follows the row's own signal,
 /// so `UiState` re-runs the list whenever a pipeline starts or stops recording.
+/// The login of a channel, for display: pipelines are keyed by channel id.
+fn login_for(
+    channels: &RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
+    channel: u64,
+) -> String {
+    channels
+        .get()
+        .iter()
+        .find(|row| row.get().id == channel)
+        .map_or_else(String::default, |row| row.get().login)
+}
+
 fn recordings(
     pipelines: &[RwSignal<PipelineView, LocalStorage>],
 ) -> Vec<RwSignal<PipelineView, LocalStorage>> {
@@ -1573,11 +1588,14 @@ fn recordings(
 #[allow(clippy::needless_pass_by_value)]
 fn RecordingRow(
     pipeline: RwSignal<PipelineView, LocalStorage>,
+    channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     intents: Rc<IntentSender>,
 ) -> impl IntoView {
     let key = pipeline.get_untracked().key;
-    let login = key.login.clone();
     let quality = key.quality.clone().unwrap_or_else(|| "best".to_owned());
+    let login = Signal::derive_local(move || {
+        login_for(&channels, pipeline.with(|pipeline| pipeline.key.channel))
+    });
     let state = Signal::derive_local(move || state_label(pipeline.get().state));
     let position = Signal::derive_local(move || {
         pipeline.with(|pipeline| {
@@ -1628,7 +1646,7 @@ fn RecordingRow(
     view! {
         column(class = "recording") {
             row(class = "recording-row") {
-                text(class = "cell cell--channel") {{login}}
+                text(class = "cell cell--channel") {{move || login.get()}}
                 text(class = "cell cell--quality") {{quality}}
                 text(class = "cell cell--state") {{move || state.get()}}
                 text(class = "cell cell--position") {{move || position.get()}}
@@ -1710,12 +1728,13 @@ fn LogsTab(
                     }
                     for pipeline in move || recordings(&pipelines.get()), key = |pipeline: &RwSignal<PipelineView, LocalStorage>| {
                         let key = pipeline.get_untracked().key;
-                        (key.login, key.quality)
+                        (key.channel, key.quality)
                     } {
                         row(class = "pipeline") {
                             text(class = "pipeline__name") {{move || {
                                 let key = pipeline.with(|pipeline| pipeline.key.clone());
-                                format!("{}{}", key.login, key.quality.as_ref().map_or_else(String::new, |quality| format!(" · {quality}")))
+                                let login = login_for(&channels, key.channel);
+                                format!("{}{}", login, key.quality.as_ref().map_or_else(String::new, |quality| format!(" · {quality}")))
                             }}}
                             text(class = "pipeline__state") {{move || state_label(pipeline.get().state)}}
                             text(class = "pipeline__meta") {{move || {
@@ -2010,7 +2029,7 @@ fn channel_error(
     }
     pipelines.iter().find_map(|pipeline| {
         pipeline.with(|pipeline| {
-            if pipeline.key.login.eq_ignore_ascii_case(&channel.login) {
+            if pipeline.key.channel == channel.id {
                 pipeline_error(pipeline)
             } else {
                 None
