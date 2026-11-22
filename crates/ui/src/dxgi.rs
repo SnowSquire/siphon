@@ -402,7 +402,7 @@ impl DxgiSwapchain {
                 width,
                 height,
                 DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG(self.flags),
+                DXGI_SWAP_CHAIN_FLAG(self.flags.cast_signed()),
             )
         }
         .inspect_err(|error| self.note_removal(error))

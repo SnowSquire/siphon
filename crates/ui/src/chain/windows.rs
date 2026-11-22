@@ -401,7 +401,7 @@ impl Chain {
             warn!(target: "ui", "plain present: {error:?}");
             return false;
         }
-        swapchain.present().is_ok()
+        swapchain.present(self.display.present().tearing).is_ok()
     }
 
     /// Whether the chain can present: a live swapchain the driver has not removed.
