@@ -192,8 +192,8 @@ mod tests {
 
     #[test]
     fn pins_without_a_version_are_v1_with_no_ids() {
-        let pins: Pins = sonic_rs::from_slice(br#"{}"#).expect("parse");
+        let pins: Pins = sonic_rs::from_slice(br"{}").expect("parse");
         assert_eq!(pins.version, Pins::VERSION);
-        assert!(pins.ids.is_empty());
+        assert_eq!(pins.ids.len(), 0);
     }
 }

@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn config_defaults_to_the_current_version() {
         assert_eq!(Config::default().version, Config::VERSION);
-        assert_eq!(Config::VERSION, 4);
+        assert_eq!(Config::VERSION, 5);
     }
 
     #[test]
