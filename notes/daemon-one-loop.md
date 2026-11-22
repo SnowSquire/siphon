@@ -52,10 +52,13 @@ a separate snapshot-only structure.
 ### Registry
 
 - `channels: Vec<Channel>` — one row per channel the registry serves, with
-  `login`, `record` (the persisted preference, mirrored from config), `stopped:
-  Option<NonZeroU64>` (the broadcast id the user stopped) and lazily fetched
-  `data: Option<Rc<ChannelData>>` (title, variants, broadcast id).
-- `streams: HashMap<StreamKey, Rc<StreamRuntime>>` — `(login, quality)` for now.
+  `login`, `id` (the Twitch channel id; from the follow list, or GQL for a
+  channel an RTSP DESCRIBE pulled in), `title`, `record` (the persisted
+  preference, mirrored from config), `stopped: Option<NonZeroU64>` (the broadcast
+  id the user stopped) and lazily fetched `data: Option<Rc<ChannelData>>`.
+- `streams: HashMap<StreamId, Rc<StreamRuntime>>` — `StreamId` is
+  `(channel id, quality)`. The login is a display field, never identity; the
+  wire `StreamKey` still carries it and is mapped through the channel row.
 - Deleted: `monitors`, `once`, `suppressed`, `max_streams`, `ensure_capacity`,
   the capacity eviction, the `debug` flag.
 - `set_record(login, bool)` is the whole monitor concept: the bool is the intent.
@@ -121,6 +124,10 @@ connection health, forced DVR URLs. The mock grows a GQL route for the queries
 - `zvtzlpyy` — the demuxer emits into a flat `SampleStore` (separate video and
   audio buffers, Copy sample records); 2006 s of media went from 0.653 s to
   0.485 s on one core with the RTP packet count unchanged.
+- Stream identity is the channel id, not the login: `streams` is keyed by
+  `StreamId { channel, quality }`, and a channel resolved without being followed
+  learns its id from GQL `UserByLogin`. Verified against servermock with an empty
+  follow list: DESCRIBE `/sunnys/chunked/` produced h264 1080p + AAC.
 - `mnwovwvt` — a write no longer drops updates queued while it was in flight.
 - `qqopoyys` — a DESCRIBE that creates the stream now attaches the media engine;
   without it the first DESCRIBE waited for codec config that nothing demuxed.
@@ -138,13 +145,11 @@ Demux baseline on this box, for measuring the sample-store work:
 
 ## What is not decided / not done
 
-- Stream identity is still `(login, quality)` internally. Keying by channel id
-  needs a login→id lookup in the resolve path, which `get_variants` does not
-  provide; it is blocked on a GQL query (or usher data) that returns it. The
-  login is already on the channel row, so the change is local once that lookup
-  exists.
-- The Windows named-pipe listener path was rewritten by analogy and neither
-  built nor run on this box; the Unix path is what the smoke tests exercised.
+- The Windows named-pipe listener path was rewritten by analogy; the Unix path
+  is what the smoke tests exercised. A cross-target `cargo check` is the most
+  that can be done here.
+- The channel-id lookup is one extra GQL `UserByLogin` per channel an RTSP client
+  resolves without following it; followed channels take their id from config.
 - `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` are updated
   to the one-loop design. The older reasoning lives in this file.
 

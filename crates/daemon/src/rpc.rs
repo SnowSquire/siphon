@@ -296,6 +296,7 @@ mod tests {
             ));
             registry.seed_channel(
                 "sunnys",
+                7,
                 false,
                 vec![debug_variant(), debug_portrait_variant()],
                 42,

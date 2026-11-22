@@ -23,7 +23,9 @@ the dual-loopback-family fallback is only in `play`. There is no stream limit
 - Path segments, never query parameters: ffmpeg joins a relative
   `a=control:trackID=0` by string append (`libavformat/rtsp.c:615`), so a query
   would swallow the track fragment (`...?quality=x/trackID=0`).
-- `<channel>` is the Twitch login, lowercased.
+- `<channel>` is the Twitch login, lowercased. The login is resolved to the
+  Twitch channel id (from the follow list, or GQL `UserByLogin` when the channel
+  is not followed); the pipeline is keyed by `(channel id, quality)`.
 - `<quality>` is a `STABLE-VARIANT-ID` (`chunked`, `720p60`, `audio_only`, ...).
   Missing means the first variant. An unknown id is a 404.
 - `a=control:trackID=0` stays relative; `Content-Base` is the request URI plus a
