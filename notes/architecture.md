@@ -55,15 +55,21 @@ append a second copy onto the same segment.
 
 ## `registry.rs`
 
-The registry behind `daemon` mode; `daemon-mode.md` has the lifecycle, URI,
-capacity and resolver. In short: one global `Client`, `ArenaSet` and downloader
-queue; `(channel, quality)` maps to a `Stream`; DESCRIBE resolves the channel,
-picks the variant and builds the pipeline; the last viewer leaving stops it;
-`--max-streams` refuses rather than evicting.  With a recording directory set a
-recording keeps its stream entry (and counts against the limit) after the last
-viewer leaves; the registry releases it when the disk recorder finishes.
-`recordPortrait` adds a second pipeline for the portrait group, keyed by its
-variant id, started and stopped with the primary recording.
+The stream registry behind `daemon` mode; `daemon-mode.md` has the lifecycle,
+URI and resolver, and `daemon-one-loop.md` the current design. In short: one
+global `Client`, `ArenaSet` and downloader queue; `(login, quality)` maps to a
+`Stream`; DESCRIBE resolves the channel, picks the variant and attaches the media
+engine. There is no stream cap and no eviction: the arena bounds memory, and a
+missing slot fails one segment (`ArenaFull`) instead of aborting.
+
+A followed channel is one row with `record: bool`, `stopped: Option<broadcast
+id>` and the lazily fetched variant data. `monitors`, `once` and `suppressed` are
+gone: `record` is the persisted intent, a one-shot recording is just a pipeline
+that starts now, and Stop latches the broadcast id so it cannot survive a
+restream. With a recording directory set a recording keeps its stream entry
+after the last viewer leaves; the registry releases it when the recorder
+finishes. `recordDualFormat` adds a second pipeline for the other orientation,
+keyed by its variant id, started and stopped with the primary recording.
 
 ## `disk.rs`
 

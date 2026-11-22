@@ -3,7 +3,8 @@
 Status: implemented. `crates/shared` (`siphon-shared`) owns the typed protocol,
 postcard framing and client in its `rpc` module, the per-client settings schema
 in `settings`, and the JSON file layer in `store`; `crates/daemon` owns config,
-GQL, Hermes, the app loop, monitors, telemetry and the admin RPC server. The UI
+GQL, Hermes, the daemon loop, the stream registry, telemetry and the admin RPC
+server. The UI
 is `crates/ui` (ZGUI, binary `siphon`) and talks only over the RPC. It presents
 through the DXGI flip chain extracted from the video spike and the libplacebo
 pass (SDR unless the client's HDR setting asks otherwise), starts the daemon
@@ -30,7 +31,7 @@ compiler catches drift; no field layout is duplicated between client and server.
 Siphon UI (ZGUI)  ── typed RPC ──  Siphon backend (compio)
                                       ├─ app state (config, channels, notifications)
                                       ├─ GQL + Hermes
-                                      ├─ monitors → pipelines (scheduler, disk, media)
+                                      ├─ channels (record flags) → pipelines
                                       └─ RTSP listener
 ```
 
@@ -160,20 +161,22 @@ backend remains authoritative.
 
 ## Ordering and backpressure
 
-- One reader task per connection handles requests; one writer task drains a
-  bounded outbound queue. Control responses and updates share that queue: a
-  writer that selected between two receive queues would drop an already-
-  completed receive when both became ready. Never block the reactor: `try_send`
-  only, exactly like RTSP `Session::out`.
-- The app loop's own event wait is lossless too: senders wake a `ConsumerWake`
-  and the loop drains with `try_recv`; background jobs are delivered through
-  the same queue. The loop's biased select puts the Hermes socket read first,
-  so a completed websocket read is never dropped for a queued request.
-- A slow UI is disconnected, never queued indefinitely. It reconnects and
-  resyncs from `Snapshot`.
-- Updates are published through an event bus of weak subscribers
-  (`RefCell<Vec<Weak<Subscriber>>>`, same shape as `WakeSet`). Publishing must
-  not keep a stream or a pipeline alive.
+- Connections are slots in the daemon loop, not tasks: each `rpc::Conn` owns its
+  frame decoder and outbound `Vec<u8>`, and the loop arms one read op and one
+  write op at a time. A request is handled inline with `&mut` access to the
+  backend state, so the response is queued before the next loop pass. A snapshot
+  is a plain function returning an owned value.
+- The listener is a task that only accepts; it hands the raw stream to the loop
+  through one kanal queue.
+- The bus is one coalesced queue, not one per connection. The loop encodes each
+  update once and appends the same bytes to every ready connection. Append-only
+  updates (`Segment`, `Log`) are never coalesced.
+- A connection whose outbound buffer exceeds `rpc::MAX_OUT` is dropped. It
+  reconnects and resyncs from `Snapshot`; nothing is queued indefinitely.
+- Background jobs (GQL refresh, saves, update checks, avatars) finish on their
+  own task and post through one kanal queue the loop drains. The loop's biased
+  select puts the Hermes socket read first, so a completed websocket read is
+  never dropped for a queued event.
 - No `RefCell` borrow is held across an `.await` in a handler.
 
 ## Backend app
@@ -204,27 +207,26 @@ listeners are tasks around it.
 - Until Hermes lands in the daemon, the same API works with an external bridge:
   a monitor is desired state, and activation is an explicit request/event.
 
-### Monitors and pipelines
+### Record state and pipelines
 
-A monitor is desired state, not a stream. The key is `(login, quality)` exactly
-like `StreamKey`; changing quality is remove + add.
+There is no monitor set. The key is `(login, quality)` exactly like `StreamKey`.
 
-- `Registry` keeps `monitors: HashSet<StreamKey>` in addition to live
-  runtimes.
-- A monitor-only runtime runs the scheduler and optional disk, but **no media
-  engine and no DVR refresh**. Segments are downloaded and discarded; this is
-  the "which segments arrived" view.
-- On DESCRIBE, `Runtime::upgrade()` creates the `Dvr` if needed and spawns the
-  media engine with the existing registration sender, `WakeSet`, live window
-  and reader wake. `media_spawned: Cell<bool>` makes it idempotent; DESCRIBE's
-  `wait_ready` covers the join.
-- `ensure_capacity`, `release_stream`, `finish_stream` and `prune_channel` must
-  treat pinned/monitored runtimes like recording ones: never evict, never drop
-  the channel entry while a monitor exists.
-- When `--max-streams` is full, `MonitorAdd` fails with a distinct status. A
-  viewer is never evicted to make room.
-- Offline at activation: keep the desired monitor and its status; retry on the
-  next Hermes event or `PipelineRestart`. No new polling loop in v1.
+- A followed channel is a row with `record: bool` (mirrored from config),
+  `stopped: Option<NonZeroU64>` (the broadcast id the user stopped) and lazily
+  fetched variant data. `set_record` writes the bool; `monitor_live` is what
+  Hermes `stream-up` and the reconnect baseline call.
+- A one-shot recording is a pipeline started now and not persisted:
+  `RecordOnce` resolves the channel and records the live broadcast.
+- Stop writes the current broadcast id into `stopped`. A restream has a new id,
+  so it is not suppressed; `stream-down` clears the latch and the fetched
+  variant data.
+- On DESCRIBE, a new runtime attaches the media engine immediately (a DESCRIBE
+  is a viewer); `Runtime::upgrade()` is idempotent through `media_spawned`.
+- No capacity check and no eviction: a runtime goes away when the last viewer
+  leaves and nothing is recording. A scheduler with no consumers parks, so an
+  idle stream costs neither polls nor fetches.
+- Offline at activation: publish the error; the next Hermes event or
+  `PipelineRestart` retries. No polling loop.
 
 ### Lifecycle
 

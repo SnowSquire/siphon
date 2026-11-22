@@ -140,12 +140,13 @@ Demux baseline on this box, for measuring the sample-store work:
 
 - Stream identity is still `(login, quality)` internally. Keying by channel id
   needs a login→id lookup in the resolve path, which `get_variants` does not
-  provide; it is blocked on a GQL query (or usher data) that returns it.
-- Nothing from the original list is open except the two blocked items above.
-- `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` still
-  describe the old loop, the per-connection queues and the monitor sets.
-- The Windows named-pipe listener path was rewritten by analogy and not built or
-  run on this box.
+  provide; it is blocked on a GQL query (or usher data) that returns it. The
+  login is already on the channel row, so the change is local once that lookup
+  exists.
+- The Windows named-pipe listener path was rewritten by analogy and neither
+  built nor run on this box; the Unix path is what the smoke tests exercised.
+- `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` are updated
+  to the one-loop design. The older reasoning lives in this file.
 
 ---
 
@@ -182,3 +183,8 @@ Recommendation, for the morning: **1**. `Option<Recorder>` is the real coupling
 independent facts about two different tasks, not states of a machine. The enum in
 (2) buys nothing that the type system was not already giving us, and it would
 have to model the dual-orientation case as an extra variant to stay honest.
+
+**Decided and implemented: (1).** `StreamRuntime.recording` is
+`RefCell<Option<Recorder { disk, metrics }>>`; `media_spawned` and `dvr_spawned`
+stay as independent spawn flags; `debug` and the per-runtime `broadcast_id` are
+gone (the broadcast id lives on the channel row and on the disk options).

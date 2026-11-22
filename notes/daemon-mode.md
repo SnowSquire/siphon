@@ -11,10 +11,10 @@ workers, the listeners.
 
 ## CLI
 
-`daemon daemon [--bind <addr>] [--max-streams N] [--admin <endpoint>]`.
+`daemon daemon [--bind <addr>] [--admin <endpoint>] [--no-admin]`.
 `--bind` defaults to `127.0.0.1:7417`; `daemon` binds exactly that address, so
-the dual-loopback-family fallback is only in `play`. `--max-streams` defaults to
-`constants::MAX_STREAMS` (8). `play` keeps `-c/--channel` and `-q/--quality`.
+the dual-loopback-family fallback is only in `play`. There is no stream limit
+(`--max-streams` was removed). `play` keeps `-c/--channel` and `-q/--quality`.
 
 ## URI
 
@@ -49,9 +49,10 @@ the dual-loopback-family fallback is only in `play`. `--max-streams` defaults to
    `Stopped`, so the scheduler returns, and the media engine's `recv` ends when
    the scheduler drops its consumer. The media loop, `play_vod` and the
    watchdog additionally check `stopped()`.
-5. The channel entry is dropped with the channel's last stream (decided). A
-   reconnect re-resolves the variant list instead of playing a stale one; there
-   is no separate expiry timer.
+5. A followed channel keeps its row; `stream-down` clears the fetched variant
+   data so the next broadcast re-resolves. An entry created by an RTSP DESCRIBE
+   for an unfollowed channel is dropped with its last stream. There is no expiry
+   timer.
 
 ## Sharing
 
@@ -66,14 +67,14 @@ resolves that variant's archive media playlist.
 
 ## Capacity
 
-- `--max-streams` (defaults to `MAX_STREAMS`). Streams with no attached
-  sessions are dropped before the count is checked; a stream someone is
-  watching is never evicted. When full, DESCRIBE gets a 503.
-- The capacity check and the registry insert are in the same synchronous block
-  (`spawn_stream` has no await), so the count is exact even when resolutions
-  interleave.
-- The slot budget is still global (`SEGMENT_SLOTS_MAX` is per spool, not per
-  stream), so a per-stream reservation remains open.
+- No cap, no eviction. `SEGMENT_SLOTS_MAX` bounds one spool, the arena bounds the
+  process, and a failed allocation is one failed segment (`ArenaFull`).
+- A runtime is created by a DESCRIBE, by `record` on a live channel, or by
+  `RecordOnce`; it goes away when the last viewer leaves and nothing is
+  recording.
+- The fixed per-stream cost is the manifest poll (and, while somebody reads, the
+  segment fetches). A parked scheduler does neither, so a recording-only stream
+  costs the DVR refresh rate.
 
 ## Naming
 
