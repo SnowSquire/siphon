@@ -124,7 +124,7 @@ connection health, forced DVR URLs. The mock grows a GQL route for the queries
 - `zvtzlpyy` — the demuxer emits into a flat `SampleStore` (separate video and
   audio buffers, Copy sample records); 2006 s of media went from 0.653 s to
   0.485 s on one core with the RTP packet count unchanged.
-- Stream identity is the channel id, not the login: `streams` is keyed by
+- `swutztou` — stream identity is the channel id, not the login: `streams` is keyed by
   `StreamId { channel, quality }`, and a channel resolved without being followed
   learns its id from GQL `UserByLogin`. Verified against servermock with an empty
   follow list: DESCRIBE `/sunnys/chunked/` produced h264 1080p + AAC.
