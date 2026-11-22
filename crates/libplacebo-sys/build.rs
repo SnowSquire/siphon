@@ -55,9 +55,17 @@ fn default_vulkan() -> PathBuf {
 }
 
 /// The xwin splat holding the MSVC CRT and Windows SDK: `%XWIN_SYS_ROOT%`, else
-/// xwin's own cache default.
+/// the flattened `~/.cache/xwin` the cross-check notes splat into, else xwin's
+/// own cache default.
 fn default_splat() -> PathBuf {
-    env::var_os("XWIN_SYS_ROOT").map_or_else(|| home().join(".xwin-cache/splat"), PathBuf::from)
+    if let Some(root) = env::var_os("XWIN_SYS_ROOT") {
+        return PathBuf::from(root);
+    }
+    let cache = home().join(".cache/xwin");
+    if cache.join("crt").is_dir() {
+        return cache;
+    }
+    home().join(".xwin-cache/splat")
 }
 
 fn main() {
@@ -302,28 +310,22 @@ fn windows() {
         .and_then(|lib| lib.include_paths.first())
         .cloned()
         .unwrap_or_else(|| panic!("libplacebo resolved without an include path"));
-    let ffmpeg = prefix("FFMPEG_DIR", default_ffmpeg());
+    // `vulkan/vulkan.h` is part of libplacebo's public headers, so the Vulkan
+    // headers are always needed; FFmpeg's are only reachable behind `libav`.
     let vulkan = prefix("VULKAN_SDK", default_vulkan());
     let splat = prefix("LIBPLACEBO_SPLAT", default_splat());
 
-    let includes = Includes {
-        placebo,
-        ffmpeg: ffmpeg.join("include"),
-        vulkan: vulkan.join("Include"),
-        crt: splat
-            .join("VC/Tools/MSVC")
-            .join(latest(&splat.join("VC/Tools/MSVC")))
-            .join("include"),
-        ucrt: sdk_include(&splat, "ucrt"),
-        um: sdk_include(&splat, "um"),
-        shared: sdk_include(&splat, "shared"),
-    };
+    let mut includes = vec![placebo, vulkan.join("Include")];
+    if feature("libav") {
+        includes.push(prefix("FFMPEG_DIR", default_ffmpeg()).join("include"));
+    }
+    includes.extend(splat_includes(&splat));
     let defines = deps.all_defines();
 
-    bindings(&includes.all(), &defines);
-    shim(&includes.all(), &defines);
+    bindings(&includes, &defines);
+    shim(&includes, &defines);
     if feature("libav") {
-        glue(&includes.all(), &defines, "clang-cl");
+        glue(&includes, &defines, "clang-cl");
     }
 
     if link == Link::Dynamic
@@ -333,30 +335,28 @@ fn windows() {
     }
 }
 
-/// Every include directory the bindings and the native shims need, in one place.
-struct Includes {
-    placebo: PathBuf,
-    ffmpeg: PathBuf,
-    vulkan: PathBuf,
-    crt: PathBuf,
-    ucrt: PathBuf,
-    um: PathBuf,
-    shared: PathBuf,
-}
-
-impl Includes {
-    /// Everything `cc` needs to compile C for this ABI.
-    fn all(&self) -> [PathBuf; 7] {
-        [
-            self.placebo.clone(),
-            self.ffmpeg.clone(),
-            self.vulkan.clone(),
-            self.crt.clone(),
-            self.ucrt.clone(),
-            self.um.clone(),
-            self.shared.clone(),
-        ]
+/// Every include directory the MSVC CRT and the Windows SDK contribute.
+///
+/// `xwin` writes the Visual Studio / Windows Kits layout on Windows and a
+/// flattened `crt/include` + `sdk/include/<part>` tree elsewhere, which is what
+/// the Linux cross-check's `--output ~/.cache/xwin` produces. Both work, so the
+/// bindings see the same headers clang-cl and lld-link are pointed at.
+fn splat_includes(splat: &Path) -> Vec<PathBuf> {
+    let msvc = splat.join("VC/Tools/MSVC");
+    let kits = splat.join("Windows Kits/10/Include");
+    if msvc.is_dir() && kits.is_dir() {
+        let msvc = msvc.join(latest(&msvc)).join("include");
+        let kits = kits.join(latest(&kits));
+        return [kits.join("ucrt"), kits.join("um"), kits.join("shared"), msvc].into();
     }
+    let sdk = splat.join("sdk/include");
+    [
+        splat.join("crt/include"),
+        sdk.join("ucrt"),
+        sdk.join("um"),
+        sdk.join("shared"),
+    ]
+    .into()
 }
 
 /// The install prefix holding the DLL, when it has a `bin` directory.
@@ -892,12 +892,6 @@ fn prefix(knob: &str, default: PathBuf) -> PathBuf {
         value.display()
     );
     value
-}
-
-/// `Windows Kits/10/Include/<version>/<part>`.
-fn sdk_include(splat: &Path, part: &str) -> PathBuf {
-    let include = splat.join("Windows Kits/10/Include");
-    include.join(latest(&include)).join(part)
 }
 
 /// The newest subdirectory of `dir`, which is how the splat versions itself.
