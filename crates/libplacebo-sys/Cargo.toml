@@ -4,7 +4,7 @@
 name = "libplacebo-sys"
 version = "0.1.0"
 edition = "2024"
-description = "Bindings, link directives and the header-only libav glue for a locally built libplacebo"
+description = "Bindings, link directives, the header-only libav glue and an optional meson build for libplacebo"
 authors = ["Ozeniken"]
 publish = false
 # One of these per native library, so two crates cannot disagree about which
@@ -26,15 +26,29 @@ path = "src/lib.rs"
 # FFmpeg at all; the video path turns it on.
 libav = []
 
-[dependencies]
-
 [build-dependencies]
 bindgen = "0.73.2"
 cc = "1.11.1"
-# The build script dispatches on the *target* OS, not the host's `cfg`, so the
-# Linux branch must compile into the script even when it runs on Windows (or
-# cross-compiles from Linux to Windows).
-pkg-config = "0.3"
+# Discovery is declarative: pkg-config on Linux, an environment-variable
+# override for the Windows prefix, and the build-internal hook that runs the
+# meson build below when the caller asks for it. Keep the `build.rs` header in
+# sync with `LIBPLACEBO_SOURCE` and friends.
+system-deps = "9"
+
+# libplacebo is a system dependency on Linux (the distro package, or a prefix
+# named by LIBPLACEBO_PREFIX) and a hand-built prefix on Windows, where the
+# scoop packages ship no pkg-config files.
+[package.metadata.system-deps]
+libplacebo = "0"
+
+# The Vulkan headers are only an include-path source for bindgen, so a missing
+# `vulkan.pc` is not fatal. The libav glue is gated on the crate feature, and on
+# Windows FFmpeg comes from FFMPEG_DIR rather than pkg-config.
+[package.metadata.system-deps.'cfg(not(windows))']
+vulkan = { version = "0", optional = true }
+libavutil = { version = "0", feature = "libav" }
+libavcodec = { version = "0", feature = "libav" }
+libavformat = { version = "0", feature = "libav" }
 
 [lints]
 workspace = true

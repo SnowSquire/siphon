@@ -111,11 +111,25 @@ before its swapchain.
 
 ## Build
 
-`libplacebo-sys` builds on both platforms. Windows keeps its prefix knobs; Linux
-uses `pkg-config` for libplacebo and the Vulkan headers, plain `cc` for the C glue,
-no DLL copy, and `LIBPLACEBO_PREFIX` wins when set. Fedora's libclang derives its
-resource dir from `libclang.so.22.1` and misses `clang/22`, so the build script asks
-`clang -print-resource-dir` for `stdbool.h`'s directory.
+`libplacebo-sys` builds on both platforms, and `system-deps` owns discovery:
+`[package.metadata.system-deps]` names libplacebo, Vulkan (optional, for the
+headers) and, behind the `libav` feature, the FFmpeg libraries. Linux uses
+pkg-config; `LIBPLACEBO_PREFIX` selects a prefix instead. Windows names its
+prefix through the same environment-variable override, because the scoop
+packages ship no pkg-config files.
+
+`LIBPLACEBO_SOURCE` picks the origin on either platform: `system` (the default on
+Linux), `prefix` (the default on Windows), `build` (meson compiles
+`LIBPLACEBO_SRC` into `OUT_DIR` or `LIBPLACEBO_BUILD_DIR`) or `auto` (system,
+then build). `LIBPLACEBO_LINK=static` links the source build statically;
+dynamic is the default. A source build forwards its libdir to the UI's build
+script: that adds the link search path (a dependency's `/usr/lib64 -L` can
+otherwise shadow it) and, for a shared build, an rpath, so
+`./target/debug/siphon` runs without `LD_LIBRARY_PATH`.
+
+Fedora's libclang derives its resource dir from `libclang.so.22.1` and misses
+`clang/22`, so the build script asks `clang -print-resource-dir` for
+`stdbool.h`'s directory.
 
 `src/shim.c` solves the version problem: libplacebo's `pl_log_create` is a macro
 expanding to `pl_log_create_<PL_API_VER>`, so the shim expands it against the
