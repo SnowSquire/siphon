@@ -35,9 +35,9 @@ cc = "1.11.1"
 # sync with `LIBPLACEBO_SOURCE` and friends.
 system-deps = "9"
 
-# libplacebo is a system dependency on Linux (the distro package, or a prefix
-# named by LIBPLACEBO_PREFIX) and a hand-built prefix on Windows, where the
-# scoop packages ship no pkg-config files.
+# libplacebo is a system dependency found through pkg-config on both platforms.
+# `LIBPLACEBO_PREFIX` names a prefix explicitly, and `LIBPLACEBO_SOURCE=build`
+# compiles a checkout when no installed copy exists.
 [package.metadata.system-deps]
 libplacebo = "0"
 

@@ -4,10 +4,9 @@
 //!
 //! `LIBPLACEBO_SOURCE` selects where the library comes from:
 //!
-//! * `system` — pkg-config. The default on Linux, where libplacebo is a
-//!   distribution package.
-//! * `prefix` — a `meson install` prefix named by `LIBPLACEBO_PREFIX`. The
-//!   default on Windows, whose scoop packages carry no pkg-config files.
+//! * `system` — pkg-config. The default on both platforms.
+//! * `prefix` — a `meson install` prefix named explicitly by
+//!   `LIBPLACEBO_PREFIX`.
 //! * `build` — meson builds the checkout at `LIBPLACEBO_SRC` into the Cargo
 //!   output directory, so a machine with no libplacebo can still link one.
 //! * `auto` — `system`, falling back to `build` when pkg-config has no
@@ -18,12 +17,11 @@
 //! `OUT_DIR` when a checkout is built repeatedly.
 //!
 //! Discovery is declarative (`[package.metadata.system-deps]` in `Cargo.toml`)
-//! and belongs to `system-deps`: pkg-config on Linux, its environment-variable
-//! overrides for the Windows prefix (which ships no pkg-config files), and the
-//! build-internal hook when the library has to be compiled. The meson
-//! invocation that used to be `scripts/build-libplacebo.sh` lives in
-//! `build_with_meson` below, so a source build needs no separate shell step and
-//! works on both platforms.
+//! and belongs to `system-deps`: pkg-config, with `LIBPLACEBO_PREFIX` as an
+//! explicit override, and the build-internal hook when the library has to be
+//! compiled. The meson invocation that used to be
+//! `scripts/build-libplacebo.sh` lives in `build_with_meson` below, so a source
+//! build needs no separate shell step and works on both platforms.
 
 use std::collections::HashMap;
 use std::env;
@@ -39,11 +37,6 @@ fn home() -> PathBuf {
     env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
-}
-
-/// `meson install`'s prefix for the libplacebo this repo builds.
-fn default_placebo() -> PathBuf {
-    home().join("Projects/Code/Libs/libplacebo/prefix")
 }
 
 /// Scoop's root: `%SCOOP%`, else `~/scoop` (scoop's own default).
@@ -201,6 +194,20 @@ fn use_prefix(prefix: &Path, lib: &str) {
     set_env("SYSTEM_DEPS_LIBPLACEBO_LIB", lib);
 }
 
+/// The prefix `LIBPLACEBO_SOURCE=prefix` must name; there is no default.
+fn explicit_prefix() -> PathBuf {
+    let prefix = env::var_os("LIBPLACEBO_PREFIX").map_or_else(
+        || panic!("LIBPLACEBO_SOURCE=prefix needs LIBPLACEBO_PREFIX to name one"),
+        PathBuf::from,
+    );
+    assert!(
+        prefix.is_dir(),
+        "LIBPLACEBO_PREFIX points at {}, which is not a directory",
+        prefix.display()
+    );
+    prefix
+}
+
 /// Resolves libplacebo through system-deps, with the meson build registered as
 /// the internal fallback.
 fn probe(source: Source, link: Link, lib: &'static str) -> system_deps::Dependencies {
@@ -228,16 +235,7 @@ fn linux() {
     let link = Link::from_env();
 
     if source == Source::Prefix {
-        let prefix = env::var_os("LIBPLACEBO_PREFIX").map_or_else(
-            || panic!("LIBPLACEBO_SOURCE=prefix needs LIBPLACEBO_PREFIX to name one"),
-            PathBuf::from,
-        );
-        assert!(
-            prefix.is_dir(),
-            "LIBPLACEBO_PREFIX points at {}, which is not a directory",
-            prefix.display()
-        );
-        use_prefix(&prefix, "placebo");
+        use_prefix(&explicit_prefix(), "placebo");
     }
 
     let deps = probe(source, link, "placebo");
@@ -290,14 +288,11 @@ fn forward_libdir(deps: &system_deps::Dependencies, link: Link, source: Source) 
 // ---------------------------------------------------------------- Windows
 
 fn windows() {
-    let source = Source::from_env(Source::Prefix);
+    let source = Source::from_env(Source::System);
     let link = Link::from_env();
 
     if source == Source::Prefix {
-        use_prefix(
-            &prefix("LIBPLACEBO_PREFIX", default_placebo()),
-            "libplacebo",
-        );
+        use_prefix(&explicit_prefix(), "libplacebo");
     }
 
     let deps = probe(source, link, "libplacebo");
@@ -332,7 +327,7 @@ fn windows() {
     }
 
     if link == Link::Dynamic
-        && let Some(prefix) = dll_prefix(source, &deps)
+        && let Some(prefix) = dll_prefix(&deps)
     {
         copy_dll(&prefix);
     }
@@ -364,16 +359,15 @@ impl Includes {
     }
 }
 
-/// The install prefix holding the DLL, for the modes that own one.
-fn dll_prefix(source: Source, deps: &system_deps::Dependencies) -> Option<PathBuf> {
+/// The install prefix holding the DLL, when it has a `bin` directory.
+fn dll_prefix(deps: &system_deps::Dependencies) -> Option<PathBuf> {
     let prefix = deps
         .get_by_name("libplacebo")
         .and_then(|lib| lib.link_paths.first())
         .and_then(|lib| lib.parent())?;
-    if source == Source::Prefix || source == Source::Build || prefix.starts_with(build_root()) {
+    if prefix.join("bin").is_dir() {
         Some(prefix.to_path_buf())
     } else {
-        // `system`: the loader has to find the DLL itself.
         None
     }
 }

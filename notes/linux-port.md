@@ -113,18 +113,18 @@ before its swapchain.
 
 `libplacebo-sys` builds on both platforms, and `system-deps` owns discovery:
 `[package.metadata.system-deps]` names libplacebo, Vulkan (optional, for the
-headers) and, behind the `libav` feature, the FFmpeg libraries. Linux uses
-pkg-config; `LIBPLACEBO_PREFIX` selects a prefix instead. Windows names its
-prefix through the same environment-variable override, because the scoop
-packages ship no pkg-config files, and defaults it to
-`~/Projects/Code/Libs/libplacebo/prefix` (the checkout itself is
+headers) and, behind the `libav` feature, the FFmpeg libraries. Both platforms
+use pkg-config; the Windows install prefix's `.pc` lives in the machine's
+pkgconf path (this checkout's is in
+`scoop/persist/pkgconf/lib/pkgconfig`), and `LIBPLACEBO_PREFIX` names a prefix
+explicitly instead. The checkout itself is
 `~/Projects/Code/Libs/libplacebo`, named to a source build through
-`LIBPLACEBO_SRC`). The checkout's Windows `.venv` holds meson, ninja and
+`LIBPLACEBO_SRC`. The checkout's Windows `.venv` holds meson, ninja and
 jinja2; the build script puts its `Scripts` on `PATH` for the meson run,
 because the uv-managed Python on this machine has no jinja2.
 
-`LIBPLACEBO_SOURCE` picks the origin on either platform: `system` (the default on
-Linux), `prefix` (the default on Windows), `build` (meson compiles
+`LIBPLACEBO_SOURCE` picks the origin on either platform: `system` (the default),
+`prefix` (a `LIBPLACEBO_PREFIX`), `build` (meson compiles
 `LIBPLACEBO_SRC` into `OUT_DIR` or `LIBPLACEBO_BUILD_DIR`) or `auto` (system,
 then build). `LIBPLACEBO_LINK=static` links the source build statically;
 dynamic is the default. A source build forwards its libdir to the UI's build
