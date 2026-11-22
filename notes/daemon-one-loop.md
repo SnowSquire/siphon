@@ -118,6 +118,20 @@ connection health, forced DVR URLs. The mock grows a GQL route for the queries
   usher master path and an avatar.
 - The RPC round-trip test now drives the real listener, the real daemon loop and
   the real registry over a Unix socket.
+- `mnwovwvt` — a write no longer drops updates queued while it was in flight.
+- `qqopoyys` — a DESCRIBE that creates the stream now attaches the media engine;
+  without it the first DESCRIBE waited for codec config that nothing demuxed.
+
+Smoke tests against `servermock` (debug build, config in a temp
+`XDG_CONFIG_HOME`): the daemon resolved the channel through the mock's GQL,
+connected Hermes, subscribed and received `stream-up`; `ffprobe
+-rtsp_transport tcp` reported h264 1920x1080 and AAC 48 kHz through a
+parked-then-resumed scheduler.
+
+Demux baseline on this box, for measuring the sample-store work:
+`cargo test -p daemon --release -- --ignored --nocapture throughput` gives
+2006 s of 1080p60 media in 0.653 s, 3072x realtime on one core, with demux at
+69% of the cost and packetize+RTP at 31%.
 
 ## What is not decided / not done
 
