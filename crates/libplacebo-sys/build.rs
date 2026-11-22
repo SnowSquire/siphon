@@ -294,7 +294,10 @@ fn windows() {
     let link = Link::from_env();
 
     if source == Source::Prefix {
-        use_prefix(&prefix("LIBPLACEBO_PREFIX", default_placebo()), "libplacebo");
+        use_prefix(
+            &prefix("LIBPLACEBO_PREFIX", default_placebo()),
+            "libplacebo",
+        );
     }
 
     let deps = probe(source, link, "libplacebo");
@@ -602,6 +605,17 @@ fn build_with_meson(link: Link) -> Result<Installed, String> {
         ],
         &environment,
     )?;
+    // `llvm-lib` (meson's `ar` under clang-cl) writes `libplacebo.a`, while the
+    // MSVC linker rustc drives looks for `libplacebo.lib`. The archive is COFF
+    // either way, so a copy under the name lld-link wants is enough.
+    if link == Link::Static && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let archive = prefix.join("lib").join("libplacebo.a");
+        let library = prefix.join("lib").join("libplacebo.lib");
+        if archive.is_file() {
+            fs::copy(&archive, &library)
+                .map_err(|error| format!("cannot name {} as a .lib: {error}", archive.display()))?;
+        }
+    }
     fs::write(root.join("link"), link.key())
         .map_err(|error| format!("cannot record the link mode: {error}"))?;
 
