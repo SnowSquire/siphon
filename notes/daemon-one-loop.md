@@ -118,6 +118,9 @@ connection health, forced DVR URLs. The mock grows a GQL route for the queries
   usher master path and an avatar.
 - The RPC round-trip test now drives the real listener, the real daemon loop and
   the real registry over a Unix socket.
+- `zvtzlpyy` — the demuxer emits into a flat `SampleStore` (separate video and
+  audio buffers, Copy sample records); 2006 s of media went from 0.653 s to
+  0.485 s on one core with the RTP packet count unchanged.
 - `mnwovwvt` — a write no longer drops updates queued while it was in flight.
 - `qqopoyys` — a DESCRIBE that creates the stream now attaches the media engine;
   without it the first DESCRIBE waited for codec config that nothing demuxed.
@@ -138,8 +141,7 @@ Demux baseline on this box, for measuring the sample-store work:
 - Stream identity is still `(login, quality)` internally. Keying by channel id
   needs a login→id lookup in the resolve path, which `get_variants` does not
   provide; it is blocked on a GQL query (or usher data) that returns it.
-- Demux sample store is implemented (`rtsp/ts.rs`: `SampleStore` + `Sample`
-  ranges), with the media engine and the bench on the new API.
+- Nothing from the original list is open except the two blocked items above.
 - `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` still
   describe the old loop, the per-connection queues and the monitor sets.
 - The Windows named-pipe listener path was rewritten by analogy and not built or
