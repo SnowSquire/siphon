@@ -80,7 +80,6 @@ use tauri_winrt_notification as _;
 use tracing::error;
 
 use crate::app::App;
-use crate::app::AppHandle;
 use crate::app::AppInit;
 use crate::arena::ArenaSet;
 use crate::bus::Bus;
@@ -221,10 +220,6 @@ struct Daemon {
     /// Do not listen for the UI
     #[arg(long)]
     no_admin: bool,
-
-    /// Streams served at once
-    #[arg(long, default_value_t = crate::constants::MAX_STREAMS)]
-    max_streams: usize,
 
     /// Record into this directory instead of the configured recordDir (dev override)
     #[arg(long)]
@@ -736,8 +731,6 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             client_id: cfg.client_id.clone(),
             auth_token: cfg.auth_token.clone(),
             low_latency: cfg.low_latency,
-            debug: cfg.debug,
-            max_streams: args.max_streams,
             recording: RegistryRecording {
                 output: args
                     .output
@@ -750,6 +743,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         },
         Rc::clone(&bus),
     ));
+    registry.sync_channels(&config.channels);
     registry.watch_finished();
 
     if let Err(error) = pid::write(config::APP_ID) {
@@ -757,36 +751,29 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     }
     notifier::register_aumid();
 
-    let (events_tx, events_rx) = kanal::unbounded();
-    let wake = ConsumerWake::new();
-    let sender = app::EventSender::new(events_tx, Rc::clone(&wake));
-    let handle = AppHandle::new(sender.clone(), Rc::clone(&bus));
+    let (accept_tx, accept_rx) = kanal::unbounded();
+    if !args.no_admin {
+        let endpoint = args
+            .admin
+            .clone()
+            .unwrap_or_else(|| siphon_shared::rpc::admin_endpoint(config::APP_ID));
+        if let Err(error) = rpc::spawn_listener(endpoint, accept_tx) {
+            error!(%error, "rpc: listener failed");
+        }
+    }
+    let (jobs_tx, jobs_rx) = kanal::unbounded();
     let app = App::new(AppInit {
         config,
         config_path,
         client: Rc::clone(&client),
         registry: Rc::clone(&registry),
         bus,
-        events: events_rx,
-        sender,
-        wake,
+        accept: accept_rx.to_async(),
+        jobs: jobs_rx.to_async(),
+        jobs_tx,
         client_id: cfg.client_id.clone(),
         debug: cfg.debug,
     });
-
-    if !args.no_admin {
-        let handle = handle.clone();
-        let endpoint = args
-            .admin
-            .clone()
-            .unwrap_or_else(|| siphon_shared::rpc::admin_endpoint(config::APP_ID));
-        compio::runtime::spawn(async move {
-            if let Err(error) = rpc::serve(endpoint, handle).await {
-                error!(%error, "rpc: listener failed");
-            }
-        })
-        .detach();
-    }
     compio::runtime::spawn(app.run()).detach();
 
     // Only returns on a bind error: the RTSP accept loop runs for the process's
@@ -842,7 +829,6 @@ mod tests {
         assert_eq!(args.bind.port(), 8554);
         assert!(args.admin.is_none());
         assert!(!args.no_admin);
-        assert_eq!(args.max_streams, constants::MAX_STREAMS);
 
         // `-c` is not a daemon option.
         assert!(Config::try_parse_from(["app", "daemon", "-c", "sunnys"]).is_err());

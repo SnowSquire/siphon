@@ -16,12 +16,6 @@ pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 /// RTSP control port; RTP/RTCP use ephemeral ports or interleaved TCP.
 pub const DEFAULT_RTSP_PORT: u16 = 7417;
 
-/// Streams a daemon may serve at once (`--max-streams`). Each stream is a whole
-/// per-variant pipeline (scheduler, DVR refresh, media engine) sharing the
-/// global downloader queue and slot pool, so this bounds those tasks rather
-/// than memory directly.
-pub const MAX_STREAMS: usize = 8;
-
 /// Debug mode replays the mock server's playlists instead of Twitch's.
 pub const DEBUG_MANIFEST_URL: &str = "http://127.0.0.2:8000/index.m3u8";
 pub const DEBUG_DVR_URL: &str = "http://127.0.0.2:8000/index-dvr.m3u8";
@@ -127,3 +121,41 @@ pub const MAX_IMAGE: usize = 4 * 1024 * 1024;
 
 /// Cap on one downloaded installer.
 pub const MAX_UPDATE: usize = 64 * 1024 * 1024;
+
+/// The mock edge server (`servermock/`). Dev builds only: a release binary has
+/// no way to reach it.
+#[cfg(debug_assertions)]
+pub const MOCK_BASE: &str = "http://127.0.0.2:8000";
+
+/// Segments kept per pipeline for `ListSegments` and the UI ring.
+pub const SEGMENT_RING: usize = 64;
+
+/// Event-log lines a snapshot carries.
+pub const LOG_CAP: usize = 512;
+
+/// Notifications kept for the UI center.
+pub const NOTIFICATION_CAP: usize = 50;
+
+/// Manifest poll bounds while the playlist is at the live edge.
+pub const EDGE_POLL_MIN: Duration = Duration::from_millis(200);
+pub const EDGE_POLL_MAX: Duration = Duration::from_secs(5);
+pub const EDGE_CATCHUP_POLL: Duration = Duration::from_millis(100);
+
+/// Scheduler restart backoff after a failed poll.
+pub const SCHEDULER_BACKOFF_MIN: Duration = Duration::from_millis(200);
+pub const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// How long a Hermes connection may take to say `welcome`.
+pub const HERMES_WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Missed keepalives before the socket is considered dead.
+pub const HERMES_KEEPALIVE_MISSES: u64 = 2;
+/// Longest reconnect backoff.
+pub const HERMES_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
+/// How long after a `stream-down` a channel's toasts stay muted. Restreams
+/// within this window update state silently instead of notifying again.
+pub const HERMES_OFFLINE_QUIET: Duration = Duration::from_mins(10);
+
+/// Update check cadence, request timeout and the release feed.
+pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
+pub const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
+pub const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";

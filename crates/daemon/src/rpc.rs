@@ -1,51 +1,126 @@
-//! The admin RPC listener: one reader and one writer task per connection.
+//! Admin connections as plain I/O, driven by the daemon's loop.
 //!
-//! A connection subscribes to the update bus, receives `Welcome` and one full
-//! snapshot, then forwards requests to the app. The writer coalesces updates
-//! by entity and disconnects a client that falls too far behind.
+//! There is no per-connection task and no per-connection queue: the loop owns
+//! every connection's decoder and outbound buffer, arms one read and one write
+//! future at a time, and encodes each message once per connection. That is what
+//! makes a snapshot a synchronous function call rather than a round trip.
+//!
+//! A listener task does one thing — accept — and hands the raw stream to the
+//! loop through a kanal queue.
 
-use std::collections::HashMap;
 use std::io;
+use std::rc::Rc;
 
 use compio::io::AsyncRead;
-use compio::io::AsyncWrite;
-use siphon_shared::rpc::ClientMessage;
-use siphon_shared::rpc::FrameReader;
-use siphon_shared::rpc::MAGIC;
-use siphon_shared::rpc::PROTOCOL_VERSION;
+use compio::io::AsyncWriteExt as _;
+use siphon_shared::rpc::FrameDecoder;
 use siphon_shared::rpc::ServerMessage;
-use siphon_shared::rpc::Update;
 use siphon_shared::rpc::codec;
+use tracing::error;
 use tracing::info;
-#[cfg(unix)]
 use tracing::warn;
 
-use crate::app::AppHandle;
-use crate::bus::Broadcast;
-use crate::bus::Outbound;
-
-/// Serves the admin endpoint forever.
+/// The admin transport: a socket on Unix, a named pipe on Windows.
+#[cfg(unix)]
+pub type AdminStream = compio::net::UnixStream;
 #[cfg(windows)]
-pub async fn serve(endpoint: String, handle: AppHandle) -> io::Result<()> {
-    use compio::fs::named_pipe::ServerOptions;
+pub type AdminStream = compio::fs::named_pipe::NamedPipeServer;
 
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&endpoint)?;
-    info!(%endpoint, "rpc: listening");
-    loop {
-        server.connect().await?;
-        let connected = server;
-        // Create the next instance before handing this one to a task, so a
-        // client never finds the pipe briefly absent.
-        server = ServerOptions::new().create(&endpoint)?;
-        compio::runtime::spawn(connection(connected, handle.clone())).detach();
+/// Bytes one read asks for. Control traffic, not a hot loop.
+const READ_CHUNK: usize = 16 * 1024;
+
+/// A connection whose outbound buffer exceeds this is dropped; the UI reconnects
+/// and resyncs from a snapshot.
+pub const MAX_OUT: usize = 1 << 20;
+
+/// One admin connection's protocol state. Owned by the daemon loop.
+pub struct Conn {
+    pub stream: Rc<AdminStream>,
+    pub decoder: FrameDecoder,
+    /// Encoded frames waiting to be written.
+    pub out: Vec<u8>,
+    /// The handshake completed and the snapshot was queued.
+    pub ready: bool,
+    /// A write future owns the buffer right now.
+    pub writing: bool,
+}
+
+impl Conn {
+    #[must_use]
+    pub fn new(stream: AdminStream) -> Self {
+        Self {
+            stream: Rc::new(stream),
+            decoder: FrameDecoder::new(),
+            out: Vec::new(),
+            ready: false,
+            writing: false,
+        }
+    }
+
+    /// Queues one frame. `false` means the connection can no longer be used.
+    pub fn push(&mut self, message: &ServerMessage) -> bool {
+        if codec::encode(message, &mut self.out).is_err() {
+            return false;
+        }
+        self.out.len() <= MAX_OUT
     }
 }
 
-/// Serves the admin endpoint forever.
+/// What one arming of a connection future produces.
+pub enum ConnEvent {
+    Accepted(io::Result<AdminStream>),
+    Read {
+        conn: usize,
+        result: io::Result<usize>,
+        buf: Vec<u8>,
+    },
+    Write {
+        conn: usize,
+        result: io::Result<()>,
+        buf: Vec<u8>,
+    },
+}
+
+/// Resolves with the next accepted connection.
+pub async fn accept(queue: &kanal::AsyncReceiver<AdminStream>) -> ConnEvent {
+    let queue = queue.clone();
+    ConnEvent::Accepted(
+        queue
+            .recv()
+            .await
+            .map_err(|error| io::Error::other(error.to_string())),
+    )
+}
+
+/// Reads up to [`READ_CHUNK`] bytes. The buffer comes back for reuse.
+pub async fn read(conn: usize, stream: Rc<AdminStream>) -> ConnEvent {
+    let buf = Vec::with_capacity(READ_CHUNK);
+    let mut source: &AdminStream = &stream;
+    let read = source.read(buf).await;
+    ConnEvent::Read {
+        conn,
+        result: read.0,
+        buf: read.1,
+    }
+}
+
+/// Writes the whole buffer, which comes back for reuse.
+pub async fn write(conn: usize, stream: Rc<AdminStream>, buf: Vec<u8>) -> ConnEvent {
+    let mut sink: &AdminStream = &stream;
+    let written = sink.write_all(buf).await;
+    ConnEvent::Write {
+        conn,
+        result: written.0,
+        buf: written.1,
+    }
+}
+
+/// Serves the admin endpoint forever, handing each accepted stream to the loop.
+///
+/// The bind happens inside the spawned task, so the caller never blocks on it;
+/// a failure is logged and leaves the daemon without an admin endpoint.
 #[cfg(unix)]
-pub async fn serve(endpoint: String, handle: AppHandle) -> io::Result<()> {
+pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     use compio::net::UnixListener;
@@ -57,198 +132,71 @@ pub async fn serve(endpoint: String, handle: AppHandle) -> io::Result<()> {
         ));
     }
     let _ = std::fs::remove_file(&endpoint);
-    let listener = UnixListener::bind(&endpoint).await?;
-    std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600))?;
-    info!(%endpoint, "rpc: listening");
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                compio::runtime::spawn(connection(stream, handle.clone())).detach();
-            }
-            Err(error) => warn!(%error, "rpc: accept failed"),
-        }
-    }
-}
-
-async fn connection<S: AsyncRead + AsyncWrite + Clone + Unpin + 'static>(
-    stream: S,
-    handle: AppHandle,
-) {
-    let (mut read, mut write) = (stream.clone(), stream);
-    let mut reader = FrameReader::new();
-    let hello: ClientMessage = match reader.read(&mut read).await {
-        Ok(message) => message,
-        Err(error) => {
-            info!(%error, "rpc: handshake read failed");
-            return;
-        }
-    };
-    let ClientMessage::Hello {
-        magic,
-        protocol,
-        app_version,
-    } = hello
-    else {
-        return;
-    };
-    if magic != MAGIC || protocol != PROTOCOL_VERSION {
-        let reason = format!("protocol {protocol} (backend speaks {PROTOCOL_VERSION})");
-        let _ = codec::write(&mut write, &ServerMessage::Rejected(reason)).await;
-        return;
-    }
-    info!(%app_version, "rpc: client connected");
-
-    let bus = handle.bus();
-    let (subscriber, outbound) = bus.subscribe();
-    let Some(snapshot) = handle.snapshot().await else {
-        return;
-    };
-    if codec::write(
-        &mut write,
-        &ServerMessage::Welcome {
-            protocol: PROTOCOL_VERSION,
-            server_version: env!("CARGO_PKG_VERSION").to_owned(),
-        },
-    )
-    .await
-    .is_err()
-    {
-        return;
-    }
-    if codec::write(&mut write, &ServerMessage::Snapshot(Box::new(snapshot)))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    compio::runtime::spawn(writer(write, outbound)).detach();
-
-    // The reader owns the last strong reference to the subscriber. Closing it
-    // on exit stops the writer after it drains, even if a request is in flight.
-    loop {
-        match reader.read::<ClientMessage, _>(&mut read).await {
-            Ok(ClientMessage::Request { id, request }) => {
-                handle.request(id, request, &subscriber);
-            }
-            Ok(ClientMessage::Hello { .. }) => {}
+    compio::runtime::spawn(async move {
+        let listener = match UnixListener::bind(&endpoint).await {
+            Ok(listener) => listener,
             Err(error) => {
-                info!(%error, "rpc: client disconnected");
-                subscriber.close();
+                error!(%error, "rpc: bind failed");
                 return;
             }
-        }
-    }
-}
-
-/// Coalesces updates by entity so one slow UI frame carries the latest value
-/// of each row instead of every intermediate step.
-#[derive(Default)]
-struct Coalescer {
-    entries: Vec<(u64, Update)>,
-    index: HashMap<Key, usize>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum Key {
-    Config,
-    Conn,
-    Pending,
-    Channel(u64),
-    Pipeline(String, Option<String>),
-    Arena,
-    Downloader,
-    Notification(u64),
-    Error,
-    Update,
-}
-
-impl Key {
-    fn of(update: &Update) -> Option<Self> {
-        match update {
-            Update::Config(_) => Some(Self::Config),
-            Update::Conn(_) => Some(Self::Conn),
-            Update::Pending(_) => Some(Self::Pending),
-            Update::ChannelUpsert(channel) => Some(Self::Channel(channel.id)),
-            Update::ChannelRemove(id) => Some(Self::Channel(*id)),
-            Update::PipelineUpsert(pipeline) => Some(Self::Pipeline(
-                pipeline.key.login.clone(),
-                pipeline.key.quality.clone(),
-            )),
-            Update::PipelineRemove(key) => {
-                Some(Self::Pipeline(key.login.clone(), key.quality.clone()))
-            }
-            Update::Arena(_) => Some(Self::Arena),
-            Update::Downloader(_) => Some(Self::Downloader),
-            Update::Notification(notification) => Some(Self::Notification(notification.id)),
-            Update::NotificationDismissed(id) => Some(Self::Notification(*id)),
-            Update::Error(_) => Some(Self::Error),
-            Update::Update(_) => Some(Self::Update),
-            // The segment ring and the event log are append-only; coalescing
-            // would lose entries.
-            Update::Segment { .. } | Update::Log(_) => None,
-        }
-    }
-}
-
-impl Coalescer {
-    fn push(&mut self, broadcast: Broadcast) {
-        if let Some(key) = Key::of(&broadcast.update) {
-            if let Some(&position) = self.index.get(&key) {
-                self.entries[position] = (broadcast.revision, broadcast.update);
-                return;
-            }
-            self.index.insert(key, self.entries.len());
-        }
-        self.entries.push((broadcast.revision, broadcast.update));
-    }
-
-    fn finish(mut self) -> Vec<(u64, Update)> {
-        self.entries.sort_by_key(|(revision, _)| *revision);
-        self.entries
-    }
-}
-
-async fn writer<W: AsyncWrite + Unpin>(mut write: W, outbound_rx: kanal::Receiver<Outbound>) {
-    let outbound = outbound_rx.clone().to_async();
-    loop {
-        let Ok(first) = outbound.recv().await else {
-            return;
         };
-        // One queue and one receive future: draining synchronously cannot drop
-        // a completed receive the way a select between two queues could.
-        let mut controls = Vec::new();
-        let mut coalescer = Coalescer::default();
-        match first {
-            Outbound::Control(message) => controls.push(message),
-            Outbound::Update(broadcast) => coalescer.push(broadcast),
+        if let Err(error) =
+            std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600))
+        {
+            warn!(%error, "rpc: could not restrict the admin socket");
         }
-        while let Ok(Some(item)) = outbound_rx.try_recv() {
-            match item {
-                Outbound::Control(message) => controls.push(message),
-                Outbound::Update(broadcast) => coalescer.push(broadcast),
+        info!(%endpoint, "rpc: listening");
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    if queue.try_send(stream).is_err() {
+                        warn!("rpc: accepting faster than the loop drains");
+                    }
+                }
+                Err(error) => warn!(%error, "rpc: accept failed"),
             }
         }
-        for message in controls {
-            if codec::write(&mut write, &message).await.is_err() {
-                return;
+    })
+    .detach();
+    Ok(())
+}
+
+/// Serves the admin endpoint forever, handing each accepted pipe to the loop.
+#[cfg(windows)]
+pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io::Result<()> {
+    use compio::fs::named_pipe::ServerOptions;
+
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&endpoint)?;
+    compio::runtime::spawn(async move {
+        info!(%endpoint, "rpc: listening");
+        loop {
+            if let Err(error) = server.connect().await {
+                warn!(%error, "rpc: pipe connect failed");
             }
-        }
-        for (_, update) in coalescer.finish() {
-            if codec::write(&mut write, &ServerMessage::Update(update))
-                .await
-                .is_err()
-            {
-                return;
+            // Create the next instance before handing this one over, so a
+            // client never finds the pipe briefly absent.
+            let next = match ServerOptions::new().create(&endpoint) {
+                Ok(next) => next,
+                Err(error) => {
+                    error!(%error, "rpc: could not create the next pipe instance");
+                    return;
+                }
+            };
+            if queue.try_send(server).is_err() {
+                warn!("rpc: accepting faster than the loop drains");
             }
+            server = next;
         }
-    }
+    })
+    .detach();
+    Ok(())
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::path::PathBuf;
-    use std::rc::Rc;
     use std::time::Duration;
 
     use siphon_shared::rpc::Channel;
@@ -262,12 +210,14 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::app::AppInit;
-    use crate::arena::ArenaSet;
     use crate::bus::Bus;
+    use crate::arena::ArenaSet;
     use crate::http::Client as HttpClient;
     use crate::metrics::DownloaderMetrics;
     use crate::registry::Options as RegistryOptions;
     use crate::registry::Registry;
+    use crate::variant::debug_portrait_variant;
+    use crate::variant::debug_variant;
 
     fn scratch_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("siphon-rpc-test-{}", std::process::id()));
@@ -313,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_add_watch_and_stop_round_trip_over_rpc() {
+    fn record_and_stop_round_trip_over_the_admin_socket() {
         let dir = scratch_dir();
         let runtime = compio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -332,8 +282,6 @@ mod tests {
                     client_id: None,
                     auth_token: None,
                     low_latency: true,
-                    debug: true,
-                    max_streams: 4,
                     recording: crate::registry::Recording {
                         output: Some(dir.clone()),
                         dual_format: false,
@@ -343,13 +291,24 @@ mod tests {
                 },
                 Rc::clone(&bus),
             ));
+            registry.seed_channel(
+                "sunnys",
+                false,
+                vec![debug_variant(), debug_portrait_variant()],
+                42,
+            );
             registry.watch_finished();
 
-            let (events_tx, events_rx) = kanal::unbounded();
-            let wake = crate::spool::ConsumerWake::new();
-            let sender = crate::app::EventSender::new(events_tx, Rc::clone(&wake));
-            let handle = AppHandle::new(sender.clone(), Rc::clone(&bus));
-            let app = App::new(AppInit {
+            let (accept_tx, accept_rx) = kanal::unbounded();
+            let endpoint = siphon_shared::rpc::admin_endpoint(&format!(
+                "test-{}-{}",
+                std::process::id(),
+                dir.file_name().unwrap().to_string_lossy()
+            ));
+            spawn_listener(endpoint.clone(), accept_tx).unwrap();
+
+            let (jobs_tx, jobs_rx) = kanal::unbounded();
+            let daemon = App::new(AppInit {
                 config: Config {
                     channels: vec![Channel {
                         login: "sunnys".to_owned(),
@@ -364,21 +323,14 @@ mod tests {
                 client: Rc::clone(&http),
                 registry,
                 bus,
-                events: events_rx,
-                sender,
-                wake,
+                accept: accept_rx.to_async(),
+                jobs: jobs_rx.to_async(),
+                jobs_tx,
                 client_id: None,
                 debug: true,
             });
-            compio::runtime::spawn(app.run()).detach();
+            compio::runtime::spawn(daemon.run()).detach();
 
-            let endpoint = siphon_shared::rpc::admin_endpoint(&format!(
-                "test-{}-{}",
-                std::process::id(),
-                dir.file_name().unwrap().to_string_lossy()
-            ));
-            let serve_endpoint = endpoint.clone();
-            compio::runtime::spawn(serve(serve_endpoint, handle)).detach();
             for _ in 0..50 {
                 if siphon_shared::rpc::probe(&endpoint) {
                     break;
@@ -405,17 +357,13 @@ mod tests {
             next_pipeline(events, "sunnys", false).await;
             next_config(second_events).await;
 
-            let response = client
-                .request(Request::GetDisk(siphon_shared::rpc::StreamKey::new(
-                    "sunnys", None,
-                )))
-                .await
-                .unwrap();
+            let key = siphon_shared::rpc::StreamKey::new("sunnys", None);
+            let response = client.request(Request::GetDisk(key.clone())).await.unwrap();
             assert!(matches!(response, Response::Disk(_)));
 
             let response = client
                 .request(Request::PipelineStop {
-                    key: siphon_shared::rpc::StreamKey::new("sunnys", None),
+                    key: key.clone(),
                     force: true,
                 })
                 .await
@@ -423,9 +371,7 @@ mod tests {
             assert!(matches!(response, Response::Ack));
             next_pipeline(events, "sunnys", true).await;
 
-            // A one-shot recording starts without a persisted monitor and can
-            // be stopped again with the same lifecycle.
-            let key = siphon_shared::rpc::StreamKey::new("sunnys", None);
+            // A one-shot recording is a pipeline, not a stored preference.
             let response = client
                 .request(Request::RecordOnce {
                     login: "sunnys".to_owned(),

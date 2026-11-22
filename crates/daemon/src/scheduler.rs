@@ -272,8 +272,8 @@ impl StreamScheduler {
     }
 
     pub async fn main(mut self) {
-        const MIN_BACKOFF: Duration = Duration::from_millis(200);
-        const MAX_BACKOFF: Duration = Duration::from_secs(5);
+        use crate::constants::SCHEDULER_BACKOFF_MAX as MAX_BACKOFF;
+        use crate::constants::SCHEDULER_BACKOFF_MIN as MIN_BACKOFF;
 
         let span = span!(Level::INFO, "scheduler");
         let _ = &span;
@@ -379,9 +379,9 @@ impl StreamScheduler {
     }
 
     async fn mainloop(&mut self) -> eros::Result<(), SchedulerErrors> {
-        const MIN_EDGE_POLL: Duration = Duration::from_millis(200);
-        const MAX_EDGE_POLL: Duration = Duration::from_secs(5);
-        const CATCHUP_POLL: Duration = Duration::from_millis(100);
+        use crate::constants::EDGE_CATCHUP_POLL as CATCHUP_POLL;
+        use crate::constants::EDGE_POLL_MAX as MAX_EDGE_POLL;
+        use crate::constants::EDGE_POLL_MIN as MIN_EDGE_POLL;
 
         let start = Instant::now();
         let now: u64 = SystemTime::now()

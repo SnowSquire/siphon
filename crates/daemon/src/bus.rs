@@ -1,33 +1,28 @@
-//! Entity-level update bus between the app/registry and RPC connections.
+//! Entity-level update bus between the daemon's spawned tasks and its loop.
 //!
-//! Publishing never keeps a stream alive: subscribers are weak, and a slow
-//! connection is closed instead of being queued indefinitely. The UI resyncs
-//! from a snapshot after reconnecting.
+//! Producers are spawned components (registry, metrics, disk); the only consumer
+//! is the daemon loop, which drains the queue and encodes it into each connected
+//! UI. There is one queue, not one per connection: a slow connection is detected
+//! by its own outbound buffer and dropped, and the UI resyncs from a snapshot.
 //!
-//! Control frames and updates share one bounded queue. A writer that selected
-//! between two receive queues could drop an already-completed receive when both
-//! became ready, losing a response or an update; one queue removes that choice.
+//! Updates are coalesced by entity on the way in, so a burst of changes to one
+//! row costs the loop one frame carrying its latest value.
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::num::NonZeroU64;
 use std::rc::Rc;
-use std::rc::Weak;
+use std::task::Poll;
 
 use siphon_shared::rpc::LogEntry;
 use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::ServerMessage;
 use siphon_shared::rpc::Update;
 
-/// How many frames a connection may fall behind before it is disconnected.
-const BACKLOG: usize = 64;
-
-/// How many event-log lines a snapshot carries.
-///
-/// The ring is bounded because the daemon outlives any UI: a full history is a
-/// leak that only looks like a feature.
-pub const LOG_CAP: usize = 512;
+use crate::constants::LOG_CAP;
+use crate::spool::ConsumerWake;
 
 /// One published change with the revision it belongs to.
 #[derive(Debug, Clone)]
@@ -36,42 +31,14 @@ pub struct Broadcast {
     pub update: Update,
 }
 
-/// One frame for a connection: a request response or a published update.
-#[derive(Debug, Clone)]
-pub enum Outbound {
-    Control(ServerMessage),
-    Update(Broadcast),
-}
-
-/// The sending end of one connection's queue.
-pub struct Subscriber {
-    tx: kanal::Sender<Outbound>,
-}
-
-impl Subscriber {
-    /// Queues a request response. Returns false when the connection is gone or
-    /// too far behind; the client will resync.
-    #[must_use]
-    pub fn control(&self, message: ServerMessage) -> bool {
-        let sent = matches!(self.tx.try_send(Outbound::Control(message)), Ok(true));
-        if sent {
-        } else {
-            let _ = self.tx.close();
-        }
-        sent
-    }
-
-    /// Closes the queue, which stops the writer after it drains.
-    pub fn close(&self) {
-        let _ = self.tx.close();
-    }
-}
-
 pub struct Bus {
     revision: Cell<u64>,
-    subscribers: RefCell<Vec<Weak<Subscriber>>>,
+    /// Coalesced updates waiting for the daemon loop.
+    pending: RefCell<Coalescer>,
     logs: RefCell<VecDeque<LogEntry>>,
     next_log: Cell<u64>,
+    /// Wakes the loop when an update lands.
+    wake: RefCell<Rc<ConsumerWake>>,
 }
 
 impl Bus {
@@ -79,9 +46,10 @@ impl Bus {
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
             revision: Cell::new(0),
-            subscribers: RefCell::new(Vec::new()),
+            pending: RefCell::new(Coalescer::default()),
             logs: RefCell::new(VecDeque::with_capacity(LOG_CAP)),
             next_log: Cell::new(1),
+            wake: RefCell::new(ConsumerWake::new()),
         })
     }
 
@@ -96,7 +64,7 @@ impl Bus {
         self.log_channel(level, target, message, None, None);
     }
 
-    /// Appends one event and sends it to every connected UI.
+    /// Appends one event and queues it for every connected UI.
     ///
     /// The ring is updated before the publish, so a UI that reconnects between
     /// the two sees the line exactly once.
@@ -135,38 +103,110 @@ impl Bus {
         self.logs.borrow().iter().cloned().collect()
     }
 
-    /// Registers one connection. The caller keeps the `Subscriber` alive for
-    /// the lifetime of the connection; the bus only holds a weak reference.
-    #[must_use]
-    pub fn subscribe(self: &Rc<Self>) -> (Rc<Subscriber>, kanal::Receiver<Outbound>) {
-        let (tx, rx) = kanal::bounded(BACKLOG);
-        let subscriber = Rc::new(Subscriber { tx });
-        self.subscribers
-            .borrow_mut()
-            .push(Rc::downgrade(&subscriber));
-        (subscriber, rx)
-    }
-
-    /// Publishes one complete entity update. Bounded subscribers that are full
-    /// are closed: the UI reconnects and asks for a snapshot.
+    /// Queues one complete entity update, coalescing it with an earlier value of
+    /// the same entity that the loop has not drained yet.
     pub fn publish(&self, update: Update) {
         let revision = self.revision.get().wrapping_add(1);
         self.revision.set(revision);
-        let broadcast = Broadcast { revision, update };
-        self.subscribers.borrow_mut().retain(|weak| {
-            let Some(subscriber) = weak.upgrade() else {
-                return false;
-            };
-            match subscriber.tx.try_send(Outbound::Update(broadcast.clone())) {
-                Ok(true) => true,
-                Ok(false) => {
-                    tracing::warn!("rpc: dropping a lagging UI connection");
-                    let _ = subscriber.tx.close();
-                    false
-                }
-                Err(_) => false,
+        self.pending.borrow_mut().push(Broadcast { revision, update });
+        self.wake.borrow().wake();
+    }
+
+    /// Takes everything queued since the last drain, oldest revision first.
+    #[must_use]
+    pub fn take_pending(&self) -> Vec<Broadcast> {
+        self.pending.borrow_mut().finish()
+    }
+
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.borrow().entries.is_empty()
+    }
+
+    /// Resolves when an update is waiting. The loop re-arms this after draining.
+    pub async fn wait(self: &Rc<Self>) {
+        poll_fn(|context| {
+            if self.has_pending() {
+                return Poll::Ready(());
             }
-        });
+            self.wake.borrow().park(context);
+            if self.has_pending() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+/// Coalesces updates by entity so one frame carries the latest value of each
+/// row instead of every intermediate step.
+#[derive(Default)]
+struct Coalescer {
+    entries: Vec<Broadcast>,
+    index: HashMap<Key, usize>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Key {
+    Config,
+    Conn,
+    Pending,
+    Channel(u64),
+    Pipeline(String, Option<String>),
+    Arena,
+    Downloader,
+    Notification(u64),
+    Error,
+    Update,
+}
+
+impl Key {
+    fn of(update: &Update) -> Option<Self> {
+        match update {
+            Update::Config(_) => Some(Self::Config),
+            Update::Conn(_) => Some(Self::Conn),
+            Update::Pending(_) => Some(Self::Pending),
+            Update::ChannelUpsert(channel) => Some(Self::Channel(channel.id)),
+            Update::ChannelRemove(id) => Some(Self::Channel(*id)),
+            Update::PipelineUpsert(pipeline) => Some(Self::Pipeline(
+                pipeline.key.login.clone(),
+                pipeline.key.quality.clone(),
+            )),
+            Update::PipelineRemove(key) => {
+                Some(Self::Pipeline(key.login.clone(), key.quality.clone()))
+            }
+            Update::Arena(_) => Some(Self::Arena),
+            Update::Downloader(_) => Some(Self::Downloader),
+            Update::Notification(notification) => Some(Self::Notification(notification.id)),
+            Update::NotificationDismissed(id) => Some(Self::Notification(*id)),
+            Update::Error(_) => Some(Self::Error),
+            Update::Update(_) => Some(Self::Update),
+            // The segment ring and the event log are append-only; coalescing
+            // would lose entries.
+            Update::Segment { .. } | Update::Log(_) => None,
+        }
+    }
+}
+
+impl Coalescer {
+    fn push(&mut self, broadcast: Broadcast) {
+        if let Some(key) = Key::of(&broadcast.update) {
+            if let Some(&position) = self.index.get(&key) {
+                self.entries[position] = broadcast;
+                return;
+            }
+            self.index.insert(key, self.entries.len());
+        }
+        self.entries.push(broadcast);
+    }
+
+    fn finish(&mut self) -> Vec<Broadcast> {
+        let mut entries = std::mem::take(&mut self.entries);
+        self.index.clear();
+        entries.sort_by_key(|broadcast| broadcast.revision);
+        entries
     }
 }
 
@@ -176,38 +216,33 @@ mod tests {
 
     use super::*;
 
-    fn revision(frame: Option<Outbound>) -> Option<u64> {
-        match frame {
-            Some(Outbound::Update(broadcast)) => Some(broadcast.revision),
-            Some(Outbound::Control(_)) | None => None,
-        }
-    }
-
     #[test]
-    fn publishing_reaches_every_live_subscriber() {
+    fn one_entity_keeps_only_its_latest_value() {
         let bus = Bus::new();
-        let (first, first_rx) = bus.subscribe();
-        let (second, second_rx) = bus.subscribe();
         bus.publish(Update::Conn(ConnHealth::Connected));
-        assert_eq!(bus.revision(), 1);
-        assert_eq!(revision(first_rx.try_recv().unwrap()), Some(1));
-        assert_eq!(revision(second_rx.try_recv().unwrap()), Some(1));
-        drop(first);
-        drop(second);
         bus.publish(Update::Conn(ConnHealth::Connecting));
-        assert_eq!(bus.revision(), 2);
+        let pending = bus.take_pending();
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending[0].update, Update::Conn(ConnHealth::Connecting)));
+        assert_eq!(pending[0].revision, 2);
     }
 
     #[test]
-    fn control_and_updates_share_one_ordered_queue() {
+    fn append_only_updates_are_not_coalesced() {
         let bus = Bus::new();
-        let (subscriber, rx) = bus.subscribe();
-        assert!(subscriber.control(ServerMessage::Rejected("x".to_owned())));
+        bus.log(LogLevel::Info, "t", "one");
+        bus.log(LogLevel::Info, "t", "two");
+        let pending = bus.take_pending();
+        assert_eq!(pending.len(), 2);
+        assert!(!bus.has_pending());
+    }
+
+    #[test]
+    fn revisions_are_monotonic_across_drains() {
+        let bus = Bus::new();
         bus.publish(Update::Conn(ConnHealth::Connected));
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            Some(Outbound::Control(ServerMessage::Rejected(_)))
-        ));
-        assert_eq!(revision(rx.try_recv().unwrap()), Some(1));
+        assert_eq!(bus.take_pending()[0].revision, 1);
+        bus.publish(Update::Conn(ConnHealth::Connecting));
+        assert_eq!(bus.take_pending()[0].revision, 2);
     }
 }

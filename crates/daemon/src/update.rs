@@ -6,7 +6,6 @@
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -15,9 +14,9 @@ use crate::constants::MAX_JSON;
 use crate::constants::MAX_UPDATE;
 use crate::http::Client;
 
-pub const CHECK_INTERVAL: Duration = Duration::from_hours(6);
-const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";
-const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
+pub use crate::constants::UPDATE_CHECK_INTERVAL as CHECK_INTERVAL;
+use crate::constants::RELEASES_URL;
+use crate::constants::UPDATE_TIMEOUT;
 #[cfg(windows)]
 const INSTALL_KEY: &str = "Software\\Ozeniken\\Siphon";
 

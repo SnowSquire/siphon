@@ -32,12 +32,12 @@ const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4
 pub fn url() -> String {
     std::env::var("SIPHON_HERMES_URL").unwrap_or_else(|_| HERMES_URL.to_owned())
 }
-const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
-const KEEPALIVE_MISSED_LIMIT: u64 = 2;
+use crate::constants::HERMES_WELCOME_TIMEOUT as WELCOME_TIMEOUT;
+use crate::constants::HERMES_MAX_RECONNECT_DELAY as MAX_RECONNECT_DELAY;
+use crate::constants::HERMES_KEEPALIVE_MISSES as KEEPALIVE_MISSED_LIMIT;
 /// How long after a `stream-down` a channel's toasts stay muted. Restreams
 /// within this window update state silently instead of notifying again.
-const OFFLINE_QUIET: Duration = Duration::from_mins(10);
+use crate::constants::HERMES_OFFLINE_QUIET as OFFLINE_QUIET;
 
 /// One Hermes pubsub subscription: title/game updates or live/viewer updates
 /// for a channel. The subscription id stays in the app; every welcome replays
@@ -285,7 +285,7 @@ impl App {
             .map(|channel| channel.login.clone())
             .collect();
         for login in live_logins {
-            self.registry.monitor_set(&login);
+            self.registry.monitor_live(&login);
         }
     }
 
@@ -799,7 +799,7 @@ impl App {
                     tracing::info!(target: "hermes", "stream-up for {id} muted by channel");
                 }
                 if channel.as_ref().is_some_and(|channel| channel.record) {
-                    self.registry.monitor_set(&login);
+                    self.registry.monitor_live(&login);
                 }
                 // Debug mode has no GQL to refresh from; the seeded detail is
                 // all there is (and a stand-in socket is what drives it).
@@ -890,7 +890,7 @@ impl App {
                     // offline and given up. The detail is in hand now; trying
                     // again is idempotent and is what makes a fresh broadcast
                     // record from its first segment.
-                    self.registry.monitor_set(&login);
+                    self.registry.monitor_live(&login);
                 }
             }
             Err(error) => {

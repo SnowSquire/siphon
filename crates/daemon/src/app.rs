@@ -1,21 +1,21 @@
-//! The Siphon backend: configuration, GQL, Hermes, notifications, monitors and
-//! the snapshot/update projection.
+//! The Siphon backend: configuration, GQL, Hermes, notifications, the stream
+//! registry and the admin connections.
 //!
-//! One task owns all mutable state. RPC connections send it [`AppEvent`]s and
-//! subscribe to the [`Bus`]; no `RefCell` borrow is ever held across an
-//! `.await`.
+//! Everything that owns state runs in this one loop: admin connections, the
+//! registry and the snapshot projection. Spawned components (schedulers, disk,
+//! downloaders) publish through the [`Bus`], which the loop drains into every
+//! connection. A snapshot is therefore a plain `&self` function, not a request.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
-use std::future::poll_fn;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
 use futures_util::FutureExt as _;
+use futures_util::StreamExt as _;
 use siphon_shared::rpc::ArenaSummary;
 use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
@@ -38,7 +38,8 @@ use siphon_shared::rpc::UpdateView;
 use crate::balesh::CheapRng;
 use crate::balesh::NanoId;
 use crate::bus::Bus;
-use crate::bus::Subscriber;
+use crate::constants::NOTIFICATION_CAP;
+use crate::rpc;
 use crate::config;
 use crate::config::ConfigError;
 use crate::gql;
@@ -53,108 +54,55 @@ use crate::http::ws::WsStream;
 use crate::matcher::Matcher;
 use crate::notifier;
 use crate::registry::Registry;
-use crate::spool::ConsumerWake;
 use crate::time::now_ms;
+use tracing::info;
 use crate::update;
 
-/// One event the app loop multiplexes.
+/// One thing the daemon loop wakes for.
 enum Event {
-    App(AppEvent),
-    Text(String),
-    SocketClosed,
-    Tick,
+    /// One admin connection produced input or finished a write.
+    Conn(rpc::ConnEvent),
+    /// Hermes produced a text frame, or the socket is gone.
+    Socket(Option<String>),
+    /// A background job finished.
+    Job(Option<Box<JobDone>>),
+    /// Something published on the bus.
+    Bus,
+    /// The nearest deadline came due.
+    Deadline,
 }
 
-/// Most notifications kept for the UI center.
-const NOTIFICATION_CAP: usize = 50;
+/// A loop operation: connection I/O, jobs and the bus wake live in one set.
+type Op = futures_util::future::LocalBoxFuture<'static, Event>;
 
-/// One RPC connection's request, or its first snapshot.
-pub enum AppEvent {
-    Snapshot(kanal::Sender<Snapshot>),
-    Request {
-        id: u64,
-        request: Request,
-        control: Rc<Subscriber>,
-    },
-    /// A finished background job, delivered through the same lossless queue.
-    Job(Box<JobDone>),
+fn accept_op(queue: &kanal::AsyncReceiver<rpc::AdminStream>) -> Op {
+    let queue = queue.clone();
+    Box::pin(async move { Event::Conn(rpc::accept(&queue).await) })
 }
 
-/// Sends an app event and wakes the loop. The event stays in the channel until
-/// the loop drains it, so a wake that races a tick cannot drop it.
-#[derive(Clone)]
-pub struct EventSender {
-    tx: kanal::Sender<AppEvent>,
-    wake: Rc<ConsumerWake>,
+fn read_op(conn: usize, stream: Rc<rpc::AdminStream>) -> Op {
+    Box::pin(async move { Event::Conn(rpc::read(conn, stream).await) })
 }
 
-impl EventSender {
-    #[must_use]
-    pub const fn new(tx: kanal::Sender<AppEvent>, wake: Rc<ConsumerWake>) -> Self {
-        Self { tx, wake }
-    }
-
-    fn send(&self, event: AppEvent) {
-        let _ = self.tx.try_send(event);
-        self.wake.wake();
-    }
+fn write_op(conn: usize, stream: Rc<rpc::AdminStream>, buf: Vec<u8>) -> Op {
+    Box::pin(async move { Event::Conn(rpc::write(conn, stream, buf).await) })
 }
 
-/// Waits for one event without consuming it unless it is returned. Dropping
-/// this future at a tick boundary cannot lose a queued request.
-async fn wait_event(events: &kanal::Receiver<AppEvent>, wake: &ConsumerWake) -> Option<AppEvent> {
-    poll_fn(|context| {
-        match events.try_recv() {
-            Ok(Some(event)) => return Poll::Ready(Some(event)),
-            Ok(None) => {}
-            Err(_) => return Poll::Ready(None),
-        }
-        wake.park(context);
-        match events.try_recv() {
-            Ok(Some(event)) => Poll::Ready(Some(event)),
-            Ok(None) => Poll::Pending,
-            Err(_) => Poll::Ready(None),
-        }
+fn bus_op(bus: Rc<Bus>) -> Op {
+    Box::pin(async move {
+        bus.wait().await;
+        Event::Bus
     })
-    .await
 }
 
-/// What the RPC server tasks use to reach the app.
-#[derive(Clone)]
-pub struct AppHandle {
-    sender: EventSender,
-    bus: Rc<Bus>,
-}
-
-impl AppHandle {
-    #[must_use]
-    pub const fn new(sender: EventSender, bus: Rc<Bus>) -> Self {
-        Self { sender, bus }
-    }
-
-    /// The bus this connection subscribes to.
-    #[must_use]
-    pub fn bus(&self) -> Rc<Bus> {
-        Rc::clone(&self.bus)
-    }
-
-    /// Forwards one request; the app answers through `control`.
-    pub fn request(&self, id: u64, request: Request, control: &Rc<Subscriber>) {
-        self.sender.send(AppEvent::Request {
-            id,
-            request,
-            control: Rc::clone(control),
-        });
-    }
-
-    /// Asks the app for a fresh snapshot. `None` means it did not answer.
-    pub async fn snapshot(&self) -> Option<Snapshot> {
-        let (tx, rx) = kanal::bounded(1);
-        self.sender.send(AppEvent::Snapshot(tx));
-        compio::time::timeout(Duration::from_secs(5), rx.to_async().recv())
-            .await
-            .ok()?
-            .ok()
+/// The smallest free slot, so a closed connection's index is reused.
+fn insert_conn(conns: &mut Vec<Option<rpc::Conn>>, conn: rpc::Conn) -> usize {
+    if let Some(index) = conns.iter().position(Option::is_none) {
+        conns[index] = Some(conn);
+        index
+    } else {
+        conns.push(Some(conn));
+        conns.len() - 1
     }
 }
 
@@ -165,9 +113,11 @@ pub struct AppInit {
     pub client: Rc<Client>,
     pub registry: Rc<Registry>,
     pub bus: Rc<Bus>,
-    pub events: kanal::Receiver<AppEvent>,
-    pub sender: EventSender,
-    pub wake: Rc<ConsumerWake>,
+    /// Accepted admin connections, from the listener task.
+    pub accept: kanal::AsyncReceiver<rpc::AdminStream>,
+    /// Finished background jobs.
+    pub jobs: kanal::AsyncReceiver<Box<JobDone>>,
+    pub jobs_tx: kanal::Sender<Box<JobDone>>,
     pub client_id: Option<String>,
     pub debug: bool,
 }
@@ -197,9 +147,13 @@ pub struct App {
     pub(crate) client: Rc<Client>,
     pub(crate) registry: Rc<Registry>,
     pub(crate) bus: Rc<Bus>,
-    pub(crate) events: kanal::Receiver<AppEvent>,
-    pub(crate) sender: EventSender,
-    pub(crate) wake: Rc<ConsumerWake>,
+    pub(crate) accept: kanal::AsyncReceiver<rpc::AdminStream>,
+    pub(crate) jobs: kanal::AsyncReceiver<Box<JobDone>>,
+    pub(crate) jobs_tx: kanal::Sender<Box<JobDone>>,
+    /// One encoded frame reused for every connection.
+    frame: Vec<u8>,
+    /// When the next counter flush is due, while a UI is connected.
+    telemetry_at: Instant,
     pub(crate) client_id: Option<String>,
     pub(crate) debug: bool,
 
@@ -252,9 +206,9 @@ impl App {
             client,
             registry,
             bus,
-            events,
-            sender,
-            wake,
+            accept,
+            jobs,
+            jobs_tx,
             client_id,
             debug,
         } = init;
@@ -311,9 +265,11 @@ impl App {
             client,
             registry,
             bus,
-            events,
-            sender,
-            wake,
+            accept,
+            jobs,
+            jobs_tx,
+            frame: Vec::new(),
+            telemetry_at: Instant::now(),
             client_id,
             debug,
             channels,
@@ -355,80 +311,273 @@ impl App {
     }
 
     pub async fn run(mut self) {
-        let mut tick = compio::time::interval(Duration::from_secs(1));
+        use futures_util::stream::FuturesUnordered;
+
+        let mut conns: Vec<Option<rpc::Conn>> = Vec::new();
+        let mut ops: FuturesUnordered<Op> = FuturesUnordered::new();
+        ops.push(accept_op(&self.accept));
+        ops.push(bus_op(Rc::clone(&self.bus)));
+
         loop {
-            if self.hermes_enabled
-                && self.socket.is_none()
-                && !self.connecting
-                && !self.config.channels.is_empty()
-                && Instant::now() >= self.reconnect_at
-            {
-                self.start_connect();
-            }
+            self.maybe_reconnect();
             if Instant::now() >= self.update_check_at {
                 self.push_update_check();
             }
 
+            let deadline = self.next_deadline(&conns);
             let event = {
-                // Biased, with the socket first: a completed read is never
-                // dropped in favour of a queued request. The event wait does
-                // not consume anything unless it returns, so losing it to a
-                // tick is safe. Jobs arrive through the same event queue.
+                // Biased, socket first: a completed read is never dropped for a
+                // connection event. The socket cannot move into the op set,
+                // because one `WsStream` serves both directions and a send must
+                // not queue behind a read.
                 let socket_fut = async {
                     match self.socket.as_mut() {
-                        Some(socket) => socket.next_text().await,
+                        Some(socket) => socket.next_text().await.ok().flatten(),
                         None => std::future::pending().await,
                     }
                 }
                 .fuse();
-                let app_fut = wait_event(&self.events, &self.wake).fuse();
-                let tick_fut = tick.tick().fuse();
+                let ops_fut = ops.next().fuse();
+                let jobs = self.jobs.clone();
+                let job_fut = jobs.recv().fuse();
+                let timer = compio::time::sleep(deadline).fuse();
 
-                futures_util::pin_mut!(socket_fut, app_fut, tick_fut);
+                futures_util::pin_mut!(socket_fut, ops_fut, job_fut, timer);
                 futures_util::select_biased! {
-                    message = socket_fut => match message {
-                        Ok(Some(text)) => Event::Text(text),
-                        Ok(None) => {
-                            tracing::info!(target: "hermes", "connection closed");
-                            Event::SocketClosed
-                        }
-                        Err(error) => {
-                            tracing::info!(target: "hermes", "read error: {error}");
-                            Event::SocketClosed
-                        }
-                    },
-                    event = app_fut => match event {
-                        Some(event) => Event::App(event),
+                    message = socket_fut => Event::Socket(message),
+                    some = ops_fut => match some {
+                        Some(event) => event,
                         None => break,
                     },
-                    _ = tick_fut => Event::Tick,
+                    job = job_fut => Event::Job(job.ok()),
+                    () = timer => Event::Deadline,
                 }
             };
+
             match event {
-                Event::App(AppEvent::Snapshot(reply)) => {
-                    let _ = reply.try_send(self.snapshot());
+                Event::Conn(event) => self.handle_conn(event, &mut conns, &ops),
+                Event::Socket(Some(text)) => self.handle_message(&text).await,
+                Event::Socket(None) => {
+                    tracing::info!(target: "hermes", "connection closed");
+                    self.on_disconnect().await;
                 }
-                Event::App(AppEvent::Request {
-                    id,
-                    request,
-                    control,
-                }) => self.handle_request(id, request, &control),
-                Event::App(AppEvent::Job(done)) => self.handle_job(*done).await,
-                Event::Text(text) => self.handle_message(&text).await,
-                Event::SocketClosed => self.on_disconnect().await,
-                Event::Tick => self.on_tick().await,
+                Event::Job(None) => break,
+                Event::Job(Some(done)) => self.handle_job(*done).await,
+                Event::Bus => ops.push(bus_op(Rc::clone(&self.bus))),
+                Event::Deadline => self.on_tick().await,
             }
+
+            self.flush_bus(&mut conns, &ops);
             self.flush_unsubscribes().await;
+        }
+    }
+
+    /// Starts a Hermes connection if one is due. Called once per loop pass; it
+    /// is cheap and makes the reconnect deadline a plain deadline.
+    fn maybe_reconnect(&mut self) {
+        if self.hermes_enabled
+            && self.socket.is_none()
+            && !self.connecting
+            && !self.config.channels.is_empty()
+            && Instant::now() >= self.reconnect_at
+        {
+            self.start_connect();
+        }
+    }
+
+    fn next_deadline(&self, conns: &[Option<rpc::Conn>]) -> Duration {
+        let now = Instant::now();
+        let mut at = now + Duration::from_secs(5);
+        if self.hermes_enabled
+            && self.socket.is_none()
+            && !self.connecting
+            && !self.config.channels.is_empty()
+        {
+            at = at.min(self.reconnect_at);
+        }
+        at = at.min(self.update_check_at);
+        if self.socket.is_some() {
+            let alive = if self.welcomed {
+                Duration::from_secs(self.keepalive_secs * crate::constants::HERMES_KEEPALIVE_MISSES)
+            } else {
+                crate::constants::HERMES_WELCOME_TIMEOUT
+            };
+            at = at.min(self.last_message + alive);
+        }
+        if conns.iter().flatten().any(|conn| conn.ready) {
+            at = at.min(self.telemetry_at);
+        }
+        at.saturating_duration_since(now)
+            .max(Duration::from_millis(10))
+    }
+
+    fn handle_conn(
+        &mut self,
+        event: rpc::ConnEvent,
+        conns: &mut Vec<Option<rpc::Conn>>,
+        ops: &futures_util::stream::FuturesUnordered<Op>,
+    ) {
+        match event {
+            rpc::ConnEvent::Accepted(Ok(stream)) => {
+                let id = insert_conn(conns, rpc::Conn::new(stream));
+                let stream = conns[id].as_ref().map(|conn| Rc::clone(&conn.stream));
+                if let Some(stream) = stream {
+                    ops.push(read_op(id, stream));
+                }
+                ops.push(accept_op(&self.accept));
+            }
+            rpc::ConnEvent::Accepted(Err(_)) => ops.push(accept_op(&self.accept)),
+            rpc::ConnEvent::Read {
+                conn: id,
+                result,
+                buf,
+            } => {
+                match result {
+                    Ok(0) | Err(_) => {
+                        conns[id] = None;
+                        return;
+                    }
+                    Ok(read) => {
+                        if let Some(conn) = conns[id].as_mut() {
+                            conn.decoder.push(&buf[..read]);
+                        }
+                    }
+                }
+                self.handle_frames(id, conns);
+                if let Some(conn) = conns[id].as_ref() {
+                    ops.push(read_op(id, Rc::clone(&conn.stream)));
+                }
+            }
+            rpc::ConnEvent::Write {
+                conn: id,
+                result,
+                mut buf,
+            } => {
+                let Some(conn) = conns[id].as_mut() else {
+                    return;
+                };
+                conn.writing = false;
+                if result.is_err() {
+                    conns[id] = None;
+                    return;
+                }
+                // `write_all` hands the buffer back untouched: reuse it.
+                buf.clear();
+                conn.out = buf;
+            }
+        }
+    }
+
+    /// Decodes and answers every complete frame already buffered.
+    fn handle_frames(&mut self, id: usize, conns: &mut [Option<rpc::Conn>]) {
+        let mut close = false;
+        loop {
+            let Some(conn) = conns[id].as_mut() else {
+                return;
+            };
+            let payload = match conn.decoder.next_frame() {
+                Ok(Some(payload)) => payload,
+                Ok(None) => break,
+                Err(_) => {
+                    close = true;
+                    break;
+                }
+            };
+            match siphon_shared::rpc::codec::decode::<siphon_shared::rpc::ClientMessage>(&payload) {
+                Ok(siphon_shared::rpc::ClientMessage::Hello {
+                    magic,
+                    protocol,
+                    app_version,
+                }) => {
+                    if magic != siphon_shared::rpc::MAGIC
+                        || protocol != siphon_shared::rpc::PROTOCOL_VERSION
+                    {
+                        let reason =
+                            format!("protocol {protocol} (backend speaks {})", siphon_shared::rpc::PROTOCOL_VERSION);
+                        close = !conn.push(&ServerMessage::Rejected(reason));
+                        break;
+                    }
+                    info!(%app_version, "rpc: client connected");
+                    let snapshot = self.snapshot();
+                    let queued = conn
+                        .push(&ServerMessage::Welcome {
+                            protocol: siphon_shared::rpc::PROTOCOL_VERSION,
+                            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        })
+                        && conn.push(&ServerMessage::Snapshot(Box::new(snapshot)));
+                    if !queued {
+                        close = true;
+                        break;
+                    }
+                    conn.ready = true;
+                }
+                Ok(siphon_shared::rpc::ClientMessage::Request { id: request_id, request }) => {
+                    let result = self.handle_request(request);
+                    if !conn.push(&ServerMessage::Response {
+                        id: request_id,
+                        result,
+                    }) {
+                        close = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    close = true;
+                    break;
+                }
+            }
+        }
+        if close {
+            conns[id] = None;
+        }
+    }
+
+    /// Encodes each queued update once and hands the bytes to every connection.
+    fn flush_bus(
+        &mut self,
+        conns: &mut [Option<rpc::Conn>],
+        ops: &futures_util::stream::FuturesUnordered<Op>,
+    ) {
+        for broadcast in self.bus.take_pending() {
+            self.frame.clear();
+            if siphon_shared::rpc::codec::encode(
+                &ServerMessage::Update(broadcast.update),
+                &mut self.frame,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            for conn in conns.iter_mut().flatten() {
+                if conn.ready {
+                    conn.out.extend_from_slice(&self.frame);
+                }
+            }
+        }
+        for (id, slot) in conns.iter_mut().enumerate() {
+            let Some(conn) = slot.as_mut() else {
+                continue;
+            };
+            if conn.out.len() > rpc::MAX_OUT {
+                *slot = None;
+                continue;
+            }
+            if conn.ready && !conn.writing && !conn.out.is_empty() {
+                conn.writing = true;
+                let stream = Rc::clone(&conn.stream);
+                let buf = std::mem::take(&mut conn.out);
+                ops.push(write_op(id, stream, buf));
+            }
         }
     }
 
     /// Runs one background future and delivers its result through the app
     /// queue, so no select ever polls a job future and drops a completed one.
     pub fn spawn_job<F: Future<Output = JobDone> + 'static>(&self, future: F) {
-        let sender = self.sender.clone();
+        let tx = self.jobs_tx.clone();
         compio::runtime::spawn(async move {
             let done = future.await;
-            sender.send(AppEvent::Job(Box::new(done)));
+            let _ = tx.send(Box::new(done));
         })
         .detach();
     }
@@ -514,8 +663,8 @@ impl App {
         }
     }
 
-    fn handle_request(&mut self, id: u64, request: Request, control: &Rc<Subscriber>) {
-        let result = match request {
+    fn handle_request(&mut self, request: Request) -> Result<Response, RpcError> {
+        match request {
             Request::AddLogin { login, switches } => {
                 self.request_add_login(&login, switches);
                 Ok(Response::Ack)
@@ -599,8 +748,7 @@ impl App {
                 .registry
                 .disk_view(&key)
                 .map_or(Err(RpcError::NotFound), |view| Ok(Response::Disk(view))),
-        };
-        let _ = control.control(ServerMessage::Response { id, result });
+        }
     }
 
     /// Snapshot built on demand from app state, the registry and metrics.
@@ -898,8 +1046,9 @@ impl App {
                 self.track_channel(user);
                 self.queue_save();
                 self.ensure_subs(id);
+                self.sync_channels();
                 if switches.record && self.registry.can_record() {
-                    self.registry.monitor_set(&login);
+                    self.registry.set_record(&login, true);
                 }
                 if self.welcomed {
                     self.subscribe_channel(id).await;
@@ -929,7 +1078,8 @@ impl App {
             return Err(RpcError::NotFound);
         };
         let removed = self.config.channels.remove(index);
-        self.registry.monitor_clear(&removed.login);
+        self.registry.set_record(&removed.login, false);
+        self.sync_channels();
         self.bus.log(
             LogLevel::Info,
             "channel",
@@ -1037,6 +1187,11 @@ impl App {
         Ok(Response::Ack)
     }
 
+    /// Mirrors the persisted follow list onto the registry's channel table.
+    fn sync_channels(&self) {
+        self.registry.sync_channels(&self.config.channels);
+    }
+
     fn apply_set_record(&mut self, channel: u64, record: bool) -> Result<Response, RpcError> {
         let Some(entry) = self
             .config
@@ -1062,12 +1217,12 @@ impl App {
         );
         if record {
             if self.registry.can_record() {
-                self.registry.monitor_set(&login);
+                self.registry.set_record(&login, true);
             } else {
                 self.set_error("recording needs an output directory");
             }
         } else {
-            self.registry.monitor_clear(&login);
+            self.registry.set_record(&login, false);
         }
         Ok(Response::Ack)
     }

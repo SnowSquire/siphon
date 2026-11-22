@@ -13,7 +13,7 @@ use siphon_shared::rpc::Update;
 use crate::bus::Bus;
 
 /// Segments kept per pipeline for `ListSegments` and the UI ring.
-const RING: usize = 64;
+use crate::constants::SEGMENT_RING as RING;
 
 /// One running pipeline's counters and segment ring.
 pub struct StreamMetrics {
