@@ -55,6 +55,8 @@ only sink; disk output is disabled and being rebuilt from
   `~/.cargo/config.toml`: `clang-cl` + `llvm-lib` compile the C dependencies and
   `lld-link` links. No Windows machine is involved.
 - UI: `cargo run -p siphon-ui` (binary `siphon`, ZGUI + DXGI). It starts `siphon-daemon.exe` next to itself if the admin named pipe is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
+- UI check (native): `cargo clippy -p siphon-ui --all-targets` — the Linux present path builds against the system libplacebo through pkg-config (`LIBPLACEBO_SOURCE=system` is the default there). Run it for any UI change; it does not need Windows.
+  The UI is *not* part of the Windows cross-check: for `x86_64-pc-windows-msvc` the crate takes the `windows()` path, which needs a hand-built Windows libplacebo prefix (`LIBPLACEBO_PREFIX`, or `LIBPLACEBO_SOURCE=build` with `LIBPLACEBO_SRC`), and this box has neither.
 
 ## Terminology
 
