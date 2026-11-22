@@ -1,0 +1,193 @@
+name: release
+
+# Tag pushes only, and the tag must be vX.Y.Z and match the workspace version,
+# so a release cannot ship binaries that do not match its source. GitHub adds
+# the source archives itself; the assets below are the setup and the portable
+# zip. Everything is built on Linux: the MSVC toolchain comes from xwin and
+# clang-cl, and libplacebo gets a statically linked shaderc so the payload
+# stays two exes and one DLL.
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Bump together with the prefixes on the dev box. The cache keys include both
+  # pins, so changing one rebuilds what depends on it.
+  XWIN_VERSION: "0.10.0"
+  SHADERC_VERSION: v2026.4
+  LIBPLACEBO_REV: b785229836d6879249ecb21551ba098ed549b5f6
+
+jobs:
+  windows:
+    name: Windows x64 installer and portable zip
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: tag matches the crate version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tags must be vX.Y.Z, got $tag"
+            exit 1
+          fi
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "::error::$tag does not match Cargo.toml's version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: install the cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm cmake ninja-build pkg-config libvulkan-dev nsis zip jq
+          # Ubuntu 26.04 ships clang 21 and, unlike the 24.04 image, clang-cl
+          # itself. The current MSVC STL refuses clang < 19, so 24.04 would need
+          # a backport.
+          clang-cl --version >/dev/null
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install meson
+        run: pip install --disable-pip-version-check meson jinja2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+          # A broken run should still leave the target dir behind.
+          cache-on-failure: true
+
+      - name: cache xwin and the MSVC CRT/SDK
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/xwin
+            ~/.cache/xwin-cache
+            ~/.cache/xwin
+          key: xwin-${{ env.XWIN_VERSION }}-${{ runner.os }}-v1
+
+      - name: install xwin and splat the CRT/SDK
+        run: |
+          command -v xwin >/dev/null || \
+            cargo install xwin --locked --version "$XWIN_VERSION"
+          if [[ ! -d "$HOME/.cache/xwin/crt/include" ]]; then
+            xwin --accept-license --cache-dir "$HOME/.cache/xwin-cache" \
+              splat --output "$HOME/.cache/xwin"
+          fi
+          splat="$HOME/.cache/xwin"
+          {
+            echo "RUSTFLAGS=-Lnative=$splat/crt/lib/x86_64 -Lnative=$splat/sdk/lib/um/x86_64 -Lnative=$splat/sdk/lib/ucrt/x86_64"
+            echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link"
+            echo "CC_x86_64_pc_windows_msvc=clang-cl"
+            echo "CXX_x86_64_pc_windows_msvc=clang-cl"
+            echo "AR_x86_64_pc_windows_msvc=llvm-lib"
+            echo "CFLAGS_x86_64_pc_windows_msvc=--target=x86_64-pc-windows-msvc /imsvc$splat/crt/include /imsvc$splat/sdk/include/ucrt /imsvc$splat/sdk/include/um /imsvc$splat/sdk/include/shared"
+            echo "CXXFLAGS_x86_64_pc_windows_msvc=--target=x86_64-pc-windows-msvc /imsvc$splat/crt/include /imsvc$splat/sdk/include/ucrt /imsvc$splat/sdk/include/um /imsvc$splat/sdk/include/shared"
+          } >> "$GITHUB_ENV"
+
+      - name: point the build scripts at the prefixes
+        run: |
+          {
+            echo "LIBS_ROOT=$RUNNER_TEMP/libs"
+            echo "SHADERC_PREFIX=$RUNNER_TEMP/libs/shaderc/win-prefix"
+            echo "SHADERC_BUILD=$RUNNER_TEMP/libs/shaderc-build"
+            echo "LIBPLACEBO_PREFIX=$RUNNER_TEMP/libs/libplacebo/win-prefix"
+            echo "LIBPLACEBO_SRC=$RUNNER_TEMP/libs/libplacebo"
+            echo "VULKAN_SDK=$RUNNER_TEMP/libs/vulkan"
+          } >> "$GITHUB_ENV"
+
+      - name: cache shaderc and libplacebo prefixes
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ runner.temp }}/libs/shaderc/win-prefix
+            ${{ runner.temp }}/libs/libplacebo/win-prefix
+            ${{ runner.temp }}/libs/vulkan
+          key: win-deps-${{ env.SHADERC_VERSION }}-${{ env.LIBPLACEBO_REV }}-${{ hashFiles('scripts/build-shaderc-win.sh', 'scripts/build-libplacebo-win.sh') }}
+
+      # The checkouts, separate from the prefixes: a script change invalidates
+      # the prefix key but the source tree and shaderc's third_party clones can
+      # still be reused. shaderc builds out of tree so this stays small.
+      - name: cache shaderc sources
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/libs/shaderc
+          key: shaderc-src-${{ env.SHADERC_VERSION }}-v1
+
+      - name: cache the libplacebo checkout
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/libs/libplacebo
+          key: libplacebo-src-${{ env.LIBPLACEBO_REV }}-v1
+
+      - name: pin libplacebo
+        run: |
+          src="$LIBPLACEBO_SRC"
+          if [[ ! -d "$src/.git" ]]; then
+            # Blobless, not shallow: any pinned commit can be checked out and
+            # the blobs arrive on demand.
+            git clone --quiet --filter=blob:none https://github.com/haasn/libplacebo "$src"
+          fi
+          git -C "$src" checkout --quiet "$LIBPLACEBO_REV"
+
+      - name: build shaderc
+        run: |
+          if [[ ! -f "$SHADERC_PREFIX/lib/pkgconfig/shaderc.pc" ]]; then
+            scripts/build-shaderc-win.sh
+          fi
+
+      - name: build libplacebo
+        run: |
+          if [[ ! -f "$LIBPLACEBO_PREFIX/lib/pkgconfig/libplacebo.pc" ]]; then
+            scripts/build-libplacebo-win.sh --clean
+          fi
+
+      - name: build the setup and the portable zip
+        env:
+          # The shipped binaries: whole-program LTO in one codegen unit. The
+          # workspace release profile is the quick local one.
+          CARGO_PROFILE_RELEASE_LTO: fat
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+        run: scripts/package-win.sh
+
+      - name: publish
+        # `act` sets ACT=true for local runs; there is no token there and no
+        # release to write.
+        if: ${{ !env.ACT }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: true
+          fail_on_unmatched_files: true
+          body: |
+            **Installer (recommended):** `siphon-${{ steps.version.outputs.version }}-x64-setup.exe`
+            installs for the current user only, with an uninstaller and a Start
+            menu entry, and is what the in-app updater downloads.
+
+            **Portable:** `siphon-${{ steps.version.outputs.version }}-x64-portable.zip`
+            extracts anywhere and runs `siphon.exe`. No install, no updater.
+
+            Both need the Microsoft Visual C++ 2015-2022 Redistributable (x64);
+            the installer adds it when it is missing, the portable zip does not.
+          files: |
+            dist/*-setup.exe
+            dist/*-portable.zip

@@ -10,17 +10,21 @@
 # Usage: scripts/build-libplacebo-win.sh [--clean]
 #
 # Knobs (defaults match the dev box):
-#   LIBPLACEBO_SRC   source checkout      ~/Projects/Code/Libs/libplacebo
-#   LIBPLACEBO_PREFIX install prefix      $LIBPLACEBO_SRC/win-prefix
-#   LIBPLACEBO_SPLAT xwin CRT/SDK splat   ~/.cache/xwin
-#   VULKAN_SDK       Vulkan headers       ~/Projects/Code/Libs/vulkan
-#   LIBS_ROOT        parent for the above ~/Projects/Code/Libs
+#   LIBPLACEBO_SRC    source checkout      ~/Projects/Code/Libs/libplacebo
+#   LIBPLACEBO_PREFIX install prefix       $LIBPLACEBO_SRC/win-prefix
+#   LIBPLACEBO_SPLAT  xwin CRT/SDK splat   ~/.cache/xwin
+#   VULKAN_SDK        Vulkan headers       ~/Projects/Code/Libs/vulkan
+#   LIBS_ROOT         parent for the above ~/Projects/Code/Libs
+#   SHADERC_PREFIX    static shaderc       unset: no GLSL compiler
 #
 # Meson needs jinja2 in its own Python (libplacebo generates code with it); the
 # uv-managed meson tool env does not ship it:
 #   uv pip install --python ~/.local/share/uv/tools/meson/bin/python jinja2
-# A GLSL compiler is deliberately not required: this prefix only has to satisfy
-# the typecheck/link, and shader compilation needs a Windows glslang or shaderc.
+#
+# With SHADERC_PREFIX the shaderc archive from scripts/build-shaderc-win.sh is
+# linked into the DLL and the meson summary reports `shaderc: YES`. Without it
+# the build has no GLSL compiler: it links, but shaders cannot be compiled at
+# run time, so that prefix is only good for the cross-check.
 
 set -euo pipefail
 
@@ -29,6 +33,7 @@ src="${LIBPLACEBO_SRC:-$root/libplacebo}"
 prefix="${LIBPLACEBO_PREFIX:-$src/win-prefix}"
 splat="${LIBPLACEBO_SPLAT:-$HOME/.cache/xwin}"
 vulkan="${VULKAN_SDK:-$root/vulkan}"
+shaderc="${SHADERC_PREFIX:-}"
 build="$src/build-win"
 cross="$root/msvc-cross.ini"
 
@@ -43,6 +48,10 @@ for tool in clang-cl llvm-lib llvm-rc lld-link meson ninja; do
         exit 1
     fi
 done
+if [[ -n "$shaderc" ]] && ! command -v pkg-config >/dev/null; then
+    echo "missing pkg-config; the shaderc dependency is found through it" >&2
+    exit 1
+fi
 
 if ! "$(command -v meson)" --version >/dev/null; then
     echo "meson is present but cannot run" >&2
@@ -80,8 +89,12 @@ if [[ ! -f "$vulkan/Include/vulkan/vulkan.h" ]]; then
 fi
 registry="/usr/share/vulkan/registry/vk.xml"
 if [[ ! -f "$registry" ]]; then
-    echo "no Vulkan registry at $registry; install the vulkan-headers package" >&2
-    exit 1
+    # Some distributions split the registry out of the headers package.
+    registry="$vulkan/vk.xml"
+    if [[ ! -f "$registry" ]]; then
+        echo "no Vulkan registry found; fetching it into $registry"
+        curl -fsSL https://raw.githubusercontent.com/KhronosGroup/Vulkan-Headers/main/registry/vk.xml -o "$registry"
+    fi
 fi
 
 includes=(
@@ -115,6 +128,7 @@ cpp = 'clang-cl'
 ar = 'llvm-lib'
 strip = 'llvm-strip'
 windres = 'llvm-rc'
+pkgconfig = 'pkg-config'
 
 [host_machine]
 system = 'windows'
@@ -139,6 +153,17 @@ EOF
 export INCLUDE="$splat/crt/include;$splat/sdk/include/ucrt;$splat/sdk/include/um;$splat/sdk/include/shared"
 export LIB="$splat/crt/lib/x86_64;$splat/sdk/lib/um/x86_64;$splat/sdk/lib/ucrt/x86_64"
 
+if [[ -n "$shaderc" ]]; then
+    if [[ ! -f "$shaderc/lib/pkgconfig/shaderc.pc" ]]; then
+        echo "SHADERC_PREFIX=$shaderc has no lib/pkgconfig/shaderc.pc; run scripts/build-shaderc-win.sh" >&2
+        exit 1
+    fi
+    shaderc_option=enabled
+else
+    shaderc_option=disabled
+    echo "note: SHADERC_PREFIX is unset, so this prefix has no GLSL compiler" >&2
+fi
+
 options=(
     --cross-file "$cross"
     --prefix "$prefix"
@@ -147,10 +172,11 @@ options=(
     -Dvulkan=enabled
     -Dvk-proc-addr=disabled
     "-Dvulkan-registry=$registry"
+    -Db_vscrt=md
     -Dopengl=disabled
     -Dd3d11=disabled
     -Dglslang=disabled
-    -Dshaderc=disabled
+    "-Dshaderc=$shaderc_option"
     -Ddovi=disabled
     -Dlibdovi=disabled
     -Dlcms=disabled
@@ -162,6 +188,10 @@ options=(
 
 if [[ $clean -eq 1 ]]; then
     rm -rf "$build"
+fi
+# pkg-config has to see the target shaderc, not anything installed for the host.
+if [[ -n "$shaderc" ]]; then
+    export PKG_CONFIG_PATH="$shaderc/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 fi
 if [[ -d "$build/meson-private" ]]; then
     meson setup --reconfigure "$build" "$src" "${options[@]}"

@@ -203,5 +203,4 @@ pub const HERMES_OFFLINE_QUIET: Duration = Duration::from_mins(10);
 /// Update check cadence, request timeout and the release feed.
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
 pub const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
-pub const RELEASES_URL: &str =
-    "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";
+pub const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/siphon/releases/latest";

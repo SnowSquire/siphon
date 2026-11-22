@@ -147,13 +147,15 @@ A Windows cross-check of the UI needs a Windows libplacebo, not a Linux one. Thi
 box builds it with clang-cl and the xwin CRT/SDK:
 `scripts/build-libplacebo-win.sh` runs a meson cross build into
 `~/Projects/Code/Libs/libplacebo/win-prefix` (Vulkan headers copied out of
-`/usr/include`, glslang and shaderc off — the check type-checks and links, it
-does not compile shaders), and `scripts/cargo-win.sh clippy -p siphon-ui
+`/usr/include`; without `SHADERC_PREFIX` it has no GLSL compiler and only
+type-checks and links), and `scripts/cargo-win.sh clippy -p siphon-ui
 --all-targets` exports `LIBPLACEBO_PREFIX`/`VULKAN_SDK` and appends the target.
-Cargo has no per-target `env` table, and exporting `LIBPLACEBO_PREFIX` globally
-would send native builds at a Windows library, hence the wrapper. `libav` stays
-off, so no Windows FFmpeg is needed; the build script only asks for
-`FFMPEG_DIR` when the feature is on.
+A shippable prefix links the static shaderc that
+`scripts/build-shaderc-win.sh` cross-builds; `notes/windows-installer.md` has
+the release pipeline. Cargo has no per-target `env` table, and exporting
+`LIBPLACEBO_PREFIX` globally would send native builds at a Windows library,
+hence the wrapper. `libav` stays off, so no Windows FFmpeg is needed; the build
+script only asks for `FFMPEG_DIR` when the feature is on.
 
 ## Video
 

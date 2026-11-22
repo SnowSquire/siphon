@@ -45,6 +45,9 @@ only sink; disk output is disabled and being rebuilt from
   variants and exits. `--mode` picks the live playlist, the DVR, or both (the
   default). It waits for the channel to go live and exits when the recording ends.
   In `-d` it needs `SIPHON_HERMES_URL` (the mock's `ws://127.0.0.1:8001/v1`).
+- Release builds use the quick profile (no LTO, 16 codegen units); the release
+  workflow sets `CARGO_PROFILE_RELEASE_LTO=fat` and
+  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1` for the shipped binaries.
 - Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
 - Benchmark: `cargo test -p daemon --release -- --ignored --nocapture throughput` (demux/packetize over `captures/servermock`, the built fixtures). Cross-compile: `cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl`.
 - Miri: `cargo +nightly miri test -p daemon` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
@@ -60,6 +63,9 @@ only sink; disk output is disabled and being rebuilt from
 - Installer: `scripts/package-win.sh` — stages the Windows release and runs
   `makensis` into `dist/` (`--no-build` reuses the current target dir; Fedora
   needs `mingw32-nsis`). `notes/windows-installer.md` has the contract.
+- Windows shaderc: `scripts/build-shaderc-win.sh` — cross-builds the static
+  shaderc the release libplacebo links; `SHADERC_PREFIX=... scripts/build-libplacebo-win.sh`
+  then produces a prefix that can compile shaders, not just link.
 - UI check (native): `cargo clippy -p siphon-ui --all-targets` — the Linux present path builds against the system libplacebo through pkg-config (`LIBPLACEBO_SOURCE=system` is the default there). Run it for any UI change; it does not need Windows.
 - UI check (Windows target): `scripts/cargo-win.sh clippy -p siphon-ui --all-targets`.
   This box builds a Windows libplacebo itself —

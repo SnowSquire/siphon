@@ -9,6 +9,7 @@
 # mingw32-nsis`). Output:
 #
 #   dist/siphon-<version>-x64-setup.exe
+#   dist/siphon-<version>-x64-portable.zip
 #
 # The setup is what the updater downloads: the release asset must keep the
 # `-setup.exe` suffix, and its name carries the tag's version.
@@ -33,9 +34,9 @@ if [[ "${1:-}" == "--no-build" ]]; then
   build=0
 fi
 
-for tool in makensis jq; do
+for tool in makensis jq zip; do
   command -v "$tool" >/dev/null || {
-    echo "missing $tool (Fedora: sudo dnf install mingw32-nsis jq)" >&2
+    echo "missing $tool (Fedora: sudo dnf install mingw32-nsis jq zip)" >&2
     exit 1
   }
 done
@@ -48,7 +49,7 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 if [[ $build -eq 1 ]]; then
-  "$root/scripts/cargo-win.sh" build --release -p siphon-ui -p daemon
+  "$root/scripts/cargo-win.sh" build --release --locked -p siphon-ui -p daemon
 fi
 
 rm -rf "$stage"
@@ -127,15 +128,24 @@ fi
 
 mkdir -p "$out_dir"
 setup="$out_dir/siphon-$version-x64-setup.exe"
-makensis -V2 -DVERSION="$version" -DPAYLOAD="$stage" -DOUTFILE="$setup" \
+makensis -V2 -DVERSION="$version" -DPAYLOAD="$stage" \
+  -DVCREDIST="$root/installer/vcredist.ps1" -DOUTFILE="$setup" \
   "$root/installer/siphon.nsi"
 
 if [[ -n "${SIPHON_SIGN_PFX:-}" ]]; then
   sign "$setup"
 fi
 
+# The portable copy is the same payload zipped: there is no single exe to ship
+# any more. The name deliberately does not end in `-setup.exe`, so the updater
+# never mistakes it for an installer.
+portable="$out_dir/siphon-$version-x64-portable.zip"
+rm -f "$portable"
+(cd "$stage" && zip -qr "$portable" .)
+
 size=$(stat -c %s "$setup")
 echo "built $setup ($((size / 1024 / 1024)) MiB)"
+echo "built $portable ($(stat -c %s "$portable") bytes)"
 if (( size > 64 * 1024 * 1024 )); then
   echo "warning: exceeds MAX_UPDATE (64 MiB); raise it in constants.rs or trim the payload" >&2
 fi

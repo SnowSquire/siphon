@@ -13,6 +13,7 @@
 Unicode true
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "LogicLib.nsh"
 
 !ifndef VERSION
   !error "VERSION is not defined (pass -DVERSION=<x.y.z>)"
@@ -22,6 +23,9 @@ Unicode true
 !endif
 !ifndef OUTFILE
   !define OUTFILE "siphon-${VERSION}-x64-setup.exe"
+!endif
+!ifndef VCREDIST
+  !error "VCREDIST is not defined (pass -DVCREDIST=<path to vcredist.ps1>)"
 !endif
 
 !define APP_NAME "Siphon"
@@ -76,9 +80,37 @@ VIAddVersionKey "LegalCopyright" "MIT OR Apache-2.0"
   Sleep 400
 !macroend
 
+; The binaries use the dynamic CRT: the UCRT ships with Windows 10/11, and the
+; VCRuntime/C++ runtime comes from the VC++ redistributable. When that is
+; missing, install Microsoft's copy (one UAC prompt) instead of letting the app
+; fail at launch with a missing MSVCP140.dll.
+Function EnsureVCRuntime
+  SetRegView 64
+  ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+  SetRegView 32
+  ${If} $0 == 1
+    Return
+  ${EndIf}
+
+  DetailPrint "Microsoft Visual C++ runtime not found; installing it"
+  InitPluginsDir
+  File /oname=$PLUGINSDIR\vcredist.ps1 "${VCREDIST}"
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\vcredist.ps1"'
+  Pop $0
+  ${If} $0 == "0"
+  ${OrIf} $0 == "3010"
+    Return
+  ${EndIf}
+
+  DetailPrint "Visual C++ runtime install failed ($0)"
+  IfSilent +2
+  MessageBox MB_ICONEXCLAMATION|MB_OK "Siphon needs the Microsoft Visual C++ 2015-2022 Redistributable (x64). Install it from https://aka.ms/vs/17/release/vc_redist.x64.exe, then run this installer again."
+FunctionEnd
+
 Section "Siphon" SecMain
   SetShellVarContext current
   !insertmacro CloseSiphon
+  Call EnsureVCRuntime
 
   ; A clean install directory: an upgrade that drops a DLL must not leave the
   ; old one behind, and nothing user-owned lives here.

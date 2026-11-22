@@ -7,6 +7,15 @@ that drives it over an RPC connection.
 The development contract and the build, test and lint commands are in
 [`AGENTS.md`](AGENTS.md); subsystem design notes are in [`notes/`](notes).
 
+## Windows
+
+The Windows build uses the dynamic MSVC runtime: the UCRT is part of Windows
+10/11, and the [Microsoft Visual C++ 2015-2022 Redistributable
+(x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) provides the VCRuntime
+and C++ runtime. The installer downloads and installs it when it is missing
+(one UAC prompt); the portable zip expects it to be present. Nothing is bundled
+with either artefact.
+
 ## License
 
 Licensed under either of

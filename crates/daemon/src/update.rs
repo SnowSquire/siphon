@@ -227,7 +227,7 @@ mod tests {
 
     const BODY: &[u8] = br#"{
         "tag_name": "v0.2.0",
-        "html_url": "https://github.com/SnowSquire/twitch-siphon/releases/tag/v0.2.0",
+        "html_url": "https://github.com/SnowSquire/siphon/releases/tag/v0.2.0",
         "assets": [
             {"name": "siphon_0.2.0_x64-portable.exe",
              "browser_download_url": "https://example.com/siphon_0.2.0_x64-portable.exe"},
@@ -246,7 +246,7 @@ mod tests {
         );
         assert_eq!(
             release.page_url,
-            "https://github.com/SnowSquire/twitch-siphon/releases/tag/v0.2.0"
+            "https://github.com/SnowSquire/siphon/releases/tag/v0.2.0"
         );
     }
 

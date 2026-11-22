@@ -45,16 +45,17 @@ missing_errors_doc = "allow" # Turn off another noisy pedantic lint
 too_many_lines = "allow"
 
 
-# The release profile is the shipped one: fat LTO and a single codegen unit, so
-# the whole program is optimised across crate boundaries. A clean build is slow;
-# a quick local iteration can override the two knobs without editing the file:
+# The release profile is the quick local one: no LTO and full codegen
+# parallelism, so `cargo build --release` is usable while iterating. The
+# release workflow overrides the two knobs for the shipped binaries:
 #
-#   CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
-#     cargo build --release
+#   CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+#
+# A clean shipped build is therefore slow, which is what that job is for.
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = false
+codegen-units = 16
 panic = "abort"
 strip = true
 
