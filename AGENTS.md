@@ -123,4 +123,6 @@ detail: `notes/architecture.md`.
 ## Repo conventions
 
 - Colocated `jj` + git repo; work with `jj`, not git. Open a commit at the start of a task, commit each step, `jj squash` back down; `jj undo` recovers.
+- Name a commit by its **change ID** (`change_id.shortest(8)`, e.g. `kkmppsq`), not by its git commit hash. A hash names one snapshot and changes on every rewrite, so it is useless to whoever wants to find or amend the work; `jj show <change>` / `jj edit <change>` only work with the change ID. Quote a hash only when that exact snapshot is the point.
+- Read history with an explicit revset: `jj chain` (the `fork_point(@ | trunk())::@` alias), `jj log -r '::@'`, or `trunk()..@` when trunk is known. Bare `jj log` interleaves every head, so its order is not a chain.
 - Style: efficient code, not borrow-checker appeasement; few dependencies (`compio`, `rustls`, `http`, `httparse`, `futures-util`); fixed-size storage when the bound is structural, `Vec` only when it is data-dependent (pre-reserve).
