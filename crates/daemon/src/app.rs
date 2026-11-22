@@ -172,6 +172,8 @@ pub struct App {
     pub(crate) last_message: Instant,
     pub(crate) reconnect_at: Instant,
     pub(crate) reconnect_attempt: u32,
+    /// Per channel: a title/game toast mute that expires `HERMES_OFFLINE_QUIET`
+    /// after a `stream-down`. Live notifications ignore it.
     pub(crate) quiet_until: HashMap<u64, Instant>,
     pub(crate) sub_ids: HashMap<Topic, SubEntry>,
     pub(crate) sub_gen: u64,

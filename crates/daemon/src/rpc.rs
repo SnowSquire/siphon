@@ -302,7 +302,7 @@ mod tests {
                 "sunnys",
                 7,
                 false,
-                vec![debug_variant(), debug_portrait_variant()],
+                vec![debug_variant("mock"), debug_portrait_variant("mock")],
                 42,
             );
             registry.watch_finished();

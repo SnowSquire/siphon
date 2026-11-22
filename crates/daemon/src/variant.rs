@@ -384,16 +384,19 @@ pub fn choose_variant<'a>(variants: &'a [Variant], quality: Option<&str>) -> Opt
     )
 }
 
-/// The landscape variant debug mode pretends the mock server offers.
+/// The landscape variant debug mode pretends the mock server offers, on `base`.
 ///
 /// The score is what `best_variant` ranks monitors by, and it must beat the
 /// portrait track: a channel's primary recording is the landscape source, the
 /// portrait one is the optional second recording.
+///
+/// Dev builds only (`test` keeps it for the release-profile test binary).
+#[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn debug_variant() -> Variant {
+pub fn debug_variant(base: &str) -> Variant {
     Variant {
         score: std::num::NonZeroU16::new(6),
-        url: crate::constants::DEBUG_MANIFEST_URL.into(),
+        url: format!("{base}/index.m3u8").into(),
         id: crate::constants::DEBUG_VARIANT_ID.into(),
         kind: VariantKind::Landscape,
         codec: None,
@@ -404,11 +407,14 @@ pub fn debug_variant() -> Variant {
 
 /// The portrait track of a dual-format broadcast, which the mock offers as a
 /// second group (`IVS-GROUPS="portrait"`).
+///
+/// Dev builds only (`test` keeps it for the release-profile test binary).
+#[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn debug_portrait_variant() -> Variant {
+pub fn debug_portrait_variant(base: &str) -> Variant {
     Variant {
         score: std::num::NonZeroU16::new(5),
-        url: crate::constants::DEBUG_PORTRAIT_MANIFEST_URL.into(),
+        url: format!("{base}/portrait.m3u8").into(),
         id: crate::constants::DEBUG_PORTRAIT_VARIANT_ID.into(),
         kind: VariantKind::Portrait,
         codec: None,

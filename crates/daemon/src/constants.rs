@@ -3,6 +3,10 @@
 //! Format-local values (`INDEX_MAGIC`, `INDEX_VERSION`) stay in `disk.rs` because
 //! they describe the on-disk format, which mirrors `index.hexpat`.
 
+// The endpoint accessors read their `OnceLock` in a dev build, so they cannot be
+// `const fn`; in a release build their body is only the constant.
+#![allow(clippy::missing_const_for_fn)]
+
 use std::time::Duration;
 
 pub const PLAYER_VERSION: &str = "1.58.0-rc.2";
@@ -10,7 +14,8 @@ pub const PLAYER_VERSION: &str = "1.58.0-rc.2";
 pub const TWITCH_GQL_ENDPOINT: &str = "https://gql.twitch.tv/gql";
 pub const TWITCH_OAUTH_ENDPOINT: &str = "https://id.twitch.tv/oauth2/validate";
 pub const TWITCH_HLS_BASE: &str = "https://usher.ttvnw.net/api/v2/channel/hls";
-/// Hermes pubsub. `SIPHON_HERMES_URL` and `--debug` override it.
+/// Hermes pubsub. `SIPHON_HERMES_URL` overrides it; `--debug` does not, because
+/// the mock's socket is on its own port.
 pub const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 
 pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
@@ -18,16 +23,18 @@ pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 /// RTSP control port; RTP/RTCP use ephemeral ports or interleaved TCP.
 pub const DEFAULT_RTSP_PORT: u16 = 7417;
 
-/// Debug mode replays the mock server's playlists instead of Twitch's.
-pub const DEBUG_MANIFEST_URL: &str = "http://127.0.0.2:8000/index.m3u8";
-pub const DEBUG_DVR_URL: &str = "http://127.0.0.2:8000/index-dvr.m3u8";
-/// The portrait group the mock offers alongside it.
-pub const DEBUG_PORTRAIT_MANIFEST_URL: &str = "http://127.0.0.2:8000/portrait.m3u8";
-pub const DEBUG_PORTRAIT_DVR_URL: &str = "http://127.0.0.2:8000/portrait-dvr.m3u8";
+// `--debug <base>` replays the mock edge instead of Twitch. Dev builds only: a
+// release binary has no such mode, and the addresses are the flag's, not these.
+// Only the names the mock pretends to serve live here.
+
 /// The mock's segments were captured from this channel.
+#[cfg(debug_assertions)]
 pub const DEBUG_CHANNEL_TITLE: &str = "sunnys";
-/// The variants the debug channel pretends the mock offers.
+/// The variants the debug channel pretends the mock offers. `test` keeps them
+/// for the release-profile test binary.
+#[cfg(any(test, debug_assertions))]
 pub const DEBUG_VARIANT_ID: &str = "1080p";
+#[cfg(any(test, debug_assertions))]
 pub const DEBUG_PORTRAIT_VARIANT_ID: &str = "1080p-portrait";
 
 /// RTP payload budget, matching gortsplib's default:
@@ -124,52 +131,70 @@ pub const MAX_IMAGE: usize = 4 * 1024 * 1024;
 /// Cap on one downloaded installer.
 pub const MAX_UPDATE: usize = 64 * 1024 * 1024;
 
-/// The mock edge server (`servermock/`). Dev builds only: a release binary has
-/// no way to reach it.
+/// Endpoint overrides, set once at startup from `--debug <base>`. Dev builds
+/// only: a release binary has no such flag, so the statics are not there and
+/// the accessors below are their Twitch constants.
 #[cfg(debug_assertions)]
-pub const MOCK_BASE: &str = "http://127.0.0.2:8000";
-
-/// Endpoint overrides, set once at startup when `--debug` points the daemon at
-/// the mock edge. The real endpoints stay the defaults, so there is no mode
-/// flag anywhere below `main`.
 static GQL_ENDPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+#[cfg(debug_assertions)]
 static HLS_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+#[cfg(debug_assertions)]
 static PUBLIC_ENDPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-static HERMES_ENDPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+#[cfg(debug_assertions)]
+static MOCK_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 #[must_use]
 pub fn gql_endpoint() -> &'static str {
-    GQL_ENDPOINT
-        .get()
-        .map_or(TWITCH_GQL_ENDPOINT, String::as_str)
+    #[cfg(debug_assertions)]
+    {
+        if let Some(endpoint) = GQL_ENDPOINT.get() {
+            return endpoint;
+        }
+    }
+    TWITCH_GQL_ENDPOINT
 }
 
 #[must_use]
 pub fn hls_base() -> &'static str {
-    HLS_BASE.get().map_or(TWITCH_HLS_BASE, String::as_str)
-}
-
-#[must_use]
-pub fn hermes_endpoint() -> &'static str {
-    HERMES_ENDPOINT.get().map_or(HERMES_URL, String::as_str)
+    #[cfg(debug_assertions)]
+    {
+        if let Some(base) = HLS_BASE.get() {
+            return base;
+        }
+    }
+    TWITCH_HLS_BASE
 }
 
 #[must_use]
 pub fn public_endpoint() -> &'static str {
-    PUBLIC_ENDPOINT
-        .get()
-        .map_or(TWITCH_OAUTH_ENDPOINT, String::as_str)
+    #[cfg(debug_assertions)]
+    {
+        if let Some(endpoint) = PUBLIC_ENDPOINT.get() {
+            return endpoint;
+        }
+    }
+    TWITCH_OAUTH_ENDPOINT
 }
 
-/// Points GQL, usher, OAuth and Hermes at the mock. Called once, from `main`,
-/// and compiled into dev builds only.
+/// The base `--debug` named, for the paths that are not one endpoint: the mock's
+/// playlists and the archive route the registry recognises. `None` when this
+/// build has no `--debug` or the flag was not given.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn mock_base() -> Option<&'static str> {
+    MOCK_BASE.get().map(String::as_str)
+}
+
+/// Points GQL, usher and OAuth at `base`. Called once, from `main`, and
+/// compiled into dev builds only. Hermes is not derived from it: the mock's
+/// socket is on its own port, so `SIPHON_HERMES_URL` names that.
 #[cfg(debug_assertions)]
 pub fn use_edge(base: &str) {
+    let base = base.trim_end_matches('/');
+    let _ = MOCK_BASE.set(base.to_owned());
     let _ = GQL_ENDPOINT.set(format!("{base}/gql"));
     let _ = HLS_BASE.set(format!("{base}/api/v2/channel/hls"));
     let _ = PUBLIC_ENDPOINT.set(format!("{base}/oauth2/validate"));
-    // The mock's websocket listens on its own port.
-    let _ = HERMES_ENDPOINT.set("ws://127.0.0.1:8001/v1".to_owned());
 }
 
 /// Segments kept per pipeline for `ListSegments` and the UI ring.
@@ -196,8 +221,9 @@ pub const HERMES_WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HERMES_KEEPALIVE_MISSES: u64 = 2;
 /// Longest reconnect backoff.
 pub const HERMES_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
-/// How long after a `stream-down` a channel's toasts stay muted. Restreams
-/// within this window update state silently instead of notifying again.
+/// How long after a `stream-down` a channel's title/game toasts stay muted.
+/// The title/game churn when a broadcast ends is noise; a restream inside the
+/// window still notifies.
 pub const HERMES_OFFLINE_QUIET: Duration = Duration::from_mins(10);
 
 /// Update check cadence, request timeout and the release feed.

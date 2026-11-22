@@ -25,16 +25,16 @@ use crate::time::now_iso;
 use crate::utils::NanoId;
 
 /// The endpoint to connect to. `SIPHON_HERMES_URL` points the daemon at the mock
-/// server (or any other stand-in) without a rebuild; it is also what makes debug
-/// mode connect at all, since debug normally pretends the socket is healthy.
+/// server (or any other stand-in) without a rebuild, which is how debug mode
+/// reaches the mock's socket: it listens on its own port, not beside the HTTP
+/// edge `--debug` names.
 pub fn url() -> String {
-    std::env::var("SIPHON_HERMES_URL")
-        .unwrap_or_else(|_| crate::constants::hermes_endpoint().to_owned())
+    std::env::var("SIPHON_HERMES_URL").unwrap_or_else(|_| crate::constants::HERMES_URL.to_owned())
 }
 use crate::constants::HERMES_KEEPALIVE_MISSES as KEEPALIVE_MISSED_LIMIT;
 use crate::constants::HERMES_MAX_RECONNECT_DELAY as MAX_RECONNECT_DELAY;
-/// How long after a `stream-down` a channel's toasts stay muted. Restreams
-/// within this window update state silently instead of notifying again.
+/// How long after a `stream-down` a channel's title/game toasts stay muted:
+/// the churn around a broadcast ending is noise, going live again is not.
 use crate::constants::HERMES_OFFLINE_QUIET as OFFLINE_QUIET;
 use crate::constants::HERMES_WELCOME_TIMEOUT as WELCOME_TIMEOUT;
 
@@ -103,7 +103,9 @@ pub fn build_matcher(words: &[String]) -> Matcher {
 }
 
 impl App {
-    /// Whether a channel's toasts are muted by a recent `stream-down`.
+    /// Whether a channel's title/game toasts are muted by a recent
+    /// `stream-down`. A restream is never muted: only the title/game churn
+    /// around the end of a broadcast is.
     fn quiet(&mut self, id: u64) -> bool {
         match self.quiet_until.get(&id) {
             Some(until) if Instant::now() < *until => true,
@@ -738,7 +740,6 @@ impl App {
                 self.bus.publish(Update::ChannelUpsert(Box::new(view)));
             }
             Some("stream-up") => {
-                let quiet = self.quiet(id);
                 let channel = self.channel_config(id);
                 let Some(user) = self.channels.get(&id) else {
                     return;
@@ -763,12 +764,7 @@ impl App {
                     Some(login.clone()),
                     stream_id,
                 );
-                if quiet {
-                    tracing::info!(
-                        target: "hermes",
-                        "stream-up for {id} inside offline window, staying silent"
-                    );
-                } else if channel.as_ref().is_none_or(|channel| channel.notify_live) {
+                if channel.as_ref().is_none_or(|channel| channel.notify_live) {
                     self.notify_live(
                         &display_name,
                         game.as_ref(),
@@ -842,7 +838,7 @@ impl App {
                 let notifies = self
                     .channel_config(id)
                     .is_none_or(|channel| channel.notify_live);
-                if !known && !self.quiet(id) && notifies {
+                if !known && notifies {
                     let display_name = user.display_name.clone();
                     let game = user.game.clone();
                     let title = user.stream_title.clone();

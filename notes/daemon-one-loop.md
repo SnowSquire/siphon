@@ -100,7 +100,9 @@ their modules.
 behavioural branches go: fake variants, seeded channels, skipped GQL, faked
 connection health, forced DVR URLs. The mock grows a GQL route for the queries
 `gql.rs` actually makes. `--debug` is compiled out of release builds
-(`cfg(debug_assertions)`).
+(`cfg(debug_assertions)`). The edge is named on the command line
+(`--debug <base>`), so no mock address is compiled in; the mock's Hermes socket
+is on its own port and comes from `SIPHON_HERMES_URL`.
 
 ### Disk and demux
 

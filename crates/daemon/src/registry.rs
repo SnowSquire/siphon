@@ -1189,26 +1189,24 @@ const fn other_orientation(kind: &VariantKind) -> Option<VariantKind> {
 /// A fixed DVR playlist for the mock edge, whose archive route is not Twitch's.
 ///
 /// Keyed off the variant URL so there is no mode flag in the registry: anything
-/// served by the mock gets the mock's DVR path, everything else is probed the
-/// way a real broadcast is. Compiled out of release builds.
+/// served by the edge `--debug` named gets the mock's DVR path, everything else
+/// is probed the way a real broadcast is. Dev builds only.
+#[cfg(debug_assertions)]
 fn mock_dvr_url(variant: &Variant) -> Option<String> {
-    #[cfg(debug_assertions)]
-    {
-        let base = crate::constants::MOCK_BASE;
-        variant.url.strip_prefix(base).map(|_| {
-            let file = if variant.kind == VariantKind::Portrait {
-                "portrait-dvr.m3u8"
-            } else {
-                "index-dvr.m3u8"
-            };
-            format!("{base}/{file}")
-        })
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = variant;
-        None
-    }
+    let base = crate::constants::mock_base()?;
+    variant.url.strip_prefix(base).map(|_| {
+        let file = if variant.kind == VariantKind::Portrait {
+            "portrait-dvr.m3u8"
+        } else {
+            "index-dvr.m3u8"
+        };
+        format!("{base}/{file}")
+    })
+}
+
+#[cfg(not(debug_assertions))]
+const fn mock_dvr_url(_: &Variant) -> Option<String> {
+    None
 }
 
 impl StreamResolver for Registry {
@@ -1338,7 +1336,7 @@ mod tests {
                 },
                 Rc::clone(&bus),
             ));
-            registry.seed_channel("sunnys", 7, false, vec![debug_variant()], 42);
+            registry.seed_channel("sunnys", 7, false, vec![debug_variant("mock")], 42);
             registry.set_record("sunnys", true);
             compio::time::sleep(Duration::from_millis(20)).await;
             let pending = bus.take_pending();
@@ -1358,12 +1356,12 @@ mod tests {
         // Dual format: the landscape source is the primary and portrait is the
         // second recording. Portrait only: portrait *is* the primary, and there
         // is no other orientation to add.
-        let dual = vec![debug_variant(), debug_portrait_variant()];
+        let dual = vec![debug_variant("mock"), debug_portrait_variant("mock")];
         assert_eq!(
             best_variant(&dual).map(|variant| &variant.kind),
             Some(&VariantKind::Landscape)
         );
-        let portrait_only = vec![debug_portrait_variant()];
+        let portrait_only = vec![debug_portrait_variant("mock")];
         assert_eq!(
             best_variant(&portrait_only).map(|variant| &variant.kind),
             Some(&VariantKind::Portrait)
@@ -1378,10 +1376,10 @@ mod tests {
     #[test]
     fn quality_selects_the_variant_and_none_takes_the_first() {
         let variants = vec![
-            debug_variant(),
+            debug_variant("mock"),
             Variant {
                 id: "audio_only".into(),
-                ..debug_variant()
+                ..debug_variant("mock")
             },
         ];
         assert_eq!(

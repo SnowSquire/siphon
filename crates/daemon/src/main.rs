@@ -81,9 +81,8 @@ use crate::app::App;
 use crate::app::AppInit;
 use crate::arena::ArenaSet;
 use crate::bus::Bus;
+#[cfg(debug_assertions)]
 use crate::constants::DEBUG_CHANNEL_TITLE;
-use crate::constants::DEBUG_DVR_URL;
-use crate::constants::DEBUG_PORTRAIT_DVR_URL;
 use crate::constants::DEFAULT_RTSP_PORT;
 use crate::http::Client;
 use crate::http::ws::WsStream;
@@ -120,9 +119,11 @@ struct Config {
     #[arg(short, long, global = true, default_value_t = true)]
     low_latency: bool,
 
-    /// Replay the mock server instead of fetching Twitch
-    #[arg(short, long, global = true)]
-    debug: bool,
+    /// Replay a mock edge at this base URL instead of fetching Twitch
+    /// (dev builds only)
+    #[cfg(debug_assertions)]
+    #[arg(short, long, global = true, value_name = "BASE")]
+    debug: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -241,6 +242,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init(config::APP_ID);
 
     let cfg = Config::parse();
+    // `--debug <base>` is only "the endpoints are the mock edge": no subsystem
+    // below this point knows the difference.
+    #[cfg(debug_assertions)]
+    if let Some(base) = cfg.debug.as_deref() {
+        constants::use_edge(base);
+    }
     match &cfg.command {
         Command::Play(args) => Box::pin(play(&cfg, args)).await?,
         Command::Record(args) => record(&cfg, args).await?,
@@ -249,24 +256,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Whether `--debug` named a mock edge. A release build has no such flag, so
+/// this is `false` there and the branches below fold away.
+#[cfg(debug_assertions)]
+const fn debug_mode(cfg: &Config) -> bool {
+    cfg.debug.is_some()
+}
+
+#[cfg(not(debug_assertions))]
+const fn debug_mode(_: &Config) -> bool {
+    false
+}
+
+/// The channel `--debug` pretends to serve: the mock's title, and the live and
+/// portrait variant groups it offers under broadcast id `0`.
+#[cfg(debug_assertions)]
+fn debug_channel(cfg: &Config) -> Option<(String, Vec<Variant>)> {
+    let base = cfg.debug.as_deref()?.trim_end_matches('/');
+    Some((
+        DEBUG_CHANNEL_TITLE.to_owned(),
+        vec![
+            variant::debug_variant(base),
+            variant::debug_portrait_variant(base),
+        ],
+    ))
+}
+
+#[cfg(not(debug_assertions))]
+const fn debug_channel(_: &Config) -> Option<(String, Vec<Variant>)> {
+    None
+}
+
+/// The mock's DVR playlist for a variant group. `NO_DVR` turns it off so the
+/// no-URL promotion path can be tested.
+#[cfg(debug_assertions)]
+fn debug_dvr_url(cfg: &Config, variant: &Variant) -> Option<String> {
+    let base = cfg.debug.as_deref()?.trim_end_matches('/');
+    if std::env::var_os("NO_DVR").is_some() {
+        return None;
+    }
+    let file = if variant.kind == VariantKind::Portrait {
+        "portrait-dvr.m3u8"
+    } else {
+        "index-dvr.m3u8"
+    };
+    Some(format!("{base}/{file}"))
+}
+
+#[cfg(not(debug_assertions))]
+const fn debug_dvr_url(_: &Config, _: &Variant) -> Option<String> {
+    None
+}
+
 /// One channel, served at the root of every loopback RTSP address.
 #[allow(clippy::future_not_send)]
 async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error>> {
-    let title = if cfg.debug {
-        DEBUG_CHANNEL_TITLE.to_owned()
-    } else {
-        args.channel.clone()
-    };
+    let mock = debug_channel(cfg);
+    let debug = debug_mode(cfg);
+    let title = mock
+        .as_ref()
+        .map_or_else(|| args.channel.clone(), |(title, _)| title.clone());
 
     let client = Rc::new(Client::new());
     let arena = Rc::new(ArenaSet::new());
     let wakes = WakeSet::new();
 
-    let (variants, broadcast_id) = if cfg.debug {
-        (
-            vec![variant::debug_variant(), variant::debug_portrait_variant()],
-            0,
-        )
+    let (variants, broadcast_id) = if let Some((_, variants)) = mock {
+        (variants, 0)
     } else {
         // A manifest failure is reported and turned into a non-zero exit; it is
         // not a reason to kill the process from deep inside the request path.
@@ -293,22 +349,14 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
             quality: args.quality.clone().unwrap_or_default(),
         }
     })?;
-    // Debug mode replays the mock's DVR playlist, which is per variant group.
+    // A debug build replays the mock's DVR playlist, which is per variant group.
     // Otherwise discovery (GQL plus domain probing) and the periodic playlist
     // refresh run in the background, concurrently with the live variant and
-    // manifest fetches. `NO_DVR` turns the mock's DVR playlist off so the no-URL
-    // promotion path can be tested.
-    let debug_dvr = (std::env::var_os("NO_DVR").is_none()).then(|| {
-        if variant.kind == VariantKind::Portrait {
-            DEBUG_PORTRAIT_DVR_URL.to_owned()
-        } else {
-            DEBUG_DVR_URL.to_owned()
-        }
-    });
-    let dvr = rtsp::dvr::Dvr::new(if cfg.debug { debug_dvr } else { None });
+    // manifest fetches.
+    let dvr = rtsp::dvr::Dvr::new(debug_dvr_url(cfg, variant));
     rtsp::dvr::spawn(
         Rc::clone(&client),
-        (!cfg.debug).then(|| args.channel.clone()),
+        (!debug).then(|| args.channel.clone()),
         Rc::clone(&dvr),
     );
     dvr.set_live_variant(variant);
@@ -334,7 +382,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
         disk::spawn_disk_output(
             disk::DiskOptions {
                 output: output.clone(),
-                stream_id: if cfg.debug { 0 } else { broadcast_id },
+                stream_id: if debug { 0 } else { broadcast_id },
                 variant: variant.id.clone(),
                 keep_runs: args.keep_runs,
                 notifier,
@@ -419,6 +467,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
 async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::Error>> {
     let login = args.channel.to_ascii_lowercase();
     let client = Rc::new(Client::new());
+    let debug = debug_mode(cfg);
 
     let Some((variants, broadcast_id)) =
         resolve_record_variants(cfg, &client, &login, args).await?
@@ -447,17 +496,10 @@ async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::E
     // The DVR side: discovery when recording one, otherwise no URL at all (the
     // disk then promotes the live recording straight into the canonical file).
     let dvr = if want_dvr {
-        let debug_url = cfg.debug.then(|| {
-            if variant.kind == VariantKind::Portrait {
-                DEBUG_PORTRAIT_DVR_URL.to_owned()
-            } else {
-                DEBUG_DVR_URL.to_owned()
-            }
-        });
-        let dvr = rtsp::dvr::Dvr::new(debug_url);
+        let dvr = rtsp::dvr::Dvr::new(debug_dvr_url(cfg, variant));
         rtsp::dvr::spawn(
             Rc::clone(&client),
-            (!cfg.debug).then(|| login.clone()),
+            (!debug).then(|| login.clone()),
             Rc::clone(&dvr),
         );
         dvr
@@ -482,12 +524,12 @@ async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::E
         .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
     let (registration_tx, registration_rx) = kanal::unbounded();
     let dir = output
-        .join(if cfg.debug { 0 } else { broadcast_id }.to_string())
+        .join(if debug { 0 } else { broadcast_id }.to_string())
         .join(&*variant.id);
     let disk = disk::spawn_disk_output(
         disk::DiskOptions {
             output: output.clone(),
-            stream_id: if cfg.debug { 0 } else { broadcast_id },
+            stream_id: if debug { 0 } else { broadcast_id },
             variant: variant.id.clone(),
             keep_runs: args.keep_runs,
             notifier,
@@ -556,11 +598,8 @@ async fn resolve_record_variants(
     login: &str,
     args: &Record,
 ) -> Result<Option<(Vec<Variant>, u64)>, Box<dyn std::error::Error>> {
-    if cfg.debug {
-        return Ok(Some((
-            vec![variant::debug_variant(), variant::debug_portrait_variant()],
-            0,
-        )));
+    if let Some((_, variants)) = debug_channel(cfg) {
+        return Ok(Some((variants, 0)));
     }
     match get_variants(
         client,
@@ -693,12 +732,6 @@ fn list_variants(login: &str, variants: &[Variant]) {
 /// disk, notifications and the admin RPC.
 #[allow(clippy::future_not_send)]
 async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::Error>> {
-    // `--debug` is only "the endpoints are the mock edge": no subsystem below
-    // this point knows the difference.
-    #[cfg(debug_assertions)]
-    if cfg.debug {
-        constants::use_edge(constants::MOCK_BASE);
-    }
     let client = Rc::new(Client::new());
     let arena = Rc::new(ArenaSet::new());
 
@@ -792,10 +825,10 @@ mod tests {
     #[test]
     fn quality_defaults_to_the_first_variant() {
         let variants = vec![
-            debug_variant(),
+            debug_variant("mock"),
             Variant {
                 id: "audio_only".into(),
-                ..debug_variant()
+                ..debug_variant("mock")
             },
         ];
         assert_eq!(

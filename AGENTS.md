@@ -89,12 +89,15 @@ only sink; disk output is disabled and being rebuilt from
 
 ## Local dev loop (servermock)
 
-`--debug` bypasses Twitch and fetches `http://127.0.0.2:8000/index.m3u8`.
+`--debug <base>` (dev builds only; a release binary has no such flag) points GQL,
+usher and OAuth at a mock edge such as `http://127.0.0.2:8000` and replays its
+playlists. The mock's Hermes socket is on its own port, so point the daemon at it
+with `SIPHON_HERMES_URL=ws://127.0.0.1:8001/v1`.
 
 1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere). `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
-2. `cargo run -p daemon -- play -c anything -d` — `-c` is required even in debug mode; broadcast id `0`.
+2. `cargo run -p daemon -- play -c anything -d http://127.0.0.2:8000` — `-c` is required even in debug mode; broadcast id `0`.
 3. `play` serves `rtsp://127.0.0.1:7417/` and `rtsp://[::1]:7417/`; `daemon` binds `--bind` (default `127.0.0.1:7417`) and serves `rtsp://host/<channel>/<quality>/`; DESCRIBE creates the stream.
-4. `ffplay -nodisp rtsp://127.0.0.1:7417/` and `ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:7417/` are the end-to-end checks (`.../sunnys/1080p/` under `daemon -d`).
+4. `ffplay -nodisp rtsp://127.0.0.1:7417/` and `ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:7417/` are the end-to-end checks (`.../sunnys/1080p/` under `daemon -d http://127.0.0.2:8000`).
 5. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
 
 ## Worktrees
