@@ -43,7 +43,7 @@ fn home() -> PathBuf {
 
 /// `meson install`'s prefix for the libplacebo this repo builds.
 fn default_placebo() -> PathBuf {
-    home().join(".local/libplacebo-shared")
+    home().join("Projects/Code/Libs/libplacebo-shared")
 }
 
 /// Scoop's root: `%SCOOP%`, else `~/scoop` (scoop's own default).
