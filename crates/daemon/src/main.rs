@@ -132,6 +132,8 @@ struct Config {
 enum Command {
     /// Serve one channel on the loopback RTSP addresses
     Play(Play),
+    /// Record one channel to disk, exit when its broadcast ends
+    Record(Record),
     /// Serve any channel through `rtsp://host/<channel>/<quality>/`
     Daemon(Daemon),
 }
@@ -149,6 +151,31 @@ struct Play {
     /// Record the complete broadcast into this directory
     #[arg(long)]
     output: Option<std::path::PathBuf>,
+
+    /// Webhook to notify about skipped DVR chunks and alignment problems
+    #[arg(long)]
+    notify: Option<String>,
+
+    /// Keep `live.NNN` run pairs after their holes are filled
+    #[arg(long)]
+    keep_runs: bool,
+}
+
+/// One channel, no UI: wait for it to go live, record it, exit when it ends.
+#[derive(Args, Debug)]
+struct Record {
+    /// Channel login to record
+    #[arg(short, long)]
+    channel: String,
+
+    /// Record here instead of the configured recordDir
+    #[arg(long)]
+    output: Option<std::path::PathBuf>,
+
+    /// Record both orientations of a dual-format broadcast, even if the config
+    /// says otherwise
+    #[arg(long)]
+    dual_format: bool,
 
     /// Webhook to notify about skipped DVR chunks and alignment problems
     #[arg(long)]
@@ -202,6 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::parse();
     match &cfg.command {
         Command::Play(args) => Box::pin(play(&cfg, args)).await?,
+        Command::Record(args) => record(&cfg, args).await?,
         Command::Daemon(args) => daemon(&cfg, args).await?,
     }
     Ok(())
@@ -370,6 +398,140 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
 }
 
 /// A long-lived RTSP server plus the Siphon backend: config, Hermes, monitors,
+/// One channel end to end, without the daemon's UI, RPC or RTSP listener.
+///
+/// Everything that matters is the same code the daemon runs — one Hermes
+/// session, the same monitors, the same registry and disk recorder — so a run of
+/// this is a run of the real path, and it exits by itself when the broadcast
+/// ends. `recordDualFormat` from the config applies as usual.
+#[allow(clippy::future_not_send)]
+async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::Error>> {
+    let login = args.channel.to_ascii_lowercase();
+    let persisted = config::load(&config::default_path(config::APP_ID));
+    let output = args.output.clone().or_else(|| {
+        persisted
+            .record_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+    });
+    let Some(output) = output else {
+        return Err("record needs --output or a recordDir in the config".into());
+    };
+
+    let dual_format = args.dual_format || persisted.record_dual_format;
+    let client = Rc::new(Client::new());
+    // The channel id keys the Hermes topic, so it is resolved before the app
+    // starts. Debug pretends one: the mock's Hermes accepts any topic.
+    let id = if cfg.debug {
+        7
+    } else {
+        let detail = gql::fetch_channel(&client, cfg.client_id.as_deref(), &login)
+            .await?
+            .ok_or_else(|| format!("no channel named {login}"))?;
+        detail.id
+    };
+
+    let config = siphon_shared::rpc::Config {
+        version: siphon_shared::rpc::Config::VERSION,
+        channels: vec![siphon_shared::rpc::Channel {
+            login: login.clone(),
+            id,
+            display_name: Some(login.clone()),
+            record: true,
+            notify_live: false,
+            notify_titles: false,
+        }],
+        notify_title_changes: false,
+        sound: false,
+        filtered_words: Vec::new(),
+        record_dir: Some(output.display().to_string()),
+        record_dual_format: dual_format,
+    };
+
+    let arena = Rc::new(ArenaSet::new());
+    let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
+    let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
+    downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(
+        &client,
+        &downloaders_rx,
+        &downloader_metrics,
+    );
+
+    let notifier = args
+        .notify
+        .as_ref()
+        .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
+    let bus = Bus::new();
+    let registry = Rc::new(Registry::new(
+        Rc::clone(&client),
+        arena,
+        downloaders_tx.to_async(),
+        downloader_metrics,
+        RegistryOptions {
+            client_id: cfg.client_id.clone(),
+            auth_token: cfg.auth_token.clone(),
+            low_latency: cfg.low_latency,
+            debug: cfg.debug,
+            // The primary recording and, with dual format, its sibling.
+            max_streams: 2,
+            recording: RegistryRecording {
+                output: Some(output.clone()),
+                dual_format,
+            },
+            notify: notifier,
+            keep_runs: args.keep_runs,
+        },
+        Rc::clone(&bus),
+    ));
+    registry.watch_finished();
+    let (finished_tx, finished_rx) = kanal::unbounded();
+    registry.on_finished(Rc::new(move |key: &rtsp::StreamKey| {
+        let _ = finished_tx.try_send(key.clone());
+    }));
+
+    // The app owns Hermes, the baseline and the monitors. Its config path is
+    // scratch: a one-channel run must never rewrite the real config.
+    let (events_tx, events_rx) = kanal::unbounded();
+    let wake = ConsumerWake::new();
+    let sender = app::EventSender::new(events_tx, Rc::clone(&wake));
+    let app = App::new(AppInit {
+        config,
+        config_path: std::env::temp_dir().join("siphon-record-config.json"),
+        client: Rc::clone(&client),
+        registry: Rc::clone(&registry),
+        bus,
+        events: events_rx,
+        sender,
+        wake,
+        client_id: cfg.client_id.clone(),
+        debug: cfg.debug,
+    });
+    compio::runtime::spawn(app.run()).detach();
+
+    println!(
+        "record: watching {login} (id {id}), output {}",
+        output.display()
+    );
+
+    // A finished recording is the channel ending: the disk stops at the live and
+    // DVR end, and both orientations finish before this returns. A channel that
+    // is already live never waits here at all.
+    let rx = finished_rx.to_async();
+    while let Ok(key) = rx.recv().await {
+        tracing::info!(
+            target: "record",
+            login = %key.login,
+            quality = key.quality.as_deref().unwrap_or("<first>"),
+            "recording finished"
+        );
+        if !registry.is_recording(&login) {
+            println!("record: {login} finished");
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// disk, notifications and the admin RPC.
 #[allow(clippy::future_not_send)]
 async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::Error>> {

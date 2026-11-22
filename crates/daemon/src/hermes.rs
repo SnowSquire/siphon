@@ -879,7 +879,19 @@ impl App {
                         Some(user.login.as_str()),
                     );
                 }
+                let record = self
+                    .channel_config(id)
+                    .is_some_and(|channel| channel.record);
+                let login = user.login.clone();
                 self.track_channel(user);
+                if record {
+                    // StreamMetadata lags `stream-up` by seconds, so the monitor
+                    // the notification started may have found the channel still
+                    // offline and given up. The detail is in hand now; trying
+                    // again is idempotent and is what makes a fresh broadcast
+                    // record from its first segment.
+                    self.registry.monitor_set(&login);
+                }
             }
             Err(error) => {
                 tracing::info!(target: "hermes", "stream-up refresh failed: {error}");
