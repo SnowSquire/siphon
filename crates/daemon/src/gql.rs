@@ -21,7 +21,6 @@ use crate::http::Client;
 use crate::http::StatusCode;
 use crate::time::parse_iso_ms;
 
-const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 
 const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login chatColor displayName profileImageURL(width:70) broadcastSettings{title game{id name displayName}}stream{viewersCount collaborationViewersCount id createdAt}lastBroadcast{startedAt}}}";
@@ -365,7 +364,7 @@ async fn post(client: &Client, client_id: &str, body: &[u8]) -> Result<Vec<u8>, 
     let mut response = crate::http::timeout(
         GQL_TIMEOUT,
         client.post(
-            GQL_URL,
+            crate::constants::gql_endpoint(),
             "application/json",
             body,
             &[("Client-ID", client_id)],
@@ -496,6 +495,24 @@ mod tests {
             .data
             .and_then(|data| data.user)
             .and_then(GqlUser::into_channel)
+    }
+
+    /// The mock edge (`servermock/main.ts`) answers this exact shape.
+    #[test]
+    fn decodes_the_mock_edges_user_by_login_response() {
+        let body = br##"{"data":{"user":{"id":"7","login":"sunnys","chatColor":"#009146",
+            "displayName":"Sunnys","profileImageURL":"http://127.0.0.2:8000/avatar.png",
+            "broadcastSettings":{"title":"mock broadcast",
+              "game":{"id":"1","name":"Mock","displayName":"Mock"}},
+            "stream":{"id":"42","createdAt":"2026-11-22T08:31:11.264Z",
+              "viewersCount":1,"collaborationViewersCount":0},
+            "lastBroadcast":null}}}"##;
+        let user = decode_login(body).expect("mock user decodes");
+        assert_eq!(user.id, 7);
+        assert_eq!(user.login, "sunnys");
+        assert_eq!(user.stream_id, NonZeroU64::new(42));
+        assert!(user.live);
+        assert_eq!(user.viewers, Some(1));
     }
 
     #[test]

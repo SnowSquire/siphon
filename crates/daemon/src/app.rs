@@ -19,7 +19,6 @@ use futures_util::StreamExt as _;
 use siphon_shared::rpc::ArenaSummary;
 use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
-use siphon_shared::rpc::ChatColor;
 use siphon_shared::rpc::Config;
 use siphon_shared::rpc::ConnHealth;
 use siphon_shared::rpc::DownloaderSummary;
@@ -34,14 +33,14 @@ use siphon_shared::rpc::Snapshot;
 use siphon_shared::rpc::StreamKey;
 use siphon_shared::rpc::Update;
 use siphon_shared::rpc::UpdateView;
+use tracing::info;
 
 use crate::balesh::CheapRng;
 use crate::balesh::NanoId;
 use crate::bus::Bus;
-use crate::constants::NOTIFICATION_CAP;
-use crate::rpc;
 use crate::config;
 use crate::config::ConfigError;
+use crate::constants::NOTIFICATION_CAP;
 use crate::gql;
 use crate::gql::ChannelDetail;
 use crate::gql::GqlError;
@@ -54,8 +53,8 @@ use crate::http::ws::WsStream;
 use crate::matcher::Matcher;
 use crate::notifier;
 use crate::registry::Registry;
+use crate::rpc;
 use crate::time::now_ms;
-use tracing::info;
 use crate::update;
 
 /// One thing the daemon loop wakes for.
@@ -119,7 +118,6 @@ pub struct AppInit {
     pub jobs: kanal::AsyncReceiver<Box<JobDone>>,
     pub jobs_tx: kanal::Sender<Box<JobDone>>,
     pub client_id: Option<String>,
-    pub debug: bool,
 }
 
 /// One finished background job.
@@ -155,7 +153,6 @@ pub struct App {
     /// When the next counter flush is due, while a UI is connected.
     telemetry_at: Instant,
     pub(crate) client_id: Option<String>,
-    pub(crate) debug: bool,
 
     pub(crate) channels: HashMap<u64, ChannelDetail>,
     /// Avatar downloads in flight, so a refresh does not start a second one.
@@ -210,55 +207,17 @@ impl App {
             jobs,
             jobs_tx,
             client_id,
-            debug,
         } = init;
         let matcher = crate::hermes::build_matcher(&config.filtered_words);
-        // Debug mode normally pretends the socket is healthy; pointing it at a
-        // stand-in with `SIPHON_HERMES_URL` makes it connect for real.
-        let hermes_enabled = !debug || std::env::var_os("SIPHON_HERMES_URL").is_some();
-        let conn = if debug && !hermes_enabled {
-            ConnHealth::Connected
-        } else if config.channels.is_empty() {
+        // Hermes is wanted whenever there is a channel to watch; the endpoint is
+        // whatever the edge is (Twitch, or the mock under `--debug`).
+        let hermes_enabled = !config.channels.is_empty();
+        let conn = if config.channels.is_empty() {
             ConnHealth::NoChannels
         } else {
             ConnHealth::Connecting
         };
-        // Debug mode never talks to GQL, so a configured channel would have no
-        // detail for the Hermes path to update and `stream-up` would be dropped.
-        // Seed them from the config so a stand-in socket can drive a broadcast.
-        let channels: HashMap<u64, ChannelDetail> = if debug {
-            config
-                .channels
-                .iter()
-                .map(|channel| {
-                    (
-                        channel.id,
-                        ChannelDetail {
-                            id: channel.id,
-                            login: channel.login.clone(),
-                            display_name: channel
-                                .display_name
-                                .clone()
-                                .unwrap_or_else(|| channel.login.clone()),
-                            chat_color: ChatColor::Twitch(0x0091_46ff),
-                            profile_image_url: String::new(),
-                            avatar_path: None,
-                            stream_id: None,
-                            stream_title: None,
-                            stream_start: None,
-                            last_live: None,
-                            viewers: None,
-                            collaboration_viewers: None,
-                            game: None,
-                            live: false,
-                            error: None,
-                        },
-                    )
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let channels: HashMap<u64, ChannelDetail> = HashMap::new();
         Self {
             config,
             config_path,
@@ -271,7 +230,6 @@ impl App {
             frame: Vec::new(),
             telemetry_at: Instant::now(),
             client_id,
-            debug,
             channels,
             avatars_pending: HashSet::new(),
             pending: Vec::new(),
@@ -492,26 +450,29 @@ impl App {
                     if magic != siphon_shared::rpc::MAGIC
                         || protocol != siphon_shared::rpc::PROTOCOL_VERSION
                     {
-                        let reason =
-                            format!("protocol {protocol} (backend speaks {})", siphon_shared::rpc::PROTOCOL_VERSION);
+                        let reason = format!(
+                            "protocol {protocol} (backend speaks {})",
+                            siphon_shared::rpc::PROTOCOL_VERSION
+                        );
                         close = !conn.push(&ServerMessage::Rejected(reason));
                         break;
                     }
                     info!(%app_version, "rpc: client connected");
                     let snapshot = self.snapshot();
-                    let queued = conn
-                        .push(&ServerMessage::Welcome {
-                            protocol: siphon_shared::rpc::PROTOCOL_VERSION,
-                            server_version: env!("CARGO_PKG_VERSION").to_owned(),
-                        })
-                        && conn.push(&ServerMessage::Snapshot(Box::new(snapshot)));
+                    let queued = conn.push(&ServerMessage::Welcome {
+                        protocol: siphon_shared::rpc::PROTOCOL_VERSION,
+                        server_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    }) && conn.push(&ServerMessage::Snapshot(Box::new(snapshot)));
                     if !queued {
                         close = true;
                         break;
                     }
                     conn.ready = true;
                 }
-                Ok(siphon_shared::rpc::ClientMessage::Request { id: request_id, request }) => {
+                Ok(siphon_shared::rpc::ClientMessage::Request {
+                    id: request_id,
+                    request,
+                }) => {
                     let result = self.handle_request(request);
                     if !conn.push(&ServerMessage::Response {
                         id: request_id,
@@ -1319,7 +1280,7 @@ impl App {
 
     pub fn push_update_check(&mut self) {
         self.update_check_at = Instant::now() + update::CHECK_INTERVAL;
-        if self.debug || self.update_busy {
+        if self.update_busy {
             return;
         }
         self.update_busy = true;

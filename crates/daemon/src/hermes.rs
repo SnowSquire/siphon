@@ -24,20 +24,19 @@ use crate::http::ws::WsStream;
 use crate::matcher::Matcher;
 use crate::time::now_iso;
 
-const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
-
 /// The endpoint to connect to. `SIPHON_HERMES_URL` points the daemon at the mock
 /// server (or any other stand-in) without a rebuild; it is also what makes debug
 /// mode connect at all, since debug normally pretends the socket is healthy.
 pub fn url() -> String {
-    std::env::var("SIPHON_HERMES_URL").unwrap_or_else(|_| HERMES_URL.to_owned())
+    std::env::var("SIPHON_HERMES_URL")
+        .unwrap_or_else(|_| crate::constants::hermes_endpoint().to_owned())
 }
-use crate::constants::HERMES_WELCOME_TIMEOUT as WELCOME_TIMEOUT;
-use crate::constants::HERMES_MAX_RECONNECT_DELAY as MAX_RECONNECT_DELAY;
 use crate::constants::HERMES_KEEPALIVE_MISSES as KEEPALIVE_MISSED_LIMIT;
+use crate::constants::HERMES_MAX_RECONNECT_DELAY as MAX_RECONNECT_DELAY;
 /// How long after a `stream-down` a channel's toasts stay muted. Restreams
 /// within this window update state silently instead of notifying again.
 use crate::constants::HERMES_OFFLINE_QUIET as OFFLINE_QUIET;
+use crate::constants::HERMES_WELCOME_TIMEOUT as WELCOME_TIMEOUT;
 
 /// One Hermes pubsub subscription: title/game updates or live/viewer updates
 /// for a channel. The subscription id stays in the app; every welcome replays
@@ -132,27 +131,9 @@ impl App {
             return;
         }
         self.connecting = true;
-        // Debug mode has no GQL: the seeded details are the whole truth, and a
-        // stand-in socket only needs the ids to subscribe to.
-        let debug_channels: Vec<ChannelDetail> = if self.debug {
-            self.channels.values().cloned().collect()
-        } else {
-            Vec::new()
-        };
-        let debug = self.debug;
         let client = std::rc::Rc::clone(&self.client);
         let client_id = self.client_id.clone();
         self.spawn_job(async move {
-            if debug {
-                let url = url();
-                tracing::info!(target: "hermes", "connecting to {url}");
-                let socket = WsStream::connect(&url).await.ok();
-                return JobDone::ConnectFinished(Box::new(ConnectOutcome {
-                    channels: debug_channels,
-                    missing: Vec::new(),
-                    socket,
-                }));
-            }
             let fetched = gql::fetch_channels(&client, client_id.as_deref(), &ids).await;
             let ok = fetched.is_ok();
             let (channels, missing) = match fetched {
@@ -801,17 +782,12 @@ impl App {
                 if channel.as_ref().is_some_and(|channel| channel.record) {
                     self.registry.monitor_live(&login);
                 }
-                // Debug mode has no GQL to refresh from; the seeded detail is
-                // all there is (and a stand-in socket is what drives it).
-                if !self.debug {
-                    let client = std::rc::Rc::clone(&self.client);
-                    let client_id = self.client_id.clone();
-                    self.spawn_job(async move {
-                        let result =
-                            gql::fetch_channels(&client, client_id.as_deref(), &[id]).await;
-                        JobDone::LiveRefreshed(id, result)
-                    });
-                }
+                let client = std::rc::Rc::clone(&self.client);
+                let client_id = self.client_id.clone();
+                self.spawn_job(async move {
+                    let result = gql::fetch_channels(&client, client_id.as_deref(), &[id]).await;
+                    JobDone::LiveRefreshed(id, result)
+                });
             }
             Some("stream-down") => {
                 let channel = self.channel_config(id);

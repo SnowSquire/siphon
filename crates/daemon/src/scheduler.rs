@@ -217,6 +217,9 @@ pub struct StreamScheduler {
 
     segment_tail: u64,
     prefetch_tail: u64,
+    /// The stream was parked with nobody reading, so the next reload starts at
+    /// the live edge instead of replaying the playlist's window.
+    resume_at_edge: bool,
     last_segment_dur: Duration,
     metrics: Option<Rc<StreamMetrics>>,
 }
@@ -251,6 +254,7 @@ impl StreamScheduler {
 
             segment_tail: 0,
             prefetch_tail: 0,
+            resume_at_edge: false,
             last_segment_dur: Duration::from_secs(5),
             metrics: None,
         }
@@ -378,6 +382,34 @@ impl StreamScheduler {
         self.readers.push(consumer);
     }
 
+    /// Polls nothing and fetches nothing while no consumer is registered.
+    ///
+    /// A parked scheduler also drops its window: those spools pin arena slots,
+    /// and nobody is going to read them. The registration channel stays open, so
+    /// the next viewer (or the disk re-attaching) resumes it in place.
+    async fn park_if_idle(&mut self) -> bool {
+        if !self.readers.is_empty() {
+            return true;
+        }
+        debug!("no consumers, parking");
+        self.segments.clear();
+        self.prefetches.clear();
+        self.init = None;
+        self.live_window.borrow_mut().clear();
+        self.resume_at_edge = true;
+        loop {
+            match next_reader(self.receive.clone(), Rc::clone(&self.reader_wake)).await {
+                Some(registration) => {
+                    self.adopt(registration);
+                    if !self.readers.is_empty() {
+                        return true;
+                    }
+                }
+                None => return false,
+            }
+        }
+    }
+
     async fn mainloop(&mut self) -> eros::Result<(), SchedulerErrors> {
         use crate::constants::EDGE_CATCHUP_POLL as CATCHUP_POLL;
         use crate::constants::EDGE_POLL_MAX as MAX_EDGE_POLL;
@@ -399,6 +431,9 @@ impl StreamScheduler {
         // recorder starting against a broadcast that just ended) would never
         // see a segment at all.
         if !self.handle_new_readers() {
+            return Err(Stopped).union();
+        }
+        if !self.park_if_idle().await {
             return Err(Stopped).union();
         }
 
@@ -651,6 +686,13 @@ impl StreamScheduler {
             match event.union()? {
                 Event::MediaSequence(front) => {
                     debug!("new front {front}");
+                    if self.resume_at_edge {
+                        // Resume at the live edge: the window before the park is
+                        // older than any consumer that just arrived can use.
+                        self.resume_at_edge = false;
+                        self.segment_tail = self.segment_tail.max(front);
+                        self.prefetch_tail = self.prefetch_tail.max(front);
+                    }
                     self.segments.retain(|s| s.sequence_num >= front);
                 }
                 Event::ProgramDateTime(pdt_ms) => {

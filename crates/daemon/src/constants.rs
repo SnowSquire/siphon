@@ -10,6 +10,8 @@ pub const PLAYER_VERSION: &str = "1.58.0-rc.2";
 pub const TWITCH_GQL_ENDPOINT: &str = "https://gql.twitch.tv/gql";
 pub const TWITCH_OAUTH_ENDPOINT: &str = "https://id.twitch.tv/oauth2/validate";
 pub const TWITCH_HLS_BASE: &str = "https://usher.ttvnw.net/api/v2/channel/hls";
+/// Hermes pubsub. `SIPHON_HERMES_URL` and `--debug` override it.
+pub const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 
 pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
@@ -127,6 +129,47 @@ pub const MAX_UPDATE: usize = 64 * 1024 * 1024;
 #[cfg(debug_assertions)]
 pub const MOCK_BASE: &str = "http://127.0.0.2:8000";
 
+/// Endpoint overrides, set once at startup when `--debug` points the daemon at
+/// the mock edge. The real endpoints stay the defaults, so there is no mode
+/// flag anywhere below `main`.
+static GQL_ENDPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static HLS_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PUBLIC_ENDPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static HERMES_ENDPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[must_use]
+pub fn gql_endpoint() -> &'static str {
+    GQL_ENDPOINT
+        .get()
+        .map_or(TWITCH_GQL_ENDPOINT, String::as_str)
+}
+
+#[must_use]
+pub fn hls_base() -> &'static str {
+    HLS_BASE.get().map_or(TWITCH_HLS_BASE, String::as_str)
+}
+
+#[must_use]
+pub fn hermes_endpoint() -> &'static str {
+    HERMES_ENDPOINT.get().map_or(HERMES_URL, String::as_str)
+}
+
+#[must_use]
+pub fn public_endpoint() -> &'static str {
+    PUBLIC_ENDPOINT
+        .get()
+        .map_or(TWITCH_OAUTH_ENDPOINT, String::as_str)
+}
+
+/// Points GQL, usher and OAuth at `base`. Called once, from `main`.
+pub fn use_edge(base: &str) {
+    let _ = GQL_ENDPOINT.set(format!("{base}/gql"));
+    let _ = HLS_BASE.set(format!("{base}/api/v2/channel/hls"));
+    let _ = PUBLIC_ENDPOINT.set(format!("{base}/oauth2/validate"));
+    // The mock's websocket listens on its own port.
+    let _ = HERMES_ENDPOINT.set("ws://127.0.0.1:8001/v1".to_owned());
+}
+
 /// Segments kept per pipeline for `ListSegments` and the UI ring.
 pub const SEGMENT_RING: usize = 64;
 
@@ -158,4 +201,5 @@ pub const HERMES_OFFLINE_QUIET: Duration = Duration::from_mins(10);
 /// Update check cadence, request timeout and the release feed.
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
 pub const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
-pub const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";
+pub const RELEASES_URL: &str =
+    "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";

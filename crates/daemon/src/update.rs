@@ -12,11 +12,10 @@ use thiserror::Error;
 
 use crate::constants::MAX_JSON;
 use crate::constants::MAX_UPDATE;
-use crate::http::Client;
-
-pub use crate::constants::UPDATE_CHECK_INTERVAL as CHECK_INTERVAL;
 use crate::constants::RELEASES_URL;
+pub use crate::constants::UPDATE_CHECK_INTERVAL as CHECK_INTERVAL;
 use crate::constants::UPDATE_TIMEOUT;
+use crate::http::Client;
 #[cfg(windows)]
 const INSTALL_KEY: &str = "Software\\Ozeniken\\Siphon";
 

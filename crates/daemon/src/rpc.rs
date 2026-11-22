@@ -210,8 +210,8 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::app::AppInit;
-    use crate::bus::Bus;
     use crate::arena::ArenaSet;
+    use crate::bus::Bus;
     use crate::http::Client as HttpClient;
     use crate::metrics::DownloaderMetrics;
     use crate::registry::Options as RegistryOptions;
@@ -327,7 +327,6 @@ mod tests {
                 jobs: jobs_rx.to_async(),
                 jobs_tx,
                 client_id: None,
-                debug: true,
             });
             compio::runtime::spawn(daemon.run()).detach();
 

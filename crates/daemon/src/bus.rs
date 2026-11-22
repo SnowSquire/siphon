@@ -108,7 +108,9 @@ impl Bus {
     pub fn publish(&self, update: Update) {
         let revision = self.revision.get().wrapping_add(1);
         self.revision.set(revision);
-        self.pending.borrow_mut().push(Broadcast { revision, update });
+        self.pending
+            .borrow_mut()
+            .push(Broadcast { revision, update });
         self.wake.borrow().wake();
     }
 
@@ -223,7 +225,10 @@ mod tests {
         bus.publish(Update::Conn(ConnHealth::Connecting));
         let pending = bus.take_pending();
         assert_eq!(pending.len(), 1);
-        assert!(matches!(pending[0].update, Update::Conn(ConnHealth::Connecting)));
+        assert!(matches!(
+            pending[0].update,
+            Update::Conn(ConnHealth::Connecting)
+        ));
         assert_eq!(pending[0].revision, 2);
     }
 

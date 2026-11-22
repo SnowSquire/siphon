@@ -270,7 +270,13 @@ impl Registry {
     /// Seeds the fetched half of a channel row, so a test can drive the
     /// lifecycle without GQL or usher.
     #[cfg(test)]
-    pub fn seed_channel(&self, login: &str, record: bool, variants: Vec<Variant>, broadcast_id: u64) {
+    pub fn seed_channel(
+        &self,
+        login: &str,
+        record: bool,
+        variants: Vec<Variant>,
+        broadcast_id: u64,
+    ) {
         self.ensure_row(login);
         self.update_row(login, |row| {
             row.record = record;
@@ -609,7 +615,10 @@ impl Registry {
             self.start_recording(&existing);
             return;
         }
-        let Some(data) = self.channel_row(&runtime.key.login).and_then(|row| row.data) else {
+        let Some(data) = self
+            .channel_row(&runtime.key.login)
+            .and_then(|row| row.data)
+        else {
             return;
         };
         let sibling = self.spawn_runtime(&key, &data, &variant, true);
@@ -1020,7 +1029,11 @@ impl Registry {
     }
 
     #[must_use]
-    pub fn segments(&self, key: &StreamKey, limit: usize) -> Option<Vec<siphon_shared::rpc::SegmentRecord>> {
+    pub fn segments(
+        &self,
+        key: &StreamKey,
+        limit: usize,
+    ) -> Option<Vec<siphon_shared::rpc::SegmentRecord>> {
         self.streams
             .borrow()
             .get(key)

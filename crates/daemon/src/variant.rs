@@ -10,9 +10,6 @@ use crate::constants::DEFAULT_CLIENT_ID;
 use crate::constants::MAX_JSON;
 use crate::constants::MAX_MANIFEST;
 use crate::constants::PLAYER_VERSION;
-use crate::constants::TWITCH_GQL_ENDPOINT;
-use crate::constants::TWITCH_HLS_BASE;
-use crate::constants::TWITCH_OAUTH_ENDPOINT;
 use crate::http::Client;
 use crate::utils::attribute;
 use crate::utils::attributes;
@@ -201,7 +198,7 @@ pub async fn fetch_variant_playlist(
 
     let mut response = client
         .post(
-            TWITCH_GQL_ENDPOINT,
+            crate::constants::gql_endpoint(),
             "text/plain;charset=UTF-8",
             &body,
             &headers,
@@ -258,7 +255,8 @@ pub async fn fetch_variant_playlist(
     ];
 
     let url = format!(
-        "{TWITCH_HLS_BASE}/{token_channel}.m3u8?{}",
+        "{}/{token_channel}.m3u8?{}",
+        crate::constants::hls_base(),
         query_string(&params)
     );
 
@@ -467,7 +465,10 @@ async fn choose_client_id<'a>(
         (None, Some(auth_token)) => {
             let authorization = format!("OAuth {auth_token}");
             let mut response = client
-                .get_with(TWITCH_OAUTH_ENDPOINT, &[("Authorization", &authorization)])
+                .get_with(
+                    crate::constants::public_endpoint(),
+                    &[("Authorization", &authorization)],
+                )
                 .await?;
             let body = response.body.read_to_end(MAX_JSON).await?;
             Ok(sonic_rs::get(body.as_slice(), pointer!["client_id"])?

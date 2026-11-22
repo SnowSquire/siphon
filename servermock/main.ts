@@ -642,6 +642,71 @@ function notFound(res: ServerResponse): void {
 
 const spark_time_ms = Date.now() - START_MS / SPEED;
 
+/** The one channel the fixtures belong to. */
+const MOCK_LOGIN = process.env.MOCK_LOGIN ?? "sunnys";
+const MOCK_CHANNEL_ID = process.env.MOCK_CHANNEL_ID ?? "7";
+const MOCK_BROADCAST_ID = "42";
+/** A 1x1 transparent PNG, so the avatar fetch is not a 404 storm. */
+const AVATAR = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+  "base64",
+);
+
+async function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** The GQL shape `gql.rs` and `variant.rs` parse, for one mock channel. */
+function mockUser(origin: string) {
+  return {
+    id: MOCK_CHANNEL_ID,
+    login: MOCK_LOGIN,
+    chatColor: "#009146",
+    displayName: "Sunnys",
+    profileImageURL: `${origin}/avatar.png`,
+    broadcastSettings: {
+      title: "mock broadcast",
+      game: { id: "1", name: "Mock", displayName: "Mock" },
+    },
+    stream: {
+      id: MOCK_BROADCAST_ID,
+      createdAt: new Date(Date.now() - 60_000).toISOString(),
+      viewersCount: 1,
+      collaborationViewersCount: 0,
+    },
+    lastBroadcast: null,
+  };
+}
+
+function gqlResponse(operation: string | undefined, variables: any, origin: string) {
+  switch (operation) {
+    case "UserByLogin": {
+      const wanted = String(variables?.login ?? "").toLowerCase();
+      if (wanted !== MOCK_LOGIN.toLowerCase()) return { data: { user: null } };
+      return { data: { user: mockUser(origin) } };
+    }
+    case "UsersByIds": {
+      const ids = (variables?.ids ?? []) as string[];
+      const user = mockUser(origin);
+      return { data: { users: ids.map((id) => (String(id) === user.id ? user : null)) } };
+    }
+    case "PlaybackAccessToken":
+      return {
+        data: {
+          streamPlaybackAccessToken: {
+            value: JSON.stringify({ channel: MOCK_LOGIN }),
+            signature: "mock",
+          },
+        },
+      };
+    // The archive routes are not modelled; the recorder promotes live.
+    default:
+      return { data: null };
+  }
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const origin = `http://${url.host}`;
@@ -649,6 +714,27 @@ const server = createServer(async (req, res) => {
   try {
     if (url.pathname === "/master.m3u8") {
       playlist(res, masterPlaylist(origin));
+      return;
+    }
+
+    // The daemon posts its GQL here when `--debug` points the edge at the mock.
+    if (req.method === "POST" && url.pathname === "/gql") {
+      const body = await readBody(req);
+      const request = JSON.parse(body) as { operationName?: string; variables?: unknown };
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(gqlResponse(request.operationName, request.variables, origin)));
+      return;
+    }
+
+    // Usher: `<base>/api/v2/channel/hls/<login>.m3u8` answers the master.
+    if (url.pathname.startsWith("/api/v2/channel/hls/")) {
+      playlist(res, masterPlaylist(origin));
+      return;
+    }
+
+    if (url.pathname === "/avatar.png") {
+      res.setHeader("content-type", "image/png");
+      res.end(AVATAR);
       return;
     }
 

@@ -700,6 +700,12 @@ fn list_variants(login: &str, variants: &[Variant]) {
 /// disk, notifications and the admin RPC.
 #[allow(clippy::future_not_send)]
 async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::Error>> {
+    // `--debug` is only "the endpoints are the mock edge": no subsystem below
+    // this point knows the difference.
+    #[cfg(debug_assertions)]
+    if cfg.debug {
+        constants::use_edge(constants::MOCK_BASE);
+    }
     let client = Rc::new(Client::new());
     let arena = Rc::new(ArenaSet::new());
 
@@ -772,7 +778,6 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         jobs: jobs_rx.to_async(),
         jobs_tx,
         client_id: cfg.client_id.clone(),
-        debug: cfg.debug,
     });
     compio::runtime::spawn(app.run()).detach();
 

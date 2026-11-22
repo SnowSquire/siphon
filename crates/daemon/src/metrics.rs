@@ -11,7 +11,6 @@ use siphon_shared::rpc::StreamKey;
 use siphon_shared::rpc::Update;
 
 use crate::bus::Bus;
-
 /// Segments kept per pipeline for `ListSegments` and the UI ring.
 use crate::constants::SEGMENT_RING as RING;
 
