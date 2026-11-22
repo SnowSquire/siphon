@@ -371,6 +371,9 @@ impl Registry {
             return Err(ResolveError::NOT_FOUND);
         };
         let runtime = self.spawn_runtime(&key, &data, variant, false);
+        // A DESCRIBE is what a viewer is: attach the media engine now, before
+        // the control connection waits for the first segment's codec config.
+        runtime.upgrade();
         self.streams
             .borrow_mut()
             .insert(key.clone(), Rc::clone(&runtime));
