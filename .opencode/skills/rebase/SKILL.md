@@ -1,19 +1,20 @@
 ---
-name: Merge worktree back
-description: Merge an OpenCode worktree's work into this jj repo, rescue media the worktree created, and delete the worktree.
+name: Rebase worktree back
+description: Rebase an OpenCode worktree's commits into this jj repo, rescue media the worktree created, and delete the worktree.
 ---
 
-# Merge a worktree back into the main repo
+# Rebase a worktree back into the main repo
 
 A worktree created by `worktree_create` is a **jj workspace on this same repo**
 (shared `.jj`, one commit store, detached git HEAD), not a clone. There is
-nothing to fetch, push or `git merge`: its commits are already in this repo's
-history and visible with `jj log`. Only the *workspace pointers* differ.
+nothing to fetch or push: its commits are already in this repo's history and
+visible with `jj log`. Only the *workspace pointers* differ, and the two lines
+almost always fork from a common base — so this is a **rebase**.
 
 Use the absolute directory `worktree_create` returned — it is
 `worktree_under/<repo-parent>` in some setups and
 `~/.local/share/opencode/worktree/<project>/<name>` in others; do not assume.
-`. ` (this directory) is the default workspace. Each live worktree is an extra
+`.` (this directory) is the default workspace. Each live worktree is an extra
 `opencode-<uuid>` entry in `jj workspace list` and a second path in
 `git worktree list`.
 
@@ -26,7 +27,7 @@ jj log -r '::@' --no-graph -T 'change_id.short() ++ " " ++ commit_id.short() ++ 
 ```
 
 **A subagent normally leaves `@` empty** (this repo's convention), so the work
-is in `@-`, `@--`, … — `jj edit @` would merge nothing. Find the **first
+is in `@-`, `@--`, … — `jj edit @` would rebase nothing. Find the **first
 described commit** of the worktree's line: that is the source for the rebase.
 
 Then look at the main checkout:
@@ -36,55 +37,23 @@ cd <repo>
 jj log -r 'ancestors(@, 10)' --no-graph -T 'change_id.short() ++ " " ++ description.first_line() ++ "\n"'
 ```
 
-Both sides almost always have commits off a common base (you were working in
-parallel), so this is a **rebase**, not a checkout.
-
-## 2. Join the two lines: rebase by default, a real merge only on purpose
-
-Two different results, and they are not interchangeable:
-
-- **Rebase** (the default here) replays the worktree's commits on top of yours.
-  The result is one line: the worktree commits get new commit IDs but keep their
-  change IDs, so nothing is lost and `jj show <change>`/`jj squash --from
-  <change>` still work. This is what an agent worktree deserves: it is a
-  short-lived convenience, never published, and its files are usually disjoint
-  from the main line's, so "it happened after" is the honest simplification.
-- **Merge** has the two lines meet in a commit with two parents, and the fork
-  stays visible in the graph. It is the truthful picture when the worktree's line
-  is not a convenience but a branch with independent identity (long-lived,
-  reviewed/tested as its own snapshot, or published), and it preserves the
-  original commit IDs. The cost is that the graph now branches: `jj chain` and
-  `jj log -r '::@'` show a merge node that owns nothing of its own, and anything
-  that later wants the change has to walk two parents.
-
-jj has no `jj merge` command: a merge commit is `jj new <rev-a> <rev-b>`. With
-disjoint files it resolves itself; otherwise resolve the conflicts in that
-commit's working copy, then `jj new` on top.
-
-### Rebase (default)
+## 2. Move the worktree's commits on top of yours
 
 ```bash
 cd <repo>                                  # @ here is your empty working copy
 jj rebase -s <first-worktree-commit> -d '@'
 jj abandon <worktree-empty-@>              # the empty tip, if it came along
-jj edit <last-worktree-commit>             # @ = the merged tip
+jj edit <last-worktree-commit>             # @ = the rebased tip
 jj new                                     # empty @ on top
 jj abandon <the-empty-commit-that-was-your-@>   # leaves no empty commit mid-history
 ```
 
-### Merge (only when the line should stay visible)
-
-```bash
-cd <repo>
-jj new <your-tip> <worktree-tip>           # the merge commit is now @; resolve here
-jj diff --git                              # a clean merge has an empty diff
-jj new                                     # empty @ on top of the merge
-jj abandon <both-empty-working-copies>     # the two empty tips, if they came along
-```
-
-Either way, verify: `jj log -r '::@'` (or `jj chain`) ends with `@` empty and
-undescribed. `jj status` must be clean — if it is not, something was dropped or a
-conflict is unresolved; inspect with `jj diff --git` before going on.
+The rebase gives the worktree commits new commit IDs but keeps their **change
+IDs**, so `jj show <change>` and `jj squash --from <change>` still work
+afterwards. Verify: `jj log -r '::@'` (or `jj chain`) shows your commits, then
+the worktree's, with `@` empty and undescribed on top. `jj status` must be clean
+— if it is not, the rebase dropped something or left a conflict; inspect with
+`jj diff --git` before going on.
 
 Do **not** squash the worktree's commits into one, and do not squash them into
 an undescribed parent: keep them as their own described commits so they can be
@@ -151,7 +120,7 @@ command errors.
 ## 6. Verify
 
 ```bash
-jj status               # @ empty, @- is the merged commit
+jj status               # @ empty, @- is the rebased commit
 jj workspace list       # only "default (current)" (plus unrelated worktrees)
 git worktree list       # only this repo (plus unrelated worktrees)
 ls <worktree-parent>    # the directory is gone
@@ -160,20 +129,19 @@ ls <worktree-parent>    # the directory is gone
 ## Pitfalls
 
 - **Empty `@` is the norm, not an exception.** Rebasing *from* the first
-  described commit is the merge; `jj edit @` is a no-op.
+  described commit is the operation; `jj edit @` is a no-op.
 - **`jj workspace list` names the workspace, not the directory.** The entry is
   `opencode-<uuid>`; match it by commit id.
 - **The two workspaces share one op log.** A `jj commit`/`describe`/`rebase` here
   rewrites `@`, and the worktree's `@` (same change id) follows on its next jj
   command — which is why the worktree then reads "no changes" instead of showing
-  the diff you just committed. `jj status` in the worktree after the merge is
+  the diff you just committed. `jj status` in the worktree after the rebase is
   not evidence of anything.
 - **Ignored media is per-directory.** The clone the setup script made is just a
   copy; files the worktree generated point nowhere else. Rescue those before
   removing it.
-- **`git` is a trap**: detached HEAD, stale index, reports merged files as
-  modified. Use `jj diff --git` / `jj log`, and only use git for
-  `git worktree list`.
+- **`git` is a trap**: detached HEAD, stale index, reports files as modified.
+  Use `jj diff --git` / `jj log`, and only use git for `git worktree list`.
 - **`rm -rf` only after `jj workspace forget`**. Deleting a registered workspace
   leaves a stale entry and jj errors on every command in the repo.
 - `scripts/worktree-setup.sh` clones `captures/` from this checkout (reflink on
