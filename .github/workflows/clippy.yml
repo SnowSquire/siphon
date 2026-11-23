@@ -1,10 +1,10 @@
 name: clippy
 
 # Lint the whole workspace natively and for the Windows target on every branch
-# push. The Windows job is the same cross setup the release uses, so it restores
-# the xwin/shaderc/libplacebo caches from a release run instead of rebuilding
-# them. Keep the pins and the cache keys identical to release.yml: the caches
-# are shared by key, not by workflow.
+# push. Both jobs build a check from the flake, so they use the same rust
+# toolchain, MSVC CRT/SDK and libplacebo prefix the packages build with, and
+# they reuse the dependency layer the binaries are built from (`cargoClippy`
+# on `cargoArtifacts`) instead of recompiling it.
 #
 # A docs-only push is skipped. A new push to the same ref cancels the previous
 # clippy run; it is a check, not a release.
@@ -29,147 +29,53 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep in sync with release.yml.
-  XWIN_VERSION: "0.10.0"
-  SHADERC_VERSION: v2026.4
-  LIBPLACEBO_REV: b785229836d6879249ecb21551ba098ed549b5f6
 
 jobs:
   linux:
     name: Linux
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
-      - name: install the native toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang libclang-dev llvm pkg-config libplacebo-dev libvulkan-dev \
-            libxkbcommon-dev libfontconfig1-dev
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The entry holds `.#linux-deps` plus everything the lint needs, so it
+      # only changes with the lockfile or a flake pin.
+      - uses: nix-community/cache-nix-action@v7
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: linux-clippy
-          cache-on-failure: true
+          primary-key: nix-clippy-linux-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          restore-prefixes-first-match: nix-clippy-linux-
+          gc-max-store-size-linux: 8G
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: nix build .#checks.linux-clippy
 
   windows:
-    name: Windows x64 (cross)
+    name: Windows x64
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
-      - name: install the cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang lld llvm cmake ninja-build pkg-config libvulkan-dev
-          clang-cl --version >/dev/null
-
-      - uses: actions/setup-python@v7
+      - uses: cachix/install-nix-action@v30
         with:
-          python-version: "3.12"
-      - name: install meson
-        run: pip install --disable-pip-version-check meson jinja2
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Shares the shape of the release's `deps` entry: same derivation, so a
+      # nightly's cache makes the next lint run fast.
+      - uses: nix-community/cache-nix-action@v7
         with:
-          targets: x86_64-pc-windows-msvc
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: windows-clippy
-          cache-on-failure: true
+          primary-key: nix-clippy-windows-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          restore-prefixes-first-match: |
+            nix-clippy-windows-
+            nix-deps-
+          gc-max-store-size-linux: 8G
 
-      - name: cache xwin and the MSVC CRT/SDK
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/xwin
-            ~/.cache/xwin-cache
-            ~/.cache/xwin
-          key: xwin-${{ env.XWIN_VERSION }}-${{ runner.os }}-v1
-
-      - name: install xwin and splat the CRT/SDK
-        run: |
-          command -v xwin >/dev/null || \
-            cargo install xwin --locked --version "$XWIN_VERSION"
-          if [[ ! -d "$HOME/.cache/xwin/crt/include" ]]; then
-            xwin --accept-license --cache-dir "$HOME/.cache/xwin-cache" \
-              splat --output "$HOME/.cache/xwin"
-          fi
-          splat="$HOME/.cache/xwin"
-          {
-            echo "RUSTFLAGS=-Lnative=$splat/crt/lib/x86_64 -Lnative=$splat/sdk/lib/um/x86_64 -Lnative=$splat/sdk/lib/ucrt/x86_64"
-            echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link"
-            echo "CC_x86_64_pc_windows_msvc=clang-cl"
-            echo "CXX_x86_64_pc_windows_msvc=clang-cl"
-            echo "AR_x86_64_pc_windows_msvc=llvm-lib"
-            echo "CFLAGS_x86_64_pc_windows_msvc=--target=x86_64-pc-windows-msvc /imsvc$splat/crt/include /imsvc$splat/sdk/include/ucrt /imsvc$splat/sdk/include/um /imsvc$splat/sdk/include/shared"
-            echo "CXXFLAGS_x86_64_pc_windows_msvc=--target=x86_64-pc-windows-msvc /imsvc$splat/crt/include /imsvc$splat/sdk/include/ucrt /imsvc$splat/sdk/include/um /imsvc$splat/sdk/include/shared"
-          } >> "$GITHUB_ENV"
-
-      - name: point the build scripts at the prefixes
-        run: |
-          {
-            echo "LIBS_ROOT=$RUNNER_TEMP/libs"
-            echo "SHADERC_PREFIX=$RUNNER_TEMP/libs/shaderc/win-prefix"
-            echo "SHADERC_BUILD=$RUNNER_TEMP/libs/shaderc-build"
-            echo "LIBPLACEBO_PREFIX=$RUNNER_TEMP/libs/libplacebo/win-prefix"
-            echo "LIBPLACEBO_SRC=$RUNNER_TEMP/libs/libplacebo"
-            echo "VULKAN_SDK=$RUNNER_TEMP/libs/vulkan"
-          } >> "$GITHUB_ENV"
-
-      - name: cache shaderc and libplacebo prefixes
-        uses: actions/cache@v6
-        with:
-          path: |
-            ${{ runner.temp }}/libs/shaderc/win-prefix
-            ${{ runner.temp }}/libs/libplacebo/win-prefix
-            ${{ runner.temp }}/libs/vulkan
-          key: win-deps-${{ env.SHADERC_VERSION }}-${{ env.LIBPLACEBO_REV }}-${{ hashFiles('scripts/build-shaderc-win.sh', 'scripts/build-libplacebo-win.sh') }}
-
-      - name: cache shaderc sources
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/libs/shaderc
-          key: shaderc-src-${{ env.SHADERC_VERSION }}-v1
-
-      - name: cache the libplacebo checkout
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/libs/libplacebo
-          key: libplacebo-src-${{ env.LIBPLACEBO_REV }}-v1
-
-      - name: pin libplacebo
-        run: |
-          src="$LIBPLACEBO_SRC"
-          if [[ ! -d "$src/.git" ]]; then
-            # Blobless, not shallow: any pinned commit can be checked out and
-            # the blobs arrive on demand.
-            git clone --quiet --filter=blob:none https://github.com/haasn/libplacebo "$src"
-          fi
-          git -C "$src" checkout --quiet "$LIBPLACEBO_REV"
-
-      - name: build shaderc
-        run: |
-          if [[ ! -f "$SHADERC_PREFIX/lib/pkgconfig/shaderc.pc" ]]; then
-            scripts/build-shaderc-win.sh
-          fi
-
-      - name: build libplacebo
-        run: |
-          if [[ ! -f "$LIBPLACEBO_PREFIX/lib/pkgconfig/libplacebo.pc" ]]; then
-            scripts/build-libplacebo-win.sh --clean
-          fi
-
+      # The cross build; `CARGO_BUILD_TARGET` comes from the check's env.
       - name: clippy
-        run: scripts/cargo-win.sh clippy --workspace --all-targets --locked
+        run: nix build .#checks.windows-clippy

@@ -305,7 +305,7 @@ pub struct UiState {
 type Rows<T> = RwSignal<Rc<Vec<RwSignal<T, LocalStorage>>>, LocalStorage>;
 
 /// Replaces one row's data, or appends a row for a key not seen before.
-fn upsert_row<T, K>(list: &Rows<T>, item: T, key: impl Fn(&T) -> K)
+fn upsert_row<T, K>(list: Rows<T>, item: T, key: impl Fn(&T) -> K)
 where
     T: PartialEq + 'static,
     K: PartialEq,
@@ -330,7 +330,7 @@ where
 ///
 /// Reusing matters more than the values: a snapshot with fresh signals behind
 /// the same keys would leave every row drawing its predecessor's data.
-fn sync_rows<T, K>(list: &Rows<T>, incoming: Vec<T>, key: impl Fn(&T) -> K)
+fn sync_rows<T, K>(list: Rows<T>, incoming: Vec<T>, key: impl Fn(&T) -> K)
 where
     T: PartialEq + 'static,
     K: PartialEq,
@@ -356,7 +356,7 @@ where
 }
 
 /// Drops every row whose key is not in `keep`.
-fn retain_rows<T>(list: &Rows<T>, keep: impl Fn(&T) -> bool)
+fn retain_rows<T>(list: Rows<T>, keep: impl Fn(&T) -> bool)
 where
     T: 'static,
 {
@@ -449,10 +449,10 @@ impl UiState {
         self.conn.set(state.conn);
         self.error.set(state.error);
         self.update.set(state.update);
-        sync_rows(&self.channels, state.channels, |channel| channel.id);
+        sync_rows(self.channels, state.channels, |channel| channel.id);
         self.reorder();
         self.pending.set(Rc::new(state.pending));
-        sync_rows(&self.pipelines, state.pipelines, |pipeline| {
+        sync_rows(self.pipelines, state.pipelines, |pipeline| {
             pipeline.key.clone()
         });
         self.arena.set(state.arena);
@@ -515,13 +515,13 @@ impl UiState {
             // One row of the list, not the list: the row's own signal carries
             // the change, so the keyed list never re-runs.
             Update::ChannelUpsert(view) => {
-                upsert_row(&self.channels, *view, |channel| channel.id);
+                upsert_row(self.channels, *view, |channel| channel.id);
                 // A live flip or a new `last live` is the only thing that can
                 // move a row; `reorder` is a no-op when the order holds.
                 self.reorder();
             }
             Update::ChannelRemove(id) => {
-                retain_rows(&self.channels, |channel| channel.id != id);
+                retain_rows(self.channels, |channel| channel.id != id);
             }
             Update::Pending(pending) => {
                 if *self.pending.get_untracked() != pending {
@@ -541,7 +541,7 @@ impl UiState {
                     self.words.set(Rc::new(config.filtered_words));
                 }
                 let ids: Vec<u64> = config.channels.iter().map(|channel| channel.id).collect();
-                retain_rows(&self.channels, |channel| ids.contains(&channel.id));
+                retain_rows(self.channels, |channel| ids.contains(&channel.id));
                 let pins = self.pins.get_untracked();
                 if pins.iter().any(|id| !ids.contains(id)) {
                     let kept: Vec<u64> =
@@ -561,7 +561,7 @@ impl UiState {
                     .map(|row| {
                         row.with_untracked(|pipeline| pipeline.recording || pipeline.disk.is_some())
                     });
-                upsert_row(&self.pipelines, view, |pipeline| pipeline.key.clone());
+                upsert_row(self.pipelines, view, |pipeline| pipeline.key.clone());
                 // The Recordings list filters on this, and a keyed list does not
                 // watch row data: re-run it when a row joins or leaves.
                 if was != Some(recorded) {
@@ -570,7 +570,7 @@ impl UiState {
                 }
             }
             Update::PipelineRemove(key) => {
-                retain_rows(&self.pipelines, |pipeline| pipeline.key != key);
+                retain_rows(self.pipelines, |pipeline| pipeline.key != key);
             }
             Update::Arena(arena) => {
                 if self.arena.get_untracked() != arena {

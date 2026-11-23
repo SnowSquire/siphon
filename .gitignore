@@ -5,8 +5,8 @@ target/
 /result
 /result-*
 
-# Staged Windows payload and the setup built from it
-dist/
+# Python bytecode from the build scripts (nix/normalise-pe-debug.py)
+__pycache__/
 
 # Downloaded/captured state
 captures/

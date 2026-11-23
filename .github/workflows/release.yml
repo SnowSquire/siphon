@@ -2,14 +2,26 @@ name: release
 
 # Releases on a vX.Y.Z tag (which must match the workspace version, so a
 # release cannot ship binaries that do not match its source) and on manual
-# dispatch of any branch, tag or commit. A manual run uploads the setup and
-# the portable zip as workflow artifacts and creates no tag or release.
+# dispatch of any branch, tag or commit. A manual run uploads the setup, the
+# portable zip and the symbols zip as workflow artifacts and creates no tag or
+# release.
 # A nightly builds main at 10:00 UTC unless that commit already has a
 # successful run of this workflow; it also uploads artifacts only.
 # Nothing runs on pull requests. GitHub adds the source archives itself; the
-# assets below are the setup and the portable zip. Everything is built on
-# Linux: the MSVC toolchain comes from xwin and clang-cl, and libplacebo gets a
-# statically linked shaderc so the payload stays two exes and one DLL.
+# assets below are the setup, the portable zip and the symbols zip.
+#
+# Everything is built by the flake: `nix/sources.nix` pins the MSVC CRT/SDK,
+# shaderc and libplacebo, `nix/msvc.nix` owns the cross toolchain, and
+# `nix/windows-installer.nix` packages the payload. The runner installs no
+# compiler of its own, so the release and `nix build .#windows-installer` on a
+# dev box produce the same bytes.
+#
+# The build is split across two jobs so the store cache holds something stable.
+# `deps` builds `.#windows-deps` — every dependency crate — and caches it under
+# a key made of the lockfile and the flake pins; the layer only changes on a
+# dependency or toolchain bump. `windows` restores that entry, reads only
+# (`save: false`), and compiles the two binaries plus the installer, which
+# change on every commit and are therefore never cached.
 on:
   push:
     tags:
@@ -35,11 +47,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Bump together with the prefixes on the dev box. The cache keys include both
-  # pins, so changing one rebuilds what depends on it.
-  XWIN_VERSION: "0.10.0"
-  SHADERC_VERSION: v2026.4
-  LIBPLACEBO_REV: b785229836d6879249ecb21551ba098ed549b5f6
+  # Bump to invalidate both cache entries without touching the tree.
+  CACHE_VERSION: v1
 
 jobs:
   # The nightly skips a commit this workflow already built successfully; a
@@ -76,8 +85,8 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-  windows:
-    name: Windows x64 installer and portable zip
+  deps:
+    name: Windows dependency layer
     needs: gate
     if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-26.04
@@ -86,9 +95,44 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit || github.sha }}
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # The entry holds the dependency layer plus everything it needed to be
+      # built: the MSVC CRT/SDK, the rust toolchain, the vendored crates and
+      # every compiled dependency. It is reused until `Cargo.lock`, a flake pin
+      # or the msvc environment changes.
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          restore-prefixes-first-match: |
+            nix-deps-${{ env.CACHE_VERSION }}-
+          gc-max-store-size-linux: 8G
+          purge: true
+          purge-prefixes: nix-deps-
+          purge-last-accessed: P30D
+
+      - name: build the dependency layer
+        run: nix build .#windows-deps
+
+  windows:
+    name: Windows x64 installer, portable zip and symbols
+    needs:
+      - gate
+      - deps
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit || github.sha }}
           # Full history so a manual run can name a short SHA as well as a
-          # branch or tag. The event SHA pins a nightly to the commit the gate
-          # checked for an existing build.
+          # branch or tag. `self.rev` also comes from the checkout, so the
+          # binaries embed the commit they were built from.
           fetch-depth: 0
 
       - name: resolve the version
@@ -110,132 +154,23 @@ jobs:
             fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: install the cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang lld llvm cmake ninja-build pkg-config libvulkan-dev nsis zip jq
-          # Ubuntu 26.04 ships clang 21 and, unlike the 24.04 image, clang-cl
-          # itself. The current MSVC STL refuses clang < 19, so 24.04 would need
-          # a backport.
-          clang-cl --version >/dev/null
-
-      - uses: actions/setup-python@v7
+      - uses: cachix/install-nix-action@v30
         with:
-          python-version: "3.12"
-      - name: install meson
-        run: pip install --disable-pip-version-check meson jinja2
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Same key as the `deps` job: this restores the dependency layer and
+      # saves nothing, so the entry stays small and stable.
+      - uses: nix-community/cache-nix-action@v7
         with:
-          targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: windows-release
-          # A broken run should still leave the target dir behind.
-          cache-on-failure: true
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          restore-prefixes-first-match: |
+            nix-deps-${{ env.CACHE_VERSION }}-
+          save: false
 
-      - name: cache xwin and the MSVC CRT/SDK
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/xwin
-            ~/.cache/xwin-cache
-            ~/.cache/xwin
-          key: xwin-${{ env.XWIN_VERSION }}-${{ runner.os }}-v1
-
-      - name: install xwin and splat the CRT/SDK
-        run: |
-          command -v xwin >/dev/null || \
-            cargo install xwin --locked --version "$XWIN_VERSION"
-          if [[ ! -d "$HOME/.cache/xwin/crt/include" ]]; then
-            xwin --accept-license --cache-dir "$HOME/.cache/xwin-cache" \
-              splat --output "$HOME/.cache/xwin"
-          fi
-          splat="$HOME/.cache/xwin"
-          {
-            echo "RUSTFLAGS=-Lnative=$splat/crt/lib/x86_64 -Lnative=$splat/sdk/lib/um/x86_64 -Lnative=$splat/sdk/lib/ucrt/x86_64"
-            echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link"
-            echo "CC_x86_64_pc_windows_msvc=clang-cl"
-            echo "CXX_x86_64_pc_windows_msvc=clang-cl"
-            echo "AR_x86_64_pc_windows_msvc=llvm-lib"
-            echo "CFLAGS_x86_64_pc_windows_msvc=--target=x86_64-pc-windows-msvc /imsvc$splat/crt/include /imsvc$splat/sdk/include/ucrt /imsvc$splat/sdk/include/um /imsvc$splat/sdk/include/shared"
-            echo "CXXFLAGS_x86_64_pc_windows_msvc=--target=x86_64-pc-windows-msvc /imsvc$splat/crt/include /imsvc$splat/sdk/include/ucrt /imsvc$splat/sdk/include/um /imsvc$splat/sdk/include/shared"
-          } >> "$GITHUB_ENV"
-
-      - name: point the build scripts at the prefixes
-        run: |
-          {
-            echo "LIBS_ROOT=$RUNNER_TEMP/libs"
-            echo "SHADERC_PREFIX=$RUNNER_TEMP/libs/shaderc/win-prefix"
-            echo "SHADERC_BUILD=$RUNNER_TEMP/libs/shaderc-build"
-            echo "LIBPLACEBO_PREFIX=$RUNNER_TEMP/libs/libplacebo/win-prefix"
-            echo "LIBPLACEBO_SRC=$RUNNER_TEMP/libs/libplacebo"
-            echo "VULKAN_SDK=$RUNNER_TEMP/libs/vulkan"
-          } >> "$GITHUB_ENV"
-
-      - name: cache shaderc and libplacebo prefixes
-        uses: actions/cache@v6
-        with:
-          path: |
-            ${{ runner.temp }}/libs/shaderc/win-prefix
-            ${{ runner.temp }}/libs/libplacebo/win-prefix
-            ${{ runner.temp }}/libs/vulkan
-          key: win-deps-${{ env.SHADERC_VERSION }}-${{ env.LIBPLACEBO_REV }}-${{ hashFiles('scripts/build-shaderc-win.sh', 'scripts/build-libplacebo-win.sh') }}
-
-      # The checkouts, separate from the prefixes: a script change invalidates
-      # the prefix key but the source tree and shaderc's third_party clones can
-      # still be reused. shaderc builds out of tree so this stays small.
-      - name: cache shaderc sources
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/libs/shaderc
-          key: shaderc-src-${{ env.SHADERC_VERSION }}-v1
-
-      - name: cache the libplacebo checkout
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/libs/libplacebo
-          key: libplacebo-src-${{ env.LIBPLACEBO_REV }}-v1
-
-      - name: pin libplacebo
-        run: |
-          src="$LIBPLACEBO_SRC"
-          if [[ ! -d "$src/.git" ]]; then
-            # Blobless, not shallow: any pinned commit can be checked out and
-            # the blobs arrive on demand.
-            git clone --quiet --filter=blob:none https://github.com/haasn/libplacebo "$src"
-          fi
-          git -C "$src" checkout --quiet "$LIBPLACEBO_REV"
-
-      - name: build shaderc
-        run: |
-          if [[ ! -f "$SHADERC_PREFIX/lib/pkgconfig/shaderc.pc" ]]; then
-            scripts/build-shaderc-win.sh
-          fi
-
-      - name: build libplacebo
-        run: |
-          if [[ ! -f "$LIBPLACEBO_PREFIX/lib/pkgconfig/libplacebo.pc" ]]; then
-            scripts/build-libplacebo-win.sh --clean
-          fi
-
-      - name: build the setup and the portable zip
-        env:
-          # The shipped binaries: whole-program LTO in one codegen unit. The
-          # workspace release profile is the quick local one.
-          CARGO_PROFILE_RELEASE_LTO: fat
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
-          # One top-level directory in the portable zip: the tag for a release,
-          # the commit for a manual or nightly build.
-          SIPHON_PORTABLE_DIR: ${{ github.event_name == 'push' && format('siphon-{0}', github.ref_name) || format('siphon-{0}', steps.version.outputs.short_sha) }}
-          # The checked-out commit, not the dispatch ref: a manual run of an
-          # older SHA must embed that SHA, not main's HEAD.
-          SIPHON_COMMIT: ${{ steps.version.outputs.commit }}
-        run: scripts/package-win.sh
+      - name: build the artefacts
+        run: nix build .#windows-installer --print-out-paths
 
       - name: publish
         # `act` sets ACT=true for local runs; there is no token there and no
@@ -254,22 +189,28 @@ jobs:
             menu entry, and is what the in-app updater downloads.
 
             **Portable:** `siphon-${{ steps.version.outputs.version }}-x64-portable.zip`
-            extracts to a `siphon-${{ github.ref_name }}/` folder; run
-            `siphon.exe` from it. No install, no updater.
+            extracts to a `siphon-${{ steps.version.outputs.version }}/` folder;
+            run `siphon.exe` from it. No install, no updater.
 
-            Both need the Microsoft Visual C++ 2015-2022 Redistributable (x64);
-            the installer adds it when it is missing, the portable zip does not.
+            **Symbols:** `siphon-${{ steps.version.outputs.version }}-x64-symbols.zip`
+            holds the release PDBs for both executables. Point a debugger's
+            symbol path at the extracted folder to resolve a minidump.
+
+            The installer and the portable build need the Microsoft Visual C++
+            2015-2022 Redistributable (x64); the installer adds it when it is
+            missing, the portable zip does not.
           files: |
-            dist/*-setup.exe
-            dist/*-portable.zip
+            result/*-setup.exe
+            result/*-portable.zip
+            result/*-symbols.zip
 
-      # v7 can upload one file unzipped: each download is the setup or the
-      # portable zip itself, not a wrapper artifact holding both.
+      # v7 can upload one file unzipped: each download is the setup, the
+      # portable zip or the symbols zip itself, not a wrapper artifact.
       - name: upload the installer
         if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
         uses: actions/upload-artifact@v7
         with:
-          path: dist/*-setup.exe
+          path: result/*-setup.exe
           if-no-files-found: error
           retention-days: 14
           archive: false
@@ -278,7 +219,16 @@ jobs:
         if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
         uses: actions/upload-artifact@v7
         with:
-          path: dist/*-portable.zip
+          path: result/*-portable.zip
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
+
+      - name: upload the symbols
+        if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: result/*-symbols.zip
           if-no-files-found: error
           retention-days: 14
           archive: false

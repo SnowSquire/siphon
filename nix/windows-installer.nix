@@ -1,16 +1,26 @@
-# The Windows installer and the portable zip, built from the payload
-# `nix/windows.nix` produces: `scripts/package-win.sh --no-build` with the
-# staging directory pointed at the store, so the setup carries exactly the
-# binaries the flake built and nothing from a local `target/`.
+# The three Windows artefacts, packaged from the payload `nix/windows.nix`
+# builds:
+#
+#   siphon-<version>-x64-setup.exe      the per-user NSIS installer
+#   siphon-<version>-x64-portable.zip   the same payload, zipped
+#   siphon-<version>-x64-symbols.zip    the release PDBs
+#
+# The setup is what the updater downloads: the release asset must keep the
+# `-setup.exe` suffix, and its name carries the version. The portable zip keeps
+# its payload under one directory so extracting it does not scatter files. The
+# symbols zip carries the PDBs a minidump needs to resolve; they stay out of the
+# installer, where a user would never need them.
+#
+# This used to be `scripts/package-win.sh`, which the release workflow ran with
+# the runner's own xwin setup. The flake builds the payload, so the packaging
+# moved in with it and there is one pipeline instead of two.
 {
   lib,
   stdenvNoCC,
   nsis,
   zip,
-  jq,
-  rustToolchain,
   windows,
-  self,
+  installerSrc,
   version,
   sources,
 }:
@@ -19,38 +29,66 @@ stdenvNoCC.mkDerivation {
   pname = "siphon-windows-installer";
   inherit version;
 
-  src = self;
+  # The licence texts, the fonts' OFL files, the NSIS script and the VC++
+  # redistributable bootstrapper: the whole of what packaging reads, and
+  # nothing else, so editing a note or the flake does not rebuild the setup.
+  src = installerSrc;
 
-  # `cargo` is here for `cargo metadata --no-deps`, which is how the packaging
-  # script reads the workspace version; it reads manifests only.
   nativeBuildInputs = [
     nsis
     zip
-    jq
-    rustToolchain
   ];
-
-  env = {
-    # The payload, not a local `target/x86_64-pc-windows-msvc/release`.
-    SIPHON_TARGET_DIR = "${windows}/bin";
-    # The meson install carries no licence text, so the script takes libplacebo's
-    # from the checkout when it is told where it is.
-    LIBPLACEBO_SRC = "${sources.libplacebo}";
-  };
 
   buildPhase = ''
     runHook preBuild
-    # `cargo metadata` insists on a cache directory, and `$HOME` is the
-    # deliberately missing /homeless-shelter.
-    export CARGO_HOME="$TMPDIR/cargo"
-    bash scripts/package-win.sh --no-build
+    dist=$TMPDIR/dist
+    stage=$dist/siphon-${version}
+    mkdir -p "$stage" "$dist"
+
+    cp ${windows}/bin/siphon.exe ${windows}/bin/siphon-daemon.exe "$stage/"
+    # `libplacebo-sys` copies the DLL it links next to the executable; a Windows
+    # process only finds it there.
+    cp ${windows}/bin/libplacebo-*.dll "$stage/"
+
+    cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
+    # Both shipped faces are OFL and the licence text has to travel with them.
+    cp crates/ui/fonts/Archivo-OFL.txt "$stage/LICENSE-Archivo-OFL.txt"
+    cp crates/ui/fonts/NotoColorEmoji-OFL.txt "$stage/LICENSE-NotoColorEmoji-OFL.txt"
+    # The meson install does not carry libplacebo's licence; take it from the
+    # checkout the DLL was built from.
+    cp ${sources.libplacebo}/LICENSE "$stage/LICENSE-libplacebo.txt"
+
+    # NSIS records the staged files' timestamps and zip stores them per entry,
+    # so pin them: without this the setup differs in a handful of bytes and the
+    # zips differ in their entry headers.
+    epoch=''${SOURCE_DATE_EPOCH:-315532800} # 1980-01-01, the oldest date zip stores
+    find "$stage" -exec touch -h -d "@$epoch" {} +
+
+    # `File` inside the script resolves against the script's own directory, so
+    # both paths handed to `makensis` have to be absolute.
+    makensis -V2 -DVERSION=${version} -DPAYLOAD="$stage" \
+      -DVCREDIST="$PWD/installer/vcredist.ps1" \
+      -DOUTFILE="$dist/siphon-${version}-x64-setup.exe" "$PWD/installer/siphon.nsi"
+
+    # The portable copy is the same payload zipped under its directory: there is
+    # no single exe to ship any more. The name deliberately does not end in
+    # `-setup.exe`, so the updater never mistakes it for an installer. `-X`
+    # drops the extra fields that carry more of the same timestamps.
+    ( cd "$dist" && zip -qrX "siphon-${version}-x64-portable.zip" "siphon-${version}" )
+
+    symbols="$dist/siphon-${version}-symbols"
+    mkdir -p "$symbols"
+    cp ${windows}/symbols/*.pdb "$symbols/"
+    find "$symbols" -exec touch -h -d "@$epoch" {} +
+    ( cd "$dist" && zip -qrX "siphon-${version}-x64-symbols.zip" "siphon-${version}-symbols" )
+
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     mkdir -p $out
-    cp dist/*.exe dist/*.zip $out/
+    cp $TMPDIR/dist/*.exe $TMPDIR/dist/*.zip $out/
     runHook postInstall
   '';
 
@@ -58,7 +96,7 @@ stdenvNoCC.mkDerivation {
   dontFixup = true;
 
   meta = {
-    description = "Siphon Windows installer and portable zip";
+    description = "Siphon Windows installer, portable zip and symbols zip";
     license = lib.licenses.mit;
     platforms = [ "x86_64-linux" ];
   };

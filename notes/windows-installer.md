@@ -1,24 +1,27 @@
 # Windows installer
 
-The shipped artefact is one per-user NSIS installer, built on Linux:
+The shipped artefact is one per-user NSIS installer, built on Linux by the
+flake:
 
 ```
-scripts/package-win.sh          # build, stage, makensis, zip
-dist/siphon-<version>-x64-setup.exe
-dist/siphon-<version>-x64-portable.zip
+nix build .#windows-installer
+result/siphon-<version>-x64-setup.exe
+result/siphon-<version>-x64-portable.zip
+result/siphon-<version>-x64-symbols.zip
 ```
 
-`scripts/package-win.sh --no-build` reuses the current
-`target/x86_64-pc-windows-msvc/release` instead of building it.
+`nix/windows-installer.nix` is the whole packaging step: it stages the payload
+`nix/windows.nix` built, adds the licence texts, runs `makensis`, and zips the
+portable copy and the PDBs. `notes/nix-build.md` covers the toolchain and pins.
+There is no packaging script, and nothing is downloaded at build time.
 
 ## Why NSIS and not an MSI
 
 The updater expected an MSI, but nothing had been installed yet and WiX is
 Windows-only to build (`WIX0000`) even as a .NET tool, so packaging would have
-meant a Windows machine or Wine. NSIS's `makensis` runs natively on Linux
-(Fedora: `mingw32-nsis`) and produces the same shape of install: per-user, an
-uninstaller, an Apps & features entry, LZMA compression, a silent mode. The
-updater's hand-off moved with it.
+meant a Windows machine or Wine. NSIS's `makensis` runs natively on Linux and
+produces the same shape of install: per-user, an uninstaller, an Apps & features
+entry, LZMA compression, a silent mode. The updater's hand-off moved with it.
 
 `msitools`/`wixl` is the other Linux-native route, but it implements a WiX-3
 subset without extensions and without ICE validation.
@@ -71,16 +74,15 @@ shortcuts and the two registry keys, and leaves that data alone.
 ## Payload pieces
 
 - **libplacebo.** `libplacebo-sys` copies `libplacebo-<api>.dll` next to the UI
-  for a dynamic build; the packager harvests it from the profile directory. The
-  DLL must be built with a shader compiler: `scripts/build-shaderc-win.sh`
-  cross-builds shaderc for MSVC (static `shaderc_combined`, so no extra DLL) and
-  `SHADERC_PREFIX=... scripts/build-libplacebo-win.sh` links it in. Without it
-  libplacebo has no GLSL compiler, links, and then fails at the first frame.
-  `scripts/build-libplacebo-win.sh` alone still builds the link-only prefix the
-  cross-check uses.
+  for a dynamic build; the packager harvests it from the payload's `bin/`. The
+  DLL must be built with a shader compiler: `nix/msvc.nix` cross-builds shaderc
+  for MSVC (static `shaderc_combined`, so no extra DLL) and links it into
+  libplacebo. Without it libplacebo has no GLSL compiler, links, and then fails
+  at the first frame.
 - **FFmpeg.** Nothing links it until the UI enables libplacebo's `libav`
-  feature. Then `SIPHON_FFMPEG_BIN` names the DLL directory; the script copies
-  the `av*` DLLs and refuses to continue without the matching `LICENSE.txt`.
+  feature, and the Nix payload ships none of it yet. When it does, the packaging
+  derivation has to copy the `av*` DLLs from a Nix-built FFmpeg and the licence
+  text with them.
   Use BtbN's `lgpl-shared` build or configure with `--disable-gpl
   --disable-nonfree --disable-version3 --enable-shared --disable-static`.
   `nvdec`, `nvenc`, `cuvid` and `cuda` are **not** on FFmpeg's nonfree list
@@ -97,9 +99,13 @@ shortcuts and the two registry keys, and leaves that data alone.
   verifies its Authenticode signature and runs it elevated — one UAC prompt,
   while the install itself stays per-user. The portable zip has no installer,
   so the runtime is a plain prerequisite there. Nothing is bundled either way.
-- **Signing.** `SIPHON_SIGN_PFX`/`SIPHON_SIGN_PASS` make the script sign both
-  exes before packing and the setup after it (`osslsigncode`). Unsigned releases
-  work, but SmartScreen warns.
+- **Signing.** The artefacts come out unsigned: a Nix build cannot hold the
+  PKCS#12 secret, and the workflow has no signing step. `osslsigncode sign
+  -pkcs12 ... -in result/*-setup.exe -out ...` is the post-build step, but it
+  only covers the setup — signing the installed exes too means signing the
+  payload and re-running the packaging derivation, which is why the two steps
+  would have to be reconciled before it is wired up. Unsigned releases work,
+  but SmartScreen warns.
 
 ## Portable copy
 
@@ -109,30 +115,39 @@ anywhere and run `siphon.exe`. It carries no install marker, so `install_mode`
 reports `Portable` and the updater only opens the release page. The name does
 not end in `-setup.exe`, so `parse_release` never mistakes it for an installer.
 
+## Symbols
+
+The release PDBs are kept, so every build also emits
+`siphon-<version>-x64-symbols.zip` with `siphon.pdb` and `siphon_daemon.pdb`.
+They stay out of the installer payload — a user never needs them — and are
+published beside it: a minidump is useless without the matching PDBs, and the
+GUID in each PDB is what the debugger matches against the dump. The packaging
+derivation takes them from the payload's `symbols/`, which is where
+`nix/windows.nix` puts the normalised copies. rustc names a PDB after its
+crate, so the daemon's file is `siphon_daemon.pdb`, not `siphon-daemon.pdb`.
+
 ## Release
 
 `.github/workflows/release.yml` runs on a `vX.Y.Z` tag and refuses a tag that
-does not equal the workspace version. It builds everything on `ubuntu-26.04`:
+does not equal the workspace version. Two jobs, both just Nix:
 
-1. xwin splats the MSVC CRT/SDK; clang-cl, llvm-lib and lld-link do the work.
-   Ubuntu 26.04 ships clang 21 and clang-cl (24.04's clang 18 is too old for
-   the current MSVC STL and does not package clang-cl).
-2. `scripts/build-shaderc-win.sh` produces the static shaderc prefix.
-3. `scripts/build-libplacebo-win.sh` links it into the release libplacebo.
-4. `scripts/package-win.sh` builds the exes, stages the payload, and emits the
-   setup and the portable zip. The step sets the shipped profile knobs
-   (`CARGO_PROFILE_RELEASE_LTO=fat`, `..._CODEGEN_UNITS=1`); the workspace
-   profile is the quick local one.
+1. `cachix/install-nix-action` puts Nix on the runner; nothing else is
+   installed — no compiler, no xwin, no meson.
+2. `deps` builds `.#windows-deps` and caches it under a key made of the
+   lockfile and the flake pins, so the MSVC CRT/SDK, shaderc, libplacebo, the
+   vendored sources and every compiled dependency survive between runs.
+3. `windows` restores that entry read-only (`save: false`) and runs
+   `nix build .#windows-installer`. The pins live in `nix/sources.nix` and
+   `flake.lock`, not in the workflow, and the shipped profile (fat LTO, one
+   codegen unit) is the derivation's `env`.
+4. `softprops/action-gh-release` publishes the setup, the portable zip and the
+   symbols zip as a draft; manual and nightly runs upload the same three as
+   workflow artifacts instead, since they never create a tag.
 
-The xwin download, the shaderc/libplacebo prefixes and the Rust target dir are
-cached; the prefixes are keyed by the shaderc tag and the pinned libplacebo
-commit, so a dependency bump rebuilds them. `LIBPLACEBO_REV` and
-`SHADERC_VERSION` at the top of the workflow are the pins to bump. The image is
-pinned to `ubuntu-26.04` rather than `ubuntu-latest`: the compiler version is
-load-bearing (the MSVC STL needs clang 19+), and GitHub's `latest` label
-migrates between images on its own schedule. GitHub adds
-the source archives to the release itself. The setup is uploaded as a draft, so
-the notes and visibility stay a deliberate step.
+The image is pinned to `ubuntu-26.04` rather than `ubuntu-latest` so the Nix
+daemon and the runner's kernel do not move without a commit. GitHub adds the
+source archives to the release itself. The setup is uploaded as a draft, so the
+notes and visibility stay a deliberate step.
 
 ### Running it locally
 
@@ -163,9 +178,8 @@ upgrade path to preserve.
 
 ## Reproducible packaging
 
-`nix build .#windows-installer` runs this script against the Nix payload, and
 `nix build --rebuild .#windows-installer` produces byte-identical artifacts.
 Two details make that hold: NSIS records the staged files' timestamps, and a zip
-stores each entry's, so the staging tree is pinned to `SOURCE_DATE_EPOCH` before
-`makensis` (1980-01-01 when unset, as in the workflow), and the portable zip is
+stores each entry's, so the staging tree and the PDBs are pinned to
+`SOURCE_DATE_EPOCH` (which the stdenv sets) before packing, and both zips are
 written with `zip -X`.

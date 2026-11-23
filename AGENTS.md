@@ -36,12 +36,14 @@ only sink; disk output is disabled and being rebuilt from
 
 ## Commands
 
-- Nix (both platforms from one host):
-  `nix build .#linux` / `nix build .#windows` / `nix build .#windows-installer`
-  / `nix develop` — hermetic Linux binaries, the cross-compiled Windows payload
-  and the installer/portable zip; `notes/nix-build.md` has the pieces and pins.
+- Nix (both platforms from one host): `nix build .#linux` / `nix build
+  .#windows` / `nix build .#windows-installer` / `nix develop` — hermetic Linux
+  binaries, the cross-compiled Windows payload, and the setup + portable zip +
+  symbols zip. The flake is the only build system for Windows: the release
+  workflow installs Nix and calls it, so there are no xwin/shaderc/libplacebo
+  shell scripts to keep in sync. `notes/nix-build.md` has the pieces and pins.
 - Build/check: `cargo clippy -p daemon`, `cargo build -p daemon`
-- Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean.
+- Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean. Whole-workspace lints (what CI runs) are `nix build .#checks.linux-clippy` and `.#checks.windows-clippy`, which reuse the dependency layer.
 - Format: `cargo +nightly fmt` — `crates/daemon/rustfmt.toml` uses unstable options (import grouping/granularity, `reorder_impl_items`, LF) that stable `cargo fmt` silently ignores.
 - One-channel recorder: `siphon-daemon record <login> [variant] [--mode live|dvr|both]
   [--list] --output <dir>` — one variant, no config, no RPC, no RTSP. Without
@@ -49,38 +51,41 @@ only sink; disk output is disabled and being rebuilt from
   variants and exits. `--mode` picks the live playlist, the DVR, or both (the
   default). It waits for the channel to go live and exits when the recording ends.
   In `-d` it needs `SIPHON_HERMES_URL` (the mock's `ws://127.0.0.1:8001/v1`).
-- Release builds use the quick profile (no LTO, 16 codegen units); the release
-  workflow sets `CARGO_PROFILE_RELEASE_LTO=fat` and
-  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1` for the shipped binaries.
+- `cargo build --release` uses the quick profile (no LTO, 16 codegen units).
+  The shipped binaries come from `nix build .#windows`, whose derivation sets
+  `CARGO_PROFILE_RELEASE_LTO=fat` and `..._CODEGEN_UNITS=1`, so a Nix build is
+  much slower than the local one and is worth backgrounding.
 - Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
 - Benchmark: `cargo test -p daemon --release -- --ignored --nocapture throughput` (demux/packetize over `captures/servermock`, the built fixtures). Cross-compile: `cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl`.
 - Miri: `cargo +nightly miri test -p daemon` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
-- Windows cross-check: `cargo check -p daemon --target x86_64-pc-windows-msvc`
-  and `cargo clippy -p daemon --target x86_64-pc-windows-msvc --all-targets`.
-  The MSVC CRT/SDK come from `~/.cache/xwin`
-  (`xwin --accept-license --cache-dir ~/.cache/xwin-cache splat
-  --output ~/.cache/xwin`; the cache defaults to `./.xwin-cache`, which must not
-  land in the repo), and the target is configured in the global
-  `~/.cargo/config.toml`: `clang-cl` + `llvm-lib` compile the C dependencies and
-  `lld-link` links. No Windows machine is involved.
+- Windows cross-check: `nix develop .#windows -c cargo clippy --workspace
+  --all-targets` (or `nix build .#windows` for the payload). The shell exports
+  the pinned MSVC CRT/SDK, `clang-cl`/`llvm-lib`/`lld-link`, libplacebo's prefix
+  and `CARGO_BUILD_TARGET`, so no `--target` or hand-set environment is needed.
+  A plain `cargo check -p daemon --target x86_64-pc-windows-msvc` still works
+  against the global `~/.cargo/config.toml` + `~/.cache/xwin` setup. No Windows
+  machine is involved.
 - UI: `cargo run -p siphon-ui` (binary `siphon`, ZGUI + DXGI). It starts `siphon-daemon.exe` next to itself if the admin named pipe is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
-- Installer: `scripts/package-win.sh` — stages the Windows release and runs
-  `makensis` into `dist/` (`--no-build` reuses the current target dir; Fedora
-  needs `mingw32-nsis`). `notes/windows-installer.md` has the contract.
-- Windows shaderc: `scripts/build-shaderc-win.sh` — cross-builds the static
-  shaderc the release libplacebo links; `SHADERC_PREFIX=... scripts/build-libplacebo-win.sh`
-  then produces a prefix that can compile shaders, not just link.
+- Dev iteration against Nix: the Rust builds are split by crane
+  (`nix/windows.nix`, `nix/linux.nix`) into a dependency layer plus one
+  derivation per binary, so editing a crate rebuilds that crate, not the ~500
+  dependencies, and the layers are shared across worktrees and CI. The payload's
+  source is filtered to `Cargo.toml`/`Cargo.lock`/`crates/`, so doc edits do not
+  invalidate it. For hot iteration use `nix develop .#windows -c cargo build`
+  (incremental `./target`, quick profile — the LTO knobs are derivation-only).
+  Never point `CARGO_TARGET_DIR` at a persistent directory for a Nix build:
+  mtime-based freshness plus 1970-stamped sources yields stale binaries.
+  `notes/nix-build.md` has the layer table.
+- Installer: `nix build .#windows-installer` — stages the payload and runs
+  `makensis` inside the derivation, producing the setup, the portable zip and
+  the symbols zip in `result/`. `notes/windows-installer.md` has the NSIS
+  contract; there is no packaging script any more.
 - UI check (native): `cargo clippy -p siphon-ui --all-targets` — the Linux present path builds against the system libplacebo through pkg-config (`LIBPLACEBO_SOURCE=system` is the default there). Run it for any UI change; it does not need Windows.
-- UI check (Windows target): `scripts/cargo-win.sh clippy -p siphon-ui --all-targets`.
-  This box builds a Windows libplacebo itself —
-  `scripts/build-libplacebo-win.sh` (meson cross build with clang-cl against the
-  xwin CRT/SDK into `~/Projects/Code/Libs/libplacebo/win-prefix`, Vulkan headers
-  copied from `/usr/include`, glslang/shaderc off) — and `cargo-win.sh` exports
-  `LIBPLACEBO_PREFIX`/`VULKAN_SDK` before appending `--target
-  x86_64-pc-windows-msvc`. Cargo has no per-target `env` table and a global
-  `LIBPLACEBO_PREFIX` would misdirect native builds, hence the wrapper. Rebuild
-  the prefix after a libplacebo or Vulkan-headers change; the daemon's plain
-  `cargo check --target` needs none of this.
+- UI check (Windows target): `nix develop .#windows -c cargo clippy -p siphon-ui
+  --all-targets`. The shell's libplacebo prefix is the one `nix/msvc.nix`
+  builds, so there is no `win-prefix` under `~/Projects/Code/Libs` to rebuild
+  when libplacebo or the Vulkan headers move: bump the pin in
+  `nix/sources.nix` and Nix rebuilds it.
 
 ## Terminology
 

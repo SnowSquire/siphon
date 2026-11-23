@@ -1,6 +1,7 @@
 ; Per-user installer for Siphon, built by makensis on Linux.
 ;
-;   scripts/package-win.sh -DVERSION=... -DPAYLOAD=... -DOUTFILE=...
+;   nix/windows-installer.nix, which runs makensis with
+;   -DVERSION=... -DPAYLOAD=... -DVCREDIST=... -DOUTFILE=...
 ;
 ; The script is deliberately small: no registry beyond the two keys the updater
 ; and Apps & features need, no services, no machine-wide state. Everything

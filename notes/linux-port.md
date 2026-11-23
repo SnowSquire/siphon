@@ -143,19 +143,19 @@ headers it compiles with and exports one `siphon_pl_log_create`. Fields added af
 source builds against both. The header-only libav glue sits behind the `libav`
 feature, which only the video path enables; the UI build needs no FFmpeg headers.
 
-A Windows cross-check of the UI needs a Windows libplacebo, not a Linux one. This
-box builds it with clang-cl and the xwin CRT/SDK:
-`scripts/build-libplacebo-win.sh` runs a meson cross build into
-`~/Projects/Code/Libs/libplacebo/win-prefix` (Vulkan headers copied out of
-`/usr/include`; without `SHADERC_PREFIX` it has no GLSL compiler and only
-type-checks and links), and `scripts/cargo-win.sh clippy -p siphon-ui
---all-targets` exports `LIBPLACEBO_PREFIX`/`VULKAN_SDK` and appends the target.
-A shippable prefix links the static shaderc that
-`scripts/build-shaderc-win.sh` cross-builds; `notes/windows-installer.md` has
-the release pipeline. Cargo has no per-target `env` table, and exporting
-`LIBPLACEBO_PREFIX` globally would send native builds at a Windows library,
-hence the wrapper. `libav` stays off, so no Windows FFmpeg is needed; the build
-script only asks for `FFMPEG_DIR` when the feature is on.
+A Windows cross-check of the UI needs a Windows libplacebo, not a Linux one.
+`nix develop .#windows` provides it: `nix/msvc.nix` cross-builds libplacebo (and
+the static shaderc it links, so the prefix can compile shaders rather than only
+type-check) against the pinned CRT/SDK, and the shell exports
+`LIBPLACEBO_PREFIX`/`VULKAN_SDK`/`CARGO_BUILD_TARGET`:
+
+    nix develop .#windows -c cargo clippy -p siphon-ui --all-targets
+
+Cargo has no per-target `env` table and exporting `LIBPLACEBO_PREFIX` globally
+would send native builds at a Windows library, which is why that environment
+lives in a separate shell rather than the default one. `libav` stays off, so no
+Windows FFmpeg is needed; the build script only asks for `FFMPEG_DIR` when the
+feature is on.
 
 ## Video
 
