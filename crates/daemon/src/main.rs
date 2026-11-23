@@ -63,6 +63,8 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use clap::Args;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
 use clap::Subcommand;
 use futures_util::future::Either;
@@ -243,7 +245,12 @@ fn default_bind() -> SocketAddr {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init(config::APP_ID);
 
-    let cfg = Config::parse();
+    let command = Config::command().after_help(format!(
+        "Build: {}",
+        siphon_shared::build::version_with_commit()
+    ));
+    let matches = command.get_matches();
+    let cfg = Config::from_arg_matches(&matches)?;
     // `--debug <base>` is only "the endpoints are the mock edge": no subsystem
     // below this point knows the difference.
     #[cfg(debug_assertions)]

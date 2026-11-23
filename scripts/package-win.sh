@@ -18,6 +18,8 @@
 # Optional environment:
 #   SIPHON_TARGET_DIR      release directory to harvest (default: the
 #                          x86_64-pc-windows-msvc release dir)
+#   SIPHON_COMMIT          checked-out commit baked into siphon-shared
+#                          (default: local; the release workflow sets it)
 #   SIPHON_PORTABLE_DIR    directory name inside the portable zip
 #                          (default: siphon-<version>)
 #   SIPHON_FFMPEG_BIN      directory with the LGPL FFmpeg DLLs to bundle

@@ -110,6 +110,7 @@ jobs:
             fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short_sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: install the cross toolchain
@@ -231,6 +232,9 @@ jobs:
           # One top-level directory in the portable zip: the tag for a release,
           # the commit for a manual or nightly build.
           SIPHON_PORTABLE_DIR: ${{ github.event_name == 'push' && format('siphon-{0}', github.ref_name) || format('siphon-{0}', steps.version.outputs.short_sha) }}
+          # The checked-out commit, not the dispatch ref: a manual run of an
+          # older SHA must embed that SHA, not main's HEAD.
+          SIPHON_COMMIT: ${{ steps.version.outputs.commit }}
         run: scripts/package-win.sh
 
       - name: publish
