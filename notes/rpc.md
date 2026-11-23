@@ -116,11 +116,17 @@ switch colour (`chatColor`, or a generated `oklch(...)` fallback), the local
 game id, viewers, stream start as milliseconds, when it was last live
 (`last_live_ms`), Twitch's `BROADCAST-ID`, the last per-channel failure
 (`error`), and the per-channel `notifyLive` / `notifyTitles` / `record`
-switches. `last_live_ms` is Twitch's `lastBroadcast.startedAt`, which is the
-current broadcast's start while live and the *end* of the last one while
-offline; `stream-down` writes the current time first so the row never shows the
-start of a stream that just ended, and the next baseline poll overwrites it
-(they differ by seconds, which the UI's minute-granular relative text hides).
+switches. `last_live_ms` is Twitch's `lastBroadcast.startedAt`, and the name is
+a misnomer: while the channel is live it is roughly the broadcast's start,
+which Twitch reports about five seconds after the real one, and while offline
+it is when that broadcast *ended*. `stream_start_ms` (from `stream.createdAt`)
+is the accurate start, so an uptime or a duration reads that and never
+`last_live_ms`. `stream-down` writes the local end time first so the row never
+shows the start of a stream that just ended, and the next baseline poll
+overwrites it with Twitch's own end time; they differ by seconds, which the
+UI's minute-granular relative text hides. That makes the field an ordering key:
+newest live first for the live tier, most recently live first for the offline
+tier — which is what puts a channel that has been dark for weeks at the bottom.
 `error` is the channel's own resolve failure, cleared by the next successful
 refresh; pipeline and disk failures stay on their own entities and the UI
 merges them by login. ZGUI's
