@@ -210,6 +210,8 @@ listeners are tasks around it.
 - Notifications are decided and displayed by the daemon, so they work with the
   UI closed. The OS toast (Windows) and the webhook are outputs; the
   notification center is daemon state and is rendered from the snapshot.
+  (Planned: the decision, the switches and the word filter move to the UI, and
+  the transitions become append-only events — `config.md`.)
 - Until Hermes lands in the daemon, the same API works with an external bridge:
   a monitor is desired state, and activation is an explicit request/event.
 
@@ -296,8 +298,8 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
 ## Open questions
 
 - Update checking/applying: daemon or UI? Applying an installer restarts processes.
-- Launch model: daemon autostart at login (needed for notifications with the UI
-  closed) versus the UI starting it on demand.
+- Launch model: settled — the UI autostarts at login and starts the daemon; see
+  `config.md`.
 - Multiple UI clients: the protocol supports it, but only one tray/window is
   expected; decide whether to enforce single-instance at the RPC layer.
 - Disk API shape: run listing, release semantics and canonical progress.
