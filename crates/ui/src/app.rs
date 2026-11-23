@@ -1558,7 +1558,7 @@ const fn is_recorded(pipeline: &PipelineView) -> bool {
 /// so `UiState` re-runs the list whenever a pipeline starts or stops recording.
 /// The login of a channel, for display: pipelines are keyed by channel id.
 fn login_for(
-    channels: &RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
+    channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     channel: u64,
 ) -> String {
     channels
@@ -1588,7 +1588,7 @@ fn RecordingRow(
     let key = pipeline.get_untracked().key;
     let quality = key.quality.clone().unwrap_or_else(|| "best".to_owned());
     let login = Signal::derive_local(move || {
-        login_for(&channels, pipeline.with(|pipeline| pipeline.key.channel))
+        login_for(channels, pipeline.with(|pipeline| pipeline.key.channel))
     });
     let state = Signal::derive_local(move || state_label(pipeline.get().state));
     let position = Signal::derive_local(move || {
@@ -1727,7 +1727,7 @@ fn LogsTab(
                         row(class = "pipeline") {
                             text(class = "pipeline__name") {{move || {
                                 let key = pipeline.with(|pipeline| pipeline.key.clone());
-                                let login = login_for(&channels, key.channel);
+                                let login = login_for(channels, key.channel);
                                 format!("{}{}", login, key.quality.as_ref().map_or_else(String::new, |quality| format!(" · {quality}")))
                             }}}
                             text(class = "pipeline__state") {{move || state_label(pipeline.get().state)}}
