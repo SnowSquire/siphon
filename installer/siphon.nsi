@@ -135,6 +135,11 @@ Section "Siphon" SecMain
 
   WriteRegStr HKCU "${REG_KEY}" "InstallDir" "$INSTDIR"
 
+  ; Autostart is the whole launch model: the window comes up at sign-in, into
+  ; the tray, and starts the daemon itself when the admin port is idle. There is
+  ; no service and nothing runs while the user is logged out.
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP_NAME}" '"$INSTDIR\${APP_EXE}" --minimized'
+
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\Uninstall.lnk" "$INSTDIR\uninstall.exe"
@@ -171,6 +176,7 @@ Section "Uninstall"
   ; %LOCALAPPDATA%\com.iken.siphon for a reinstall to pick up.
   RMDir /r "$INSTDIR"
 
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP_NAME}"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "${REG_KEY}"
 SectionEnd

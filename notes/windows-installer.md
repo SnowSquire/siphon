@@ -37,6 +37,12 @@ subset without extensions and without ICE validation.
 - **Install marker**: `HKCU\Software\Ozeniken\Siphon\InstallDir`, written by the
   installer and read by `update::install_mode`. Without it the copy counts as
   portable and updates only open the release page.
+- **Autostart**: the installer writes
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Siphon` as
+  `"<installdir>\siphon.exe" --minimized`, and the uninstaller deletes it. So an
+  installed copy comes up at sign-in, into the tray, and starts the daemon
+  itself; `--minimized` hides the window after its first frame and the tray's
+  Open shows it. A portable copy has no Run value and does not autostart.
 - **Processes**: the installer closes `siphon.exe` and `siphon-daemon.exe`
   (`taskkill /F`) before replacing files. The updater runs it as
   `setup.exe /S /RESTART`; `/RESTART` makes the section start
@@ -69,7 +75,8 @@ subset without extensions and without ICE validation.
 The UI starts the daemon from its own directory, so the two exes cannot be
 separated. Config, logs and recordings stay in
 `%LOCALAPPDATA%\com.iken.siphon`; uninstall removes the install tree, the
-shortcuts and the two registry keys, and leaves that data alone.
+shortcuts and the three registry keys (install marker, uninstall entry and the
+autostart value), and leaves that data alone.
 
 ## Payload pieces
 

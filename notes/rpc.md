@@ -19,17 +19,17 @@ The whole app is Siphon. The long-lived process is the **Siphon backend** (today
 and the UI is a dumb renderer:
 
 - backend: config load/save/migrate, GQL resolution, Hermes, live/title
-  decisions, filtered words, notifications, monitor list, pipelines, disk,
-  telemetry;
-- UI: render the latest state, send user intents, show the notification center
-  and tray. No GQL, no Hermes, no config writes, no decisions.
+  transitions, monitor list, pipelines, disk, telemetry;
+- UI: render the latest state, send user intents, decide and show notifications,
+  own the notification centre and the tray. No GQL, no Hermes, no daemon-config
+  writes.
 
 The two talk over one typed RPC. The protocol types live in one crate so the
 compiler catches drift; no field layout is duplicated between client and server.
 
 ```
 Siphon UI (ZGUI)  ── typed RPC ──  Siphon backend (compio)
-                                      ├─ app state (config, channels, notifications)
+                                      ├─ app state (config, channels, transitions)
                                       ├─ GQL + Hermes
                                       ├─ channels (record flags) → pipelines
                                       └─ RTSP listener
@@ -85,7 +85,6 @@ struct Snapshot {
     pipelines: Vec<PipelineView>,
     arena: ArenaSummary,
     downloader: DownloaderSummary,
-    notifications: Vec<NotificationView>,
     logs: Vec<LogEntry>,
     error: Option<String>,
     update: Option<UpdateView>,
@@ -102,8 +101,9 @@ enum Update {
     Segment { key: StreamKey, record: SegmentRecord },
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
-    Notification(NotificationView),
-    NotificationDismissed(u64),
+    /// Append-only: never coalesced, because the transition is the value. The
+    /// client decides whether it is worth a toast.
+    StreamEvent(Box<StreamEvent>),
     Log(LogEntry),
     Error(Option<String>),
     Update(Option<UpdateView>),
@@ -115,8 +115,9 @@ switch colour (`chatColor`, or a generated `oklch(...)` fallback), the local
 `avatarPath` the daemon cached, live, title, game, the
 game id, viewers, stream start as milliseconds, when it was last live
 (`last_live_ms`), Twitch's `BROADCAST-ID`, the last per-channel failure
-(`error`), and the per-channel `notifyLive` / `notifyTitles` / `record`
-switches. `last_live_ms` is Twitch's `lastBroadcast.startedAt`, and the name is
+(`error`), and the per-channel `record` switch — the notification switches are
+the client's and never cross this boundary. `last_live_ms` is Twitch's
+`lastBroadcast.startedAt`, and the name is
 a misnomer: while the channel is live it is roughly the broadcast's start,
 which Twitch reports about five seconds after the real one, and while offline
 it is when that broadcast *ended*. `stream_start_ms` (from `stream.createdAt`)
@@ -139,10 +140,12 @@ pinned, recording, sessions, position, live edge, segment tail, window size,
 counters, last error and the attached recorder's `disk` counters. `SegmentRecord`
 is only scalars; the segment ring is queryable and updates append to it.
 
-Pins are the one ordering fact the daemon never sees: `pins.json` next to
-`ui.json` (`siphon_shared::settings::{load_pins, save_pins}`) holds the channel
-ids a client keeps at the top, and the UI prunes ids that a snapshot no longer
-contains. Ordering therefore differs per window, which is the point.
+Pins are the one ordering fact the daemon never sees: `ui.json`'s `channels`
+map holds a `pinned` flag per channel id (`siphon_shared::settings`), and a
+snapshot only decides which rows are drawn, not what is pinned — an entry for a
+channel that is no longer followed is inert rather than pruned. Ordering
+therefore differs per window, which is the point. There is no separate
+`pins.json`.
 
 `LogEntry` is the daemon's bounded event ring (`LOG_CAP`, 512): `seq`, `at_ms`,
 level, subsystem target, message, and the stream identity beside it (`login`,
@@ -151,13 +154,12 @@ and the snapshot still carries the whole history.
 
 Requests:
 
-- intents: `AddLogin { login, switches }`, `RemoveChannel`, `SetNotifyTitleChanges`, `SetSound`,
-  `SetRecordDir(Option<String>)`, `SetRecordDualFormat(bool)`,
-  `AddFilteredWord`, `RemoveFilteredWord`, `SetRecord { channel, record }`,
-  `SetNotifyLive { channel, notify }`, `SetNotifyTitles { channel, notify }`,
-  `ClearError`, `DismissNotification`, `ApplyUpdate`, `PipelineStop { key,
-  force }`, `PipelineRestart(StreamKey)`, `DisconnectViewers(StreamKey)`,
-  `RecordOnce { login, quality }`;
+- intents: `AddLogin { login }`, `RemoveChannel`, `SetRecordDir(Option<String>)`,
+  `SetRecordDualFormat(bool)`, `SetRecord { channel, record }`, `ClearError`,
+  `ApplyUpdate`, `PipelineStop { key, force }`, `PipelineRestart(StreamKey)`,
+  `DisconnectViewers(StreamKey)`, `RecordOnce { login, quality }`. The
+  notification switches and the word filter are not here: they are client
+  settings, written to `ui.json` (`config.md`);
 - queries: `GetSnapshot`, `GetStreamDetail { key }`, `ListSegments { key,
   limit }`, `GetArena`, `GetDownloader`, `GetDisk { key }`.
 
@@ -193,10 +195,12 @@ listeners are tasks around it.
 
 ### Config
 
-- The daemon owns `Config` (channels, filtered words, notification
-  preferences, sound, recording defaults) and its migrations.
-- Reuse Siphon's `%APPDATA%\com.iken.siphon\config.json` schema and path so
-  existing installs keep their channels; the UI stops touching the file.
+- The daemon owns `Config` (the follow list and its `record` switch, the
+  recording defaults, the cached `account` and the `network` section) and its
+  migrations. Everything a notification is made of moved out of it: see
+  `config.md`.
+- Reuse Siphon's `%APPDATA%\com.iken.siphon\config.json` path so existing
+  installs keep their channels; the UI stops touching the file.
 - Save asynchronously on compio. The UI receives config in the snapshot and
   mutates it only through intents.
 
@@ -206,12 +210,15 @@ listeners are tasks around it.
   `ws`/`ws-connect`; no second runtime.
 - Hermes `stream-up` activates the desired monitor; `stream-down` stops the
   pipeline but keeps the monitor; title/game/viewcount events update
-  `ChannelView`s and drive the matcher.
-- Notifications are decided and displayed by the daemon, so they work with the
-  UI closed. The OS toast (Windows) and the webhook are outputs; the
-  notification center is daemon state and is rendered from the snapshot.
-  (Planned: the decision, the switches and the word filter move to the UI, and
-  the transitions become append-only events — `config.md`.)
+  `ChannelView`s.
+- The daemon **publishes** transitions rather than deciding notifications:
+  `stream-up`, `stream-down` and a title/game move each publish one
+  `StreamEvent` (kind, `previous`, and the row as it stood), uncoalesced. The
+  client owns the switches, the word filter and the mute window and raises the
+  OS toast itself, so the notification centre is client state and does not
+  survive a window restart. This is safe because the UI autostarts at login and
+  owns the daemon (`config.md`). The webhook in `notify.rs` stays: it reports
+  the disk output's own conditions, not the user's notifications.
 - Until Hermes lands in the daemon, the same API works with an external bridge:
   a monitor is desired state, and activation is an explicit request/event.
 
@@ -294,6 +301,120 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
   restart; no network.
 - `cargo clippy -p daemon --all-targets`, `cargo +nightly fmt`.
   No new unsafe in the RPC path, so no Miri requirement.
+
+## Remote clients
+
+Status: designed, not implemented. Everything below is what the transport
+becomes when the UI is pointed at a daemon that is not on this machine; the
+client-side storage for it is described in `config.md`.
+
+### Local
+
+The pipe/socket stays the local transport. It *is* the access control (pipe
+DACL, 0600 socket), there is no listener on a machine that does not need one,
+and `probe`, `ensure_running` and restart are built on it. `Connection::Local`
+means "this install's endpoint", not "a URL that says loopback": trusting
+loopback would let any local process impersonate a daemon.
+
+### Remote
+
+`siphon://host:port#<fingerprint>` is the **enrollment string** the daemon
+prints and the user pastes once. It is parsed into the fields of `ui.json`'s
+`connections` entry and never re-parsed at connect time. The fingerprint rides
+in the fragment because a fragment is never sent to a server; the credential
+never goes in the URL at all — paths and userinfo leak into logs, shell history
+and, if the scheme is ever registered, the URI-handler registry.
+
+`rpc::AdminStream` is a concrete type and `spawn_listener(endpoint)` takes a
+string, so a TCP admin transport is a third case, not a rewrite.
+
+### Identity and pinning
+
+- The daemon generates its key on first run and prints the fingerprint with the
+  enrollment string, so **the first connection is pinned, not trusted on first
+  use**. TOFU is the fallback for a hand-typed address. This matters more than
+  in SSH, because the first connection carries the credential.
+- Pin the key, not the certificate: the SPKI hash (TLS) or the static key
+  (Noise). Pinning a self-signed certificate turns every renewal into a false
+  alarm for no security gain.
+- A mismatch offers "paste the enrollment string again", never a "connect
+  anyway" button.
+
+### Two transports, undecided
+
+- **TLS**: `rustls` is already a dependency, and the hand-rolled HTTP could
+  reuse it. Needs a `ServerCertVerifier` that ignores names and validity and
+  compares the SPKI to the pin (the `dangerous` API), and keeps
+  `openssl s_client` as a debugging tool.
+- **Noise** (`snow`): the static key *is* the identity, and `XX` gives mutual
+  authentication, so there is no bearer value on the wire at all and revoking a
+  device is deleting a line from `clients.json`.
+
+This decides whether the daemon keeps a `clients.json` of authorized client
+keys and each client a `client.key`, or the credential is a bearer value on the
+client side.
+
+### What remote costs
+
+- `ensure_running` must not spawn, and `restart` cannot be process-level: the
+  tray Restart degrades to an RPC exit request, or to "go restart it there".
+  The tuned "a frozen daemon is still restartable from the tray" property is
+  local-only, and that should be said in the UI, not discovered.
+- `probe` needs a connect plus handshake with a timeout, and "unreachable" must
+  be distinguishable from "wrong fingerprint".
+- Intents differ in blast radius. `applyUpdate` is local-only: running an
+  installer on another machine is a different feature. `setRecordDir` is
+  local-only: the path is on the daemon's filesystem, so a remote folder picker
+  would be a lie. `network.remoteControl` in `config.json` gates the rest.
+- No NAT traversal, no rendezvous. An address and a port, plus "use a tailnet
+  or forward a port", is the honest scope.
+
+### Version skew
+
+One build today, two machines later. Because every install carries a daemon, a
+mismatch is never a dead end — the UI can fall back to its own local daemon. So
+the contract is exact-match `PROTOCOL_VERSION` with both versions named in the
+refusal, rather than compatibility shims.
+
+The protocol version now gates framing as well as messages, so a mismatch that
+slipped through would be a corrupt picture rather than a clean error: gate on
+the handshake, never open media before `Welcome`, and carry a capability set
+(media framing, HDR, what the client can decode) because the two machines'
+renderers genuinely differ.
+
+## Video over the RPC
+
+RTSP is being removed and media goes over an extended RPC. That deletes the
+only unauthenticated surface and puts video behind the same credential. A media
+subscriber is just another spool consumer with a `Reader`, which fits better
+than the per-session packet queues did.
+
+The control plane's assumptions invert:
+
+- **Framing.** `RPC_MAX_FRAME` is 1 MiB and the codec is postcard. Access units
+  need their own message class and cap, and a length-prefixed borrowed slice
+  rather than a postcard-scanned `Vec<u8>`. Keep "reject before allocating".
+- **Backpressure.** A control connection over `MAX_OUT` is dropped and resyncs
+  from `Snapshot`. Media must never drop the connection; it skips forward to
+  the next IDR and tells the client to flush. `Stream::send`'s "first IDR on
+  every track" is that resync gate.
+- **Head-of-line blocking.** A `Snapshot` must not queue behind a keyframe. The
+  cheap answer is a second connection on the same handshake and credential,
+  subscribing by `StreamKey` — RTSP's SETUP/PLAY split without RTSP. Per-stream
+  flow control in one socket is the expensive answer.
+- **Buffer ownership.** One packet is shared as `Rc<Vec<u8>>` today because
+  per-session copies cost ~20k allocations/s. The RPC writer's per-connection
+  `Vec<u8>` has to become a queue of shared buffers plus a per-connection
+  header, with the write completion handing the buffer back.
+- **Time.** PTS/DTS and codec config travel explicitly. Seek becomes an intent,
+  and the SR-anchoring and seek-epoch rigmarole in `rtsp-output.md` goes with
+  RTSP.
+
+Keep a probe. RTSP is the only independent end-to-end check today
+(`ffplay -nodisp rtsp://...`, `ffprobe`), and once the UI player is the only
+consumer, "pipeline wrong" and "renderer wrong" look the same. Before RTSP
+goes, add a `--dump` or `siphon-cli` subscriber that writes Annex-B or fMP4 so
+`ffplay -f h264 -` still works.
 
 ## Open questions
 

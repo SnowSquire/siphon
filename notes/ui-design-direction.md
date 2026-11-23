@@ -174,7 +174,7 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   most recently live, with ties keeping config order. Live rows are never
   ranked by viewers — a list that reshuffles every counter tick cannot be
   reached for — and the sort only runs when a row's key changes (a live flip,
-  a pin, a new `last live`). Pins are a client preference (`pins.json`), so two
+  a pin, a new `last live`). Pins are a client preference (`ui.json`), so two
   windows on one daemon may order differently.
 - The `Uptime` column is the row's clock: live rows show how long the stream
   has been running (`2h 14m`), offline rows show `2h ago` in muted type,
