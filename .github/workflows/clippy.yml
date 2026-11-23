@@ -52,7 +52,7 @@ jobs:
           gc-max-store-size-linux: 8G
 
       - name: clippy
-        run: nix build .#checks.linux-clippy
+        run: nix build .#linux-clippy
 
   windows:
     name: Windows x64
@@ -78,4 +78,4 @@ jobs:
 
       # The cross build; `CARGO_BUILD_TARGET` comes from the check's env.
       - name: clippy
-        run: nix build .#checks.windows-clippy
+        run: nix build .#windows-clippy

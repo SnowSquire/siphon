@@ -168,9 +168,13 @@ environment as the build and reuses its artifacts. CI builds exactly those two;
 locally the same command works:
 
 ```sh
-nix build .#checks.windows-clippy
-nix build .#checks.linux-clippy
+nix build .#windows-clippy
+nix build .#linux-clippy
 ```
+
+They are packages as well as checks: `nix build` only inserts the system for
+`packages`/`legacyPackages`, so `.#checks.linux-clippy` would need
+`.#checks.x86_64-linux.linux-clippy`, while `.#linux-clippy` resolves.
 
 `nix flake check --no-build` evaluates every output; the real `nix flake check`
 now builds both lint checks as well, which is a full workspace compile per

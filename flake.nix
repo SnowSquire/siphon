@@ -153,8 +153,17 @@
             # binaries (which change on every commit).
             linux-deps = linux.deps;
             windows-deps = windows.deps;
+
+            # The full-workspace lints. They are here as well as in `checks`
+            # because `nix build .#foo` only inserts the system for `packages`
+            # and `legacyPackages`: `. #checks.x86_64-linux.linux-clippy` needs
+            # the system spelled out, `.#linux-clippy` does not.
+            linux-clippy = linux.clippy;
+            windows-clippy = windows.clippy;
           };
 
+          # `nix flake check` builds these; `packages.*-clippy` is the same
+          # derivation under the name that resolves without the system.
           checks = {
             linux-clippy = linux.clippy;
             windows-clippy = windows.clippy;

@@ -43,7 +43,7 @@ only sink; disk output is disabled and being rebuilt from
   workflow installs Nix and calls it, so there are no xwin/shaderc/libplacebo
   shell scripts to keep in sync. `notes/nix-build.md` has the pieces and pins.
 - Build/check: `cargo clippy -p daemon`, `cargo build -p daemon`
-- Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean. Whole-workspace lints (what CI runs) are `nix build .#checks.linux-clippy` and `.#checks.windows-clippy`, which reuse the dependency layer.
+- Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean. Whole-workspace lints (what CI runs) are `nix build .#linux-clippy` and `.#windows-clippy`, which reuse the dependency layer.
 - Format: `cargo +nightly fmt` — `crates/daemon/rustfmt.toml` uses unstable options (import grouping/granularity, `reorder_impl_items`, LF) that stable `cargo fmt` silently ignores.
 - One-channel recorder: `siphon-daemon record <login> [variant] [--mode live|dvr|both]
   [--list] --output <dir>` — one variant, no config, no RPC, no RTSP. Without
