@@ -18,6 +18,10 @@ Use the absolute directory `worktree_create` returned — it is
 `opencode-<uuid>` entry in `jj workspace list` and a second path in
 `git worktree list`.
 
+`<repo>` below is the main checkout, `~/code/siphon`. Its `@-` (the newest
+described commit of the local line) is the **only** base this skill rebases
+onto.
+
 ## 1. Check both sides
 
 ```bash
@@ -26,34 +30,59 @@ jj status                        # jj snapshots automatically; @ always holds th
 jj log -r '::@' --no-graph -T 'change_id.short() ++ " " ++ commit_id.short() ++ " " ++ description.first_line() ++ "\n"' | head
 ```
 
-**A subagent normally leaves `@` empty** (this repo's convention), so the work
-is in `@-`, `@--`, … — `jj edit @` would rebase nothing. Find the **first
-described commit** of the worktree's line: that is the source for the rebase.
+**A subagent normally leaves `@` empty** (this repo's convention), but if it does
+not, those are its uncommitted changes and section 2 carries them into the main
+checkout's working copy. The described work is in `@-`, `@--`, … — `jj edit @`
+would rebase nothing. Find the **first described commit** of the worktree's
+line: that is the source for the rebase.
 
 Then look at the main checkout:
 
 ```bash
-cd <repo>
-jj log -r 'ancestors(@, 10)' --no-graph -T 'change_id.short() ++ " " ++ description.first_line() ++ "\n"'
+cd <repo>   # ~/code/siphon
+jj log -r '@|@-' --no-graph -T 'change_id.short() ++ " " ++ commit_id.short() ++ " " ++ description.first_line() ++ "\n"'
 ```
+
+`@` is the working copy; `@-` is the last described commit here and the rebase
+destination.
 
 ## 2. Move the worktree's commits on top of yours
 
+Rebase onto this checkout's **`@-`**: the newest described commit of your local
+line. Do **not** use the `main` bookmark (it can lag the local line, and it is a
+publishing pointer, not a base) and do not use `@` (the working copy: the
+worktree line would land on top of it, making your working copy an ancestor of
+the chain, so it could no longer be moved to the new tip and would be left
+undescribed in the middle).
+
 ```bash
-cd <repo>                                  # @ here is your empty working copy
-jj rebase -s <first-worktree-commit> -d '@'
-jj abandon <worktree-empty-@>              # the empty tip, if it came along
-jj edit <last-worktree-commit>             # @ = the rebased tip
-jj new                                     # empty @ on top
-jj abandon <the-empty-commit-that-was-your-@>   # leaves no empty commit mid-history
+cd <repo>                                        # ~/code/siphon
+jj rebase -s <first-worktree-commit> -d '@-'
+# The worktree's @ is its working copy: whatever was uncommitted there is in
+# it. Carry that into your own working copy; the squash drops it once empty.
+jj diff -r <worktree-@> --stat                   # empty output: nothing to carry
+jj squash --from <worktree-@> --into '@'         # removes the emptied source
+jj abandon <worktree-@>                          # only if it printed "Nothing changed."
+jj rebase -s '@' -d <last-worktree-commit>       # your @ becomes the new tip
 ```
+
+The last step is what keeps the rule: only `@` is undescribed, and it is the
+tip — now carrying the worktree's uncommitted changes, if any, as this
+checkout's working-copy changes (`jj status` shows them, `jj diff` is that work).
+When the squash has something to apply it removes the emptied `<worktree-@>`;
+when it prints `Nothing changed.` the commit was empty, so abandon it yourself.
+If the main `@` had changes of its own, the squash merges both (resolve a
+conflict as usual). If the worktree's line has an undescribed commit *below* its
+tip, describe it (`jj describe -r <change>`) before rebasing, or abandon it if it
+is empty.
 
 The rebase gives the worktree commits new commit IDs but keeps their **change
 IDs**, so `jj show <change>` and `jj squash --from <change>` still work
-afterwards. Verify: `jj log -r '::@'` (or `jj chain`) shows your commits, then
-the worktree's, with `@` empty and undescribed on top. `jj status` must be clean
-— if it is not, the rebase dropped something or left a conflict; inspect with
-`jj diff --git` before going on.
+afterwards. Verify: `jj chain` shows your commits, then the worktree's, with `@`
+on top. `@` is the only undescribed commit and holds whatever the worktree's
+working copy had. `jj status` should show exactly those changes and nothing
+else; a conflict (from the squash or the rebase) is the one thing to resolve
+with `jj diff --git` before going on.
 
 Do **not** squash the worktree's commits into one, and do not squash them into
 an undescribed parent: keep them as their own described commits so they can be
@@ -117,35 +146,28 @@ If you are sitting in the worktree, `tools.opencode.session_move({ directory:
 `git worktree remove` — it leaves the jj workspace entry and every later jj
 command errors.
 
-## 6. Move main and push
+## 6. Move main
 
-`@` is the empty working-copy commit; the rebased tip is `@-`. Move the bookmark
-and push it. jj's push is force-with-lease: it updates the remote only if the
-remote is still where the last fetch left it.
+`@` is the working-copy commit — empty, or carrying the worktree's uncommitted
+changes — and the rebased tip is `@-`. Moving the `main` bookmark is the
+separate final pointer update; it is never the rebase base.
 
 ```bash
 cd <repo>
 jj bookmark set main -r '@-'
-jj git push --bookmark main
 ```
 
-**Never use `--allow-empty-description`.** If jj refuses a commit because it has
-no description, describe it and push again:
-
-```bash
-jj describe -r <change>                     # still local
-jj describe -r <change> --ignore-immutable  # already published
-jj git push --bookmark main
-```
-
-The empty `@` is not in the pushed range, so it may stay undescribed. Every
+The `@` commit is not in the pushed range, so it may stay undescribed. Every
 commit below it must be described. If the remote moved, `jj git fetch`,
 reconcile the bookmark, and push again.
 
 ## 7. Verify
 
 ```bash
-jj status               # @ empty, @- is the rebased commit
+jj status               # @ is the tip, @- is the rebased commit; @ may have changes
+# Nothing below @ is undescribed: no output is the pass.
+jj log -r '((fork_point(@ | trunk())::@) ~ @) & description(exact:"")' \
+  --no-graph -T 'change_id.shortest(8) ++ "\n"'
 jj bookmark list main   # main and main@origin at the rebased tip
 jj workspace list       # only "default (current)" (plus unrelated worktrees)
 git worktree list       # only this repo (plus unrelated worktrees)
@@ -156,6 +178,22 @@ ls <worktree-parent>    # the directory is gone
 
 - **Empty `@` is the norm, not an exception.** Rebasing *from* the first
   described commit is the operation; `jj edit @` is a no-op.
+- **Only `@` may be undescribed, and only at the tip.** An empty, undescribed
+  commit below `@` is a defect: `jj describe -r <change>` it, or abandon it if
+  it is empty. Do not reason that it "will be squashed later" — it is exactly
+  the state this skill must never leave behind.
+- **The worktree's `@` is not just an empty tip.** jj snapshots automatically,
+  so it holds whatever was uncommitted there. Squash it into your `@` before
+  abandoning it, or the uncommitted work dies with the worktree. An empty
+  `jj diff -r <worktree-@>` is the only reason to drop it outright.
+- **Never rebase onto `main` or onto `@`.** The base is `@-`
+  (`~/code/siphon`'s newest described commit). `main` can lag the local line,
+  and `@` would become an ancestor of the chain, so the working copy could not
+  be moved to the new tip afterwards.
+- **Move the previous `@`, do not rebuild it.** `jj rebase -s '@' -d
+  <last-worktree-commit>` puts the working copy — with the worktree's changes
+  now in it — back at the tip. Replacing it with `jj edit`/`jj new` can leave the
+  old `@` behind as a second head.
 - **`jj workspace list` names the workspace, not the directory.** The entry is
   `opencode-<uuid>`; match it by commit id.
 - **The two workspaces share one op log.** A `jj commit`/`describe`/`rebase` here
