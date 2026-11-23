@@ -160,3 +160,12 @@ The tag is `vX.Y.Z` and the setup name carries the crate version. NSIS's
 `VIProductVersion` takes four numeric fields, so the script rejects a version
 with a prerelease suffix. Nothing was installed from the old MSI, so there is no
 upgrade path to preserve.
+
+## Reproducible packaging
+
+`nix build .#windows-installer` runs this script against the Nix payload, and
+`nix build --rebuild .#windows-installer` produces byte-identical artifacts.
+Two details make that hold: NSIS records the staged files' timestamps, and a zip
+stores each entry's, so the staging tree is pinned to `SOURCE_DATE_EPOCH` before
+`makensis` (1980-01-01 when unset, as in the workflow), and the portable zip is
+written with `zip -X`.

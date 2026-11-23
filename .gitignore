@@ -1,6 +1,10 @@
 # Cargo build output
 target/
 
+# `nix build` output links
+/result
+/result-*
+
 # Staged Windows payload and the setup built from it
 dist/
 

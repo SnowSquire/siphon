@@ -139,6 +139,14 @@ if [[ -n "${SIPHON_SIGN_PFX:-}" ]]; then
   sign "$stage/siphon-daemon.exe"
 fi
 
+# makensis records the staged files' timestamps, so pin them once signing is
+# done and before compiling: a second packaging of the same payload would
+# otherwise produce a setup that differs in those bytes. SOURCE_DATE_EPOCH is
+# set under Nix; the workflow does not set it, so it keeps its old behaviour
+# there.
+epoch="${SOURCE_DATE_EPOCH:-315532800}" # 1980-01-01, the oldest date zip stores
+find "$stage" -exec touch -h -d "@$epoch" {} +
+
 mkdir -p "$out_dir"
 setup="$out_dir/siphon-$version-x64-setup.exe"
 makensis -V2 -DVERSION="$version" -DPAYLOAD="$stage" \
@@ -154,7 +162,9 @@ fi
 # `-setup.exe`, so the updater never mistakes it for an installer.
 portable="$out_dir/siphon-$version-x64-portable.zip"
 rm -f "$portable"
-(cd "$out_dir" && zip -qr "$portable" "$folder")
+# `-X` drops the extra fields that carry more of the same timestamps the touch
+# above already pinned.
+(cd "$out_dir" && zip -qrX "$portable" "$folder")
 
 size=$(stat -c %s "$setup")
 echo "built $setup ($((size / 1024 / 1024)) MiB)"

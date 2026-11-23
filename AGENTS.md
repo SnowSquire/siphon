@@ -36,6 +36,10 @@ only sink; disk output is disabled and being rebuilt from
 
 ## Commands
 
+- Nix (both platforms from one host):
+  `nix build .#linux` / `nix build .#windows` / `nix build .#windows-installer`
+  / `nix develop` — hermetic Linux binaries, the cross-compiled Windows payload
+  and the installer/portable zip; `notes/nix-build.md` has the pieces and pins.
 - Build/check: `cargo clippy -p daemon`, `cargo build -p daemon`
 - Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean.
 - Format: `cargo +nightly fmt` — `crates/daemon/rustfmt.toml` uses unstable options (import grouping/granularity, `reorder_impl_items`, LF) that stable `cargo fmt` silently ignores.
