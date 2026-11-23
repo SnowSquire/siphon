@@ -29,6 +29,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep in sync with release.yml: the Windows lint restores that job's entry.
+  CACHE_VERSION: v1
 
 jobs:
   linux:
@@ -66,15 +68,17 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # Shares the shape of the release's `deps` entry: same derivation, so a
-      # nightly's cache makes the next lint run fast.
+      # Restores the release's `deps` entry and saves nothing: the Windows
+      # dependency layer is the same derivation, so a second copy under a
+      # `nix-clippy-windows-` key would only spend the repository cache budget
+      # twice. The lint artifacts on top are a workspace compile, which is
+      # minutes, not the layer.
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-clippy-windows-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
           restore-prefixes-first-match: |
-            nix-clippy-windows-
-            nix-deps-
-          gc-max-store-size-linux: 8G
+            nix-deps-${{ env.CACHE_VERSION }}-
+          save: false
 
       # The cross build; `CARGO_BUILD_TARGET` comes from the check's env.
       - name: clippy
