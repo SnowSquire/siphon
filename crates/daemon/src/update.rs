@@ -1,8 +1,9 @@
 //! Update checking and installer hand-off.
 //!
 //! The backend owns the check and the installer run; the UI only renders the
-//! offer and sends `ApplyUpdate`. The installer closes both processes and the
-//! waiter opens the window again, which starts a daemon of its own.
+//! offer and sends `ApplyUpdate`. The setup runs silently with `/RESTART`: it
+//! closes both processes, lays the files down and opens the window again,
+//! which starts a daemon of its own.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -169,33 +170,13 @@ pub async fn download_installer(
     Ok(path)
 }
 
-/// Builds the waiter script: installs silently, then opens the window.
-/// Single quotes cover spaces in both paths; embedded quotes are doubled.
-#[cfg(any(windows, test))]
-fn relaunch_script(installer: &Path, relaunch: &Path) -> String {
-    let quote = |path: &Path| path.display().to_string().replace('\'', "''");
-    format!(
-        "Start-Process -FilePath '{}' -ArgumentList '/S' -Wait; Start-Process -FilePath '{}'",
-        quote(installer),
-        quote(relaunch),
-    )
-}
-
 /// Launches the installer and returns immediately. The daemon exits so no
-/// files are locked; the script reopens the window once the install is done.
+/// files are locked; `/RESTART` makes the setup reopen the window once the
+/// install is done, and that window brings back a daemon of its own.
 #[cfg(windows)]
 pub fn install_and_relaunch(installer: &Path) -> Result<(), UpdateError> {
-    use std::os::windows::process::CommandExt as _;
-
-    let exe = std::env::current_exe()?;
-    // The installer closes both processes. Reopening the window also brings
-    // back the daemon it starts; a tree without one falls back to this exe.
-    let window = exe.with_file_name("siphon.exe");
-    let relaunch = if window.is_file() { &window } else { &exe };
-    let script = relaunch_script(installer, relaunch);
-    std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
+    std::process::Command::new(installer)
+        .args(["/S", "/RESTART"])
         .spawn()?;
     Ok(())
 }
@@ -216,10 +197,6 @@ pub fn open_page(url: &str) {
 /// Opens the release page for builds with no installer hand-off.
 #[cfg(not(windows))]
 pub const fn open_page(_url: &str) {}
-
-/// `CREATE_NO_WINDOW`: no console flashes for the installer waiter.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(test)]
 mod tests {
@@ -271,21 +248,5 @@ mod tests {
     fn parse_rejects_non_semver_tag() {
         let body = br#"{"tag_name": "nightly", "html_url": "https://example.com/r", "assets": []}"#;
         assert!(parse_release(body).is_err());
-    }
-
-    #[test]
-    fn relaunch_script_installs_before_reopening_and_quotes_paths() {
-        let script = relaunch_script(
-            Path::new("C:\\My Dir\\siphon-update-0.2.0.exe"),
-            Path::new("C:\\App Dir\\siphon.exe"),
-        );
-        let install = script.find("/S").expect("installs silently");
-        let open = script
-            .find("C:\\App Dir\\siphon.exe")
-            .expect("reopens the window");
-        assert!(install < open, "reopen must wait for the install");
-        assert!(script.contains("-Wait"));
-        assert!(script.contains("'C:\\My Dir\\siphon-update-0.2.0.exe'"));
-        assert!(script.contains("'C:\\App Dir\\siphon.exe'"));
     }
 }

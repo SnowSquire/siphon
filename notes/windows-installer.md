@@ -35,9 +35,13 @@ subset without extensions and without ICE validation.
   installer and read by `update::install_mode`. Without it the copy counts as
   portable and updates only open the release page.
 - **Processes**: the installer closes `siphon.exe` and `siphon-daemon.exe`
-  (`taskkill /F`) before replacing files. The daemon's waiter then opens
-  `siphon.exe`, which starts a daemon of its own; the daemon being replaced is
-  the one that launched the waiter.
+  (`taskkill /F`) before replacing files. The updater runs it as
+  `setup.exe /S /RESTART`; `/RESTART` makes the section start
+  `$INSTDIR\siphon.exe` once the files are down, and that window starts a
+  daemon of its own. A bare `/S` stays headless, so a manual silent install
+  does not pop the app. No PowerShell waiter sits between the daemon and the
+  setup: the NSIS script is ours, so the installer does the relaunch an MSI
+  could not, and `install_and_relaunch` is one `spawn`.
 - **Size**: `MAX_UPDATE` in `constants.rs` caps the downloaded installer at
   64 MiB. The packaging script warns when the setup crosses it.
 - **Trust**: the installer is fetched over TLS from the GitHub release and run

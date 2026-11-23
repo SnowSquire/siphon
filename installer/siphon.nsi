@@ -7,8 +7,9 @@
 ; lives under %LOCALAPPDATA%\Programs\Siphon, and the daemon keeps its data in
 ; %LOCALAPPDATA%\com.iken.siphon, which uninstall leaves alone.
 ;
-; Silent install (`/S`) is the update hand-off: it closes both processes, lays
-; the files down, and exits. The daemon's waiter reopens the window afterwards.
+; Silent install (`/S`) is the update hand-off: it closes both processes and
+; lays the files down. The updater also passes `/RESTART`, and the section then
+; reopens the window once the files are in place. A bare `/S` stays headless.
 
 Unicode true
 !include "MUI2.nsh"
@@ -109,6 +110,18 @@ FunctionEnd
 
 Section "Siphon" SecMain
   SetShellVarContext current
+
+  ; The updater's hand-off. GetOptions sets the error flag when the switch is
+  ; absent, so latch the result before the section's file and registry work can
+  ; disturb it. A plain `/S` install must not start the app by itself.
+  ${GetParameters} $R0
+  ${GetOptions} $R0 "/RESTART" $R1
+  ${If} ${Errors}
+    StrCpy $R1 0
+  ${Else}
+    StrCpy $R1 1
+  ${EndIf}
+
   !insertmacro CloseSiphon
   Call EnsureVCRuntime
 
@@ -137,6 +150,12 @@ Section "Siphon" SecMain
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD HKCU "${UNINST_KEY}" "EstimatedSize" "$0"
+
+  ; An interactive install already offers this on the finish page; in silent
+  ; mode that page never runs, so the update hand-off does the reopen here.
+  ${If} $R1 == 1
+    Exec '"$INSTDIR\${APP_EXE}"'
+  ${EndIf}
 SectionEnd
 
 Section "Uninstall"
