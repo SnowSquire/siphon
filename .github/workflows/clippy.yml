@@ -74,7 +74,7 @@ jobs:
             clang lld llvm cmake ninja-build pkg-config libvulkan-dev
           clang-cl --version >/dev/null
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: install meson

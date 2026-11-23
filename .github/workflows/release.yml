@@ -123,7 +123,7 @@ jobs:
           # a backport.
           clang-cl --version >/dev/null
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: install meson
@@ -265,7 +265,7 @@ jobs:
 
       - name: upload the build
         if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: siphon-${{ steps.version.outputs.version }}-x64-${{ steps.version.outputs.short_sha }}
           path: |
