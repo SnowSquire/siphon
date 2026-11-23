@@ -84,7 +84,9 @@ use crate::bus::Bus;
 #[cfg(debug_assertions)]
 use crate::constants::DEBUG_CHANNEL_TITLE;
 use crate::constants::DEFAULT_RTSP_PORT;
+use crate::constants::HERMES_WELCOME_TIMEOUT;
 use crate::http::Client;
+use crate::http::timeout;
 use crate::http::ws::WsStream;
 use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
@@ -647,9 +649,11 @@ async fn resolve_record_variants(
 #[allow(clippy::future_not_send)]
 async fn wait_for_stream_up(login: &str, id: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut socket = WsStream::connect(&hermes::url()).await?;
-    // Welcome first: subscribing before it is accepted would be dropped.
+    // Welcome first: subscribing before it is accepted would be dropped. The
+    // socket's reads have no deadline (a live channel can stay quiet for a
+    // whole keepalive interval), so the welcome gets its own.
     loop {
-        let Some(message) = socket.next_text().await? else {
+        let Some(message) = timeout(HERMES_WELCOME_TIMEOUT, socket.next_text()).await?? else {
             return Err("hermes closed before the welcome".into());
         };
         if sonic_rs::from_str::<sonic_rs::Value>(&message)?["type"].as_str() == Some("welcome") {

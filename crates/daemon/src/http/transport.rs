@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use compio::io::AsyncRead;
 use compio::io::AsyncWriteExt;
@@ -44,6 +45,10 @@ impl Carry {
 pub struct TcpConn {
     stream: TcpStream,
     carry: Carry,
+    /// Per-read deadline. `None` waits indefinitely, which is what a WebSocket
+    /// needs: its peer may legitimately stay silent for the whole keepalive
+    /// interval. Writes always keep `IO_TIMEOUT`.
+    read_timeout: Option<Duration>,
 }
 
 impl TcpConn {
@@ -54,6 +59,7 @@ impl TcpConn {
                 data: Vec::new(),
                 off: 0,
             },
+            read_timeout: Some(IO_TIMEOUT),
         }
     }
 
@@ -68,7 +74,11 @@ impl TcpConn {
         // A completion read learns its capacity from the buffer, and a fresh `Vec`
         // has none: reserve before handing it over.
         buf.reserve(READ_BUFFER);
-        let result = timeout(IO_TIMEOUT, self.stream.read(buf)).await?;
+        let read_timeout = self.read_timeout;
+        let result = match read_timeout {
+            Some(limit) => timeout(limit, self.stream.read(buf)).await?,
+            None => self.stream.read(buf).await,
+        };
         self.carry.data = result.1;
         let read = result.0?;
         self.carry.off = 0;
@@ -110,6 +120,16 @@ impl Conn {
             )))
         } else {
             Ok(Self::Tcp(TcpConn::new(stream)))
+        }
+    }
+
+    /// Changes the per-read deadline for later reads. The handshake and every
+    /// HTTP request keep `IO_TIMEOUT`; only a long-lived WebSocket turns this
+    /// off and lets the event loop enforce liveness from `last_message`.
+    pub fn set_read_timeout(&mut self, limit: Option<Duration>) {
+        match self {
+            Self::Tcp(conn) => conn.read_timeout = limit,
+            Self::Tls(conn) => conn.set_read_timeout(limit),
         }
     }
 

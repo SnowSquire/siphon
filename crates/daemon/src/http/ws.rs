@@ -4,6 +4,11 @@
 //! fragmentation and the close handshake. No extensions, no compression and
 //! no binary payloads; Hermes speaks JSON text frames.
 
+use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+
 use crate::constants::IO_TIMEOUT;
 use crate::http::Error;
 use crate::http::pool::PoolKey;
@@ -27,6 +32,11 @@ const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
 const OP_PONG: u8 = 0xA;
 
+/// One transport read in flight. It owns the connection handle and its buffer,
+/// so the read survives the outer `next_text()` future being dropped: the next
+/// call resumes it instead of losing bytes the peer already sent.
+type ChunkFuture = Pin<Box<dyn Future<Output = (Result<usize, Error>, Vec<u8>)>>>;
+
 /// One decoded frame, after fragmentation has been reassembled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -39,7 +49,15 @@ pub enum Frame {
 
 /// A connected WebSocket, read and written sequentially by one task.
 pub struct WsStream {
-    conn: Conn,
+    /// Shared with the armed read future, which holds a `RefMut` across the
+    /// await. Every write cancels the read before borrowing the connection.
+    conn: Rc<RefCell<Conn>>,
+    /// The pending transport read. It stays here across calls so the event loop
+    /// dropping `next_text()` cannot cancel a read mid-chunk.
+    read: Option<ChunkFuture>,
+    /// Reused staging buffer for the next read.
+    read_buf: Vec<u8>,
+    /// Bytes received but not yet consumed as whole frames.
     buffered: Vec<u8>,
     fragments: Vec<u8>,
     fragment_opcode: Option<u8>,
@@ -84,8 +102,16 @@ impl WsStream {
             return Err(Error::Protocol("websocket accept key mismatch"));
         }
 
+        // Hermes is idle between keepalives (every `keepaliveSec`, 15 s real
+        // Twitch), so a per-read deadline of the same size races the peer and
+        // turns a healthy socket into a reconnect. Liveness is the event loop's
+        // job: it drops the socket after `last_message` misses two keepalives.
+        conn.set_read_timeout(None);
+
         Ok(Self {
-            conn,
+            conn: Rc::new(RefCell::new(conn)),
+            read: None,
+            read_buf: Vec::new(),
             buffered: head.leftover,
             fragments: Vec::new(),
             fragment_opcode: None,
@@ -129,33 +155,73 @@ impl WsStream {
         result
     }
 
+    // The `RefMut` is held across the await on purpose: this is the stored read,
+    // and the single-threaded loop cannot borrow the connection elsewhere while
+    // it is armed (every write cancels it first).
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn send(&mut self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
+        // A write needs the connection, so give up an armed read. This is the
+        // pong/subscribe path, never the passive read path the event loop
+        // cancels; at worst it loses one already-received chunk.
+        self.read = None;
         let frame = encode_client_frame(opcode, payload, rand::random::<[u8; 4]>());
-        timeout(IO_TIMEOUT, self.conn.write_all(&frame)).await??;
+        let mut conn = self.conn.borrow_mut();
+        timeout(IO_TIMEOUT, conn.write_all(&frame)).await??;
         Ok(())
     }
 
-    /// Reads exactly `len` bytes, pulling from the connection as needed.
-    async fn read_exact(&mut self, len: usize) -> Result<Vec<u8>, Error> {
-        while self.buffered.len() < len {
-            let mut chunk = vec![0u8; READ_BUFFER];
-            let read = timeout(IO_TIMEOUT, self.conn.read_into(&mut chunk)).await??;
-            if read == 0 {
-                return Err(Error::Closed);
-            }
-            self.buffered.extend_from_slice(&chunk[..read]);
-            if self.buffered.len() > MAX_BUFFERED {
-                return Err(Error::Protocol("websocket frame too large"));
-            }
+    /// Makes one more transport read available in `buffered`.
+    ///
+    /// The read lives in `self.read`, so cancelling this future (the event loop
+    /// drops `next_text()` whenever another branch wins) only stops waiting;
+    /// the next call polls the same read and keeps every byte.
+    #[allow(clippy::await_holding_refcell_ref)] // see `send`
+    async fn fill(&mut self) -> Result<(), Error> {
+        if self.read.is_none() {
+            let conn = Rc::clone(&self.conn);
+            let mut buf = std::mem::take(&mut self.read_buf);
+            buf.resize(READ_BUFFER, 0);
+            self.read = Some(Box::pin(async move {
+                let mut conn = conn.borrow_mut();
+                let result = conn.read_into(&mut buf).await;
+                (result, buf)
+            }));
         }
-        Ok(self.buffered.drain(..len).collect())
+        let (result, buf) =
+            std::future::poll_fn(|cx| self.read.as_mut().expect("armed above").as_mut().poll(cx))
+                .await;
+        self.read = None;
+        self.read_buf = buf;
+        let read = result?;
+        if read == 0 {
+            return Err(Error::Closed);
+        }
+        self.buffered.extend_from_slice(&self.read_buf[..read]);
+        if self.buffered.len() > MAX_BUFFERED {
+            return Err(Error::Protocol("websocket frame too large"));
+        }
+        Ok(())
     }
 
     async fn read_frame(&mut self) -> Result<Frame, Error> {
         loop {
-            let header = self.read_exact(2).await?;
-            let first = header[0];
-            let second = header[1];
+            if let Some(frame) = self.parse_frame()? {
+                return Ok(frame);
+            }
+            self.fill().await?;
+        }
+    }
+
+    /// Parses one whole frame out of `buffered`, or returns `None` when more
+    /// bytes are needed. Nothing is consumed until the complete frame is
+    /// present, so a cancelled read leaves the parser exactly where it was.
+    fn parse_frame(&mut self) -> Result<Option<Frame>, Error> {
+        loop {
+            if self.buffered.len() < 2 {
+                return Ok(None);
+            }
+            let first = self.buffered[0];
+            let second = self.buffered[1];
             let fin = first & 0x80 != 0;
             if first & 0x70 != 0 {
                 return Err(Error::Protocol("websocket reserved bits set"));
@@ -164,15 +230,22 @@ impl WsStream {
             if second & 0x80 != 0 {
                 return Err(Error::Protocol("masked server frame"));
             }
+            let mut header_len: usize = 2;
             let mut length = u64::from(second & 0x7F);
             if length == 126 {
-                let extended = self.read_exact(2).await?;
-                length = u64::from(u16::from_be_bytes(
-                    extended.try_into().map_err(|_| Error::Closed)?,
-                ));
+                if self.buffered.len() < 4 {
+                    return Ok(None);
+                }
+                length = u64::from(u16::from_be_bytes([self.buffered[2], self.buffered[3]]));
+                header_len = 4;
             } else if length == 127 {
-                let extended = self.read_exact(8).await?;
-                length = u64::from_be_bytes(extended.try_into().map_err(|_| Error::Closed)?);
+                if self.buffered.len() < 10 {
+                    return Ok(None);
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&self.buffered[2..10]);
+                length = u64::from_be_bytes(bytes);
+                header_len = 10;
             }
             let length = usize::try_from(length)
                 .map_err(|_| Error::Protocol("websocket frame too large"))?;
@@ -183,10 +256,18 @@ impl WsStream {
             if is_control && (!fin || length > 125) {
                 return Err(Error::Protocol("invalid websocket control frame"));
             }
-            let payload = self.read_exact(length).await?;
+            let total = header_len
+                .checked_add(length)
+                .ok_or(Error::Protocol("websocket frame too large"))?;
+            if self.buffered.len() < total {
+                return Ok(None);
+            }
+            // Whole frame is buffered: consume it now, with no await in between.
+            self.buffered.drain(..header_len);
+            let payload: Vec<u8> = self.buffered.drain(..length).collect();
 
             match opcode {
-                OP_TEXT | OP_BINARY if fin => return complete_message(opcode, payload),
+                OP_TEXT | OP_BINARY if fin => return complete_message(opcode, payload).map(Some),
                 OP_TEXT | OP_BINARY => {
                     if self.fragment_opcode.is_some() {
                         return Err(Error::Protocol("interleaved websocket fragments"));
@@ -195,9 +276,9 @@ impl WsStream {
                     self.fragments = payload;
                 }
                 OP_CONTINUATION => {
-                    let Some(_) = self.fragment_opcode else {
+                    if self.fragment_opcode.is_none() {
                         return Err(Error::Protocol("unexpected websocket continuation"));
-                    };
+                    }
                     if self.fragments.len() + payload.len() > MAX_MESSAGE {
                         return Err(Error::Protocol("websocket message too large"));
                     }
@@ -208,12 +289,12 @@ impl WsStream {
                             .take()
                             .expect("checked above before extending");
                         let payload = std::mem::take(&mut self.fragments);
-                        return complete_message(opcode, payload);
+                        return complete_message(opcode, payload).map(Some);
                     }
                 }
                 OP_CLOSE => {
                     if payload.is_empty() {
-                        return Ok(Frame::Close(1005, String::new()));
+                        return Ok(Some(Frame::Close(1005, String::new())));
                     }
                     if payload.len() < 2 {
                         return Err(Error::Protocol("invalid websocket close frame"));
@@ -221,10 +302,10 @@ impl WsStream {
                     let code = u16::from_be_bytes([payload[0], payload[1]]);
                     let reason = String::from_utf8(payload[2..].to_vec())
                         .map_err(|_| Error::Protocol("invalid websocket close reason"))?;
-                    return Ok(Frame::Close(code, reason));
+                    return Ok(Some(Frame::Close(code, reason)));
                 }
-                OP_PING => return Ok(Frame::Ping(payload)),
-                OP_PONG => return Ok(Frame::Pong(payload)),
+                OP_PING => return Ok(Some(Frame::Ping(payload))),
+                OP_PONG => return Ok(Some(Frame::Pong(payload))),
                 _ => return Err(Error::Protocol("unknown websocket opcode")),
             }
         }
@@ -521,6 +602,40 @@ mod tests {
         });
     }
 
+    /// The event loop drops `next_text()` whenever any other branch wins. That
+    /// must not cancel the transport read or forget a header already consumed:
+    /// the old parser lost the frame boundary and desynced.
+    #[test]
+    fn a_cancelled_read_keeps_the_partial_frame() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = async move {
+                use compio::io::AsyncWriteExt as _;
+                let (mut stream, _) = listener.accept().await.unwrap();
+                serve_handshake(&mut stream).await.unwrap();
+                // Header now, payload later: the client is suspended between
+                // them when its read is cancelled.
+                let frame = server_frame(true, OP_TEXT, b"hello");
+                stream.write_all(frame[..2].to_vec()).await.0.unwrap();
+                compio::time::sleep(std::time::Duration::from_millis(100)).await;
+                stream.write_all(frame[2..].to_vec()).await.0.unwrap();
+                compio::time::sleep(std::time::Duration::from_secs(1)).await;
+            };
+            let client = async {
+                let mut ws = WsStream::connect(&format!("ws://{addr}/")).await.unwrap();
+                let first = timeout(std::time::Duration::from_millis(30), ws.next_text()).await;
+                assert!(first.is_err(), "the read must still be pending");
+                let text = timeout(std::time::Duration::from_secs(5), ws.next_text())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(text.as_deref(), Some("hello"));
+            };
+            futures_util::join!(server, client);
+        });
+    }
+
     #[test]
     fn urls_split_into_key_and_path() {
         let (key, path) = parse_url("wss://hermes.twitch.tv/v1?clientId=x").unwrap();
@@ -533,5 +648,61 @@ mod tests {
         assert!(!key.tls);
         assert_eq!(key.port, 8000);
         assert_eq!(path, "/");
+    }
+
+    /// Live Hermes: write a burst of subscriptions while responses and pings
+    /// arrive, then keep reading. The TLS transport used to decrypt inbound
+    /// records seen during a write without discarding their ciphertext, so the
+    /// next read re-decrypted them into garbage and the WebSocket parser saw an
+    /// opcode-0 continuation. The daemon's 15-channel subscribe burst hit this
+    /// immediately. Ignored because it needs the network and ~30 s.
+    #[test]
+    #[ignore = "connects to hermes.twitch.tv and waits through two keepalives"]
+    fn live_hermes_survives_a_subscribe_burst() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut ws = WsStream::connect(crate::constants::HERMES_URL)
+                .await
+                .expect("connect");
+            let welcome = timeout(std::time::Duration::from_secs(10), ws.next_text())
+                .await
+                .expect("welcome timed out")
+                .expect("welcome read failed")
+                .expect("closed before the welcome");
+            assert!(welcome.contains("\"type\":\"welcome\""), "{welcome}");
+            // The daemon subscribes to every channel's two topics back to back.
+            // Doing the same here forces inbound records to land between the
+            // writes, which is where the old discard bug corrupted the stream.
+            for index in 0..30 {
+                let subscribe = sonic_rs::json!({
+                    "type": "subscribe",
+                    "id": format!("live-{index}"),
+                    "subscribe": {
+                        "id": format!("live-{index}"),
+                        "type": "pubsub",
+                        "pubsub": { "topic": format!("video-playback-by-id.{}", 12826 + index) },
+                    },
+                    "timestamp": "1970-01-01T00:00:00Z",
+                });
+                ws.send_text(&sonic_rs::to_string(&subscribe).expect("json"))
+                    .await
+                    .expect("subscribe");
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            let mut keepalives = 0;
+            while keepalives < 2 {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "no keepalive arrived in 40 s");
+                let text = timeout(remaining, ws.next_text())
+                    .await
+                    .expect("read timed out")
+                    .expect("read failed");
+                let Some(text) = text else {
+                    panic!("socket closed before two keepalives");
+                };
+                if text.contains("\"type\":\"keepalive\"") {
+                    keepalives += 1;
+                }
+            }
+        });
     }
 }

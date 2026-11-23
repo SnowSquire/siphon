@@ -81,6 +81,10 @@ Costs, in detail (the whole bill):
 - **Writes appear inside the read loop.** Post-handshake tickets and key updates
   surface as `EncodeTlsData`/`TransmitTlsData` at arbitrary points, so the read path
   must be able to write to the socket.
+- **Reads appear inside the write path.** `process_tls_records` can return
+  `ReadTraffic` during a `write_all`; queue that plaintext for the next read and
+  fold each record's `discard` into the same drain, or the next read decrypts
+  already-consumed ciphertext again.
 - **Granularity.** One call advances roughly one record: a 1.8 MB segment is ~115
   iterations, all our loop, our bounds checks, our `close_notify` handling.
 

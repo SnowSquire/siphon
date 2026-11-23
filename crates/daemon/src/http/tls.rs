@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use compio::io::AsyncRead;
 use compio::io::AsyncWriteExt;
@@ -35,6 +36,10 @@ pub struct TlsConn {
     /// Decrypted bytes waiting to be served.
     plain: Carry,
     closed: bool,
+    /// Per-read deadline for ciphertext reads. `None` waits indefinitely, for a
+    /// WebSocket whose peer may idle for a full keepalive interval; the TLS
+    /// handshake always runs with `IO_TIMEOUT`.
+    read_timeout: Option<Duration>,
     /// A TLS error was returned once. rustls has already queued its fatal
     /// alert and a second `process_tls_records` on the same connection trips
     /// its `sent_fatal_alert` assertion, so a dead connection answers every
@@ -75,6 +80,7 @@ impl TlsConn {
             out: vec![0; OUT_BUFFER],
             plain: Carry::default(),
             closed: false,
+            read_timeout: Some(IO_TIMEOUT),
             failed: false,
         };
         this.handshake().await?;
@@ -127,11 +133,19 @@ impl TlsConn {
         Ok(())
     }
 
+    pub const fn set_read_timeout(&mut self, limit: Option<Duration>) {
+        self.read_timeout = limit;
+    }
+
     async fn refill(&mut self) -> Result<(), Error> {
         let mut buf = std::mem::take(&mut self.inbuf);
         buf.clear();
         buf.reserve(READ_BUFFER);
-        let result = timeout(IO_TIMEOUT, self.raw.read(buf)).await?;
+        let read_timeout = self.read_timeout;
+        let result = match read_timeout {
+            Some(limit) => timeout(limit, self.raw.read(buf)).await?,
+            None => self.raw.read(buf).await,
+        };
         self.inbuf = result.1;
         let read = result.0?;
         if read == 0 {
@@ -233,7 +247,7 @@ impl TlsConn {
             return Err(Error::Closed);
         }
         while !data.is_empty() {
-            let discard;
+            let mut discard;
             let mut wrote = 0;
             let mut pending = None;
 
@@ -259,7 +273,14 @@ impl TlsConn {
                     }
                     Ok(ConnectionState::ReadTraffic(mut traffic)) => {
                         while let Some(record) = traffic.next_record() {
-                            self.plain.data.extend_from_slice(record?.payload);
+                            let record = record?;
+                            self.plain.data.extend_from_slice(record.payload);
+                            // The ciphertext of every decrypted record must leave
+                            // `ct` here too. Pings and subscribe responses arrive
+                            // while the client is writing, and leaving their bytes
+                            // in `ct` makes the next read decrypt them again into
+                            // garbage.
+                            discard += record.discard;
                         }
                     }
                     Ok(ConnectionState::BlockedHandshake) => {

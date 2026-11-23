@@ -87,6 +87,16 @@ keepalive, reconnect, update check, telemetry flush — and sleeps exactly that
 long. Telemetry is still needed only while a UI is connected, so it is a deadline
 armed at 1 Hz only then.
 
+The Hermes socket read is **cancel-safe**. The loop drops `next_text()` whenever
+another branch wins, so the in-flight transport read lives in the `WsStream` and
+the parser never consumes a partial frame: cancelling only stops waiting, and
+the next call resumes both. Without this, a dropped TLS read discards its
+in-flight chunk (and a consumed header), the next frame is garbage, and the
+socket reconnects; a lost `subscribeResponse` also trips the 10 s confirmation
+deadline. HTTP reads keep `IO_TIMEOUT`; the upgraded WebSocket clears it and
+relies on the two-keepalive deadline above. The one-shot `record` welcome wait
+arms its own 10 s timeout, since it has no loop ticking.
+
 ### Constants
 
 Tunables live in `constants.rs`: segment ring, RPC backlog cap, log cap,

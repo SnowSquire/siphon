@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use futures_util::FutureExt as _;
 use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use siphon_shared::rpc::ArenaSummary;
 use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
@@ -56,13 +57,12 @@ use crate::time::now_ms;
 use crate::update;
 use crate::utils::CheapRng;
 use crate::utils::NanoId;
-
 /// One thing the daemon loop wakes for.
 enum Event {
     /// One admin connection produced input or finished a write.
     Conn(rpc::ConnEvent),
-    /// Hermes produced a text frame, or the socket is gone.
-    Socket(Option<String>),
+    /// Hermes produced a text frame, closed cleanly, or failed the read.
+    Socket(Result<Option<String>, crate::http::Error>),
     /// A background job finished.
     Job(Option<Box<JobDone>>),
     /// Something published on the bus.
@@ -271,8 +271,6 @@ impl App {
     }
 
     pub async fn run(mut self) {
-        use futures_util::stream::FuturesUnordered;
-
         let mut conns: Vec<Option<rpc::Conn>> = Vec::new();
         let mut ops: FuturesUnordered<Op> = FuturesUnordered::new();
         ops.push(accept_op(&self.accept));
@@ -292,7 +290,7 @@ impl App {
                 // not queue behind a read.
                 let socket_fut = async {
                     match self.socket.as_mut() {
-                        Some(socket) => socket.next_text().await.ok().flatten(),
+                        Some(socket) => socket.next_text().await,
                         None => std::future::pending().await,
                     }
                 }
@@ -316,9 +314,13 @@ impl App {
 
             match event {
                 Event::Conn(event) => self.handle_conn(event, &mut conns, &ops),
-                Event::Socket(Some(text)) => self.handle_message(&text).await,
-                Event::Socket(None) => {
-                    tracing::info!(target: "hermes", "connection closed");
+                Event::Socket(Ok(Some(text))) => self.handle_message(&text).await,
+                Event::Socket(Ok(None)) => {
+                    tracing::info!(target: "hermes", "connection closed by peer");
+                    self.on_disconnect().await;
+                }
+                Event::Socket(Err(error)) => {
+                    tracing::info!(target: "hermes", "socket read failed: {error}");
                     self.on_disconnect().await;
                 }
                 Event::Job(None) => break,
@@ -375,7 +377,7 @@ impl App {
         &mut self,
         event: rpc::ConnEvent,
         conns: &mut Vec<Option<rpc::Conn>>,
-        ops: &futures_util::stream::FuturesUnordered<Op>,
+        ops: &FuturesUnordered<Op>,
     ) {
         match event {
             rpc::ConnEvent::Accepted(Ok(stream)) => {
@@ -499,11 +501,7 @@ impl App {
     }
 
     /// Encodes each queued update once and hands the bytes to every connection.
-    fn flush_bus(
-        &mut self,
-        conns: &mut [Option<rpc::Conn>],
-        ops: &futures_util::stream::FuturesUnordered<Op>,
-    ) {
+    fn flush_bus(&mut self, conns: &mut [Option<rpc::Conn>], ops: &FuturesUnordered<Op>) {
         for broadcast in self.bus.take_pending() {
             self.frame.clear();
             if siphon_shared::rpc::codec::encode(
