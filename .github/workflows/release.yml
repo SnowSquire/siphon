@@ -263,16 +263,22 @@ jobs:
             dist/*-setup.exe
             dist/*-portable.zip
 
-      - name: upload the build
+      # v7 can upload one file unzipped: each download is the setup or the
+      # portable zip itself, not a wrapper artifact holding both.
+      - name: upload the installer
         if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
         uses: actions/upload-artifact@v7
         with:
-          name: siphon-${{ steps.version.outputs.version }}-x64-${{ steps.version.outputs.short_sha }}
-          path: |
-            dist/*-setup.exe
-            dist/*-portable.zip
+          path: dist/*-setup.exe
           if-no-files-found: error
           retention-days: 14
-          # Both files are already compressed; storing them avoids a second
-          # archive pass and keeps the artifact close to their real size.
-          compression-level: 0
+          archive: false
+
+      - name: upload the portable zip
+        if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/*-portable.zip
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
