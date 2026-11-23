@@ -12,11 +12,14 @@
 #   dist/siphon-<version>-x64-portable.zip
 #
 # The setup is what the updater downloads: the release asset must keep the
-# `-setup.exe` suffix, and its name carries the tag's version.
+# `-setup.exe` suffix, and its name carries the tag's version. The portable zip
+# keeps its payload under one directory so extracting it does not scatter files.
 #
 # Optional environment:
 #   SIPHON_TARGET_DIR      release directory to harvest (default: the
 #                          x86_64-pc-windows-msvc release dir)
+#   SIPHON_PORTABLE_DIR    directory name inside the portable zip
+#                          (default: siphon-<version>)
 #   SIPHON_FFMPEG_BIN      directory with the LGPL FFmpeg DLLs to bundle
 #   SIPHON_FFMPEG_LICENSE  licence text that ships with them (default:
 #                          the LICENSE.txt next to SIPHON_FFMPEG_BIN)
@@ -26,7 +29,6 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target="${SIPHON_TARGET_DIR:-$root/target/x86_64-pc-windows-msvc/release}"
-stage="$root/dist/win64"
 out_dir="$root/dist"
 
 build=1
@@ -47,6 +49,15 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "installer versions are numeric only, got '$version'" >&2
   exit 1
 fi
+
+# One directory inside the portable zip, named for the release tag on a tag
+# build or for the commit on a manual/nightly build (the workflow sets this).
+folder="${SIPHON_PORTABLE_DIR:-siphon-$version}"
+if [[ ! "$folder" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "SIPHON_PORTABLE_DIR must be a plain directory name, got '$folder'" >&2
+  exit 1
+fi
+stage="$out_dir/$folder"
 
 if [[ $build -eq 1 ]]; then
   "$root/scripts/cargo-win.sh" build --release --locked -p siphon-ui -p daemon
@@ -136,12 +147,12 @@ if [[ -n "${SIPHON_SIGN_PFX:-}" ]]; then
   sign "$setup"
 fi
 
-# The portable copy is the same payload zipped: there is no single exe to ship
-# any more. The name deliberately does not end in `-setup.exe`, so the updater
-# never mistakes it for an installer.
+# The portable copy is the same payload zipped under its directory: there is
+# no single exe to ship any more. The name deliberately does not end in
+# `-setup.exe`, so the updater never mistakes it for an installer.
 portable="$out_dir/siphon-$version-x64-portable.zip"
 rm -f "$portable"
-(cd "$stage" && zip -qr "$portable" .)
+(cd "$out_dir" && zip -qr "$portable" "$folder")
 
 size=$(stat -c %s "$setup")
 echo "built $setup ($((size / 1024 / 1024)) MiB)"
