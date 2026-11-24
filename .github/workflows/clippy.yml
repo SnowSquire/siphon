@@ -90,12 +90,17 @@ jobs:
         # `depsSrc` deliberately keeps out of the layer.
         run: echo "drv=$(nix eval --raw .#windows-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
 
+      # Saving this entry is the point of the shared key: the Windows job builds
+      # `.#windows-deps` anyway, so the release workflow's `deps` job restores
+      # what this already compiled instead of building it a second time. The
+      # Windows job of the release restores it read-only; the content is the
+      # same derivation, so whichever run writes first is the one that counts.
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ steps.deps.outputs.drv }}
           restore-prefixes-first-match: |
             nix-deps-${{ env.CACHE_VERSION }}-
-          save: false
+          gc-max-store-size-linux: 8G
 
       # The cross build; `CARGO_BUILD_TARGET` comes from the check's env.
       - name: clippy
