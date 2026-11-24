@@ -435,6 +435,9 @@ fn App(
     let closing = RwSignal::new_local(BTreeSet::<u64>::new());
     let draft = RwSignal::new_local(String::new());
     let word_draft = RwSignal::new_local(String::new());
+    // Owned here because the field is drawn in the tab strip, above the tab's
+    // own body; the Channels list reads it through a prop.
+    let channel_filter = RwSignal::new_local(String::new());
     let once_login = RwSignal::new_local(String::new());
     let once_quality = RwSignal::new_local(String::new());
 
@@ -555,6 +558,22 @@ fn App(
                     text {"Watch"}
                 }
                 spacer()
+                // The filter lives in the tab strip: a field of its own would
+                // cost a whole row for one control. It is only in the strip on
+                // Channels, which is the only tab it filters.
+                if move || tab.get() == Tab::Channels {
+                    Input(
+                        value = channel_filter,
+                        placeholder = "Filter channels",
+                        class = "tabs__filter",
+                        on:key_down = move |ev| {
+                            if matches!(ev.key, Key::Named(NamedKey::Escape)) {
+                                channel_filter.set(String::new());
+                                ev.prevent_default();
+                            }
+                        },
+                    )
+                }
                 text(class = "conn") {
                     {move || conn_summary(conn_sig.get(), &channels_sig.get())}
                 }
@@ -572,6 +591,7 @@ fn App(
                     draft = draft,
                     intents = Rc::clone(&channels_intents),
                     toggle_pin = toggle_pin,
+                    filter = channel_filter,
                     settings = settings_sig,
                     set_prefs = UnsyncCallback::new({
                         let state = state_channels.clone();
@@ -674,6 +694,7 @@ fn ChannelsTab(
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
     closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
+    filter: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
     toggle_pin: UnsyncCallback<u64>,
     settings: RwSignal<ClientSettings, LocalStorage>,
@@ -702,31 +723,10 @@ fn ChannelsTab(
     // A view of the same keyed list, not a second order: the filter only
     // decides which rows are drawn, so pins and the sort still hold underneath.
     // It matches the login and the display name; a title changes constantly and
-    // is not a stable way to find a channel.
-    let filter = RwSignal::new_local(String::new());
-
+    // is not a stable way to find a channel. The field itself is in the tab
+    // strip above.
     view! {
         column(class = "tabbody") {
-            row(class = "filterbar") {
-                Input(
-                    value = filter,
-                    placeholder = "Filter channels",
-                    class = "filterbar__input",
-                    on:key_down = move |ev| {
-                        if matches!(ev.key, Key::Named(NamedKey::Escape)) {
-                            filter.set(String::new());
-                            ev.prevent_default();
-                        }
-                    },
-                )
-                if move || !filter.get().is_empty() {
-                    Button(
-                        size = ButtonSize::IconSm,
-                        variant = ButtonVariant::Ghost,
-                        on:click = move |_| filter.set(String::new()),
-                    ) {"×"}
-                }
-            }
             row(class = "tablehead") {
                 text(class = "cell cell--dot") {""}
                 text(class = "cell cell--chevron") {""}

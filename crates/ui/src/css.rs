@@ -575,13 +575,7 @@ pub const SHEET: &str = css!(
     .add__input { flex-grow: 1; }
     .add__quality { width: 170px; }
 
-    .filterbar {
-        gap: 8px;
-        align-items: center;
-        padding-bottom: 2px;
-    }
 
-    .filterbar__input { flex-grow: 1; }
 
     .word {
         align-items: center;
@@ -952,6 +946,17 @@ pub const SHEET: &str = css!(
     padding: 0 6px;
     color: oklch(0.80 0.012 240);
     font-size: 12px;
+}
+/* The channel filter sits in the tab strip rather than in a row of its own: a
+   whole row for one field cost more height than the field is worth. Scoped to
+   the strip so it outranks the input's own `width: 100%`/34px, and shorter than
+   that 34px so the strip keeps its own height. */
+.tabs .tabs__filter {
+    flex: 0 0 auto;
+    width: 190px;
+    height: 26px;
+    margin-right: 10px;
+    padding: 0 8px;
 }
 .ticker {
     flex: 1 1 auto;
