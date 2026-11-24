@@ -17,23 +17,23 @@ use std::time::Instant;
 use futures_util::FutureExt as _;
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
-use siphon_shared::rpc::ArenaSummary;
-use siphon_shared::rpc::ChannelView;
-use siphon_shared::rpc::Config;
-use siphon_shared::rpc::ConnHealth;
-use siphon_shared::rpc::DownloaderSummary;
-use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::PipelineView;
-use siphon_shared::rpc::Request;
-use siphon_shared::rpc::Response;
-use siphon_shared::rpc::RpcError;
-use siphon_shared::rpc::ServerMessage;
-use siphon_shared::rpc::Snapshot;
-use siphon_shared::rpc::StreamEvent;
-use siphon_shared::rpc::StreamEventKind;
-use siphon_shared::rpc::StreamKey;
-use siphon_shared::rpc::Update;
-use siphon_shared::rpc::UpdateView;
+use siphon_shared::riffle::ArenaSummary;
+use siphon_shared::riffle::ChannelView;
+use siphon_shared::riffle::Config;
+use siphon_shared::riffle::ConnHealth;
+use siphon_shared::riffle::DownloaderSummary;
+use siphon_shared::riffle::LogLevel;
+use siphon_shared::riffle::PipelineView;
+use siphon_shared::riffle::Request;
+use siphon_shared::riffle::Response;
+use siphon_shared::riffle::RpcError;
+use siphon_shared::riffle::ServerMessage;
+use siphon_shared::riffle::Snapshot;
+use siphon_shared::riffle::StreamEvent;
+use siphon_shared::riffle::StreamEventKind;
+use siphon_shared::riffle::StreamKey;
+use siphon_shared::riffle::Update;
+use siphon_shared::riffle::UpdateView;
 use tracing::info;
 
 use crate::bus::Bus;
@@ -49,7 +49,7 @@ use crate::hermes::Topic;
 use crate::http::Client;
 use crate::http::ws::WsStream;
 use crate::registry::Registry;
-use crate::rpc;
+use crate::riffle;
 use crate::time::now_ms;
 use crate::update;
 use crate::utils::CheapRng;
@@ -57,7 +57,7 @@ use crate::utils::NanoId;
 /// One thing the daemon loop wakes for.
 enum Event {
     /// One admin connection produced input or finished a write.
-    Conn(rpc::ConnEvent),
+    Conn(riffle::ConnEvent),
     /// Hermes produced a text frame, closed cleanly, or failed the read.
     Socket(Result<Option<String>, crate::http::Error>),
     /// A background job finished.
@@ -71,17 +71,17 @@ enum Event {
 /// A loop operation: connection I/O, jobs and the bus wake live in one set.
 type Op = futures_util::future::LocalBoxFuture<'static, Event>;
 
-fn accept_op(queue: &kanal::AsyncReceiver<rpc::AdminStream>) -> Op {
+fn accept_op(queue: &kanal::AsyncReceiver<riffle::AdminStream>) -> Op {
     let queue = queue.clone();
-    Box::pin(async move { Event::Conn(rpc::accept(&queue).await) })
+    Box::pin(async move { Event::Conn(riffle::accept(&queue).await) })
 }
 
-fn read_op(conn: usize, stream: Rc<rpc::AdminStream>) -> Op {
-    Box::pin(async move { Event::Conn(rpc::read(conn, stream).await) })
+fn read_op(conn: usize, stream: Rc<riffle::AdminStream>) -> Op {
+    Box::pin(async move { Event::Conn(riffle::read(conn, stream).await) })
 }
 
-fn write_op(conn: usize, stream: Rc<rpc::AdminStream>, buf: Vec<u8>) -> Op {
-    Box::pin(async move { Event::Conn(rpc::write(conn, stream, buf).await) })
+fn write_op(conn: usize, stream: Rc<riffle::AdminStream>, buf: Vec<u8>) -> Op {
+    Box::pin(async move { Event::Conn(riffle::write(conn, stream, buf).await) })
 }
 
 fn bus_op(bus: Rc<Bus>) -> Op {
@@ -92,7 +92,7 @@ fn bus_op(bus: Rc<Bus>) -> Op {
 }
 
 /// The smallest free slot, so a closed connection's index is reused.
-fn insert_conn(conns: &mut Vec<Option<rpc::Conn>>, conn: rpc::Conn) -> usize {
+fn insert_conn(conns: &mut Vec<Option<riffle::Conn>>, conn: riffle::Conn) -> usize {
     if let Some(index) = conns.iter().position(Option::is_none) {
         conns[index] = Some(conn);
         index
@@ -110,7 +110,7 @@ pub struct AppInit {
     pub registry: Rc<Registry>,
     pub bus: Rc<Bus>,
     /// Accepted admin connections, from the listener task.
-    pub accept: kanal::AsyncReceiver<rpc::AdminStream>,
+    pub accept: kanal::AsyncReceiver<riffle::AdminStream>,
     /// Finished background jobs.
     pub jobs: kanal::AsyncReceiver<Box<JobDone>>,
     pub jobs_tx: kanal::Sender<Box<JobDone>>,
@@ -137,7 +137,7 @@ pub struct App {
     pub(crate) client: Rc<Client>,
     pub(crate) registry: Rc<Registry>,
     pub(crate) bus: Rc<Bus>,
-    pub(crate) accept: kanal::AsyncReceiver<rpc::AdminStream>,
+    pub(crate) accept: kanal::AsyncReceiver<riffle::AdminStream>,
     pub(crate) jobs: kanal::AsyncReceiver<Box<JobDone>>,
     pub(crate) jobs_tx: kanal::Sender<Box<JobDone>>,
     /// One encoded frame reused for every connection.
@@ -161,6 +161,15 @@ pub struct App {
     pub(crate) connecting: bool,
     pub(crate) keepalive_secs: u64,
     pub(crate) last_message: Instant,
+    /// When the current socket finished its handshake. The reconnect backoff
+    /// resets on how long a connection *stayed up*, never on `welcome`: a
+    /// socket that dies just after the handshake is a flapping one, and
+    /// resetting on welcome turned it into a 500 ms reconnect loop.
+    pub(crate) connected_at: Instant,
+    /// The `type` of the last frame seen, for disconnect diagnosis.
+    pub(crate) last_frame_kind: &'static str,
+    /// Frames decoded on the current socket.
+    pub(crate) frames_received: u32,
     pub(crate) reconnect_at: Instant,
     pub(crate) reconnect_attempt: u32,
     pub(crate) sub_ids: HashMap<Topic, SubEntry>,
@@ -227,6 +236,9 @@ impl App {
             connecting: false,
             keepalive_secs: 15,
             last_message: Instant::now(),
+            connected_at: Instant::now(),
+            last_frame_kind: "none",
+            frames_received: 0,
             reconnect_at: Instant::now(),
             reconnect_attempt: 0,
             sub_ids: HashMap::new(),
@@ -251,7 +263,7 @@ impl App {
     }
 
     pub async fn run(mut self) {
-        let mut conns: Vec<Option<rpc::Conn>> = Vec::new();
+        let mut conns: Vec<Option<riffle::Conn>> = Vec::new();
         let mut ops: FuturesUnordered<Op> = FuturesUnordered::new();
         ops.push(accept_op(&self.accept));
         ops.push(bus_op(Rc::clone(&self.bus)));
@@ -297,11 +309,11 @@ impl App {
                 Event::Socket(Ok(Some(text))) => self.handle_message(&text).await,
                 Event::Socket(Ok(None)) => {
                     tracing::info!(target: "hermes", "connection closed by peer");
-                    self.on_disconnect().await;
+                    self.on_disconnect("peer-closed").await;
                 }
                 Event::Socket(Err(error)) => {
                     tracing::info!(target: "hermes", "socket read failed: {error}");
-                    self.on_disconnect().await;
+                    self.on_disconnect("read-error").await;
                 }
                 Event::Job(None) => break,
                 Event::Job(Some(done)) => self.handle_job(*done).await,
@@ -327,7 +339,7 @@ impl App {
         }
     }
 
-    fn next_deadline(&self, conns: &[Option<rpc::Conn>]) -> Duration {
+    fn next_deadline(&self, conns: &[Option<riffle::Conn>]) -> Duration {
         let now = Instant::now();
         let mut at = now + Duration::from_mins(1);
         if self.hermes_enabled
@@ -355,13 +367,13 @@ impl App {
 
     fn handle_conn(
         &mut self,
-        event: rpc::ConnEvent,
-        conns: &mut Vec<Option<rpc::Conn>>,
+        event: riffle::ConnEvent,
+        conns: &mut Vec<Option<riffle::Conn>>,
         ops: &FuturesUnordered<Op>,
     ) {
         match event {
-            rpc::ConnEvent::Accepted(Ok(stream)) => {
-                let id = insert_conn(conns, rpc::Conn::new(stream));
+            riffle::ConnEvent::Accepted(Ok(stream)) => {
+                let id = insert_conn(conns, riffle::Conn::new(stream));
                 let stream = conns[id].as_ref().map(|conn| Rc::clone(&conn.stream));
                 if let Some(stream) = stream {
                     ops.push(read_op(id, stream));
@@ -369,8 +381,8 @@ impl App {
                 ops.push(accept_op(&self.accept));
             }
             // The listener is gone; do not re-arm into a spin.
-            rpc::ConnEvent::Accepted(Err(_)) => {}
-            rpc::ConnEvent::Read {
+            riffle::ConnEvent::Accepted(Err(_)) => {}
+            riffle::ConnEvent::Read {
                 conn: id,
                 result,
                 buf,
@@ -391,7 +403,7 @@ impl App {
                     ops.push(read_op(id, Rc::clone(&conn.stream)));
                 }
             }
-            rpc::ConnEvent::Write {
+            riffle::ConnEvent::Write {
                 conn: id,
                 result,
                 mut buf,
@@ -414,7 +426,7 @@ impl App {
     }
 
     /// Decodes and answers every complete frame already buffered.
-    fn handle_frames(&mut self, id: usize, conns: &mut [Option<rpc::Conn>]) {
+    fn handle_frames(&mut self, id: usize, conns: &mut [Option<riffle::Conn>]) {
         let mut close = false;
         loop {
             let Some(conn) = conns[id].as_mut() else {
@@ -428,18 +440,20 @@ impl App {
                     break;
                 }
             };
-            match siphon_shared::rpc::codec::decode::<siphon_shared::rpc::ClientMessage>(&payload) {
-                Ok(siphon_shared::rpc::ClientMessage::Hello {
+            match siphon_shared::riffle::codec::decode::<siphon_shared::riffle::ClientMessage>(
+                &payload,
+            ) {
+                Ok(siphon_shared::riffle::ClientMessage::Hello {
                     magic,
                     protocol,
                     app_version,
                 }) => {
-                    if magic != siphon_shared::rpc::MAGIC
-                        || protocol != siphon_shared::rpc::PROTOCOL_VERSION
+                    if magic != siphon_shared::riffle::MAGIC
+                        || protocol != siphon_shared::riffle::PROTOCOL_VERSION
                     {
                         let reason = format!(
                             "protocol {protocol} (backend speaks {})",
-                            siphon_shared::rpc::PROTOCOL_VERSION
+                            siphon_shared::riffle::PROTOCOL_VERSION
                         );
                         close = !conn.push(&ServerMessage::Rejected(reason));
                         break;
@@ -447,7 +461,7 @@ impl App {
                     info!(%app_version, "rpc: client connected");
                     let snapshot = self.snapshot();
                     let queued = conn.push(&ServerMessage::Welcome {
-                        protocol: siphon_shared::rpc::PROTOCOL_VERSION,
+                        protocol: siphon_shared::riffle::PROTOCOL_VERSION,
                         server_version: env!("CARGO_PKG_VERSION").to_owned(),
                     }) && conn.push(&ServerMessage::Snapshot(Box::new(snapshot)));
                     if !queued {
@@ -456,7 +470,7 @@ impl App {
                     }
                     conn.ready = true;
                 }
-                Ok(siphon_shared::rpc::ClientMessage::Request {
+                Ok(siphon_shared::riffle::ClientMessage::Request {
                     id: request_id,
                     request,
                 }) => {
@@ -481,10 +495,10 @@ impl App {
     }
 
     /// Encodes each queued update once and hands the bytes to every connection.
-    fn flush_bus(&mut self, conns: &mut [Option<rpc::Conn>], ops: &FuturesUnordered<Op>) {
+    fn flush_bus(&mut self, conns: &mut [Option<riffle::Conn>], ops: &FuturesUnordered<Op>) {
         for broadcast in self.bus.take_pending() {
             self.frame.clear();
-            if siphon_shared::rpc::codec::encode(
+            if siphon_shared::riffle::codec::encode(
                 &ServerMessage::Update(broadcast.update),
                 &mut self.frame,
             )
@@ -502,7 +516,7 @@ impl App {
             let Some(conn) = slot.as_mut() else {
                 continue;
             };
-            if conn.out.len() > rpc::MAX_OUT {
+            if conn.out.len() > riffle::MAX_OUT {
                 *slot = None;
                 continue;
             }
@@ -580,7 +594,7 @@ impl App {
                         "subscription to {topic} not confirmed, reconnecting"
                     );
                     if self.socket.is_some() {
-                        self.on_disconnect().await;
+                        self.on_disconnect("subscription-unconfirmed").await;
                     }
                 }
             }
@@ -899,7 +913,7 @@ impl App {
                     "channel",
                     format!("added {} ({})", user.login, id),
                 );
-                self.config.channels.push(siphon_shared::rpc::Channel {
+                self.config.channels.push(siphon_shared::riffle::Channel {
                     login: user.login.clone(),
                     id,
                     display_name: Some(user.display_name.clone()),
@@ -1051,7 +1065,7 @@ impl App {
 
     /// Re-sends one channel row after a switch moved, so a controlled toggle
     /// in the UI follows the backend rather than snapping back.
-    fn publish_channel_flags(&self, flags: &siphon_shared::rpc::Channel) {
+    fn publish_channel_flags(&self, flags: &siphon_shared::riffle::Channel) {
         if let Some(detail) = self.channels.get(&flags.id) {
             self.bus
                 .publish(Update::ChannelUpsert(Box::new(detail.view(Some(flags)))));

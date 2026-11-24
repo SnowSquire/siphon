@@ -17,9 +17,9 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::task::Poll;
 
-use siphon_shared::rpc::LogEntry;
-use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::Update;
+use siphon_shared::riffle::LogEntry;
+use siphon_shared::riffle::LogLevel;
+use siphon_shared::riffle::Update;
 
 use crate::constants::LOG_CAP;
 use crate::spool::ConsumerWake;
@@ -210,7 +210,7 @@ impl Coalescer {
 
 #[cfg(test)]
 mod tests {
-    use siphon_shared::rpc::ConnHealth;
+    use siphon_shared::riffle::ConnHealth;
 
     use super::*;
 

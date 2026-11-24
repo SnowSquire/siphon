@@ -32,7 +32,7 @@ mod matcher;
 mod notify;
 mod placebo;
 mod renderer;
-mod rpc;
+mod riffle;
 mod service;
 mod settings;
 
@@ -47,9 +47,9 @@ mod tray;
 fn main() {
     use tracing_subscriber::EnvFilter;
 
-    use crate::rpc::EVENT_QUEUE_CAP;
-    use crate::rpc::intent_channel;
-    use crate::rpc::run;
+    use crate::riffle::EVENT_QUEUE_CAP;
+    use crate::riffle::intent_channel;
+    use crate::riffle::run;
     use crate::service::APP_ID;
 
     tracing_subscriber::fmt()
@@ -110,9 +110,9 @@ fn main() {
 fn main() {
     use tracing_subscriber::EnvFilter;
 
-    use crate::rpc::EVENT_QUEUE_CAP;
-    use crate::rpc::intent_channel;
-    use crate::rpc::run;
+    use crate::riffle::EVENT_QUEUE_CAP;
+    use crate::riffle::intent_channel;
+    use crate::riffle::run;
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())

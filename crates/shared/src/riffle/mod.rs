@@ -1,16 +1,21 @@
-//! Typed RPC between the Siphon backend (the daemon) and its UI.
+//! Typed Riffle between the Siphon backend (the daemon) and its UI.
 //!
 //! The wire is a big-endian `u32` length followed by a `postcard` payload;
 //! [`protocol`] owns the messages and state types, [`codec`] the framing, and
 //! [`client`] the UI side of a connection. The server side lives in the
 //! daemon because it needs the application state.
+//!
+//! [`object`] is the media form of the same framing: one header shared by every
+//! carrier, with a class, policy bits and fragment offsets. The RPC is class
+//! `Control`; nothing about media uses a second protocol.
 
-// compio is thread-per-core: RPC futures are deliberately !Send.
+// compio is thread-per-core: Riffle futures are deliberately !Send.
 #![allow(clippy::future_not_send)]
 
 pub mod client;
 pub mod codec;
 pub mod endpoint;
+pub mod object;
 pub mod protocol;
 
 pub use client::Client;
@@ -23,6 +28,11 @@ pub use endpoint::admin_endpoint;
 pub use endpoint::log_path;
 pub use endpoint::probe;
 pub use endpoint::state_dir;
+pub use object::Class;
+pub use object::Flags;
+pub use object::Object;
+pub use object::ObjectError;
+pub use object::fragment_count;
 pub use protocol::Account;
 pub use protocol::ArenaSummary;
 pub use protocol::Channel;

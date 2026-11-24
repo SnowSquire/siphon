@@ -45,7 +45,7 @@ struct Stored {
 /// Where the token lives: per-machine state, never a roaming config directory.
 #[must_use]
 pub fn path() -> PathBuf {
-    siphon_shared::rpc::state_dir(APP_ID).join(FILE)
+    siphon_shared::riffle::state_dir(APP_ID).join(FILE)
 }
 
 /// Reads the token, or `None` when there is no usable one.
@@ -139,7 +139,7 @@ pub fn resolve(flag: Option<String>) -> Option<String> {
 pub async fn validate(
     client: &crate::http::Client,
     token: &str,
-) -> Result<siphon_shared::rpc::Account, String> {
+) -> Result<siphon_shared::riffle::Account, String> {
     use sonic_rs::JsonValueTrait as _;
 
     const MAX_BODY: usize = 8 * 1024;
@@ -172,7 +172,7 @@ pub async fn validate(
         .as_u64()
         .or_else(|| value["user_id"].as_str().and_then(|text| text.parse().ok()))
         .ok_or("validate has no user id")?;
-    Ok(siphon_shared::rpc::Account { login, user_id })
+    Ok(siphon_shared::riffle::Account { login, user_id })
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -315,8 +315,10 @@ mod tests {
 
     #[test]
     fn a_round_trip_keeps_every_field() {
-        let mut written = ClientSettings::default();
-        written.tearing = true;
+        let mut written = ClientSettings {
+            tearing: true,
+            ..ClientSettings::default()
+        };
         written.notifications.filtered_words = vec!["offline".to_owned(), "brb".to_owned()];
         written.set_channel(
             42,

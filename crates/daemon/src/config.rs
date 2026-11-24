@@ -8,10 +8,10 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use siphon_shared::rpc::Account;
-use siphon_shared::rpc::Channel;
-use siphon_shared::rpc::Config;
-use siphon_shared::rpc::Network;
+use siphon_shared::riffle::Account;
+use siphon_shared::riffle::Channel;
+use siphon_shared::riffle::Config;
+use siphon_shared::riffle::Network;
 use siphon_shared::store;
 use siphon_shared::store::StoreError;
 use thiserror::Error;

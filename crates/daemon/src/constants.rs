@@ -218,6 +218,9 @@ pub const HERMES_WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HERMES_KEEPALIVE_MISSES: u64 = 2;
 /// Longest reconnect backoff.
 pub const HERMES_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
+/// How long a connection must stay up before a later failure resets the
+/// backoff. Shorter than this and it is treated as a flapping connection.
+pub const HERMES_STABLE_UP: Duration = Duration::from_secs(30);
 
 /// Update check cadence, request timeout and the release feed.
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);

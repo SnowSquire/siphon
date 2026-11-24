@@ -167,7 +167,7 @@ Demux baseline on this box, for measuring the sample-store work:
   Windows libplacebo prefix.
 - The registry serves only channels the daemon follows. A DESCRIBE for any other
   login is a 404; that is now the contract, not an accident.
-- `notes/architecture.md`, `notes/rpc.md` and `notes/daemon-mode.md` are updated
+- `notes/architecture.md`, `notes/riffle.md` and `notes/daemon-mode.md` are updated
   to the one-loop design. The older reasoning lives in this file.
 
 ---

@@ -16,20 +16,20 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 
-use siphon_shared::rpc::ArenaSummary;
-use siphon_shared::rpc::ChannelView;
-use siphon_shared::rpc::Client;
-use siphon_shared::rpc::ClientEvent;
-use siphon_shared::rpc::ConnHealth;
-use siphon_shared::rpc::DownloaderSummary;
-use siphon_shared::rpc::LogEntry;
-use siphon_shared::rpc::PipelineView;
-pub use siphon_shared::rpc::Request;
-use siphon_shared::rpc::Snapshot;
-use siphon_shared::rpc::StreamEvent;
-use siphon_shared::rpc::StreamEventKind;
-use siphon_shared::rpc::Update;
-use siphon_shared::rpc::UpdateView;
+use siphon_shared::riffle::ArenaSummary;
+use siphon_shared::riffle::ChannelView;
+use siphon_shared::riffle::Client;
+use siphon_shared::riffle::ClientEvent;
+use siphon_shared::riffle::ConnHealth;
+use siphon_shared::riffle::DownloaderSummary;
+use siphon_shared::riffle::LogEntry;
+use siphon_shared::riffle::PipelineView;
+pub use siphon_shared::riffle::Request;
+use siphon_shared::riffle::Snapshot;
+use siphon_shared::riffle::StreamEvent;
+use siphon_shared::riffle::StreamEventKind;
+use siphon_shared::riffle::Update;
+use siphon_shared::riffle::UpdateView;
 use siphon_shared::settings::ChannelPrefs;
 use siphon_shared::settings::ClientSettings;
 use zgui::reactive::LocalStorage;
@@ -146,8 +146,8 @@ pub async fn run(
     wake: Arc<Wake>,
     events: kanal::Sender<UiEvent>,
 ) {
-    let endpoint = siphon_shared::rpc::admin_endpoint(crate::service::APP_ID);
-    tracing::info!(target: "rpc", %endpoint, "admin endpoint");
+    let endpoint = siphon_shared::riffle::admin_endpoint(crate::service::APP_ID);
+    tracing::info!(target: "riffle", %endpoint, "admin endpoint");
     let mut backoff = Duration::from_secs(1);
     loop {
         let failure = match Client::connect(&endpoint, env!("CARGO_PKG_VERSION")).await {
@@ -739,7 +739,7 @@ impl UiState {
 
 #[cfg(test)]
 mod tests {
-    use siphon_shared::rpc::ChatColor;
+    use siphon_shared::riffle::ChatColor;
     use zgui::reactive::Mounted;
     use zgui::reactive::install;
 

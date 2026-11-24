@@ -23,15 +23,15 @@ use std::task::Waker;
 
 use futures_util::future::LocalBoxFuture;
 use kanal::AsyncSender;
-use siphon_shared::rpc::ArenaSummary;
-use siphon_shared::rpc::DiskView;
-use siphon_shared::rpc::DownloaderSummary;
-use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::PipelineState;
-use siphon_shared::rpc::PipelineView;
-use siphon_shared::rpc::StreamDetail;
-use siphon_shared::rpc::StreamKey;
-use siphon_shared::rpc::Update;
+use siphon_shared::riffle::ArenaSummary;
+use siphon_shared::riffle::DiskView;
+use siphon_shared::riffle::DownloaderSummary;
+use siphon_shared::riffle::LogLevel;
+use siphon_shared::riffle::PipelineState;
+use siphon_shared::riffle::PipelineView;
+use siphon_shared::riffle::StreamDetail;
+use siphon_shared::riffle::StreamKey;
+use siphon_shared::riffle::Update;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -268,7 +268,7 @@ impl Registry {
 
     /// Mirrors the persisted follow list onto the channel table. Called at
     /// startup and whenever the UI adds, removes or toggles a channel.
-    pub fn sync_channels(&self, channels: &[siphon_shared::rpc::Channel]) {
+    pub fn sync_channels(&self, channels: &[siphon_shared::riffle::Channel]) {
         let mut rows = self.channels.borrow_mut();
         for row in &mut *rows {
             let Some(channel) = channels.iter().find(|c| c.login == row.login) else {
@@ -1134,7 +1134,7 @@ impl Registry {
         &self,
         key: &StreamKey,
         limit: usize,
-    ) -> Option<Vec<siphon_shared::rpc::SegmentRecord>> {
+    ) -> Option<Vec<siphon_shared::riffle::SegmentRecord>> {
         self.runtime(key)
             .map(|runtime| runtime.metrics.recent(limit))
     }

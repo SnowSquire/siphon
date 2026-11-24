@@ -11,9 +11,9 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 use std::time::Instant;
 
-use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::StreamEventKind;
-use siphon_shared::rpc::Update;
+use siphon_shared::riffle::LogLevel;
+use siphon_shared::riffle::StreamEventKind;
+use siphon_shared::riffle::Update;
 use sonic_rs::JsonValueTrait as _;
 use sonic_rs::Value;
 use sonic_rs::json;
@@ -37,6 +37,7 @@ pub fn url() -> String {
 }
 use crate::constants::HERMES_KEEPALIVE_MISSES as KEEPALIVE_MISSED_LIMIT;
 use crate::constants::HERMES_MAX_RECONNECT_DELAY as MAX_RECONNECT_DELAY;
+use crate::constants::HERMES_STABLE_UP as STABLE_UP;
 use crate::constants::HERMES_WELCOME_TIMEOUT as WELCOME_TIMEOUT;
 
 /// One Hermes pubsub subscription: title/game updates or live/viewer updates
@@ -216,18 +217,21 @@ impl App {
                 target: "hermes",
                 "no channels resolved, retrying (typo in a login?)"
             );
-            self.schedule_reconnect();
+            self.schedule_reconnect(None);
             self.publish_no_channels();
             return;
         }
         let Some(live) = socket else {
-            self.schedule_reconnect();
+            self.schedule_reconnect(None);
             self.publish_conn_health();
             return;
         };
         self.socket = Some(live);
         self.welcomed = false;
         self.last_message = Instant::now();
+        self.connected_at = Instant::now();
+        self.frames_received = 0;
+        self.last_frame_kind = "none";
         // A channel that is already live when the baseline lands starts its
         // recording monitor now; Hermes will not replay a `stream-up` for it.
         let live_logins: Vec<String> = self
@@ -251,7 +255,7 @@ impl App {
     ///
     /// Cloned because callers hold a mutable borrow of `channels` when they
     /// build the view, and a view needs both sides.
-    fn channel_config(&self, id: u64) -> Option<siphon_shared::rpc::Channel> {
+    fn channel_config(&self, id: u64) -> Option<siphon_shared::riffle::Channel> {
         self.config
             .channels
             .iter()
@@ -345,26 +349,57 @@ impl App {
         removed
     }
 
-    /// Drops the socket and backs off. Reconnects always start fresh and
-    /// replay all subscriptions.
-    pub(crate) async fn on_disconnect(&mut self) {
+    /// Drops the socket and backs off, recording why. Reconnects always start
+    /// fresh and replay all subscriptions.
+    pub(crate) async fn on_disconnect(&mut self, cause: &'static str) {
+        let up = self.connected_at.elapsed();
+        let since_last = self.last_message.elapsed();
+        let last_frame = self.last_frame_kind;
+        let frames = self.frames_received;
         self.close_socket().await;
         self.welcomed = false;
+        // The one line that says why a socket went away: `since_last_ms` is the
+        // gap to the previous frame, `last_frame` what that frame was, `frames`
+        // how much arrived at all. Together they separate "never spoke" from
+        // "spoke, then went quiet" from "died mid-conversation".
+        tracing::info!(
+            target: "hermes",
+            cause,
+            attempt = self.reconnect_attempt,
+            up_ms = u64::try_from(up.as_millis()).unwrap_or(u64::MAX),
+            since_last_ms = u64::try_from(since_last.as_millis()).unwrap_or(u64::MAX),
+            last_frame,
+            frames,
+            "hermes disconnect"
+        );
         self.bus.log(
             LogLevel::Error,
             "hermes",
             "disconnected from Twitch, reconnecting",
         );
         self.publish_conn_health();
-        self.schedule_reconnect();
+        self.schedule_reconnect(Some(up));
     }
 
-    fn schedule_reconnect(&mut self) {
+    /// `up` is how long the socket that just went away had been up, or `None`
+    /// when the connect attempt failed before there was a socket.
+    fn schedule_reconnect(&mut self, up: Option<Duration>) {
+        // A connection that stayed up long enough is not a flapping one, so the
+        // next failure starts from the floor again. Resetting on `welcome`
+        // instead made a socket that dies just after the handshake reconnect
+        // every 500 ms, forever.
+        if up.is_some_and(|up| up >= STABLE_UP) {
+            self.reconnect_attempt = 0;
+        }
         self.reconnect_attempt += 1;
         let delay = Duration::from_millis(500)
             .saturating_mul(1 << (self.reconnect_attempt.min(10) - 1))
             .min(MAX_RECONNECT_DELAY);
-        tracing::info!(target: "hermes", "disconnected, reconnecting in {delay:?}");
+        tracing::info!(
+            target: "hermes",
+            "disconnected, reconnecting in {delay:?} (attempt {})",
+            self.reconnect_attempt
+        );
         self.reconnect_at = Instant::now() + delay;
     }
 
@@ -386,7 +421,7 @@ impl App {
         if !self.welcomed {
             if self.last_message.elapsed() > WELCOME_TIMEOUT {
                 tracing::info!(target: "hermes", "no welcome within 10s, dropping connection");
-                self.on_disconnect().await;
+                self.on_disconnect("no-welcome").await;
             }
         } else if self.last_message.elapsed()
             > Duration::from_secs(self.keepalive_secs * KEEPALIVE_MISSED_LIMIT)
@@ -396,21 +431,49 @@ impl App {
                 "no keepalive for {}s, dropping connection",
                 self.keepalive_secs * KEEPALIVE_MISSED_LIMIT
             );
-            self.on_disconnect().await;
+            self.on_disconnect("no-keepalive").await;
         }
     }
 
     pub(crate) async fn handle_message(&mut self, text: &str) {
         // Any frame at all is proof the connection is alive, even a blank one.
         self.last_message = Instant::now();
+        self.frames_received = self.frames_received.saturating_add(1);
         if text.trim().is_empty() {
+            self.last_frame_kind = "blank";
             return;
         }
         let Ok(message) = sonic_rs::from_str::<Value>(text) else {
+            self.last_frame_kind = "unparseable";
             tracing::info!(target: "hermes", "unparseable message: {text}");
             return;
         };
-        match message["type"].as_str() {
+        let kind = message["type"].as_str();
+        self.last_frame_kind = match kind {
+            Some("welcome") => "welcome",
+            Some("keepalive") => "keepalive",
+            Some("PING") => "PING",
+            Some("subscribeResponse") => "subscribeResponse",
+            Some("unsubscribeResponse") => "unsubscribeResponse",
+            Some("notification") => "notification",
+            Some(_) => "other",
+            None => "no-type",
+        };
+        match kind {
+            // Twitch's pubsub sends an application-level `{"type":"PING"}` and
+            // expects a `{"type":"PONG"}` back. An unanswered one gets the
+            // socket closed on us. This is not RFC 6455 ping/pong, which
+            // `ws.rs` answers itself and never surfaces here.
+            Some("PING") => {
+                let sent = match self.socket.as_mut() {
+                    Some(socket) => socket.send_text(r#"{"type":"PONG"}"#).await,
+                    None => Ok(()),
+                };
+                if let Err(error) = sent {
+                    tracing::info!(target: "hermes", "pong send failed: {error}");
+                    self.on_disconnect("pong-send-failed").await;
+                }
+            }
             Some("welcome") => {
                 let summary = if self.reconnect_attempt == 0 {
                     "Hermes connected"
@@ -418,7 +481,6 @@ impl App {
                     "Hermes reconnected"
                 };
                 self.welcomed = true;
-                self.reconnect_attempt = 0;
                 self.keepalive_secs = message["welcome"]["keepaliveSec"].as_u64().unwrap_or(15);
                 tracing::info!(
                     target: "hermes",
@@ -541,7 +603,7 @@ impl App {
         let text = sonic_rs::to_string(message).unwrap_or_default();
         if let Err(error) = socket.send_text(&text).await {
             tracing::info!(target: "hermes", "send failed: {error}");
-            self.on_disconnect().await;
+            self.on_disconnect("send-failed").await;
         }
     }
 

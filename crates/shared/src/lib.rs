@@ -10,6 +10,6 @@
 //! one day — and each of those clients keeps its own display settings.
 
 pub mod build;
-pub mod rpc;
+pub mod riffle;
 pub mod settings;
 pub mod store;

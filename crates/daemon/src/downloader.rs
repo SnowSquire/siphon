@@ -2,8 +2,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use kanal::AsyncReceiver;
-use siphon_shared::rpc::FetchOutcome as SegmentOutcome;
-use siphon_shared::rpc::SegmentRecord;
+use siphon_shared::riffle::FetchOutcome as SegmentOutcome;
+use siphon_shared::riffle::SegmentRecord;
 use thiserror::Error;
 use tracing::Instrument;
 use tracing::Span;

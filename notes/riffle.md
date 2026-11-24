@@ -1,7 +1,313 @@
-# Daemon RPC and the Siphon backend/UI split
+# Riffle: the daemon↔UI protocol
+
+Status: Part I is designed and nothing is built; `play` still serves RTSP and the
+UI has no video path. Parts II and III are implemented. The ALPN is `riffle/1`.
+It is one protocol: the RPC is the control plane (`Class::Control`) and media is
+the same framing with media classes, over a carrier that can lose datagrams.
+
+Part I is the transport and the media model. Part II is the control plane the
+daemon and UI already speak. Part III is the UI's presentation path.
+
+## Why RTSP goes
+
+RTSP/RTP is built for a client across a network. It costs SDP negotiation, a
+session state machine, RTP 90 kHz timestamps mapped to NTP, RTCP sender reports
+once a second, `Range` signalling for the live position, TCP interleaving, and a
+jitter/reorder buffer on the far side. The UI wants one thing: the next access
+unit, or an older one when it is behind.
+
+The daemon already holds exactly that. `rtsp/h264.rs` splits Annex-B NALs and
+knows keyframes; `rtsp/ts.rs` demuxes and splits at AUD boundaries (PES is *not*
+an AU boundary — `notes/ts-demux.md`). RTSP then shatters each AU into
+STAP-A/FU-A datagrams under a 1450-byte budget and the UI puts them back
+together. That round trip exists only to satisfy RTSP.
+
+## Two carriers, one transport
+
+| carrier | when | what it gives |
+|---|---|---|
+| pipe / domain socket | same machine | reliable ordered bytes, no loss, no reorder |
+| QUIC over UDP | any other machine | streams + DATAGRAM, ACKs, pacing, congestion control, PMTU |
+
+`compio-quic` 0.8.x (quinn-proto 0.11 + rustls 0.23) on the compio reactor,
+pinned. The pipe is not the second-class path — it is the fast one, and the only
+one that can hand over arena slots.
+
+Only elementary stream crosses either carrier. No MPEG-TS, no fMP4: containers
+exist on disk and inside the fetch path only. The demuxer is incremental and
+emits an access unit as soon as the AU is complete, never waiting for a whole
+segment. The AU is the atomic unit; within one, the transport fragments at
+~1200 bytes.
+
+## Connection, lane, object
+
+- **connection** — one per UI. Control and media share it; QUIC multiplexing
+  removes the head-of-line blocking that argued for a second one.
+- **lane** — one per watched stream, unlimited. A lane is a reader position and a
+  rate, not a queue.
+- **object** — one access unit, one audio frame, one blob. The unit the policy
+  bits apply to.
+
+### One header
+
+Datagram: 18 B, ~1.5% of a 1200-byte payload.
+
+```
+u8 class | u8 flags | u64 obj_id | u32 total_len | u32 frag_offset | payload
+```
+
+Stream and pipe frames prepend `u32 len`. `class` doubles as the datagram lane
+tag, because a QUIC DATAGRAM frame carries no stream association. `obj_id` is
+monotonic for the life of the connection and **never reset**, so a seek needs no
+epoch field and "drop if `obj_id <= last_delivered`" survives one. `flags` is
+`supersede | keyframe | last_fragment`.
+
+### Policy, not delivery classes
+
+Reliability and ordering are per object, not per connection.
+
+| class | retransmit incomplete | cross-object | note |
+|---|---|---|---|
+| video AU | no | supersede | datamosh on loss |
+| audio frame | no — sent twice | supersede | absolute priority in the lane |
+| control, acks | yes | ordered | bidi stream 0 |
+| blob | yes | independent | one unidirectional stream per object |
+| state update | no | supersede | versioned, coalesced |
+
+That is the whole taxonomy. Neither "reliable unordered" nor "unreliable ordered"
+needs to exist as a delivery class: order *inside* an object is free, and order
+*between* objects is the `supersede` bit.
+
+## Push, not pull
+
+The daemon pushes; a UI cannot ask for what has not been sent. It reports where
+it is:
+
+```
+StreamPlayback { position, rate, buffer_ms }    // on change, plus a 5 s heartbeat
+```
+
+The daemon keeps one estimate — reported position advanced by rate and elapsed
+time — and pushes while
+
+```
+sent_position < predicted_playhead + buffer_ms
+```
+
+and never faster than data exists. That single rule produces all three
+behaviours:
+
+- **at the edge** — "data exists" is the binding constraint, so AUs leave as the
+  demuxer emits them. Chunk by chunk, no lookahead, no added latency.
+- **below 1×** — the playhead falls behind, `sent_position` runs ahead until the
+  buffer is full, and the daemon stops reading until it catches up.
+- **a DVR seek** — it fills `buffer_ms` forward from the seek point.
+
+`buffer_ms` defaults to 30 s, clamps to 1–120 s, and is **the client's RAM**: the
+daemon retains nothing per lane. The 5 s heartbeat exists for clock drift between
+the two estimates, not for liveness — a stall at the edge is already known to the
+daemon, because it has nothing more to send.
+
+There is no credit protocol and no window on the wire. This rule *is* the flow
+control, which is also why "unlimited lanes" is cheap on the daemon side.
+
+## Video: unreliable ordered, and it never gives up
+
+Drops are whole AUs. A truncated AU is not a broken picture, it is a broken
+bitstream — CABAC desync, garbage, or a hard error.
+
+On loss the UI keeps decoding against a stale reference and lets the picture
+smear: it does not freeze and does not flush. Concretely, `AV_EF_EXPLODE` off,
+`FF_EC_GUESS_MVS | FF_EC_DEBLOCK` on, and **no** `avcodec_flush_buffers`. At
+Twitch's ~2 s GOP a smear heals itself within a GOP, and live Twitch has no
+keyframe-request API anyway, so gating on the next IDR buys a freeze and nothing
+else.
+
+There is no drift threshold. The picture may look wrong for a while after a bad
+patch and recovers at the next IDR.
+
+Keyframes are one `keyframe` bit — the same fact `AV_PKT_FLAG_KEY` carries, set on
+any IRAP including HEVC CRA. The UI drops RASL pictures itself when it starts at a
+CRA; the transport does not model IDR vs CRA vs BLA.
+
+## Audio
+
+Separate class, same lane, never sharing video's fate. ~400 B per AAC frame, so it
+is **sent twice** rather than retransmitted: +16 KB/s buys near-zero loss without
+a round trip, and a round trip is the only thing that could make it late.
+
+Audio has absolute priority inside the lane: when the congestion window cannot
+carry both, a video AU is dropped. Audio also drives the playback clock; video is
+presented to match it.
+
+## Seek, join and the window
+
+- **Seek** is GOP-aligned by the daemon and precise by the client. `StreamSeek {
+  target }` → `StreamStarted { start_pts, start_segment }`; the client discards
+  decoded frames before its target. Trimming in the daemon would remove the
+  keyframe needed to decode the target, so it is not merely expensive — it is
+  wrong.
+- **Joining live** starts at the *previous* IDR from the window, runs above 1×
+  until it reaches the edge, then settles to 1×. Join is instant; the cost is
+  being one GOP behind, which is invisible on a live stream.
+- **A position outside the retained window** is clamped forward to the oldest
+  retained segment and reported through `StreamStarted`, so the client knows it
+  jumped. This is a rare path: a DVR 403, or a DVR URL that cannot be resolved.
+
+## Codecs
+
+- v1: H.264 over MPEG-TS.
+- Then: H.265, which Twitch carries **only in fMP4**, so it needs an fMP4 demuxer
+  (`moof`/`trun`/`mdat`, init-segment `hvcC`, length-prefixed NALs converted to
+  Annex-B). That is a deliverable of its own and is not allowed to block the
+  transport. The same path later carries AV1.
+- Codec config is one opaque blob — the raw `avcC` / `hvcC` / `av1C` record —
+  which is bit-for-bit what `avcodec_open2` takes as `extradata`. No per-codec
+  parameter-set modelling.
+
+`StreamConfig { video: { codec, extradata, timescale, width, height }, audio: {
+extradata, timescale, sample_rate, channels } }`, sent once, reliably, before any
+object.
+
+## Multiple lanes
+
+Unlimited, bounded by the network, the client's decoder, and the arena. Two
+streamers in the same room means two lanes with independent playheads, and the
+client's playback modulator nudges each with small rate corrections (0.98–1.02) —
+which is why a rate change must never cause a burst or a gap.
+
+Edge lanes get strict priority over catching-up lanes. A catch-up has no deadline;
+a live lane does.
+
+`StreamKey` becomes `{ channel, stream_id, quality }`. The stream id (Twitch's
+`BROADCAST-ID`) is the identity, so a restream is a different stream and an old
+lane never inherits a new broadcast. The channel rides along for attribution,
+because a lane whose broadcast just ended must still be able to name its channel.
+
+## Blobs and avatars
+
+`ChannelView` carries `avatar { id, rev }` where `id` is a content hash, not a
+path. `GetAvatar { id, px }` on the control plane returns pre-scaled bytes; the UI
+caches them by hash in its own directory and hands ZGUI a local file, because
+ZGUI's image element reads files and not URLs. A blob is an object with
+`retransmit + independent`, and nothing else.
+
+## Zero copy ends at the pipe
+
+The spool is a chain of 192 KiB arena slots with cursor readers. On the same
+machine a message can carry a slot range instead of bytes, so the media path
+copies nothing. That is what the pipe is for, and it is why the local path is not
+"QUIC over loopback".
+
+QUIC copies by construction — it encrypts — so the handle path is a carrier
+property, not a protocol assumption.
+
+## Trust: pinned keys, typed code
+
+TLS 1.3, a self-signed certificate on each side, no CA. The pin is the SPKI's
+SHA-256, i.e. the key rather than the certificate wrapper, so a renewal is not a
+false alarm.
+
+Pairing, once per client:
+
+1. `siphon-daemon pair` opens a 120 s window: one attempt at a time, no RPC
+   served.
+2. The UI connects, and both sides derive a short authentication string from the
+   TLS exporter, which is bound to the full transcript including both
+   certificates. An active MITM produces two different strings.
+3. The daemon prints its string; the user types it into the UI; the UI sends it
+   back over the provisional connection.
+4. Match: the daemon pins the client's SPKI in `peers.json` and the UI pins the
+   daemon's. Mismatch: everything is torn down and forgotten.
+
+The typed code is proof, not comparison — an MITM on the UI's leg cannot produce
+the daemon's string. Revocation is deleting an entry from `peers.json`: the
+operator of a remote daemon is someone who edits JSON.
+
+No session resumption and no 0-RTT. Resumption skips certificate verification, so
+it would bypass the pin on exactly the reconnects it exists to speed up, and 0-RTT
+early data is replayable. What a roamed UI needs is QUIC connection migration,
+which needs neither.
+
+Keys are 0600 on Unix and DPAPI on Windows, and are never regenerated by an
+update: a new daemon key is an explicit re-pair for every client.
+
+## Reaching the daemon
+
+`network.listen: Vec<String>` in `config.json`, already in the schema and already
+migrated. Empty means no UDP listener at all, and a local install uses the pipe.
+Non-empty binds those `host:port`s, and **remote clients get full capability** —
+`ApplyUpdate` and `SetRecordDir` included, because the operator of a remote daemon
+is the same person. `network.remoteControl` and `RemoteCapability` are deleted;
+the gate is `listen.is_empty()`.
+
+The pipe stays bound regardless. `ui.json` already has `Connection::Remote {
+endpoint, fingerprint, label }` and `active_connection`; nothing reads them yet,
+and that is the change.
+
+## Telemetry
+
+`ConnHealth` gains `rtt_ms`, `cwnd_bytes`, `lost`, `dropped_video`, `dropped_audio`,
+`last_drop_age_ms`, and a derived `recovering`. Datamosh makes drops normal, so
+they have to be visible, or "smearing because lossy" is indistinguishable from
+"smearing because broken".
+
+`Update::Lane(LaneView)` and `Update::LaneRemove(StreamKey)`, coalesced per key:
+
+```
+LaneView { key, state, position_ms, playhead_ms, buffered_ahead_ms, rate,
+           dropped_video, dropped_audio, recovering, started_ms }
+```
+
+The snapshot carries `lanes: Vec<LaneView>` for this connection's lanes only.
+
+## What stays
+
+`play` keeps its RTSP server: it is the external harness (`ffplay`, `ffprobe`) and
+the only way to check the packetizers against a real client. Removing the UI's use
+of RTSP does not delete `crates/daemon/src/rtsp/`; the packetizers just stop being
+on the critical path.
+
+## Open
+
+- **AV1** — the same fMP4 path, a different config record and OBU framing.
+- **Quality downgrade under pressure** — audio-only today, a different video track
+  later.
+- **Cross-lane alignment** — the client's modulator owns it and is audio-driven; a
+  manual offset knob first. The protocol carries no anchor for it.
+- **Frame-accurate seek** — needs an AU index in the demuxer.
+- **DVR 403** — the one path that turns a clamp into a restart.
+
+## Rejected
+
+- **TQUIC** — a better `!Send` shape than quinn, but DATAGRAM exists only on an
+  unmerged branch, there is no custom certificate verifier and no way to require a
+  client certificate, no TLS exporter, the peer certificate is unreachable from a
+  connection, TLS config takes file paths only, and a git dependency cannot build
+  because BoringSSL is a submodule. It is an HTTP/3 client, not a transport.
+- **quiche** — sans-IO, and the only option with RFC 7250 raw public keys, i.e.
+  literally "present a key, no certificate". Killed by BoringSSL in a hermetic
+  Nix cross-build to MSVC.
+- **A hand-rolled protocol over UDP** — that is a congestion controller, ACK
+  ranges, RTT estimation, flow control and PMTU discovery to own and debug, for a
+  6–40 Mbps workload that every library serves at 6–13 Gbps.
+- **Noise instead of TLS** — dropping TLS was the goal, not the mechanism. QUIC
+  makes the handshake mandatory, and the SAS falls out of the exporter.
+- **SRT / RIST** — reliable ordered only, which deletes latest-wins and datamosh.
+- **A subchannel per channel for RPC ordering** — versions make order irrelevant;
+  `Update` is already an idempotent entity value.
+- **Four delivery classes** — two policy bits on an object cover every class.
+- **Credit, or any window on the wire** — the playhead estimate is the flow
+  control.
+- **A daemon-side lookahead buffer** — the buffer is the client's RAM.
+- **A datamosh drift threshold** — it recovers at the next IDR.
+
+---
+
+# Part II: the control plane
 
 Status: implemented. `crates/shared` (`siphon-shared`) owns the typed protocol,
-postcard framing and client in its `rpc` module, the per-client settings schema
+postcard framing and client in its `riffle` module, the per-client settings schema
 in `settings`, and the JSON file layer in `store`; `crates/daemon` owns config,
 GQL, Hermes, the daemon loop, the stream registry, telemetry and the admin RPC
 server. The UI
@@ -169,7 +475,7 @@ backend remains authoritative.
 
 ## Ordering and backpressure
 
-- Connections are slots in the daemon loop, not tasks: each `rpc::Conn` owns its
+- Connections are slots in the daemon loop, not tasks: each `riffle::Conn` owns its
   frame decoder and outbound `Vec<u8>`, and the loop arms one read op and one
   write op at a time. A request is handled inline with `&mut` access to the
   backend state, so the response is queued before the next loop pass. A snapshot
@@ -179,7 +485,7 @@ backend remains authoritative.
 - The bus is one coalesced queue, not one per connection. The loop encodes each
   update once and appends the same bytes to every ready connection. Append-only
   updates (`Segment`, `Log`) are never coalesced.
-- A connection whose outbound buffer exceeds `rpc::MAX_OUT` is dropped. It
+- A connection whose outbound buffer exceeds `riffle::MAX_OUT` is dropped. It
   reconnects and resyncs from `Snapshot`; nothing is queued indefinitely.
 - Background jobs (GQL refresh, saves, update checks, avatars) finish on their
   own task and post through one kanal queue the loop drains. The loop's biased
@@ -283,14 +589,14 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
 ## Crates
 
 - `crates/shared` (package `siphon-shared`): everything both sides agree on. The
-  `rpc` module holds the serde message types, the `postcard` codec, the frame
+  `riffle` module holds the serde message types, the `postcard` codec, the frame
   decoder and the compio client — no ZGUI and no daemon internals. `settings`
   is the per-client schema a UI persists for itself, `store` the versioned-JSON
   file layer it and the daemon's config both read and write through.
 - `crates/daemon`: the backend app and the RPC server module; `registry.rs`
   owns pipelines, `app.rs` owns everything else.
 - `crates/ui` (`siphon-ui`, binary `siphon`): the ZGUI window presented through
-  the DXGI/libplacebo renderer, the native tray and the RPC worker. It owns the daemon lifecycle (`service.rs`): auto-start on launch and
+  the DXGI/libplacebo renderer, the native tray and the Riffle worker. It owns the daemon lifecycle (`service.rs`): auto-start on launch and
   a process-level restart (`daemon.pid` in the app data dir, image-name check,
   `taskkill` fallback).
 - `play` keeps its current pipeline and needs no protocol types.
@@ -310,11 +616,10 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
 
 ## Remote clients
 
-Status: designed, not implemented. Everything below is what the transport
-becomes when the UI is pointed at a daemon that is not on this machine. The
-client side of it is already stored — `ui.json`'s `connections` and
-`activeConnection` — but nothing reads those yet, and `config.json`'s `network`
-section is stored and not bound: `--admin` is still the only way in.
+Status: designed, not implemented. `ui.json`'s `connections` and
+`activeConnection` exist and nothing reads them; `config.json`'s
+`network.listen` is stored and not bound. The protocol is Part I; this is what
+the control plane becomes when the UI is pointed at another machine.
 
 ### Local
 
@@ -326,56 +631,38 @@ loopback would let any local process impersonate a daemon.
 
 ### Remote
 
-`siphon://host:port#<fingerprint>` is the **enrollment string** the daemon
-prints and the user pastes once. It is parsed into the fields of `ui.json`'s
-`connections` entry and never re-parsed at connect time. The fingerprint rides
-in the fragment because a fragment is never sent to a server; the credential
-never goes in the URL at all — paths and userinfo leak into logs, shell history
-and, if the scheme is ever registered, the URI-handler registry.
+One QUIC connection per UI carries both planes: the control plane on a
+bidirectional stream, media as datagrams on the same connection. No second
+credential, no second listener.
 
-`rpc::AdminStream` is a concrete type and `spawn_listener(endpoint)` takes a
-string, so a TCP admin transport is a third case, not a rewrite.
+`network.listen: Vec<String>` is the only switch. Empty means no UDP listener at
+all, and a local install uses the pipe. Non-empty binds those `host:port`s, and
+**remote clients get full capability** — `ApplyUpdate` and `SetRecordDir`
+included, because the operator of a remote daemon is the same person. There is
+no per-intent capability gate; the gate is `listen.is_empty()`, and
+`RemoteCapability` is deleted.
 
 ### Identity and pinning
 
-- The daemon generates its key on first run and prints the fingerprint with the
-  enrollment string, so **the first connection is pinned, not trusted on first
-  use**. TOFU is the fallback for a hand-typed address. This matters more than
-  in SSH, because the first connection carries the credential.
-- Pin the key, not the certificate: the SPKI hash (TLS) or the static key
-  (Noise). Pinning a self-signed certificate turns every renewal into a false
-  alarm for no security gain.
-- A mismatch offers "paste the enrollment string again", never a "connect
-  anyway" button.
-
-### Two transports, undecided
-
-- **TLS**: `rustls` is already a dependency, and the hand-rolled HTTP could
-  reuse it. Needs a `ServerCertVerifier` that ignores names and validity and
-  compares the SPKI to the pin (the `dangerous` API), and keeps
-  `openssl s_client` as a debugging tool.
-- **Noise** (`snow`): the static key *is* the identity, and `XX` gives mutual
-  authentication, so there is no bearer value on the wire at all and revoking a
-  device is deleting a line from `clients.json`.
-
-This decides whether the daemon keeps a `clients.json` of authorized client
-keys and each client a `client.key`, or the credential is a bearer value on the
-client side.
+- A self-signed certificate per side, no CA. The pin is the SPKI's SHA-256: the
+  key, not the certificate wrapper, so a renewal is not a false alarm.
+- Pairing is a typed code, not a pasted string. `siphon-daemon pair` opens a
+  120 s window, the UI connects, the daemon prints the short authentication
+  string, and the user types it into the UI. Part I has the sequence and why the
+  code is proof rather than comparison.
+- A mismatch offers "pair again", never a "connect anyway" button.
 
 ### What remote costs
 
 - `ensure_running` must not spawn, and `restart` cannot be process-level: the
   tray Restart degrades to an RPC exit request, or to "go restart it there".
-  The tuned "a frozen daemon is still restartable from the tray" property is
-  local-only, and that should be said in the UI, not discovered.
 - `probe` needs a connect plus handshake with a timeout, and "unreachable" must
   be distinguishable from "wrong fingerprint".
-- Intents differ in blast radius. `applyUpdate` is local-only: running an
-  installer on another machine is a different feature. `setRecordDir` is
-  local-only: the path is on the daemon's filesystem, so a remote folder picker
-  would be a lie. `network.remoteControl` in `config.json` gates the rest.
-- No NAT traversal, no rendezvous. An address and a port, plus "use a tailnet
-  or forward a port", is the honest scope.
+- Applying an update runs an installer on the daemon's machine. That is the
+  operator's own machine, so it is allowed; the blast radius is still different
+  from a local update's.
+- No NAT traversal, no rendezvous. An address and a port, plus "use a tailnet or
+  forward a port", is the honest scope.
 
 ### Version skew
 
@@ -390,39 +677,6 @@ the handshake, never open media before `Welcome`, and carry a capability set
 (media framing, HDR, what the client can decode) because the two machines'
 renderers genuinely differ.
 
-## Video over the RPC
-
-RTSP is being removed and media goes over an extended RPC. That deletes the
-only unauthenticated surface and puts video behind the same credential. A media
-subscriber is just another spool consumer with a `Reader`, which fits better
-than the per-session packet queues did.
-
-The control plane's assumptions invert:
-
-- **Framing.** `RPC_MAX_FRAME` is 1 MiB and the codec is postcard. Access units
-  need their own message class and cap, and a length-prefixed borrowed slice
-  rather than a postcard-scanned `Vec<u8>`. Keep "reject before allocating".
-- **Backpressure.** A control connection over `MAX_OUT` is dropped and resyncs
-  from `Snapshot`. Media must never drop the connection; it skips forward to
-  the next IDR and tells the client to flush. `Stream::send`'s "first IDR on
-  every track" is that resync gate.
-- **Head-of-line blocking.** A `Snapshot` must not queue behind a keyframe. The
-  cheap answer is a second connection on the same handshake and credential,
-  subscribing by `StreamKey` — RTSP's SETUP/PLAY split without RTSP. Per-stream
-  flow control in one socket is the expensive answer.
-- **Buffer ownership.** One packet is shared as `Rc<Vec<u8>>` today because
-  per-session copies cost ~20k allocations/s. The RPC writer's per-connection
-  `Vec<u8>` has to become a queue of shared buffers plus a per-connection
-  header, with the write completion handing the buffer back.
-- **Time.** PTS/DTS and codec config travel explicitly. Seek becomes an intent,
-  and the SR-anchoring and seek-epoch rigmarole in `rtsp-output.md` goes with
-  RTSP.
-
-Keep a probe. RTSP is the only independent end-to-end check today
-(`ffplay -nodisp rtsp://...`, `ffprobe`), and once the UI player is the only
-consumer, "pipeline wrong" and "renderer wrong" look the same. Before RTSP
-goes, add a `--dump` or `siphon-cli` subscriber that writes Annex-B or fMP4 so
-`ffplay -f h264 -` still works.
 
 ## Open questions
 
@@ -457,6 +711,9 @@ goes, add a `--dump` or `siphon-cli` subscriber that writes Annex-B or fMP4 so
   resulting config update.
 - Hermes viewcount traffic can be frequent; coalesce `ChannelUpsert` per channel
   before the writer.
+
+
+# Part III: the UI
 
 ## UI and video context
 
@@ -632,7 +889,7 @@ that moved to another output changes them, which is the next feature's problem.
 There are no external textures to lose: RPC events are drained by a 100 ms
 `set_interval` in the view, not by a surface pump. That interval checks the
 channel before touching the state, so an idle tick costs nothing. The protocol is incremental — an `Update` names one
-entity and carries it whole — so the signals *are* the state: `rpc::UiState`
+entity and carries it whole — so the signals *are* the state: `riffle::UiState`
 holds one per thing the view draws and applies an update to the signal it names.
 A snapshot exists only for the first connect and a reconnect. That is what makes
 ZGUI's reactivity pay: a viewer count touches `channels` alone, and no closure

@@ -22,19 +22,19 @@ use kanal::AsyncReceiver;
 use kanal::Sender;
 use thiserror::Error;
 
-use crate::rpc::codec::CodecError;
-use crate::rpc::codec::FrameReader;
-use crate::rpc::codec::write;
-use crate::rpc::endpoint;
-use crate::rpc::protocol::ClientMessage;
-use crate::rpc::protocol::MAGIC;
-use crate::rpc::protocol::PROTOCOL_VERSION;
-use crate::rpc::protocol::Request;
-use crate::rpc::protocol::Response;
-use crate::rpc::protocol::RpcError;
-use crate::rpc::protocol::ServerMessage;
-use crate::rpc::protocol::Snapshot;
-use crate::rpc::protocol::Update;
+use crate::riffle::codec::CodecError;
+use crate::riffle::codec::FrameReader;
+use crate::riffle::codec::write;
+use crate::riffle::endpoint;
+use crate::riffle::protocol::ClientMessage;
+use crate::riffle::protocol::MAGIC;
+use crate::riffle::protocol::PROTOCOL_VERSION;
+use crate::riffle::protocol::Request;
+use crate::riffle::protocol::Response;
+use crate::riffle::protocol::RpcError;
+use crate::riffle::protocol::ServerMessage;
+use crate::riffle::protocol::Snapshot;
+use crate::riffle::protocol::Update;
 
 /// How long one request may wait for its response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);

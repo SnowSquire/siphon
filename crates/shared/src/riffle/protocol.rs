@@ -583,11 +583,11 @@ mod tests {
     fn a_channel_defaults_to_not_recording() {
         let channel = Channel::default();
         assert!(!channel.record);
-        assert!(channel.id == 0);
+        assert_eq!(channel.id, 0);
     }
 
     #[test]
     fn a_local_install_listens_on_nothing() {
-        assert!(Network::default().listen.is_empty());
+        assert_eq!(Network::default().listen.len(), 0);
     }
 }

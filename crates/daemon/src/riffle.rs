@@ -13,9 +13,9 @@ use std::rc::Rc;
 
 use compio::io::AsyncRead;
 use compio::io::AsyncWriteExt as _;
-use siphon_shared::rpc::FrameDecoder;
-use siphon_shared::rpc::ServerMessage;
-use siphon_shared::rpc::codec;
+use siphon_shared::riffle::FrameDecoder;
+use siphon_shared::riffle::ServerMessage;
+use siphon_shared::riffle::codec;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -128,7 +128,7 @@ pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io
 
     use compio::net::UnixListener;
 
-    if siphon_shared::rpc::probe(&endpoint) {
+    if siphon_shared::riffle::probe(&endpoint) {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             "admin socket is already in use",
@@ -202,13 +202,13 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use siphon_shared::rpc::Channel;
-    use siphon_shared::rpc::Client;
-    use siphon_shared::rpc::ClientEvent;
-    use siphon_shared::rpc::Config;
-    use siphon_shared::rpc::Request;
-    use siphon_shared::rpc::Response;
-    use siphon_shared::rpc::Update;
+    use siphon_shared::riffle::Channel;
+    use siphon_shared::riffle::Client;
+    use siphon_shared::riffle::ClientEvent;
+    use siphon_shared::riffle::Config;
+    use siphon_shared::riffle::Request;
+    use siphon_shared::riffle::Response;
+    use siphon_shared::riffle::Update;
 
     use super::*;
     use crate::app::App;
@@ -308,7 +308,7 @@ mod tests {
             registry.watch_finished();
 
             let (accept_tx, accept_rx) = kanal::unbounded();
-            let endpoint = siphon_shared::rpc::admin_endpoint(&format!(
+            let endpoint = siphon_shared::riffle::admin_endpoint(&format!(
                 "test-{}-{}",
                 std::process::id(),
                 dir.file_name().unwrap().to_string_lossy()
@@ -338,7 +338,7 @@ mod tests {
             compio::runtime::spawn(daemon.run()).detach();
 
             for _ in 0..50 {
-                if siphon_shared::rpc::probe(&endpoint) {
+                if siphon_shared::riffle::probe(&endpoint) {
                     break;
                 }
                 compio::time::sleep(Duration::from_millis(20)).await;
@@ -363,7 +363,7 @@ mod tests {
             next_pipeline(events, 7, false).await;
             next_config(second_events).await;
 
-            let key = siphon_shared::rpc::StreamKey::new(7, None);
+            let key = siphon_shared::riffle::StreamKey::new(7, None);
             let response = client.request(Request::GetDisk(key.clone())).await.unwrap();
             assert!(matches!(response, Response::Disk(_)));
 

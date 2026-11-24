@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::de::Visitor;
-use siphon_shared::rpc::ChannelView;
-use siphon_shared::rpc::ChatColor;
+use siphon_shared::riffle::ChannelView;
+use siphon_shared::riffle::ChatColor;
 use thiserror::Error;
 
 use crate::constants::DEFAULT_CLIENT_ID;
@@ -90,7 +90,7 @@ impl ChannelDetail {
     /// row does not show yet. The notification switches are the client's and
     /// never cross this boundary.
     #[must_use]
-    pub fn view(&self, channel: Option<&siphon_shared::rpc::Channel>) -> ChannelView {
+    pub fn view(&self, channel: Option<&siphon_shared::riffle::Channel>) -> ChannelView {
         ChannelView {
             id: self.id,
             login: self.login.clone(),

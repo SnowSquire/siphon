@@ -8,15 +8,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use siphon_shared::rpc::ArenaSummary;
-use siphon_shared::rpc::ChannelView;
-use siphon_shared::rpc::ConnHealth;
-use siphon_shared::rpc::DownloaderSummary;
-use siphon_shared::rpc::LogEntry;
-use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::PipelineState;
-use siphon_shared::rpc::PipelineView;
-use siphon_shared::rpc::Request;
+use siphon_shared::riffle::ArenaSummary;
+use siphon_shared::riffle::ChannelView;
+use siphon_shared::riffle::ConnHealth;
+use siphon_shared::riffle::DownloaderSummary;
+use siphon_shared::riffle::LogEntry;
+use siphon_shared::riffle::LogLevel;
+use siphon_shared::riffle::PipelineState;
+use siphon_shared::riffle::PipelineView;
+use siphon_shared::riffle::Request;
 use siphon_shared::settings::ClientSettings;
 use siphon_shared::settings::HdrMode;
 use zgui::prelude::*;
@@ -42,9 +42,9 @@ use crate::format::format_duration_ms;
 use crate::format::format_iso_ms;
 use crate::format::format_time_ms;
 use crate::format::format_uptime;
-use crate::rpc::IntentSender;
-use crate::rpc::UiEvent;
-use crate::rpc::UiState;
+use crate::riffle::IntentSender;
+use crate::riffle::UiEvent;
+use crate::riffle::UiState;
 use crate::settings::Display;
 #[cfg(windows)]
 use crate::tray::TrayAction;
@@ -1712,7 +1712,7 @@ fn LogsTab(
     channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     arena: RwSignal<ArenaSummary, LocalStorage>,
     downloader: RwSignal<DownloaderSummary, LocalStorage>,
-    notices: RwSignal<Rc<Vec<crate::rpc::Notice>>, LocalStorage>,
+    notices: RwSignal<Rc<Vec<crate::riffle::Notice>>, LocalStorage>,
     logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
     pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
 ) -> impl IntoView {
@@ -1740,7 +1740,7 @@ fn LogsTab(
                 column(class = "loglist") {
                     if move || !(*notices.get()).is_empty() {
                         text(class = "section-title") {"Notifications"}
-                        for note in move || (*notices.get()).clone().into_iter().rev().collect::<Vec<_>>(), key = |note: &crate::rpc::Notice| note.id {
+                        for note in move || (*notices.get()).clone().into_iter().rev().collect::<Vec<_>>(), key = |note: &crate::riffle::Notice| note.id {
                             row(class = "notification") {
                                 text(class = "log__time") {{format_time_ms(note.at_ms)}}
                                 column(class = "notification__body") {
@@ -1850,7 +1850,7 @@ fn conn_summary(conn: ConnHealth, channels: &[RwSignal<ChannelView, LocalStorage
 /// copy (-12.5%) and lands on an identical string with no seam.
 fn ticker_text(
     channels: &[RwSignal<ChannelView, LocalStorage>],
-    notices: &[crate::rpc::Notice],
+    notices: &[crate::riffle::Notice],
 ) -> String {
     let mut items = channels
         .iter()

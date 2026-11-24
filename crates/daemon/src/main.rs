@@ -33,7 +33,7 @@ mod pid;
 #[allow(clippy::future_not_send)]
 mod registry;
 #[allow(clippy::future_not_send)]
-mod rpc;
+mod riffle;
 #[allow(clippy::future_not_send)]
 mod spool;
 #[allow(clippy::future_not_send)]
@@ -833,8 +833,8 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         let endpoint = args
             .admin
             .clone()
-            .unwrap_or_else(|| siphon_shared::rpc::admin_endpoint(config::APP_ID));
-        if let Err(error) = rpc::spawn_listener(endpoint, accept_tx) {
+            .unwrap_or_else(|| siphon_shared::riffle::admin_endpoint(config::APP_ID));
+        if let Err(error) = riffle::spawn_listener(endpoint, accept_tx) {
             error!(%error, "rpc: listener failed");
         }
     }

@@ -6,9 +6,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use siphon_shared::rpc::SegmentRecord;
-use siphon_shared::rpc::StreamKey;
-use siphon_shared::rpc::Update;
+use siphon_shared::riffle::SegmentRecord;
+use siphon_shared::riffle::StreamKey;
+use siphon_shared::riffle::Update;
 
 use crate::bus::Bus;
 /// Segments kept per pipeline for `ListSegments` and the UI ring.

@@ -2,7 +2,7 @@
 //!
 //! The UI starts the daemon with no console, so without this everything it
 //! prints — including the message a panic prints before `abort` — is lost. The
-//! log lives in [`siphon_shared::rpc::state_dir`], next to nothing the user edits, and
+//! log lives in [`siphon_shared::riffle::state_dir`], next to nothing the user edits, and
 //! is rotated at startup so a daemon left running for weeks cannot fill a disk.
 //!
 //! A console is still a console: when stdout is a terminal the same lines are
@@ -27,7 +27,7 @@ const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 /// printed when stdout is a terminal.
 pub fn init(app_id: &str) {
     let console = std::io::stdout().is_terminal();
-    let path = siphon_shared::rpc::log_path(app_id);
+    let path = siphon_shared::riffle::log_path(app_id);
     let file = open(&path);
     let failed = file.is_none();
 
