@@ -118,9 +118,10 @@ jobs:
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          # A tag push still has to be vX.Y.Z and agree with the tree. A manual
-          # build is allowed to name any commit, so only its Cargo.toml counts.
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+          # A tag still has to be vX.Y.Z and agree with the tree. A push to a
+          # branch and a manual build are allowed to name any commit, so only
+          # their Cargo.toml counts.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF_NAME}"
             if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::release tags must be vX.Y.Z, got $tag"
