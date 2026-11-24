@@ -2,9 +2,11 @@
 
 Twitch HLS live-stream client (Rust, single-threaded `compio` reactor) plus
 `servermock/`, a Node mock of Twitch's edge used to test it offline. RTSP has
-been removed; Riffle (`notes/riffle.md`) is the transport that replaces it and
-has no implementation yet, so nothing can watch a stream. Disk output is
-disabled and being rebuilt from `notes/disk-complete-recording.md`.
+been removed; Riffle (`notes/riffle.md`) replaces it — the carrier, pairing,
+lanes and the media path are implemented and tested, and the client reassembles
+whole access units, but there is no decoder or player yet, so nothing displays a
+stream. Disk output is disabled and being rebuilt from
+`notes/disk-complete-recording.md`.
 
 ## Who writes what
 
