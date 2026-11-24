@@ -45,11 +45,20 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # The entry holds `.#linux-deps` plus everything the lint needs, so it
-      # only changes with the lockfile or a flake pin.
+      # The entry holds `.#linux-deps` plus everything the lint needs. The key
+      # is that derivation's own hash, so it changes with the dependency set,
+      # the toolchain or the cross environment -- and not with a release bump.
+      - name: dependency layer key
+        id: deps
+        # The layer's own derivation names exactly the inputs that matter: the
+        # dependency set, the toolchain and the cross environment. Hashing the
+        # lockfile instead would also hash the workspace version, which
+        # `depsSrc` deliberately keeps out of the layer.
+        run: echo "drv=$(nix eval --raw .#linux-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
+
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-clippy-linux-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          primary-key: nix-clippy-linux-${{ steps.deps.outputs.drv }}
           restore-prefixes-first-match: nix-clippy-linux-
           gc-max-store-size-linux: 8G
 
@@ -73,9 +82,17 @@ jobs:
       # `nix-clippy-windows-` key would only spend the repository cache budget
       # twice. The lint artifacts on top are a workspace compile, which is
       # minutes, not the layer.
+      - name: dependency layer key
+        id: deps
+        # The layer's own derivation names exactly the inputs that matter: the
+        # dependency set, the toolchain and the cross environment. Hashing the
+        # lockfile instead would also hash the workspace version, which
+        # `depsSrc` deliberately keeps out of the layer.
+        run: echo "drv=$(nix eval --raw .#windows-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
+
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ steps.deps.outputs.drv }}
           restore-prefixes-first-match: |
             nix-deps-${{ env.CACHE_VERSION }}-
           save: false

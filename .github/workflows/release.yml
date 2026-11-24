@@ -103,11 +103,20 @@ jobs:
 
       # The entry holds the dependency layer plus everything it needed to be
       # built: the MSVC CRT/SDK, the rust toolchain, the vendored crates and
-      # every compiled dependency. It is reused until `Cargo.lock`, a flake pin
-      # or the msvc environment changes.
+      # every compiled dependency. The key is `.#windows-deps`'s own derivation
+      # hash, so it is reused until the dependency set, a flake pin or the msvc
+      # environment changes -- and a release bump does not touch it.
+      - name: dependency layer key
+        id: deps
+        # The layer's own derivation names exactly the inputs that matter: the
+        # dependency set, the toolchain and the cross environment. Hashing the
+        # lockfile instead would also hash the workspace version, which
+        # `depsSrc` deliberately keeps out of the layer.
+        run: echo "drv=$(nix eval --raw .#windows-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
+
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ steps.deps.outputs.drv }}
           restore-prefixes-first-match: |
             nix-deps-${{ env.CACHE_VERSION }}-
           gc-max-store-size-linux: 8G
@@ -162,9 +171,17 @@ jobs:
 
       # Same key as the `deps` job: this restores the dependency layer and
       # saves nothing, so the entry stays small and stable.
+      - name: dependency layer key
+        id: deps
+        # The layer's own derivation names exactly the inputs that matter: the
+        # dependency set, the toolchain and the cross environment. Hashing the
+        # lockfile instead would also hash the workspace version, which
+        # `depsSrc` deliberately keeps out of the layer.
+        run: echo "drv=$(nix eval --raw .#windows-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
+
       - uses: nix-community/cache-nix-action@v7
         with:
-          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**') }}
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ steps.deps.outputs.drv }}
           restore-prefixes-first-match: |
             nix-deps-${{ env.CACHE_VERSION }}-
           save: false

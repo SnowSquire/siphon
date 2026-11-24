@@ -202,8 +202,10 @@ The dependency layers are packages of their own — `.#windows-deps`,
 `.#linux-deps` — so CI can cache exactly them and nothing that changes per
 commit. `release.yml` is two jobs:
 
-1. `deps` builds `.#windows-deps` under `nix-deps-<version>-hash(flake.lock,
-   Cargo.lock, nix/**)`. That entry holds the layer plus everything it took to
+1. `deps` builds `.#windows-deps` under `nix-deps-<CACHE_VERSION>-<the hash in
+   that derivation's store path>`. Keying on the derivation rather than on
+   `Cargo.lock` is what keeps a release bump out of the cache key; the entry
+   holds the layer plus everything it took to
    build it: the MSVC CRT/SDK, the rust toolchain, the vendored crate sources
    and every compiled dependency. It is rebuilt only when a dependency or a pin
    moves.
