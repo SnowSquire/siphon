@@ -49,10 +49,6 @@ permissions:
   contents: write
   actions: read
 
-concurrency:
-  group: build-${{ github.ref }}-${{ inputs.commit || github.sha }}
-  cancel-in-progress: false
-
 env:
   CARGO_TERM_COLOR: always
   # Bump to invalidate both cache entries without touching the tree.
@@ -61,6 +57,17 @@ env:
 jobs:
   deps:
     name: Windows dependency layer
+    # One build per commit at a time. A `vX.Y.Z` tag calls this workflow for a
+    # commit a main push already built, so the group is the commit and not the
+    # ref: the two runs take turns over the same tree instead of compiling it
+    # twice at once on two runners against one cache entry. `queue: max` (with
+    # cancellation off) keeps the later run's job queued rather than replacing
+    # the pending one, and the group is on the jobs rather than the workflow so
+    # a called run and a pushed run use exactly the same group.
+    concurrency:
+      group: siphon-build-${{ inputs.commit || github.sha }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
@@ -102,6 +109,12 @@ jobs:
   windows:
     name: Windows x64 installer, portable zip and symbols
     needs: deps
+    # Same group as `deps`, for the same reason: this is the job that compiles
+    # the payload, and it must not run beside the other run's copy of it.
+    concurrency:
+      group: siphon-build-${{ inputs.commit || github.sha }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:

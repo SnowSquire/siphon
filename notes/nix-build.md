@@ -213,6 +213,17 @@ commit. `build.yml` is two jobs:
    `.#windows-installer`. The two binaries and the installer change on every
    commit, so they are never cached; a run pays two crate compiles and a link.
 
+Both jobs take the concurrency group `siphon-build-<commit>`. The group is the
+commit rather than the ref because a `vX.Y.Z` tag names a commit a main push
+has already built: the release run is a `workflow_call` of these same jobs, so
+without the group the two runs compile one tree twice, at the same time, on two
+runners against one cache entry. With it the later run waits its turn — same
+work, once. `queue: max` is what makes the wait a queue: the default would let
+a newly queued job replace the pending one, and with two jobs per run that is a
+race that can cancel a release. Cancellation stays off, so neither run kills the
+other. The group sits on the jobs rather than the workflow so the called run and
+the pushed run land in exactly the same group.
+
 `clippy.yml`'s Windows job builds the same `.#windows-deps` and *saves* it under
 that key, so a lint run warms the build cache: the build's `deps` job then
 restores instead of compiling. `build.yml` builds `main` on any push that
