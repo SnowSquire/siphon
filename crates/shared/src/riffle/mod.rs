@@ -56,7 +56,6 @@ pub use protocol::PROTOCOL_VERSION;
 pub use protocol::PipelineState;
 pub use protocol::PipelineView;
 pub use protocol::PlaybackPosition;
-pub use protocol::RemoteCapability;
 pub use protocol::Request;
 pub use protocol::Response;
 pub use protocol::RpcError;

@@ -202,29 +202,17 @@ pub struct Account {
     pub user_id: u64,
 }
 
-/// One intent a remote client may invoke.
-///
-/// Anything not listed is local-only, and the destructive ones (`ApplyUpdate`,
-/// `SetRecordDir`) are not here at all: they act on the daemon's own machine,
-/// not on the client's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RemoteCapability {
-    RecordOnce,
-    SetRecord,
-    PipelineControl,
-}
-
 /// How the admin surface may be reached beyond the local pipe/socket.
 ///
 /// `listen` is empty by default: a local install has no network surface at all.
+/// A non-empty vector is the whole gate — a remote client gets the full intent
+/// set, because the operator of a remote daemon is the same person as this one.
+/// There is deliberately no per-intent capability list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Network {
-    /// `host:port` addresses to bind the admin transport on.
+    /// `host:port` addresses to bind the Riffle listener on.
     pub listen: Vec<String>,
-    /// What a non-local client may ask for.
-    pub remote_control: Vec<RemoteCapability>,
 }
 
 /// The persisted daemon configuration.
