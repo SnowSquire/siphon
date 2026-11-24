@@ -58,6 +58,7 @@ use crate::hermes::Topic;
 use crate::http::Client;
 use crate::http::ws::WsStream;
 use crate::lane::Lanes;
+use crate::registry::Job;
 use crate::registry::LanePlace;
 use crate::registry::Registry;
 use crate::riffle;
@@ -118,7 +119,7 @@ pub struct AppInit {
     pub config: Config,
     pub config_path: PathBuf,
     pub client: Rc<Client>,
-    pub registry: Rc<Registry>,
+    pub registry: Registry,
     pub bus: Rc<Bus>,
     /// Accepted admin connections, from the listener task.
     pub accept: kanal::AsyncReceiver<riffle::AdminStream>,
@@ -131,7 +132,7 @@ pub struct AppInit {
     pub trust: Option<Trust>,
 }
 
-/// One finished background job.
+/// One message for the loop's queue.
 pub enum JobDone {
     AddResolved(String, Box<Result<Option<ChannelDetail>, GqlError>>),
     LiveRefreshed(u64, Result<Vec<ChannelDetail>, GqlError>),
@@ -143,6 +144,9 @@ pub enum JobDone {
     /// A picture finished caching: the channel id and the avatar's content id,
     /// or `None` when the download failed.
     AvatarCached(u64, Option<String>),
+    /// Work the registry queued for the loop: it owns no reactor handle, so an
+    /// activation or a recorder that ended comes back here to be performed.
+    Registry(Job),
 }
 
 /// One in-flight job. `!Send` is fine: everything stays on the reactor thread.
@@ -151,7 +155,7 @@ pub struct App {
     pub(crate) config: Config,
     pub(crate) config_path: PathBuf,
     pub(crate) client: Rc<Client>,
-    pub(crate) registry: Rc<Registry>,
+    pub(crate) registry: Registry,
     pub(crate) bus: Rc<Bus>,
     pub(crate) accept: kanal::AsyncReceiver<riffle::AdminStream>,
     pub(crate) jobs: kanal::AsyncReceiver<Box<JobDone>>,
@@ -781,6 +785,7 @@ impl App {
                     self.bus.publish(Update::ChannelUpsert(Box::new(view)));
                 }
             }
+            JobDone::Registry(job) => self.registry.apply(job).await,
         }
     }
 
@@ -1464,7 +1469,7 @@ mod tests {
             config: Config::default(),
             config_path: PathBuf::from("config.json"),
             client: Rc::new(Client::new()),
-            registry: Rc::new(Registry::new(
+            registry: Registry::new(
                 Rc::new(Client::new()),
                 Rc::new(ArenaSet::new()),
                 downloaders.to_async(),
@@ -1481,7 +1486,8 @@ mod tests {
                     keep_runs: false,
                 },
                 Bus::new(),
-            )),
+                jobs_tx.clone(),
+            ),
             bus: Bus::new(),
             accept: accept_rx.to_async(),
             jobs: jobs_rx.to_async(),

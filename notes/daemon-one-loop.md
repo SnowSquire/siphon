@@ -64,9 +64,15 @@ a separate snapshot-only structure.
   the capacity eviction, the `debug` flag.
 - `set_record(login, bool)` is the whole monitor concept: the bool is the intent.
   `monitor_live(login)` is what Hermes stream-up and the reconnect baseline call.
-  `record_once(key)` spawns a recording now and stores nothing. `stop_pipeline`
+  `record_once(key)` starts a recording now and stores nothing. `stop_pipeline`
   writes the current broadcast id into `stopped`; a restream has a new id, so it
   is not suppressed.
+- The registry is a field of the loop's `App`, not an `Rc` it hands around, so
+  it cannot clone itself into a task. What has to happen after the call returns
+  — resolving a channel for `monitor_live`/`record_once`/`restart_pipeline`, and
+  a recorder that ended — is a `registry::Job` queued on the loop's existing job
+  channel; the loop applies it. There is no `watch_finished` task and no
+  finished-recordings channel any more: the disk watcher queues the job itself.
 - The gate (one async mutex per key) is keyed by `xxh3(login) ^ xxh3(quality)`,
   so no string is allocated per resolve.
 - `StreamRuntime.recording` is `RefCell<Option<Recorder { disk, metrics }>>`, so

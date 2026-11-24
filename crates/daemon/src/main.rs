@@ -608,7 +608,8 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             Err(error) => tracing::info!(target: "auth", "could not resolve the account: {error}"),
         }
     }
-    let registry = Rc::new(Registry::new(
+    let (jobs_tx, jobs_rx) = kanal::unbounded();
+    let registry = Registry::new(
         Rc::clone(&client),
         arena,
         downloaders_tx.to_async(),
@@ -628,9 +629,9 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             keep_runs: args.keep_runs,
         },
         Rc::clone(&bus),
-    ));
+        jobs_tx.clone(),
+    );
     registry.sync_channels(&config.channels);
-    registry.watch_finished();
 
     if let Err(error) = pid::write(config::APP_ID) {
         error!(%error, "failed to write the daemon pid file");
@@ -672,12 +673,11 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             }
         }
     }
-    let (jobs_tx, jobs_rx) = kanal::unbounded();
     let app = App::new(AppInit {
         config,
         config_path,
         client: Rc::clone(&client),
-        registry: Rc::clone(&registry),
+        registry,
         bus,
         accept: accept_rx.to_async(),
         jobs: jobs_rx.to_async(),

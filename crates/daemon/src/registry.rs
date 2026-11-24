@@ -6,9 +6,11 @@
 //! engine to an existing recording runtime, and the last viewer of a
 //! non-recording runtime drops it together with the channel entry.
 //!
-//! The registry is still shared with the RTSP server (`Rc<Registry>`), so its
-//! state is behind `RefCell`. Everything else funnels through the daemon's
-//! single loop.
+//! The registry is a field of the app loop, so it has no handle on the reactor:
+//! work that has to run after the call returns — an activation, a recording
+//! that finished — goes back to that loop as a [`Job`] through its job queue.
+//! Its state is behind `RefCell` because the loop calls it from `&self`
+//! contexts too (a snapshot, a connection close).
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -37,6 +39,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::app::JobDone;
 use crate::arena::ArenaSet;
 use crate::bus::Bus;
 use crate::disk::DiskOptions;
@@ -92,6 +95,23 @@ pub struct Recording {
     pub dual_format: bool,
 }
 
+/// Work the registry hands back to the app loop.
+///
+/// The registry is owned by [`App`](crate::app::App), so it cannot clone itself
+/// into a task to finish something later. A call that has to resolve a channel
+/// over the network, or react to a recorder ending, queues one of these instead
+/// and the loop performs it on its next pass. It is the same queue the loop's
+/// other background work returns through, never a channel of its own.
+#[derive(Clone, Debug)]
+pub enum Job {
+    /// Start the recording pipeline for a wanted channel, unless it is running.
+    Activate(StreamKey),
+    /// Start a one-shot recording of the broadcast that is live right now.
+    ActivateOnce(StreamKey),
+    /// The disk recorder for this key ended, so its runtime can be released.
+    Finished(StreamKey),
+}
+
 /// Everything the registry shares between streams.
 pub struct Registry {
     client: Rc<Client>,
@@ -112,9 +132,8 @@ pub struct Registry {
     /// cheaper than hashing two strings.
     streams: RefCell<HashMap<StreamId, Rc<StreamRuntime>>>,
     gate: Gate,
-    /// Disk recordings that finished, so the stream entry can be released.
-    finished: kanal::Sender<StreamKey>,
-    finished_rx: RefCell<Option<kanal::Receiver<StreamKey>>>,
+    /// Where a [`Job`] goes: the app loop's queue, drained every pass.
+    jobs: kanal::Sender<Box<JobDone>>,
 }
 
 /// A channel row: the followed preference, the identity, and once fetched, the
@@ -287,8 +306,8 @@ impl Registry {
         downloader_metrics: Rc<DownloaderMetrics>,
         options: Options,
         bus: Rc<Bus>,
+        jobs: kanal::Sender<Box<JobDone>>,
     ) -> Self {
-        let (finished_tx, finished_rx) = kanal::unbounded();
         let output = RefCell::new(options.recording.output.clone());
         let dual_format = Cell::new(options.recording.dual_format);
         Self {
@@ -303,8 +322,7 @@ impl Registry {
             channels: RefCell::new(Vec::new()),
             streams: RefCell::new(HashMap::new()),
             gate: Gate::default(),
-            finished: finished_tx,
-            finished_rx: RefCell::new(Some(finished_rx)),
+            jobs,
         }
     }
 
@@ -376,19 +394,14 @@ impl Registry {
         });
     }
 
-    /// Drain the recordings that finished. One task for the whole registry.
-    pub fn watch_finished(self: &Rc<Self>) {
-        let Some(rx) = self.finished_rx.borrow_mut().take() else {
-            return;
-        };
-        let registry = Rc::clone(self);
-        compio::runtime::spawn(async move {
-            let rx = rx.to_async();
-            while let Ok(key) = rx.recv().await {
-                registry.finish_stream(&key);
-            }
-        })
-        .detach();
+    /// Performs one queued job. The app loop is the only caller: the registry
+    /// cannot reach the reactor on its own, so it asks the loop to.
+    pub async fn apply(&self, job: Job) {
+        match job {
+            Job::Activate(key) => self.activate(key).await,
+            Job::ActivateOnce(key) => self.activate_once(key).await,
+            Job::Finished(key) => self.finish_stream(&key),
+        }
     }
 
     #[must_use]
@@ -655,7 +668,7 @@ impl Registry {
             Some(&registration),
         ));
 
-        let finished = self.finished.clone();
+        let jobs = self.jobs.clone();
         let key = runtime.key.clone();
         let watcher = Rc::clone(&disk);
         compio::runtime::spawn(async move {
@@ -663,7 +676,7 @@ impl Registry {
                 error!(%error, "daemon: fatal disk output error");
                 std::process::exit(1);
             }
-            let _ = finished.send(key);
+            enqueue(&jobs, Job::Finished(key));
         })
         .detach();
 
@@ -780,7 +793,7 @@ impl Registry {
     }
 
     /// Record toggled for a channel. Turning it off keeps a watched pipeline.
-    pub fn set_record(self: &Rc<Self>, login: &str, record: bool) {
+    pub fn set_record(&self, login: &str, record: bool) {
         self.ensure_row(login);
         self.update_row(login, |row| row.record = record);
         if record {
@@ -793,7 +806,7 @@ impl Registry {
 
     /// A live broadcast of a wanted channel: attach recording now, or start the
     /// pipeline when it is not running yet.
-    pub fn monitor_live(self: &Rc<Self>, login: &str) {
+    pub fn monitor_live(&self, login: &str) {
         if !self.wanted(login) {
             return;
         }
@@ -810,29 +823,22 @@ impl Registry {
         let Some(channel) = self.channel_row(login).and_then(|row| row.id) else {
             return;
         };
-        let key = StreamKey::new(channel, None);
-        let registry = Rc::clone(self);
-        compio::runtime::spawn(async move {
-            registry.activate(key).await;
-        })
-        .detach();
+        // Resolving the channel is a GQL + usher round trip, so the loop starts
+        // it rather than this call.
+        enqueue(&self.jobs, Job::Activate(StreamKey::new(channel, None)));
     }
 
     /// Record the broadcast that is live right now, without persisting
     /// anything. An offline channel is a `NotFound`.
-    pub fn record_once(self: &Rc<Self>, key: StreamKey) {
+    pub fn record_once(&self, key: StreamKey) {
         if let Some(runtime) = self.runtime(&key) {
             self.start_recording(&runtime);
             return;
         }
-        let registry = Rc::clone(self);
-        compio::runtime::spawn(async move {
-            registry.activate_once(key).await;
-        })
-        .detach();
+        enqueue(&self.jobs, Job::ActivateOnce(key));
     }
 
-    async fn activate(self: Rc<Self>, key: StreamKey) {
+    async fn activate(&self, key: StreamKey) {
         let Some(login) = self.login_of(key.channel) else {
             return;
         };
@@ -870,7 +876,7 @@ impl Registry {
         self.publish_pipeline(&runtime);
     }
 
-    async fn activate_once(self: Rc<Self>, key: StreamKey) {
+    async fn activate_once(&self, key: StreamKey) {
         let Some(login) = self.login_of(key.channel) else {
             return;
         };
@@ -908,7 +914,7 @@ impl Registry {
     /// already attached takes a second claim rather than spawning a second
     /// pipeline; the lane set itself is per connection and the app only calls
     /// this for a lane it does not already hold.
-    pub async fn attach(self: &Rc<Self>, key: &StreamKey) -> Result<Rc<StreamRuntime>, RpcError> {
+    pub async fn attach(&self, key: &StreamKey) -> Result<Rc<StreamRuntime>, RpcError> {
         if let Some(runtime) = self.runtime(key) {
             runtime.viewers.set(runtime.viewers.get().saturating_add(1));
             return Ok(runtime);
@@ -1055,19 +1061,14 @@ impl Registry {
         self.remove_runtime(key);
     }
 
-    pub fn restart_pipeline(self: &Rc<Self>, key: &StreamKey) {
+    pub fn restart_pipeline(&self, key: &StreamKey) {
         self.update_row_by_id(key.channel, |row| row.stopped = None);
         self.remove_runtime(key);
         let wanted = self
             .login_of(key.channel)
             .is_some_and(|login| self.wanted(&login));
         if wanted {
-            let registry = Rc::clone(self);
-            let key = key.clone();
-            compio::runtime::spawn(async move {
-                registry.activate(key).await;
-            })
-            .detach();
+            enqueue(&self.jobs, Job::Activate(key.clone()));
         }
     }
 
@@ -1263,6 +1264,15 @@ impl Registry {
     }
 }
 
+/// Hands one job to the app loop.
+///
+/// The queue is unbounded and the loop drains it on every pass, so this neither
+/// blocks nor drops a job. It is a free function because the disk watcher — a
+/// spawned task, not the loop — is one of the callers.
+fn enqueue(jobs: &kanal::Sender<Box<JobDone>>, job: Job) {
+    let _ = jobs.send(Box::new(JobDone::Registry(job)));
+}
+
 /// The orientation the *other* recording would be, if the broadcast has one.
 const fn other_orientation(kind: &VariantKind) -> Option<VariantKind> {
     match kind {
@@ -1388,33 +1398,49 @@ mod tests {
         });
     }
 
+    /// A registry plus the app loop's job queue, so a test can perform the work
+    /// the real loop would.
+    fn new_registry(bus: &Rc<Bus>) -> (Registry, kanal::AsyncReceiver<Box<JobDone>>) {
+        let (downloaders, _rx) = kanal::bounded(4);
+        let (jobs_tx, jobs_rx) = kanal::unbounded();
+        let registry = Registry::new(
+            Rc::new(Client::new()),
+            Rc::new(ArenaSet::new()),
+            downloaders.to_async(),
+            Rc::new(DownloaderMetrics::new(4)),
+            Options {
+                client_id: None,
+                auth_token: None,
+                low_latency: true,
+                recording: Recording {
+                    output: None,
+                    dual_format: false,
+                },
+                notify: None,
+                keep_runs: false,
+            },
+            Rc::clone(bus),
+            jobs_tx,
+        );
+        (registry, jobs_rx.to_async())
+    }
+
     #[test]
     fn set_record_starts_a_pipeline_and_publishes_it() {
         run(async {
-            let client = Rc::new(Client::new());
-            let (tx, _rx) = kanal::bounded(4);
             let bus = Bus::new();
-            let registry = Rc::new(Registry::new(
-                client,
-                Rc::new(ArenaSet::new()),
-                tx.to_async(),
-                Rc::new(DownloaderMetrics::new(4)),
-                Options {
-                    client_id: None,
-                    auth_token: None,
-                    low_latency: true,
-                    recording: Recording {
-                        output: None,
-                        dual_format: false,
-                    },
-                    notify: None,
-                    keep_runs: false,
-                },
-                Rc::clone(&bus),
-            ));
+            let (registry, jobs) = new_registry(&bus);
             registry.seed_channel("sunnys", 7, false, vec![debug_variant("mock")], 42);
             registry.set_record("sunnys", true);
-            compio::time::sleep(Duration::from_millis(20)).await;
+            // The loop performs what the registry queues; here the test is it.
+            let done = compio::time::timeout(Duration::from_secs(1), jobs.recv())
+                .await
+                .expect("activation queued")
+                .expect("queue open");
+            let JobDone::Registry(job) = *done else {
+                panic!("the registry queues its own work");
+            };
+            registry.apply(job).await;
             let pending = bus.take_pending();
             assert!(
                 pending.iter().any(|broadcast| matches!(
@@ -1430,27 +1456,8 @@ mod tests {
     #[test]
     fn attach_is_idempotent_and_the_last_detach_releases_the_pipeline() {
         run(async {
-            let client = Rc::new(Client::new());
-            let (tx, _rx) = kanal::bounded(4);
             let bus = Bus::new();
-            let registry = Rc::new(Registry::new(
-                client,
-                Rc::new(ArenaSet::new()),
-                tx.to_async(),
-                Rc::new(DownloaderMetrics::new(4)),
-                Options {
-                    client_id: None,
-                    auth_token: None,
-                    low_latency: true,
-                    recording: Recording {
-                        output: None,
-                        dual_format: false,
-                    },
-                    notify: None,
-                    keep_runs: false,
-                },
-                Rc::clone(&bus),
-            ));
+            let (registry, _jobs) = new_registry(&bus);
             registry.seed_channel("sunnys", 7, false, vec![debug_variant("mock")], 42);
 
             let key = StreamKey::new(7, None);

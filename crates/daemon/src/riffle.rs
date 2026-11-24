@@ -580,7 +580,8 @@ mod tests {
             crate::downloader::spawn_downloaders::<1>(&http, &downloaders_rx, &downloader_metrics);
 
             let bus = Bus::new();
-            let registry = Rc::new(Registry::new(
+            let (jobs_tx, jobs_rx) = kanal::unbounded();
+            let registry = Registry::new(
                 Rc::clone(&http),
                 Rc::new(ArenaSet::new()),
                 downloaders_tx.to_async(),
@@ -597,7 +598,8 @@ mod tests {
                     keep_runs: false,
                 },
                 Rc::clone(&bus),
-            ));
+                jobs_tx.clone(),
+            );
             registry.seed_channel(
                 "sunnys",
                 7,
@@ -605,7 +607,6 @@ mod tests {
                 vec![debug_variant("mock"), debug_portrait_variant("mock")],
                 42,
             );
-            registry.watch_finished();
 
             let (accept_tx, accept_rx) = kanal::unbounded();
             let endpoint = siphon_shared::riffle::admin_endpoint(&format!(
@@ -615,7 +616,6 @@ mod tests {
             ));
             spawn_listener(endpoint.clone(), accept_tx).unwrap();
 
-            let (jobs_tx, jobs_rx) = kanal::unbounded();
             let daemon = App::new(AppInit {
                 config: Config {
                     channels: vec![Channel {
@@ -723,7 +723,8 @@ mod tests {
         crate::downloader::spawn_downloaders::<1>(&http, &downloaders_rx, &downloader_metrics);
 
         let bus = Bus::new();
-        let registry = Rc::new(Registry::new(
+        let (jobs_tx, jobs_rx) = kanal::unbounded();
+        let registry = Registry::new(
             Rc::clone(&http),
             Rc::new(ArenaSet::new()),
             downloaders_tx.to_async(),
@@ -740,7 +741,8 @@ mod tests {
                 keep_runs: false,
             },
             Rc::clone(&bus),
-        ));
+            jobs_tx.clone(),
+        );
         registry.seed_channel(
             "sunnys",
             7,
@@ -748,7 +750,6 @@ mod tests {
             vec![debug_variant("mock"), debug_portrait_variant("mock")],
             42,
         );
-        registry.watch_finished();
 
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
@@ -800,7 +801,6 @@ mod tests {
         })
         .detach();
 
-        let (jobs_tx, jobs_rx) = kanal::unbounded();
         let daemon = App::new(AppInit {
             config: Config {
                 channels: vec![Channel {
