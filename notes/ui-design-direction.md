@@ -176,6 +176,11 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   reached for — and the sort only runs when a row's key changes (a live flip,
   a pin, a new `last live`). Pins are a client preference (`ui.json`), so two
   windows on one daemon may order differently.
+- The filter bar narrows the list by login or display name; it is a view of the
+  same keyed list, so the order above still holds under it and a pin is not
+  disturbed. The title is deliberately not searched: it changes constantly, so
+  it is not how a channel is found again. Escape or the × clears it, and the
+  empty state names the filter that matched nothing.
 - The `Uptime` column is the row's clock: live rows show how long the stream
   has been running (`2h 14m`), offline rows show `2h ago` in muted type,
   never-live rows `—`. The dot already says live/offline, and the viewer

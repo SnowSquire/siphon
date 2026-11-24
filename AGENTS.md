@@ -23,8 +23,6 @@ only sink; disk output is disabled and being rebuilt from
 - `hls-transport-probe.md` — measurements of how Twitch actually delivers.
 - `disk-complete-recording.md` — the disk-recording design.
 - `rpc.md` — the daemon RPC, Siphon backend/UI split, state updates and monitor lifecycle.
-- `config.md` — the three config files, who owns which field, local vs remote
-  clients, the launch model and video over the RPC.
 - `ui-design-direction.md` — the ZGUI surface: tokens, density, marquees, row states.
 - `linux-port.md` — the UI on Linux: present path, buffer counts, build constraints,
   and what the hardware on the dev box can and cannot do.
@@ -67,7 +65,7 @@ only sink; disk output is disabled and being rebuilt from
   A plain `cargo check -p daemon --target x86_64-pc-windows-msvc` still works
   against the global `~/.cargo/config.toml` + `~/.cache/xwin` setup. No Windows
   machine is involved.
-- UI: `cargo run -p siphon-ui` (binary `siphon`, ZGUI + DXGI). It starts `siphon-daemon.exe` next to itself if the admin named pipe is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly.
+- UI: `cargo run -p siphon-ui` (binary `siphon`, ZGUI + DXGI). It starts `siphon-daemon.exe` next to itself if the admin named pipe is not listening; the tray has Open / Restart service / Quit. `siphon.exe --restart-service` does the same process-level restart headlessly. There is no Windows service: the daemon is the UI's child and both die with the session, so nothing runs while the user is logged out and nothing may assume a clean shutdown.
 - Dev iteration against Nix: the Rust builds are split by crane
   (`nix/windows.nix`, `nix/linux.nix`) into a dependency layer plus one
   derivation per binary, so editing a crate rebuilds that crate, not the ~500

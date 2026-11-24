@@ -159,7 +159,7 @@ Requests:
   `ApplyUpdate`, `PipelineStop { key, force }`, `PipelineRestart(StreamKey)`,
   `DisconnectViewers(StreamKey)`, `RecordOnce { login, quality }`. The
   notification switches and the word filter are not here: they are client
-  settings, written to `ui.json` (`config.md`);
+  settings, written to the client's own `ui.json`;
 - queries: `GetSnapshot`, `GetStreamDetail { key }`, `ListSegments { key,
   limit }`, `GetArena`, `GetDownloader`, `GetDisk { key }`.
 
@@ -197,10 +197,16 @@ listeners are tasks around it.
 
 - The daemon owns `Config` (the follow list and its `record` switch, the
   recording defaults, the cached `account` and the `network` section) and its
-  migrations. Everything a notification is made of moved out of it: see
-  `config.md`.
-- Reuse Siphon's `%APPDATA%\com.iken.siphon\config.json` path so existing
-  installs keep their channels; the UI stops touching the file.
+  migrations. Everything a notification is made of moved out of it.
+- Two files, one owner each: `config.json` in `%APPDATA%\com.iken.siphon`
+  (`$XDG_CONFIG_HOME` on Unix) is the daemon's, `ui.json` in the same directory
+  is a client's — display, notification policy, the per-channel switches and
+  pins, and `connections`/`activeConnection`. The one secret is `auth.json` in
+  the state directory (`%LOCALAPPDATA%` / `$XDG_STATE_HOME`), which the daemon
+  reads and never puts on a command line. The module docs in `settings.rs` and
+  `auth.rs` own the details.
+- Reuse Siphon's config path so existing installs keep their channels; the UI
+  stops touching the daemon's file.
 - Save asynchronously on compio. The UI receives config in the snapshot and
   mutates it only through intents.
 
@@ -217,7 +223,7 @@ listeners are tasks around it.
   client owns the switches, the word filter and the mute window and raises the
   OS toast itself, so the notification centre is client state and does not
   survive a window restart. This is safe because the UI autostarts at login and
-  owns the daemon (`config.md`). The webhook in `notify.rs` stays: it reports
+  owns the daemon. The webhook in `notify.rs` stays: it reports
   the disk output's own conditions, not the user's notifications.
 - Until Hermes lands in the daemon, the same API works with an external bridge:
   a monitor is desired state, and activation is an explicit request/event.
@@ -305,8 +311,10 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
 ## Remote clients
 
 Status: designed, not implemented. Everything below is what the transport
-becomes when the UI is pointed at a daemon that is not on this machine; the
-client-side storage for it is described in `config.md`.
+becomes when the UI is pointed at a daemon that is not on this machine. The
+client side of it is already stored — `ui.json`'s `connections` and
+`activeConnection` — but nothing reads those yet, and `config.json`'s `network`
+section is stored and not bound: `--admin` is still the only way in.
 
 ### Local
 
@@ -419,8 +427,9 @@ goes, add a `--dump` or `siphon-cli` subscriber that writes Annex-B or fMP4 so
 ## Open questions
 
 - Update checking/applying: daemon or UI? Applying an installer restarts processes.
-- Launch model: settled — the UI autostarts at login and starts the daemon; see
-  `config.md`.
+- Launch model: settled — the UI autostarts at login and starts the daemon.
+  There is no service and nothing runs while the user is logged out; the
+  installer's Run value and `--minimized` are in `notes/windows-installer.md`.
 - Multiple UI clients: the protocol supports it, but only one tray/window is
   expected; decide whether to enforce single-instance at the RPC layer.
 - Disk API shape: run listing, release semantics and canonical progress.

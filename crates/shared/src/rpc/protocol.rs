@@ -48,7 +48,7 @@ impl StreamKey {
 /// `record` is the per-channel monitor: true starts a recording pipeline on
 /// `stream-up`. It is the only switch left here, because it is the only one
 /// that makes the daemon *do* something; the notification switches belong to
-/// the client and live in its settings file (see `notes/config.md`).
+/// the client and live in its own settings file (`siphon_shared::settings`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Channel {

@@ -699,8 +699,34 @@ fn ChannelsTab(
         }
     });
 
+    // A view of the same keyed list, not a second order: the filter only
+    // decides which rows are drawn, so pins and the sort still hold underneath.
+    // It matches the login and the display name; a title changes constantly and
+    // is not a stable way to find a channel.
+    let filter = RwSignal::new_local(String::new());
+
     view! {
         column(class = "tabbody") {
+            row(class = "filterbar") {
+                Input(
+                    value = filter,
+                    placeholder = "Filter channels",
+                    class = "filterbar__input",
+                    on:key_down = move |ev| {
+                        if matches!(ev.key, Key::Named(NamedKey::Escape)) {
+                            filter.set(String::new());
+                            ev.prevent_default();
+                        }
+                    },
+                )
+                if move || !filter.get().is_empty() {
+                    Button(
+                        size = ButtonSize::IconSm,
+                        variant = ButtonVariant::Ghost,
+                        on:click = move |_| filter.set(String::new()),
+                    ) {"×"}
+                }
+            }
             row(class = "tablehead") {
                 text(class = "cell cell--dot") {""}
                 text(class = "cell cell--chevron") {""}
@@ -718,7 +744,14 @@ fn ChannelsTab(
             }
             ScrollArea(class = "channels") {
                 column(class = "list") {
-                    for channel in move || (*channels.get()).clone(), key = |channel: &RwSignal<ChannelView, LocalStorage>| channel.get_untracked().id {
+                    for channel in move || {
+                        let needle = filter.get().trim().to_lowercase();
+                        (*channels.get())
+                            .iter()
+                            .filter(|row| row.with_untracked(|channel| matches_filter(channel, &needle)))
+                            .copied()
+                            .collect::<Vec<_>>()
+                    }, key = |channel: &RwSignal<ChannelView, LocalStorage>| channel.get_untracked().id {
                         ChannelRow(
                             channel = channel,
                             pins = pins,
@@ -732,7 +765,14 @@ fn ChannelsTab(
                             set_prefs = set_prefs,
                         )
                     }
-                    for login in move || (*pending.get()).clone(), key = |login: &String| login.clone() {
+                    for login in move || {
+                        let needle = filter.get().trim().to_lowercase();
+                        (*pending.get())
+                            .iter()
+                            .filter(|login| needle.is_empty() || login.to_lowercase().contains(&needle))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    }, key = |login: &String| login.clone() {
                         row(class = "channel-row pending") {
                             text(class = "cell cell--dot") {""}
                             box(class = "live-dot") {box(class = "live-dot__lamp")}
@@ -743,6 +783,23 @@ fn ChannelsTab(
                     if move || channels.get().is_empty() && pending.get().is_empty() {
                         text(class = "empty") {
                             "No channels yet. Add a Twitch login below to follow a channel."
+                        }
+                    }
+                    if move || {
+                        let needle = filter.get().trim().to_lowercase();
+                        if needle.is_empty() || (channels.get().is_empty() && pending.get().is_empty()) {
+                            return false;
+                        }
+                        let matched = channels.get().iter().any(|row| {
+                            row.with_untracked(|channel| matches_filter(channel, &needle))
+                        });
+                        !matched
+                            && !pending.get().iter().any(|login| {
+                                login.to_lowercase().contains(&needle)
+                            })
+                    } {
+                        text(class = "empty") {
+                            {move || format!("No channel matches “{}”", filter.get().trim())}
                         }
                     }
                 }
@@ -1758,6 +1815,16 @@ const fn conn_label(conn: ConnHealth) -> &'static str {
 /// A text input leaves `Enter` to its caller, so each add box has to opt in.
 /// `Shift` is left alone: it is how a field that later grows into a composer
 /// keeps its newline.
+/// Whether a channel belongs in the list under the filter box: the login or the
+/// display name contains `needle`, which is already lowercased. The title is
+/// deliberately excluded — it changes constantly, so it is not what a person
+/// types to find a channel again.
+fn matches_filter(channel: &ChannelView, needle: &str) -> bool {
+    needle.is_empty()
+        || channel.login.to_lowercase().contains(needle)
+        || channel.display_name.to_lowercase().contains(needle)
+}
+
 fn on_enter(ev: &EventCx<'_, events::KeyDown>, run: impl Fn()) {
     if matches!(ev.key, Key::Named(NamedKey::Enter)) && !ev.modifiers.shift() {
         run();

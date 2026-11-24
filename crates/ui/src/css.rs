@@ -575,6 +575,14 @@ pub const SHEET: &str = css!(
     .add__input { flex-grow: 1; }
     .add__quality { width: 170px; }
 
+    .filterbar {
+        gap: 8px;
+        align-items: center;
+        padding-bottom: 2px;
+    }
+
+    .filterbar__input { flex-grow: 1; }
+
     .word {
         align-items: center;
         gap: 8px;
