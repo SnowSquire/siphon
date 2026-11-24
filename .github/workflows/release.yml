@@ -1,12 +1,13 @@
 name: release
 
-# Releases on a vX.Y.Z tag (which must match the workspace version, so a
-# release cannot ship binaries that do not match its source) and on manual
-# dispatch of any branch, tag or commit. A manual run uploads the setup, the
-# portable zip and the symbols zip as workflow artifacts and creates no tag or
-# release.
-# A nightly builds main at 10:00 UTC unless that commit already has a
-# successful run of this workflow; it also uploads artifacts only.
+# Builds main on every push that can change the payload, and uploads the setup,
+# the portable zip and the symbols zip as workflow artifacts. A vX.Y.Z tag
+# (which must match the workspace version, so a release cannot ship binaries
+# that do not match its source) publishes a draft release instead; that trigger
+# lives in `release-tag.yml`, because a path filter on the branch push would
+# also have to match a tag, and a tag has no changed files to match against.
+# Manual dispatch builds any branch, tag or commit and uploads artifacts only.
+# There is no nightly: a successful main push is the nightly.
 # Nothing runs on pull requests. GitHub adds the source archives itself; the
 # assets below are the setup, the portable zip and the symbols zip.
 #
@@ -24,12 +25,19 @@ name: release
 # change on every commit and are therefore never cached.
 on:
   push:
-    tags:
-      - "v[0-9]*.[0-9]*.[0-9]*"
-  schedule:
-    # GitHub may fire this late; the gate only cares whether the commit is
-    # already built, not what time it is.
-    - cron: "0 10 * * *"
+    branches: ["main"]
+    # Only what can change the payload. A note, a README or an unrelated
+    # workflow no longer starts a nine-minute build.
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "nix/**"
+      - "flake.nix"
+      - "flake.lock"
+      - "installer/**"
+      - ".github/workflows/release.yml"
+  workflow_call:
   workflow_dispatch:
     inputs:
       commit:
@@ -51,44 +59,8 @@ env:
   CACHE_VERSION: v1
 
 jobs:
-  # The nightly skips a commit this workflow already built successfully; a
-  # failed or cancelled run is retried the next day. Everything that is not a
-  # schedule passes straight through.
-  gate:
-    name: nightly gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      run: ${{ steps.gate.outputs.run }}
-    steps:
-      - name: decide
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" != "schedule" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          built="$(
-            gh run list --workflow release.yml --commit "$GITHUB_SHA" --limit 100 \
-              --json databaseId,status,conclusion 2>/dev/null \
-              | jq --argjson current "$GITHUB_RUN_ID" \
-                '[.[] | select(.databaseId != $current and .status == "completed" and .conclusion == "success")] | length' \
-              || echo 0
-          )"
-          if (( built > 0 )); then
-            echo "$GITHUB_SHA already has a successful build"
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
   deps:
     name: Windows dependency layer
-    needs: gate
-    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
@@ -129,10 +101,7 @@ jobs:
 
   windows:
     name: Windows x64 installer, portable zip and symbols
-    needs:
-      - gate
-      - deps
-    if: needs.gate.outputs.run == 'true'
+    needs: deps
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -191,9 +160,10 @@ jobs:
 
       - name: publish
         # `act` sets ACT=true for local runs; there is no token there and no
-        # release to write. Manual and scheduled runs publish artifacts below
-        # instead, so they never create a tag.
-        if: ${{ !env.ACT && github.event_name == 'push' }}
+        # release to write. Only a tag publishes: a branch push uploads
+        # artifacts below instead, and `github.ref_name` on main would
+        # otherwise name a release "main".
+        if: ${{ !env.ACT && startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
@@ -224,7 +194,7 @@ jobs:
       # v7 can upload one file unzipped: each download is the setup, the
       # portable zip or the symbols zip itself, not a wrapper artifact.
       - name: upload the installer
-        if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v7
         with:
           path: result/*-setup.exe
@@ -233,7 +203,7 @@ jobs:
           archive: false
 
       - name: upload the portable zip
-        if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v7
         with:
           path: result/*-portable.zip
@@ -242,7 +212,7 @@ jobs:
           archive: false
 
       - name: upload the symbols
-        if: ${{ !env.ACT && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+        if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v7
         with:
           path: result/*-symbols.zip

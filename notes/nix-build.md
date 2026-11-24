@@ -213,6 +213,15 @@ commit. `release.yml` is two jobs:
    `.#windows-installer`. The two binaries and the installer change on every
    commit, so they are never cached; a run pays two crate compiles and a link.
 
+`clippy.yml`'s Windows job builds the same `.#windows-deps` and *saves* it under
+that key, so a lint run warms the release cache: the release's `deps` job then
+restores instead of compiling. `release.yml` builds `main` on any push that
+touches `crates/`, the manifests, `nix/` or `installer/`, and uploads the three
+artifacts; a `vX.Y.Z` tag publishes a draft release instead, through
+`release-tag.yml` (a tag has no changed files, so it could not satisfy a `paths`
+filter; the tag trigger lives in its own file that calls `release.yml`). There
+is no nightly — a successful `main` push is it.
+
 Both entries are capped at `gc-max-store-size-linux: 8G`: GitHub's cache budget
 is 10 GB per repository with LRU eviction, so one entry must not be able to take
 the lot. Nixpkgs paths are substitutable and are re-fetched rather than kept,

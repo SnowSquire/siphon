@@ -1,0 +1,21 @@
+name: release-tag
+
+# A `vX.Y.Z` tag publishes a draft release; `siphon-daemon --version` and the
+# asset names must match the workspace version, which `release.yml` checks.
+#
+# This trigger lives apart from `release.yml` because that workflow also builds
+# main on a path filter, and GitHub evaluates `paths` against a tag push too --
+# a tag has no changed files, so it would never match. Calling the workflow
+# keeps one build definition.
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    uses: ./.github/workflows/release.yml
