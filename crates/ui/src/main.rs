@@ -64,7 +64,7 @@ fn main() {
         std::process::exit(0);
     }
     // Toasts are the window's job now; the AUMID is registered per user once.
-    crate::notify::register_aumid();
+    notify::register_aumid();
 
     // A second launch wakes the first instance and exits immediately.
     if app_single_instance::notify_if_running(APP_ID) {
