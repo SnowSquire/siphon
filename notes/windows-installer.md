@@ -140,8 +140,11 @@ The release PDBs are kept, so every build also emits
 `siphon-<version>-x64-symbols.zip` with `siphon.pdb` and `siphon_daemon.pdb`.
 They stay out of the installer payload — a user never needs them — and are
 published beside it: a minidump is useless without the matching PDBs, and the
-GUID in each PDB is what the debugger matches against the dump. The packaging
-derivation takes them from the payload's `symbols/`, which is where
+GUID in each PDB is what the debugger matches against the dump. The payload is
+built with `CARGO_PROFILE_RELEASE_DEBUG=2`, so the PDBs carry source lines and
+locals rather than just public symbol addresses; the executable is unaffected
+because the CodeView data lives in the PDB. The packaging derivation takes them
+from the payload's `symbols/`, which is where
 `nix/windows.nix` puts the normalized copies. rustc names a PDB after its
 crate, so the daemon's file is `siphon_daemon.pdb`, not `siphon-daemon.pdb`.
 

@@ -74,6 +74,16 @@ let
       CARGO_PROFILE_RELEASE_LTO = "fat";
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";
 
+      # Full debug info, so a release minidump resolves to lines and locals, not
+      # just addresses. It goes in the PDB, not the executable: `strip = true`
+      # (Cargo.toml) still drops the COFF symbol table, and on MSVC the CodeView
+      # data has always been a separate file. Only the symbols zip grows.
+      #
+      # It is set for the dependency layer too, because lld merges each rlib's
+      # `.debug$S` into the PDB: debuginfo on the binary alone would leave every
+      # frame below `siphon-ui` as a bare address.
+      CARGO_PROFILE_RELEASE_DEBUG = "2";
+
       SIPHON_CHILLAX_TTF = "${sources.chillax}/Fonts/TTF/Chillax-Variable.ttf";
     };
   };
