@@ -26,6 +26,7 @@ use siphon_shared::riffle::DownloaderSummary;
 use siphon_shared::riffle::LogLevel;
 use siphon_shared::riffle::MAX_AVATAR;
 use siphon_shared::riffle::PipelineView;
+use siphon_shared::riffle::PlaybackPosition;
 use siphon_shared::riffle::Request;
 use siphon_shared::riffle::Response;
 use siphon_shared::riffle::RpcError;
@@ -34,6 +35,8 @@ use siphon_shared::riffle::Snapshot;
 use siphon_shared::riffle::StreamEvent;
 use siphon_shared::riffle::StreamEventKind;
 use siphon_shared::riffle::StreamKey;
+use siphon_shared::riffle::StreamPlayback;
+use siphon_shared::riffle::StreamStarted;
 use siphon_shared::riffle::Update;
 use siphon_shared::riffle::UpdateView;
 use tracing::info;
@@ -50,6 +53,8 @@ use crate::hermes::SubState;
 use crate::hermes::Topic;
 use crate::http::Client;
 use crate::http::ws::WsStream;
+use crate::lane::Lanes;
+use crate::registry::LanePlace;
 use crate::registry::Registry;
 use crate::riffle;
 use crate::time::now_ms;
@@ -393,7 +398,7 @@ impl App {
             } => {
                 match result {
                     Ok(0) | Err(_) => {
-                        conns[id] = None;
+                        self.close_conn(conns, id);
                         return;
                     }
                     Ok(read) => {
@@ -417,7 +422,7 @@ impl App {
                 };
                 conn.writing = false;
                 if result.is_err() {
-                    conns[id] = None;
+                    self.close_conn(conns, id);
                     return;
                 }
                 // `write_all` hands the buffer back untouched. It is the
@@ -426,6 +431,19 @@ impl App {
                 buf.clear();
                 conn.spare = buf;
             }
+        }
+    }
+
+    /// Drops one connection and releases every pipeline its lanes claimed.
+    ///
+    /// Lanes are per connection, so a UI that goes away must not leave a
+    /// watch-only runtime running: the claim is the only thing keeping it up.
+    fn close_conn(&self, conns: &mut [Option<riffle::Conn>], id: usize) {
+        let Some(conn) = conns[id].take() else {
+            return;
+        };
+        for key in conn.lanes.iter() {
+            self.registry.detach(key);
         }
     }
 
@@ -463,7 +481,9 @@ impl App {
                         break;
                     }
                     info!(%app_version, "rpc: client connected");
-                    let snapshot = self.snapshot();
+                    // A fresh connection starts with no lanes; this only ever
+                    // carries the snapshot's own (empty) set.
+                    let snapshot = self.snapshot(&conn.lanes);
                     let queued = conn.push(&ServerMessage::Welcome {
                         protocol: siphon_shared::riffle::PROTOCOL_VERSION,
                         server_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -478,7 +498,10 @@ impl App {
                     id: request_id,
                     request,
                 }) => {
-                    let result = self.handle_request(request).await;
+                    // The request handler owns the connection it arrived on:
+                    // lanes are per connection, and a lane update must be
+                    // written to that connection's queue rather than broadcast.
+                    let result = self.handle_request(request, conn).await;
                     if !conn.push(&ServerMessage::Response {
                         id: request_id,
                         result,
@@ -494,12 +517,13 @@ impl App {
             }
         }
         if close {
-            conns[id] = None;
+            self.close_conn(conns, id);
         }
     }
 
     /// Encodes each queued update once and hands the bytes to every connection.
     fn flush_bus(&mut self, conns: &mut [Option<riffle::Conn>], ops: &FuturesUnordered<Op>) {
+        let mut overflowed: Vec<usize> = Vec::new();
         for broadcast in self.bus.take_pending() {
             self.frame.clear();
             if siphon_shared::riffle::codec::encode(
@@ -521,7 +545,9 @@ impl App {
                 continue;
             };
             if conn.out.len() > riffle::MAX_OUT {
-                *slot = None;
+                // Closed after this loop: `close_conn` needs all of `conns`, and
+                // this loop holds one connection at a time.
+                overflowed.push(id);
                 continue;
             }
             if conn.ready && !conn.writing && !conn.out.is_empty() {
@@ -531,6 +557,9 @@ impl App {
                 let buf = std::mem::take(&mut conn.spare);
                 ops.push(write_op(id, stream, buf));
             }
+        }
+        for id in overflowed {
+            self.close_conn(conns, id);
         }
     }
 
@@ -625,7 +654,11 @@ impl App {
         }
     }
 
-    async fn handle_request(&mut self, request: Request) -> Result<Response, RpcError> {
+    async fn handle_request(
+        &mut self,
+        request: Request,
+        conn: &mut riffle::Conn,
+    ) -> Result<Response, RpcError> {
         match request {
             Request::AddLogin { login } => {
                 self.request_add_login(&login);
@@ -670,7 +703,11 @@ impl App {
                 Ok(Response::Ack)
             }
             Request::RecordOnce { login, quality } => self.apply_record_once(&login, quality),
-            Request::GetSnapshot => Ok(Response::Snapshot(Box::new(self.snapshot()))),
+            Request::StreamOpen { key, playback } => self.stream_open(conn, key, playback).await,
+            Request::StreamUpdate { key, playback } => self.stream_update(conn, &key, playback),
+            Request::StreamClose { key } => self.stream_close(conn, key),
+            Request::StreamSeek { key, target } => self.stream_seek(conn, &key, target),
+            Request::GetSnapshot => Ok(Response::Snapshot(Box::new(self.snapshot(&conn.lanes)))),
             Request::GetStreamDetail(key) => self
                 .registry
                 .detail(&key, 256)
@@ -693,9 +730,126 @@ impl App {
         }
     }
 
+    /// Attaches a lane, or updates one already attached on this connection.
+    ///
+    /// Re-opening is idempotent: the lane set is checked before `attach`,
+    /// because the registry counts claims on a pipeline and knows nothing about
+    /// lanes, so a second `attach` would be a second claim that no close would
+    /// ever release.
+    async fn stream_open(
+        &self,
+        conn: &mut riffle::Conn,
+        key: StreamKey,
+        playback: StreamPlayback,
+    ) -> Result<Response, RpcError> {
+        let now = Instant::now();
+        let place = if conn.lanes.contains(&key) {
+            self.registry.place(&key)
+        } else {
+            let runtime = self.registry.attach(&key).await?;
+            Some(runtime.place())
+        };
+        let position_ms = position_of(playback.position, place);
+        conn.lanes
+            .open(key.clone(), playback, position_ms, now, wall_ms());
+        if !Self::push_lane(conn, &key, now, place) {
+            return Err(RpcError::Disconnected);
+        }
+        Ok(Response::Ack)
+    }
+
+    /// The periodic correction. A key this connection never opened is
+    /// `NotFound`: an update states where a lane is, it does not attach one.
+    fn stream_update(
+        &self,
+        conn: &mut riffle::Conn,
+        key: &StreamKey,
+        playback: StreamPlayback,
+    ) -> Result<Response, RpcError> {
+        if !conn.lanes.contains(key) {
+            return Err(RpcError::NotFound);
+        }
+        let now = Instant::now();
+        let place = self.registry.place(key);
+        let position_ms = position_of(playback.position, place);
+        conn.lanes
+            .open(key.clone(), playback, position_ms, now, wall_ms());
+        if !Self::push_lane(conn, key, now, place) {
+            return Err(RpcError::Disconnected);
+        }
+        Ok(Response::Ack)
+    }
+
+    /// Closes a lane and releases its claim. Closing twice is an ack, not an
+    /// error: the lane is simply not there any more.
+    fn stream_close(&self, conn: &mut riffle::Conn, key: StreamKey) -> Result<Response, RpcError> {
+        if conn.lanes.remove(&key) {
+            self.registry.detach(&key);
+            if !conn.push(&ServerMessage::Update(Update::LaneRemove(key))) {
+                return Err(RpcError::Disconnected);
+            }
+        }
+        Ok(Response::Ack)
+    }
+
+    /// Answers where the daemon would start serving, not the target itself.
+    ///
+    /// GOP alignment needs the demuxer's access-unit index, which is not wired
+    /// yet, so the answer is the position the runtime holds (the live edge) and
+    /// the newest segment's sequence. `trimmed` stays false because nothing is
+    /// clamped here: [`LaneState::Starved`] already says the retained window no
+    /// longer holds a position, and the clamp lands with the media lane.
+    ///
+    /// [`LaneState::Starved`]: siphon_shared::riffle::LaneState::Starved
+    fn stream_seek(
+        &self,
+        conn: &riffle::Conn,
+        key: &StreamKey,
+        target: PlaybackPosition,
+    ) -> Result<Response, RpcError> {
+        if !conn.lanes.contains(key) {
+            return Err(RpcError::NotFound);
+        }
+        // The target is what the client discards towards; the daemon cannot
+        // place it without the AU index, so it is deliberately unused here.
+        let _ = target;
+        let place = self.registry.place(key);
+        let held = conn.lanes.position_ms(key);
+        let started = StreamStarted {
+            start_pts_ms: place.map_or_else(|| held.unwrap_or(0), |place| place.position_ms),
+            start_sequence: place.map_or(0, |place| place.sequence),
+            trimmed: false,
+        };
+        // The lane's own position moves on the client's next `StreamUpdate`;
+        // this answer only says what the daemon would serve.
+        Ok(Response::StreamStarted(started))
+    }
+
+    /// Writes one lane row straight to the owning connection's queue.
+    ///
+    /// The update bus broadcasts the same encoded bytes to every client, so a
+    /// lane update must never be published there: it would leak this
+    /// connection's lanes into every other UI. Everything the bus carries is
+    /// daemon-wide and identical for every connection; a lane is neither.
+    fn push_lane(
+        conn: &mut riffle::Conn,
+        key: &StreamKey,
+        now: Instant,
+        place: Option<LanePlace>,
+    ) -> bool {
+        let window_start_ms = place.map_or(0, |place| place.window_start_ms);
+        let Some(view) = conn.lanes.view(key, now, window_start_ms) else {
+            return true;
+        };
+        conn.push(&ServerMessage::Update(Update::Lane(view)))
+    }
+
     /// Snapshot built on demand from app state, the registry and metrics.
+    ///
+    /// `lanes` is the asking connection's own set: lanes are per connection, so
+    /// there is no global list to read here.
     #[must_use]
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self, lanes: &Lanes) -> Snapshot {
         let mut channels = Vec::with_capacity(self.config.channels.len());
         for channel in &self.config.channels {
             let view = self.channels.get(&channel.id).map_or_else(
@@ -731,6 +885,7 @@ impl App {
             channels,
             pending: self.pending.clone(),
             pipelines: self.registry.views(),
+            lanes: lanes.views(Instant::now(), |key| self.registry.window_start_ms(key)),
             arena: self.registry.arena_summary(),
             downloader: self.registry.downloader_summary(),
             logs: self.bus.logs(),
@@ -1141,6 +1296,109 @@ fn update_view(release: &update::Release) -> UpdateView {
         version: release.version.to_string(),
         page_url: release.page_url.clone(),
         installer: release.installer_url.is_some(),
+    }
+}
+
+/// The position a lane is at from what it reported.
+///
+/// `Live` is the pipeline's edge at that moment: the client cannot name a
+/// number it does not have, so the daemon resolves it.
+fn position_of(position: PlaybackPosition, place: Option<LanePlace>) -> u64 {
+    match position {
+        PlaybackPosition::Live => place.map_or(0, |place| place.position_ms),
+        PlaybackPosition::Absolute { pts_ms } => pts_ms,
+    }
+}
+
+/// Wall-clock milliseconds for [`siphon_shared::riffle::LaneView::started_ms`],
+/// which is unsigned while [`now_ms`] is signed for the channel rows.
+fn wall_ms() -> u64 {
+    u64::try_from(now_ms()).unwrap_or_default()
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::arena::ArenaSet;
+    use crate::metrics::DownloaderMetrics;
+    use crate::registry::Options as RegistryOptions;
+    use crate::registry::Recording;
+
+    fn app() -> App {
+        let (downloaders, _downloaders_rx) = kanal::bounded(1);
+        let (_accept, accept_rx) = kanal::unbounded();
+        let (jobs_tx, jobs_rx) = kanal::unbounded();
+        App::new(AppInit {
+            config: Config::default(),
+            config_path: PathBuf::from("config.json"),
+            client: Rc::new(Client::new()),
+            registry: Rc::new(Registry::new(
+                Rc::new(Client::new()),
+                Rc::new(ArenaSet::new()),
+                downloaders.to_async(),
+                Rc::new(DownloaderMetrics::new(1)),
+                RegistryOptions {
+                    client_id: None,
+                    auth_token: None,
+                    low_latency: true,
+                    recording: Recording {
+                        output: None,
+                        dual_format: false,
+                    },
+                    notify: None,
+                    keep_runs: false,
+                },
+                Bus::new(),
+            )),
+            bus: Bus::new(),
+            accept: accept_rx.to_async(),
+            jobs: jobs_rx.to_async(),
+            jobs_tx,
+            client_id: None,
+        })
+    }
+
+    const fn playback() -> StreamPlayback {
+        StreamPlayback {
+            position: PlaybackPosition::Absolute { pts_ms: 1_000 },
+            rate: 1.0,
+            buffer_ms: 30_000,
+        }
+    }
+
+    /// Lanes are per connection, so the snapshot is built from the asking
+    /// connection's set and never from a daemon-wide one.
+    #[test]
+    fn a_snapshot_carries_only_the_asking_connections_lanes() {
+        let app = app();
+        let mut mine = Lanes::default();
+        mine.open(
+            StreamKey::new(1, None),
+            playback(),
+            1_000,
+            Instant::now(),
+            0,
+        );
+        let mut theirs = Lanes::default();
+        theirs.open(
+            StreamKey::new(2, None),
+            playback(),
+            1_000,
+            Instant::now(),
+            0,
+        );
+
+        let mine_view = app.snapshot(&mine).lanes;
+        assert_eq!(mine_view.len(), 1);
+        assert_eq!(mine_view[0].key.channel, 1);
+
+        let theirs_view = app.snapshot(&theirs).lanes;
+        assert_eq!(theirs_view.len(), 1);
+        assert_eq!(theirs_view[0].key.channel, 2);
+
+        assert_eq!(app.snapshot(&Lanes::default()).lanes.len(), 0);
     }
 }
 

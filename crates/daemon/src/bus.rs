@@ -182,8 +182,15 @@ impl Key {
             Update::Update(_) => Some(Self::Update),
             // The segment ring, the event log and stream events are
             // append-only; coalescing would lose entries, and for a stream
-            // event the transition *is* the value.
-            Update::Segment { .. } | Update::Log(_) | Update::StreamEvent(_) => None,
+            // event the transition *is* the value. Lanes are per connection and
+            // written straight to the owning connection's outbound queue, so
+            // they never reach the bus at all; naming them here means a future
+            // publisher cannot coalesce one connection's row with another's.
+            Update::Segment { .. }
+            | Update::Log(_)
+            | Update::StreamEvent(_)
+            | Update::Lane(_)
+            | Update::LaneRemove(_) => None,
         }
     }
 }

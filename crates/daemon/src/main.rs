@@ -21,6 +21,8 @@ mod downloader;
 mod gql;
 #[allow(clippy::future_not_send)]
 mod hermes;
+#[allow(dead_code, clippy::future_not_send)]
+mod lane;
 #[allow(clippy::future_not_send)]
 mod logging;
 

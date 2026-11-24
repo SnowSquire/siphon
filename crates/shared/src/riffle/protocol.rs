@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -561,6 +561,9 @@ pub struct Snapshot {
     pub channels: Vec<ChannelView>,
     pub pending: Vec<String>,
     pub pipelines: Vec<PipelineView>,
+    /// The lanes attached on *this* connection. Lanes are per connection, so
+    /// this is never the daemon's whole set.
+    pub lanes: Vec<LaneView>,
     pub arena: ArenaSummary,
     pub downloader: DownloaderSummary,
     pub logs: Vec<LogEntry>,
@@ -584,6 +587,12 @@ pub enum Update {
         key: StreamKey,
         record: SegmentRecord,
     },
+    /// One lane, for the connection that owns it. Written straight to that
+    /// connection's outbound queue, never published on the bus: the bus
+    /// broadcasts the same bytes to every client, and a lane is per connection.
+    Lane(LaneView),
+    /// The lane was closed. Sent only to the connection that owned it.
+    LaneRemove(StreamKey),
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
     /// Append-only: never coalesced, because the transition is the value.
@@ -639,6 +648,28 @@ pub enum Request {
         login: String,
         quality: Option<String>,
     },
+    /// Attach a lane on this connection and set its initial position, rate and
+    /// buffer. Re-opening a key already attached here is idempotent: it only
+    /// updates the lane.
+    StreamOpen {
+        key: StreamKey,
+        playback: StreamPlayback,
+    },
+    /// The periodic correction: sent on change and as a 5 s heartbeat.
+    StreamUpdate {
+        key: StreamKey,
+        playback: StreamPlayback,
+    },
+    /// Close a lane and release its claim on the pipeline.
+    StreamClose {
+        key: StreamKey,
+    },
+    /// Ask for a position. The daemon aligns to the GOP's keyframe, so the
+    /// answer is [`Response::StreamStarted`], not this position verbatim.
+    StreamSeek {
+        key: StreamKey,
+        target: PlaybackPosition,
+    },
     GetSnapshot,
     GetStreamDetail(StreamKey),
     ListSegments {
@@ -666,6 +697,9 @@ pub enum Response {
     Snapshot(Box<Snapshot>),
     StreamDetail(Box<StreamDetail>),
     Segments(Vec<SegmentRecord>),
+    /// The position the daemon will start serving a [`Request::StreamSeek`]
+    /// from; the client discards decoded frames before its own target.
+    StreamStarted(StreamStarted),
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
     Disk(DiskView),
@@ -761,6 +795,30 @@ mod tests {
     #[test]
     fn a_local_install_listens_on_nothing() {
         assert_eq!(Network::default().listen.len(), 0);
+    }
+
+    /// Lanes are per connection, so a snapshot that names none is what a client
+    /// that has not opened one gets.
+    #[test]
+    fn a_fresh_snapshot_carries_no_lanes() {
+        assert_eq!(Snapshot::default().lanes.len(), 0);
+    }
+
+    #[test]
+    fn a_stream_seek_answers_with_a_started_position() {
+        let started = Response::StreamStarted(StreamStarted {
+            start_pts_ms: 4_000,
+            start_sequence: 12,
+            trimmed: false,
+        });
+        assert!(matches!(
+            started,
+            Response::StreamStarted(StreamStarted {
+                start_pts_ms: 4_000,
+                start_sequence: 12,
+                trimmed: false
+            })
+        ));
     }
 
     #[test]

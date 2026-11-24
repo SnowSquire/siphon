@@ -28,6 +28,7 @@ use siphon_shared::riffle::DownloaderSummary;
 use siphon_shared::riffle::LogLevel;
 use siphon_shared::riffle::PipelineState;
 use siphon_shared::riffle::PipelineView;
+use siphon_shared::riffle::RpcError;
 use siphon_shared::riffle::StreamDetail;
 use siphon_shared::riffle::StreamKey;
 use siphon_shared::riffle::Update;
@@ -153,6 +154,21 @@ struct StreamId {
     quality: Option<Box<str>>,
 }
 
+/// Where a lane's pipeline is right now, as scalars.
+///
+/// Read from the live window under one borrow; a `Segment` is never copied out,
+/// because it owns a `Reader` and cloning it pins an arena slot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LanePlace {
+    /// End of the newest live segment, in broadcast milliseconds.
+    pub position_ms: u64,
+    /// The oldest position this runtime can still serve, or `0` when it is not
+    /// known yet (nothing published, or the runtime is gone).
+    pub window_start_ms: u64,
+    /// Playlist sequence of the newest live segment, or `0`.
+    pub sequence: u64,
+}
+
 impl StreamId {
     fn new(channel: u64, quality: Option<&str>) -> Self {
         Self {
@@ -163,7 +179,7 @@ impl StreamId {
 }
 
 /// One running pipeline.
-struct StreamRuntime {
+pub struct StreamRuntime {
     key: StreamKey,
     /// The channel's login: display, logging and the DVR's archive lookup. Not
     /// identity; `key.channel` is.
@@ -189,6 +205,10 @@ struct StreamRuntime {
     /// orientation.
     variant_kind: VariantKind,
     metrics: Rc<StreamMetrics>,
+    /// Lanes attached to this runtime across every connection. A watch-only
+    /// runtime lives until the last one detaches; a recording keeps it either
+    /// way.
+    viewers: Cell<u32>,
 }
 
 struct Recorder {
@@ -220,6 +240,41 @@ impl StreamRuntime {
             Some(self.login.clone()),
             Rc::clone(&self.dvr),
         );
+    }
+
+    /// Where this pipeline is right now: the live edge, the retained window's
+    /// front, and the newest sequence. Scalars only, under one borrow.
+    ///
+    /// The retained window is the DVR archive's front when one has been
+    /// discovered, otherwise the live playlist's oldest segment. A watch-only
+    /// runtime does not spawn the DVR, so that half is usually absent.
+    pub(crate) fn place(&self) -> LanePlace {
+        let (position_ms, live_start_ms, sequence) = {
+            let window = self.live_window.borrow();
+            let first = window.first().map(|segment| segment.timestamp_ms);
+            let last = window.last();
+            (
+                last.map_or(0, |segment| {
+                    segment.timestamp_ms.saturating_add(segment.duration_ms)
+                }),
+                first,
+                last.map_or(0, |segment| segment.sequence_num),
+            )
+        };
+        let dvr_start_ms = self
+            .dvr
+            .snapshot()
+            .and_then(|timeline| timeline.segments.first().map(|segment| segment.start_ms));
+        let window_start_ms = match (dvr_start_ms, live_start_ms) {
+            (Some(dvr), Some(live)) => dvr.min(live),
+            (Some(dvr), None) => dvr,
+            (None, live) => live.unwrap_or(0),
+        };
+        LanePlace {
+            position_ms,
+            window_start_ms,
+            sequence,
+        }
     }
 }
 
@@ -551,6 +606,7 @@ impl Registry {
             variant: variant.id.clone(),
             variant_kind: variant.kind.clone(),
             metrics,
+            viewers: Cell::new(0),
         });
 
         if record {
@@ -710,9 +766,11 @@ impl Registry {
         let key = StreamKey::new(runtime.key.channel, Some(portrait));
         if let Some(sibling) = self.runtime(&key) {
             self.stop_recording(&sibling);
-            // Nobody owns it but the primary recording; a viewer of that quality
-            // keeps its pipeline alive.
-            self.remove_runtime(&key);
+            // The primary recording is the only owner of that quality, but a
+            // lane watching it directly keeps its pipeline alive.
+            if sibling.viewers.get() == 0 {
+                self.remove_runtime(&key);
+            }
         }
     }
 
@@ -842,6 +900,90 @@ impl Registry {
         self.publish_pipeline(&runtime);
     }
 
+    /// Attaches one lane as a consumer of `key`'s pipeline, spawning it when it
+    /// is not running.
+    ///
+    /// This is the consumer the old DESCRIBE used to be: a lane keeps a
+    /// watch-only runtime alive, and [`Self::detach`] releases it. A key that is
+    /// already attached takes a second claim rather than spawning a second
+    /// pipeline; the lane set itself is per connection and the app only calls
+    /// this for a lane it does not already hold.
+    pub async fn attach(self: &Rc<Self>, key: &StreamKey) -> Result<Rc<StreamRuntime>, RpcError> {
+        if let Some(runtime) = self.runtime(key) {
+            runtime.viewers.set(runtime.viewers.get().saturating_add(1));
+            return Ok(runtime);
+        }
+        let Some(login) = self.login_of(key.channel) else {
+            return Err(RpcError::NotFound);
+        };
+        let _guard = self
+            .gate
+            .acquire(gate_key(&login, key.quality.as_deref()))
+            .await;
+        if let Some(runtime) = self.runtime(key) {
+            runtime.viewers.set(runtime.viewers.get().saturating_add(1));
+            return Ok(runtime);
+        }
+        // Offline is the channel's answer, not an unknown one: `login_of`
+        // already established that this channel exists.
+        let data = self
+            .channel_data(&login)
+            .await
+            .map_err(|_| RpcError::Failed(format!("{login} is offline")))?;
+        let Some(variant) = choose_variant(&data.variants, key.quality.as_deref()) else {
+            return Err(RpcError::BadRequest(format!(
+                "{login} has no {} variant",
+                key.quality.as_deref().unwrap_or("default")
+            )));
+        };
+        let id = StreamId::new(data.id, key.quality.as_deref());
+        let runtime = self.spawn_runtime(key, &data, variant, false);
+        runtime.viewers.set(1);
+        self.streams.borrow_mut().insert(id, Rc::clone(&runtime));
+        self.publish_pipeline(&runtime);
+        info!(
+            login = %runtime.login,
+            quality = key.quality.as_deref().unwrap_or("<first>"),
+            "daemon: lane attached"
+        );
+        Ok(runtime)
+    }
+
+    /// Releases one lane's claim on its pipeline.
+    ///
+    /// The runtime goes away when this was the last lane, nothing is recording
+    /// and the channel's record preference is off — the same condition the old
+    /// `release_stream` used. A runtime that is already gone (stopped, or the
+    /// broadcast ended) is not an error.
+    pub fn detach(&self, key: &StreamKey) {
+        let Some(runtime) = self.runtime(key) else {
+            return;
+        };
+        let viewers = runtime.viewers.get().saturating_sub(1);
+        runtime.viewers.set(viewers);
+        if viewers > 0 || runtime.is_recording() || self.wanted(&runtime.login) {
+            return;
+        }
+        info!(
+            login = %runtime.login,
+            quality = key.quality.as_deref().unwrap_or("<first>"),
+            "daemon: lane detached, stream stopped"
+        );
+        self.remove_runtime(&runtime.key);
+    }
+
+    /// Where the pipeline behind `key` is right now, if it is running.
+    #[must_use]
+    pub fn place(&self, key: &StreamKey) -> Option<LanePlace> {
+        self.runtime(key).map(|runtime| runtime.place())
+    }
+
+    /// The oldest position `key`'s pipeline can still serve; `0` when unknown.
+    #[must_use]
+    pub fn window_start_ms(&self, key: &StreamKey) -> u64 {
+        self.place(key).map_or(0, |place| place.window_start_ms)
+    }
+
     /// Recording was turned off for a channel: stop the disk, keep viewers.
     pub fn monitor_clear(&self, login: &str) {
         let entries: Vec<(StreamId, Rc<StreamRuntime>)> = self
@@ -853,6 +995,11 @@ impl Registry {
             .collect();
         for (id, runtime) in entries {
             self.stop_recording(&runtime);
+            // The recording is what a monitor owns; a lane is another consumer
+            // and keeps the runtime until it detaches.
+            if runtime.viewers.get() > 0 {
+                continue;
+            }
             self.remove_runtime_id(&id, &runtime.key);
         }
     }
@@ -877,12 +1024,19 @@ impl Registry {
             if runtime.is_recording() {
                 continue;
             }
+            // A lane is the consumer that keeps a watch-only runtime alive; the
+            // broadcast ending is the client's cue to close it.
+            if runtime.viewers.get() > 0 {
+                continue;
+            }
             self.remove_runtime_id(&id, &runtime.key);
         }
     }
 
     /// Stops serving. Without `force` a watched pipeline keeps running and
-    /// only its recording stops; with `force` the sessions are disconnected.
+    /// only its recording stops; with `force` it is torn down, which leaves its
+    /// lanes [`LaneState::Starved`](siphon_shared::riffle::LaneState::Starved)
+    /// until they close.
     pub fn stop_pipeline(&self, key: &StreamKey, force: bool) {
         let runtime = self.runtime(key);
         if let Some(runtime) = &runtime {
@@ -892,8 +1046,12 @@ impl Registry {
         let Some(runtime) = runtime else {
             return;
         };
-        let _ = force;
         self.stop_recording(&runtime);
+        if !force && runtime.viewers.get() > 0 {
+            // A lane is watching: `force` is what disconnects viewers, so
+            // without it the pipeline outlives its recording.
+            return;
+        }
         self.remove_runtime(key);
     }
 
@@ -930,8 +1088,14 @@ impl Registry {
         info!(
             login = %runtime.login,
             quality = key.quality.as_deref().unwrap_or("<first>"),
-            "daemon: recording finished, stream stopped"
+            viewers = runtime.viewers.get(),
+            "daemon: recording finished"
         );
+        // The recording was one consumer; a lane is another.
+        if runtime.viewers.get() > 0 {
+            self.publish_pipeline(&runtime);
+            return;
+        }
         self.remove_runtime(key);
     }
 
@@ -1019,7 +1183,7 @@ impl Registry {
             state,
             pinned: recording.is_some() || self.wanted(&runtime.login),
             recording: recording.is_some(),
-            sessions: 0,
+            sessions: runtime.viewers.get(),
             position_ms: live_edge_ms,
             live_edge_ms,
             segment_tail: metrics.segment_tail.get(),
@@ -1260,6 +1424,56 @@ mod tests {
                 "no pipeline update in {pending:?}"
             );
             assert_eq!(registry.views().len(), 1);
+        });
+    }
+
+    #[test]
+    fn attach_is_idempotent_and_the_last_detach_releases_the_pipeline() {
+        run(async {
+            let client = Rc::new(Client::new());
+            let (tx, _rx) = kanal::bounded(4);
+            let bus = Bus::new();
+            let registry = Rc::new(Registry::new(
+                client,
+                Rc::new(ArenaSet::new()),
+                tx.to_async(),
+                Rc::new(DownloaderMetrics::new(4)),
+                Options {
+                    client_id: None,
+                    auth_token: None,
+                    low_latency: true,
+                    recording: Recording {
+                        output: None,
+                        dual_format: false,
+                    },
+                    notify: None,
+                    keep_runs: false,
+                },
+                Rc::clone(&bus),
+            ));
+            registry.seed_channel("sunnys", 7, false, vec![debug_variant("mock")], 42);
+
+            let key = StreamKey::new(7, None);
+            let first = registry.attach(&key).await.expect("attach");
+            assert_eq!(first.viewers.get(), 1);
+            // A second lane takes a second claim on the same runtime.
+            let second = registry.attach(&key).await.expect("attach");
+            assert!(Rc::ptr_eq(&first, &second));
+            assert_eq!(second.viewers.get(), 2);
+            assert_eq!(registry.views().len(), 1);
+
+            registry.detach(&key);
+            assert_eq!(first.viewers.get(), 1);
+            assert_eq!(registry.views().len(), 1);
+            registry.detach(&key);
+            assert!(registry.views().is_empty(), "the last lane releases it");
+            // A lane whose pipeline is already gone is not an error.
+            registry.detach(&key);
+
+            assert!(matches!(
+                registry.attach(&StreamKey::new(8, None)).await,
+                Err(RpcError::NotFound)
+            ));
         });
     }
 

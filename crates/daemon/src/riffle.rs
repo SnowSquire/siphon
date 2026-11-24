@@ -20,6 +20,8 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::lane::Lanes;
+
 /// The admin transport: a socket on Unix, a named pipe on Windows.
 #[cfg(unix)]
 pub type AdminStream = compio::net::UnixStream;
@@ -45,6 +47,10 @@ pub struct Conn {
     pub ready: bool,
     /// A write future owns the buffer right now.
     pub writing: bool,
+    /// The lanes this connection opened. Per connection, because a lane is a
+    /// reader position on one UI: it is not daemon state, and one UI cannot see
+    /// or close another's.
+    pub lanes: Lanes,
 }
 
 impl Conn {
@@ -57,6 +63,7 @@ impl Conn {
             spare: Vec::new(),
             ready: false,
             writing: false,
+            lanes: Lanes::default(),
         }
     }
 

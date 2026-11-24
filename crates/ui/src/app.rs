@@ -13,6 +13,8 @@ use siphon_shared::riffle::ArenaSummary;
 use siphon_shared::riffle::ChannelView;
 use siphon_shared::riffle::ConnHealth;
 use siphon_shared::riffle::DownloaderSummary;
+use siphon_shared::riffle::LaneState;
+use siphon_shared::riffle::LaneView;
 use siphon_shared::riffle::LogEntry;
 use siphon_shared::riffle::LogLevel;
 use siphon_shared::riffle::PipelineState;
@@ -279,6 +281,7 @@ fn App(
     let pins_sig = state.pins;
     let pending_sig = state.pending;
     let pipelines_sig = state.pipelines;
+    let lanes_sig = state.lanes;
     let arena_sig = state.arena;
     let downloader_sig = state.downloader;
     let notices_sig = state.notices;
@@ -632,6 +635,7 @@ fn App(
                     notices = notices_sig,
                     logs = logs_sig,
                     pipelines = pipelines_sig,
+                    lanes = lanes_sig,
                 )
             }
             if move || tab.get() == Tab::Settings {
@@ -1623,6 +1627,32 @@ fn recordings(
         .collect()
 }
 
+/// A lane row's name: the channel's login and the quality it was attached at.
+/// A lane is keyed by the channel id, so the login comes from the channel list
+/// the same way a pipeline row finds it.
+fn lane_name(
+    lane: RwSignal<LaneView, LocalStorage>,
+    channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
+) -> String {
+    let key = lane.with(|lane| lane.key.clone());
+    let login = login_for(channels, key.channel);
+    format!(
+        "{}{}",
+        login,
+        key.quality
+            .as_ref()
+            .map_or_else(String::new, |quality| { format!(" · {quality}") })
+    )
+}
+
+const fn lane_state_label(state: LaneState) -> &'static str {
+    match state {
+        LaneState::Attached => "attached",
+        LaneState::Paused => "paused",
+        LaneState::Starved => "starved",
+    }
+}
+
 #[component]
 #[allow(clippy::needless_pass_by_value)]
 fn RecordingRow(
@@ -1716,8 +1746,10 @@ fn RecordingRow(
     }
 }
 
+/// Properties for one tab; the list is long because every signal it draws is
+/// one field and sharing a signal is what keeps a redraw local.
 #[component]
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn LogsTab(
     conn: RwSignal<ConnHealth, LocalStorage>,
     channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
@@ -1726,6 +1758,7 @@ fn LogsTab(
     notices: RwSignal<Rc<Vec<crate::riffle::Notice>>, LocalStorage>,
     logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
     pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
+    lanes: RwSignal<Rc<Vec<RwSignal<LaneView, LocalStorage>>>, LocalStorage>,
 ) -> impl IntoView {
     view! {
         column(class = "tabbody") {
@@ -1780,6 +1813,19 @@ fn LogsTab(
                                 pipeline.with(|pipeline| format!("{} · {} viewers", format_duration_ms(pipeline.position_ms), pipeline.sessions))
                             }}}
                             text(class = "pipeline__rec", class:on = move || pipeline.get().recording) {"REC"}
+                        }
+                    }
+                    text(class = "section-title") {"Lanes"}
+                    if move || lanes.get().is_empty() {
+                        text(class = "empty") {"No lane is attached."}
+                    }
+                    for lane in move || (*lanes.get()).clone(), key = |lane: &RwSignal<LaneView, LocalStorage>| lane.get_untracked().key {
+                        row(class = "pipeline") {
+                            text(class = "pipeline__name") {{move || lane_name(lane, channels)}}
+                            text(class = "pipeline__state") {{move || lane_state_label(lane.get().state)}}
+                            text(class = "pipeline__meta") {{move || {
+                                lane.with(|lane| format!("{} · {:.2}x", format_duration_ms(lane.playhead_ms), lane.rate))
+                            }}}
                         }
                     }
                     text(class = "section-title") {"Events"}

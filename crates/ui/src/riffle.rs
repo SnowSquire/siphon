@@ -24,12 +24,16 @@ use siphon_shared::riffle::Client;
 use siphon_shared::riffle::ClientEvent;
 use siphon_shared::riffle::ConnHealth;
 use siphon_shared::riffle::DownloaderSummary;
+use siphon_shared::riffle::LaneView;
 use siphon_shared::riffle::LogEntry;
 use siphon_shared::riffle::PipelineView;
 pub use siphon_shared::riffle::Request;
+use siphon_shared::riffle::Response;
 use siphon_shared::riffle::Snapshot;
 use siphon_shared::riffle::StreamEvent;
 use siphon_shared::riffle::StreamEventKind;
+use siphon_shared::riffle::StreamKey;
+use siphon_shared::riffle::StreamStarted;
 use siphon_shared::riffle::Update;
 use siphon_shared::riffle::UpdateView;
 use siphon_shared::settings::ChannelPrefs;
@@ -48,6 +52,12 @@ pub enum UiEvent {
     Avatar {
         id: String,
         path: Option<String>,
+    },
+    /// The daemon's answer to a `StreamSeek`: where it will actually start,
+    /// which is not the target the client asked for.
+    Started {
+        key: StreamKey,
+        started: StreamStarted,
     },
 }
 
@@ -248,6 +258,31 @@ async fn serve_connection(
                     })
                     .detach();
                 }
+                // `StreamStarted` is a query's answer rather than an entity
+                // update, so it waits on its own task too: the lane rows keep
+                // flowing while the daemon says where it will start.
+                Request::StreamSeek { key, target } => {
+                    let client = Rc::clone(&client);
+                    let events = events.clone();
+                    compio::runtime::spawn(async move {
+                        let request = Request::StreamSeek {
+                            key: key.clone(),
+                            target,
+                        };
+                        match client.request(request).await {
+                            Ok(Response::StreamStarted(started)) => {
+                                let _ = events.try_send(UiEvent::Started { key, started });
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(
+                                    Some(error.to_string()),
+                                ))));
+                            }
+                        }
+                    })
+                    .detach();
+                }
                 // Fire and forget: a slow handler must not stall the update
                 // stream, and the ack would be discarded anyway. A rejected
                 // intent arrives as an `Update`.
@@ -326,6 +361,12 @@ pub struct UiState {
     pub pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
     pub pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
     pub pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
+    /// The lanes this connection has attached, one row each. The daemon writes
+    /// them straight to this connection, so the list is per window.
+    pub lanes: RwSignal<Rc<Vec<RwSignal<LaneView, LocalStorage>>>, LocalStorage>,
+    /// The last `StreamStarted` the daemon answered a seek with. A lane's real
+    /// start is the daemon's to decide, not the target the client asked for.
+    pub started: RwSignal<Option<(StreamKey, StreamStarted)>, LocalStorage>,
     pub arena: RwSignal<ArenaSummary, LocalStorage>,
     pub downloader: RwSignal<DownloaderSummary, LocalStorage>,
     /// The notification centre. Client state: it does not survive a window
@@ -496,6 +537,8 @@ impl UiState {
             pins: RwSignal::new_local(Rc::new(pins)),
             pending: RwSignal::new_local(Rc::new(state.pending)),
             pipelines: RwSignal::new_local(Rc::new(Vec::new())),
+            lanes: RwSignal::new_local(Rc::new(Vec::new())),
+            started: RwSignal::new_local(None),
             arena: RwSignal::new_local(state.arena),
             downloader: RwSignal::new_local(state.downloader),
             notices: RwSignal::new_local(Rc::new(Vec::new())),
@@ -523,6 +566,7 @@ impl UiState {
         sync_rows(self.pipelines, state.pipelines, |pipeline| {
             pipeline.key.clone()
         });
+        sync_rows(self.lanes, state.lanes, |lane| lane.key.clone());
         self.arena.set(state.arena);
         self.downloader.set(state.downloader);
         self.logs.set(Rc::new(state.logs));
@@ -788,6 +832,14 @@ impl UiState {
             Update::PipelineRemove(key) => {
                 retain_rows(self.pipelines, |pipeline| pipeline.key != key);
             }
+            // A lane arrives as a complete row; upserting by key is the same
+            // operation for the first one and for a correction.
+            Update::Lane(view) => {
+                upsert_row(self.lanes, view, |lane| lane.key.clone());
+            }
+            Update::LaneRemove(key) => {
+                retain_rows(self.lanes, |lane| lane.key != key);
+            }
             Update::Arena(arena) => {
                 if self.arena.get_untracked() != arena {
                     self.arena.set(arena);
@@ -832,6 +884,7 @@ impl UiState {
                     self.set_avatar(&id, path);
                 }
             }
+            UiEvent::Started { key, started } => self.started.set(Some((key, started))),
         }
     }
 }
@@ -839,6 +892,7 @@ impl UiState {
 #[cfg(test)]
 mod tests {
     use siphon_shared::riffle::ChatColor;
+    use siphon_shared::riffle::LaneState;
     use zgui::reactive::Mounted;
     use zgui::reactive::install;
 
@@ -848,6 +902,21 @@ mod tests {
     fn state() -> UiState {
         let (intents, _intent_rx, _wake) = intent_channel();
         UiState::new(RwSignal::new_local(ClientSettings::default()), intents)
+    }
+
+    fn lane(channel: u64, playhead_ms: u64) -> LaneView {
+        LaneView {
+            key: StreamKey::new(channel, None),
+            state: LaneState::Attached,
+            position_ms: playhead_ms,
+            playhead_ms,
+            buffered_ahead_ms: 0,
+            rate: 1.0,
+            dropped_video: 0,
+            dropped_audio: 0,
+            recovering: false,
+            started_ms: 0,
+        }
     }
 
     fn view(id: u64, viewers: u32) -> ChannelView {
@@ -966,6 +1035,33 @@ mod tests {
             let ordered = order_channels(&rows, &[5]);
             let ids: Vec<u64> = ordered.iter().map(|row| row.get_untracked().id).collect();
             assert_eq!(ids, vec![5, 2, 4, 3, 1]);
+        });
+        scope.unmount();
+    }
+
+    /// A lane arrives whole and is keyed by its `StreamKey`: an update reaches
+    /// the row, and a removal drops it.
+    #[test]
+    fn lane_updates_reach_the_row_and_a_removal_drops_it() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let state = state();
+            state.reset(Snapshot {
+                lanes: vec![lane(1, 1_000)],
+                ..Snapshot::default()
+            });
+            let row = state.lanes.get_untracked()[0];
+            state.apply(Update::Lane(lane(2, 2_000)));
+            assert_eq!(state.lanes.get_untracked().len(), 2);
+
+            state.apply(Update::Lane(lane(1, 3_000)));
+            assert_eq!(row.get_untracked().playhead_ms, 3_000);
+
+            state.apply(Update::LaneRemove(StreamKey::new(1, None)));
+            let rows = state.lanes.get_untracked();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get_untracked().key.channel, 2);
         });
         scope.unmount();
     }

@@ -1,8 +1,12 @@
 # Riffle: the daemon↔UI protocol
 
-Status: Part I is designed and nothing is built. RTSP is gone — `play`, the
-RTSP listener and the RTP packetizers were removed — so there is no viewer path
-at all until this lands. Parts II and III are implemented. The ALPN is `riffle/1`.
+Status: Part I is designed and the *lane control plane* is built — the
+per-connection state machine behind `StreamOpen`/`StreamUpdate`/`StreamClose`/
+`StreamSeek`, the playhead estimate and the `LaneView` rows. There is still no
+packet transport, no demuxer wiring and no GOP alignment. RTSP is gone — `play`,
+the RTSP listener and the RTP packetizers were removed — so there is no viewer
+path at all until that lands. Parts II and III are implemented. The ALPN is
+`riffle/1`.
 It is one protocol: the RPC is the control plane (`Class::Control`) and media is
 the same framing with media classes, over a carrier that can lose datagrams.
 
@@ -392,6 +396,8 @@ struct Snapshot {
     channels: Vec<ChannelView>,
     pending: Vec<String>,
     pipelines: Vec<PipelineView>,
+    /// This connection's lanes only.
+    lanes: Vec<LaneView>,
     arena: ArenaSummary,
     downloader: DownloaderSummary,
     logs: Vec<LogEntry>,
@@ -408,6 +414,9 @@ enum Update {
     PipelineUpsert(PipelineView),
     PipelineRemove(StreamKey),
     Segment { key: StreamKey, record: SegmentRecord },
+    /// Per connection, written straight to its own queue, never broadcast.
+    Lane(LaneView),
+    LaneRemove(StreamKey),
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
     /// Append-only: never coalesced, because the transition is the value. The
@@ -492,6 +501,20 @@ backend remains authoritative.
   updates (`Segment`, `Log`) are never coalesced.
 - A connection whose outbound buffer exceeds `riffle::MAX_OUT` is dropped. It
   reconnects and resyncs from `Snapshot`; nothing is queued indefinitely.
+- **Lanes are per connection.** Each `riffle::Conn` owns its lane set, the
+  snapshot carries only that connection's rows, and `Update::Lane` /
+  `Update::LaneRemove` are written straight to the owning connection's outbound
+  queue. They never go through the bus: the bus encodes one frame and appends it
+  to every client, so a lane update there would leak one UI's lanes into every
+  other. A lane is also a claim on its pipeline (`Registry::attach`/`detach`,
+  counted per runtime), and closing a connection releases every claim it held, so
+  a UI that goes away cannot leave a watch-only runtime running.
+- The playhead estimate is the reported position advanced by rate × elapsed time,
+  recomputed from the last `StreamOpen`/`StreamUpdate`; `buffered_ahead_ms` is 0
+  until the media lane pushes, and `Paused` is never reported until then.
+  `Starved` is decided against the DVR archive's front, else the live playlist's
+  oldest segment. `StreamSeek` cannot GOP-align yet, so it answers the position
+  the runtime holds (the live edge) and the newest sequence, with `trimmed` false.
 - Background jobs (GQL refresh, saves, update checks, avatars) finish on their
   own task and post through one kanal queue the loop drains. The loop's biased
   select puts the Hermes socket read first, so a completed websocket read is
