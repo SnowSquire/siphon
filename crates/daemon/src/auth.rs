@@ -103,6 +103,7 @@ pub fn save(token: &str) -> Result<(), StoreError> {
         std::fs::create_dir_all(dir).map_err(StoreError::Io)?;
     }
     siphon_shared::store::write(&path, &stored)?;
+    #[cfg(unix)]
     restrict(&path).map_err(StoreError::Io)?;
     tracing::info!(target: "auth", "stored the token at {}", path.display());
     Ok(())
@@ -185,20 +186,17 @@ pub enum StoreError {
     Undecodable,
 }
 
-/// Owner-only permissions on the platforms that have them. On Windows the
-/// token is wrapped instead, and the profile's ACLs are the outer layer.
+/// Owner-only permissions on the platforms that have them.
+///
+/// Windows has no mode bits to narrow: the token is wrapped with DPAPI there
+/// (`protect`) and the profile's ACLs are the outer layer. The function is
+/// `cfg(unix)` rather than a no-op `Ok(())` so that callers are not handed a
+/// result that cannot fail.
+#[cfg(unix)]
 fn restrict(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(windows)]
