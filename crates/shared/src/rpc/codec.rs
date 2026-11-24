@@ -180,7 +180,6 @@ mod tests {
             id: 7,
             request: Request::AddLogin {
                 login: "alice".to_owned(),
-                switches: None,
             },
         };
         let mut frame = Vec::new();
@@ -196,7 +195,7 @@ mod tests {
         let message: ClientMessage = decode(&payload).unwrap();
         assert!(matches!(
             message,
-            ClientMessage::Request { id: 7, request: Request::AddLogin { login, switches: None } } if login == "alice"
+            ClientMessage::Request { id: 7, request: Request::AddLogin { login } } if login == "alice"
         ));
     }
 
@@ -233,7 +232,10 @@ mod tests {
     fn decode_rejects_a_truncated_payload() {
         let message = ClientMessage::Request {
             id: 1,
-            request: Request::AddFilteredWord("sponsored".to_owned()),
+            request: Request::SetRecord {
+                channel: 7,
+                record: true,
+            },
         };
         let mut frame = Vec::new();
         encode(&message, &mut frame).unwrap();

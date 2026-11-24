@@ -9,18 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use siphon_shared::rpc::ArenaSummary;
-use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
 use siphon_shared::rpc::ConnHealth;
 use siphon_shared::rpc::DownloaderSummary;
 use siphon_shared::rpc::LogEntry;
 use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::NotificationView;
 use siphon_shared::rpc::PipelineState;
 use siphon_shared::rpc::PipelineView;
 use siphon_shared::rpc::Request;
+use siphon_shared::settings::ClientSettings;
 use siphon_shared::settings::HdrMode;
-use siphon_shared::settings::UiSettings;
 use zgui::prelude::*;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
@@ -97,8 +95,10 @@ impl zgui::runtime::FrameProbe for FrameLog {
 }
 
 pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Result<()> {
-    let state = UiState::new();
-    state.set_pins(siphon_shared::settings::load_pins(crate::service::APP_ID).ids);
+    // The settings document comes first: the state and the renderer hold the
+    // same handle to it, so a switch writes the value the file keeps.
+    let display = Display::load();
+    let state = UiState::new(display.settings());
     // The preset dark scheme is close, but the window has its own ink. The
     // token block is what makes every zgui-ui control (switches, inputs,
     // tooltips, buttons) use the same palette as the hand-written classes.
@@ -139,9 +139,6 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
     // through a chain: DXGI on Windows, a Vulkan swapchain on Wayland. Only the
     // chain differs, and it is chosen inside the renderer factory.
     //
-    // The display settings are the client's own — they describe the screen the
-    // window is on — so they are read here rather than from the daemon.
-    let display = Display::load();
     let window = {
         let (gpu, _decode) = crate::gpu::create()?;
         let graphics = zgui_render_wgpu::SharedGraphics::with_gpu(Arc::clone(&gpu));
@@ -283,11 +280,9 @@ fn App(
     let pipelines_sig = state.pipelines;
     let arena_sig = state.arena;
     let downloader_sig = state.downloader;
-    let notifications_sig = state.notifications;
+    let notices_sig = state.notices;
     let logs_sig = state.logs;
-    let words_sig = state.words;
-    let title_sig = state.title_changes;
-    let sound_sig = state.sound;
+    let settings_sig = state.settings;
 
     // The tray owns the window's lifetime on Windows: closing it puts it away,
     // and a tray click is what brings it back. Linux has neither, so the close
@@ -339,6 +334,18 @@ fn App(
         // The callback lives as long as the window; the component has no teardown
         // hook that owns the guard.
         std::mem::forget(close);
+
+        // A login autostart passes `--minimized`, and the surface is shown by
+        // its first presented frame, so the hide cannot precede it: this runs
+        // just after, and the tray's Open is the way back. The handle is
+        // forgotten because the timer fires once and nothing can cancel it.
+        if std::env::args().any(|argument| argument == "--minimized") {
+            let handle = set_timeout(Duration::from_millis(50), move || {
+                window.set_visible(false);
+                release_hidden_memory();
+            });
+            std::mem::forget(handle);
+        }
     }
 
     // The RPC worker publishes into this channel, and that send is what wakes the
@@ -360,8 +367,7 @@ fn App(
         }
     });
 
-    let ticker =
-        Signal::derive_local(move || ticker_text(&channels_sig.get(), &notifications_sig.get()));
+    let ticker = Signal::derive_local(move || ticker_text(&channels_sig.get(), &notices_sig.get()));
     // Relative labels ("2h ago") age on their own clock. Once a minute is
     // enough for the buckets `format_ago` uses; the timer re-arms itself, and
     // nothing else in the interface ticks. The handle has to outlive the call:
@@ -435,9 +441,11 @@ fn App(
     let update = Rc::clone(&intents);
     let dismiss = Rc::clone(&intents);
     let channels_intents = Rc::clone(&intents);
-    let filter_intents = Rc::clone(&intents);
     let recordings_intents = Rc::clone(&intents);
-    let settings_intents = Rc::clone(&intents);
+    // One clone per tab: the view's `if` bodies are closures, so each one that
+    // uses the state has to own its handle.
+    let state_channels = state.clone();
+    let state_filter = state.clone();
 
     view! {
         column(class = "app") {
@@ -564,13 +572,23 @@ fn App(
                     draft = draft,
                     intents = Rc::clone(&channels_intents),
                     toggle_pin = toggle_pin,
+                    settings = settings_sig,
+                    set_prefs = UnsyncCallback::new({
+                        let state = state_channels.clone();
+                        move |(id, live, titles): (u64, bool, bool)| {
+                            state.set_channel_prefs(id, |prefs| {
+                                prefs.notify_live = live;
+                                prefs.notify_titles = titles;
+                            });
+                        }
+                    }),
                 )
             }
             if move || tab.get() == Tab::Filter {
                 FilterTab(
-                    words = words_sig,
+                    settings = settings_sig,
                     draft = word_draft,
-                    intents = Rc::clone(&filter_intents),
+                    state = state_filter.clone(),
                 )
             }
             if move || tab.get() == Tab::Recordings {
@@ -588,17 +606,15 @@ fn App(
                     channels = channels_sig,
                     arena = arena_sig,
                     downloader = downloader_sig,
-                    notifications = notifications_sig,
+                    notices = notices_sig,
                     logs = logs_sig,
                     pipelines = pipelines_sig,
                 )
             }
             if move || tab.get() == Tab::Settings {
                 SettingsTab(
-                    title_changes = title_sig,
-                    sound = sound_sig,
+                    settings = settings_sig,
                     display = Rc::clone(&display),
-                    intents = Rc::clone(&settings_intents),
                 )
             }
         }
@@ -660,6 +676,8 @@ fn ChannelsTab(
     draft: RwSignal<String, LocalStorage>,
     intents: Rc<IntentSender>,
     toggle_pin: UnsyncCallback<u64>,
+    settings: RwSignal<ClientSettings, LocalStorage>,
+    set_prefs: UnsyncCallback<(u64, bool, bool)>,
 ) -> impl IntoView {
     let add_login: Rc<dyn Fn()> = {
         let intents = Rc::clone(&intents);
@@ -668,10 +686,7 @@ fn ChannelsTab(
             if login.is_empty() {
                 return;
             }
-            intents.send(Request::AddLogin {
-                login,
-                switches: None,
-            });
+            intents.send(Request::AddLogin { login });
             draft.set(String::new());
         })
     };
@@ -713,6 +728,8 @@ fn ChannelsTab(
                             closing = closing,
                             intents = Rc::clone(&rows),
                             toggle_pin = toggle_pin,
+                            settings = settings,
+                            set_prefs = set_prefs,
                         )
                     }
                     for login in move || (*pending.get()).clone(), key = |login: &String| login.clone() {
@@ -764,6 +781,8 @@ fn ChannelRow(
     closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     intents: Rc<IntentSender>,
     toggle_pin: UnsyncCallback<u64>,
+    settings: RwSignal<ClientSettings, LocalStorage>,
+    set_prefs: UnsyncCallback<(u64, bool, bool)>,
 ) -> impl IntoView {
     // Nothing below reads `channel` directly: the component body runs once, so
     // every value that has to follow the daemon is a derived signal read by the
@@ -890,30 +909,23 @@ fn ChannelRow(
     // the scope tree, and a handler runs outside it.
     let toasts = use_toaster();
 
-    let live_intents = Rc::clone(&intents);
-    let title_intents = Rc::clone(&intents);
     let record_intents = Rc::clone(&intents);
     let detail_intents = Rc::clone(&intents);
 
-    // The three switches are controlled: the click sends the intent and the
-    // switch moves when the daemon's word on it comes back, so a rejected
-    // change cannot sit on screen looking applied.
+    // The notify switches are the client's own, so they are written straight to
+    // the settings document rather than sent to the daemon. The record switch
+    // stays an intent: it is the daemon's word to give.
+    let prefs = Signal::derive_local(move || settings.with(|settings| settings.channel(id)));
     let notify_live = Binding::controlled(
-        Signal::derive_local(move || channel.with(|c| c.notify_live)),
+        Signal::derive_local(move || prefs.get().notify_live),
         move |on: bool| {
-            live_intents.send(Request::SetNotifyLive {
-                channel: id,
-                notify: on,
-            });
+            set_prefs.run((id, on, prefs.get_untracked().notify_titles));
         },
     );
     let notify_titles = Binding::controlled(
-        Signal::derive_local(move || channel.with(|c| c.notify_titles)),
+        Signal::derive_local(move || prefs.get().notify_titles),
         move |on: bool| {
-            title_intents.send(Request::SetNotifyTitles {
-                channel: id,
-                notify: on,
-            });
+            set_prefs.run((id, prefs.get_untracked().notify_live, on));
         },
     );
     let record = Binding::controlled(
@@ -930,13 +942,7 @@ fn ChannelRow(
     let remove_select = UnsyncCallback::new({
         let intents = Rc::clone(&intents);
         move |()| {
-            remove_channel(
-                Rc::clone(&intents),
-                &channel.get_untracked(),
-                toasts,
-                pinned.get_untracked(),
-                toggle_pin,
-            );
+            remove_channel(Rc::clone(&intents), &channel.get_untracked(), toasts);
         }
     });
 
@@ -1115,15 +1121,9 @@ fn ChannelRow(
 /// Removes a channel and offers the undo that makes it safe.
 ///
 /// The daemon's removal is immediate (its monitors and topics go with it), so
-/// the undo is a real re-add carrying the switches the row had. `AddLogin`
-/// applies them when the resolve lands, so the row never shows the defaults.
-fn remove_channel(
-    intents: Rc<IntentSender>,
-    view: &ChannelView,
-    toasts: Option<ToastQueue>,
-    pinned: bool,
-    toggle_pin: UnsyncCallback<u64>,
-) {
+/// the undo is a real re-add. The per-channel switches are the client's and are
+/// deliberately not pruned on removal, so the re-add finds them intact.
+fn remove_channel(intents: Rc<IntentSender>, view: &ChannelView, toasts: Option<ToastQueue>) {
     let id = view.id;
     let name = if view.display_name.is_empty() {
         view.login.clone()
@@ -1135,24 +1135,13 @@ fn remove_channel(
         return;
     };
     let login = view.login.clone();
-    let switches = Some(ChannelSwitches {
-        notify_live: view.notify_live,
-        notify_titles: view.notify_titles,
-        record: view.record,
-    });
     toasts.push(
         Toast::new(format!("Removed {name}"))
             .duration(Duration::from_secs(8))
             .action("Undo", move || {
                 intents.send(Request::AddLogin {
                     login: login.clone(),
-                    switches,
                 });
-                // The config prune drops the pin the moment the channel
-                // leaves, so the undo has to put it back explicitly.
-                if pinned {
-                    toggle_pin.run(id);
-                }
             }),
     );
 }
@@ -1259,13 +1248,7 @@ fn channel_detail_view(
                     variant = ButtonVariant::Outline,
                     class = "detail-remove",
                     on:click = move |_| {
-                        remove_channel(
-                            Rc::clone(&remove_intents),
-                            &remove_view,
-                            toasts,
-                            pinned.get_untracked(),
-                            toggle_pin,
-                        );
+                        remove_channel(Rc::clone(&remove_intents), &remove_view, toasts);
                     }
                 ) {"Remove"}
             }
@@ -1299,22 +1282,21 @@ fn detail_item_tip(key: &'static str, value: String, tip: String) -> impl IntoVi
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn FilterTab(
-    words: RwSignal<Rc<Vec<String>>, LocalStorage>,
+    settings: RwSignal<ClientSettings, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
-    intents: Rc<IntentSender>,
+    state: UiState,
 ) -> impl IntoView {
     let add_word: Rc<dyn Fn()> = {
-        let intents = Rc::clone(&intents);
+        let state = state.clone();
         Rc::new(move || {
             let word = draft.get_untracked().trim().to_owned();
             if word.is_empty() {
                 return;
             }
-            intents.send(Request::AddFilteredWord(word));
+            state.add_word(&word);
             draft.set(String::new());
         })
     };
-    let word_rows = Rc::clone(&intents);
 
     view! {
         column(class = "tabbody") {
@@ -1334,8 +1316,8 @@ fn FilterTab(
             }
             ScrollArea(class = "words") {
                 column(class = "list") {
-                    for word in move || (*words.get()).clone(), key = |word: &String| word.clone() {
-                        WordRowView(word = word, intents = Rc::clone(&word_rows))
+                    for word in move || settings.with(|settings| settings.notifications.filtered_words.clone()), key = |word: &String| word.clone() {
+                        WordRowView(word = word, state = state.clone())
                     }
                 }
             }
@@ -1345,19 +1327,14 @@ fn FilterTab(
 
 /// Everything that is a preference rather than a list.
 ///
-/// Two sections: the screen the window is on (the client's own settings) and
-/// what the daemon does with a notification (the daemon's).
+/// Two sections, both the client's: the screen the window is on, and what this
+/// window does with a stream transition.
 #[component]
 #[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
 fn SettingsTab(
-    title_changes: RwSignal<bool, LocalStorage>,
-    sound: RwSignal<bool, LocalStorage>,
+    settings: RwSignal<ClientSettings, LocalStorage>,
     display: Rc<Display>,
-    intents: Rc<IntentSender>,
 ) -> impl IntoView {
-    let titles = Rc::clone(&intents);
-    let sound_switch = Rc::clone(&intents);
-
     view! {
         column(class = "tabbody") {
             text(class = "section-title") {"Display"}
@@ -1377,10 +1354,11 @@ fn SettingsTab(
                             {
                                 let display = Rc::clone(&display);
                                 move |on: bool| {
-                                    display.set(UiSettings {
-                                        hdr: if on { HdrMode::Auto } else { HdrMode::Off },
-                                        ..display.present()
-                                    });
+                                    let current = display.present();
+                                    display.set(
+                                        if on { HdrMode::Auto } else { HdrMode::Off },
+                                        current.tearing,
+                                    );
                                 }
                             },
                         )
@@ -1401,10 +1379,8 @@ fn SettingsTab(
                             {
                                 let display = Rc::clone(&display);
                                 move |on: bool| {
-                                    display.set(UiSettings {
-                                        tearing: on,
-                                        ..display.present()
-                                    });
+                                    let current = display.present();
+                                    display.set(current.hdr, on);
                                 }
                             },
                         )
@@ -1421,9 +1397,11 @@ fn SettingsTab(
                     spacer()
                     Switch(
                         checked = Binding::controlled(
-                            Signal::derive_local(move || title_changes.get()),
+                            Signal::derive_local(move || settings.with(|settings| settings.notifications.title_changes)),
                             move |on| {
-                                titles.send(Request::SetNotifyTitleChanges(on));
+                                crate::settings::update(settings, |settings| {
+                                    settings.notifications.title_changes = on;
+                                });
                             },
                         )
                     )
@@ -1431,14 +1409,16 @@ fn SettingsTab(
                 row(class = "switch-row") {
                     column(class = "switch-copy") {
                         text(class = "switch-title") {"Notification sound"}
-                        text(class = "switch-hint") {"Play a sound with every toast and webhook."}
+                        text(class = "switch-hint") {"Play a sound with every toast."}
                     }
                     spacer()
                     Switch(
                         checked = Binding::controlled(
-                            Signal::derive_local(move || sound.get()),
+                            Signal::derive_local(move || settings.with(|settings| settings.notifications.sound)),
                             move |on| {
-                                sound_switch.send(Request::SetSound(on));
+                                crate::settings::update(settings, |settings| {
+                                    settings.notifications.sound = on;
+                                });
                             },
                         )
                     )
@@ -1450,7 +1430,7 @@ fn SettingsTab(
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
-fn WordRowView(word: String, intents: Rc<IntentSender>) -> impl IntoView {
+fn WordRowView(word: String, state: UiState) -> impl IntoView {
     let remove = word.clone();
     view! {
         row(class = "word") {
@@ -1459,11 +1439,8 @@ fn WordRowView(word: String, intents: Rc<IntentSender>) -> impl IntoView {
             Button(
                 size = ButtonSize::IconSm,
                 variant = ButtonVariant::Ghost,
-                on:click = {
-                    let intents = Rc::clone(&intents);
-                    move |_| {
-                        intents.send(Request::RemoveFilteredWord(remove.clone()));
-                    }
+                on:click = move |_| {
+                    state.remove_word(&remove);
                 }
             ) {"×"}
         }
@@ -1678,7 +1655,7 @@ fn LogsTab(
     channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
     arena: RwSignal<ArenaSummary, LocalStorage>,
     downloader: RwSignal<DownloaderSummary, LocalStorage>,
-    notifications: RwSignal<Rc<Vec<NotificationView>>, LocalStorage>,
+    notices: RwSignal<Rc<Vec<crate::rpc::Notice>>, LocalStorage>,
     logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
     pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
 ) -> impl IntoView {
@@ -1704,9 +1681,9 @@ fn LogsTab(
             }
             ScrollArea(class = "logs") {
                 column(class = "loglist") {
-                    if move || !(*notifications.get()).is_empty() {
+                    if move || !(*notices.get()).is_empty() {
                         text(class = "section-title") {"Notifications"}
-                        for note in move || (*notifications.get()).clone().into_iter().rev().collect::<Vec<_>>(), key = |note: &NotificationView| note.id {
+                        for note in move || (*notices.get()).clone().into_iter().rev().collect::<Vec<_>>(), key = |note: &crate::rpc::Notice| note.id {
                             row(class = "notification") {
                                 text(class = "log__time") {{format_time_ms(note.at_ms)}}
                                 column(class = "notification__body") {
@@ -1806,7 +1783,7 @@ fn conn_summary(conn: ConnHealth, channels: &[RwSignal<ChannelView, LocalStorage
 /// copy (-12.5%) and lands on an identical string with no seam.
 fn ticker_text(
     channels: &[RwSignal<ChannelView, LocalStorage>],
-    notifications: &[NotificationView],
+    notices: &[crate::rpc::Notice],
 ) -> String {
     let mut items = channels
         .iter()
@@ -1823,7 +1800,7 @@ fn ticker_text(
             })
         })
         .collect::<Vec<_>>();
-    items.extend(notifications.iter().rev().take(8).map(|note| {
+    items.extend(notices.iter().rev().take(8).map(|note| {
         if note.body.is_empty() {
             format!("● {}", note.summary)
         } else {

@@ -4,6 +4,8 @@ mod app;
 #[allow(dead_code, clippy::future_not_send)]
 mod arena;
 #[allow(clippy::future_not_send)]
+mod auth;
+#[allow(clippy::future_not_send)]
 mod avatar;
 #[allow(dead_code, clippy::future_not_send)]
 mod bus;
@@ -22,11 +24,8 @@ mod hermes;
 #[allow(clippy::future_not_send)]
 mod logging;
 
-mod matcher;
 #[allow(dead_code, clippy::future_not_send)]
 mod metrics;
-#[allow(clippy::future_not_send)]
-mod notifier;
 #[allow(clippy::future_not_send)]
 mod notify;
 #[allow(clippy::future_not_send)]
@@ -73,10 +72,6 @@ use futures_util::pin_mut;
 #[cfg(not(miri))]
 use mimalloc::MiMalloc;
 use sonic_rs::JsonValueTrait as _;
-// Cargo's unused-dependency lint only sees the crate root for target-gated
-// crates; the real use is in `notifier`.
-#[cfg(windows)]
-use tauri_winrt_notification as _;
 use tracing::error;
 
 use crate::app::App;
@@ -114,10 +109,6 @@ struct Config {
     /// Twitch client id used for GQL requests
     #[arg(long, global = true)]
     client_id: Option<String>,
-
-    /// Optional OAuth authorization token
-    #[arg(long, global = true)]
-    auth_token: Option<String>,
 
     /// Enable low latency mode flags
     #[arg(short, long, global = true, default_value_t = true)]
@@ -164,6 +155,11 @@ struct Play {
     /// Keep `live.NNN` run pairs after their holes are filled
     #[arg(long)]
     keep_runs: bool,
+
+    /// Twitch token used for GQL and usher; `play` also stores it in
+    /// `auth.json` so a later daemon start does not need it again
+    #[arg(long)]
+    auth_token: Option<String>,
 }
 
 /// One channel, no UI: wait for it to go live, record it, exit when it ends.
@@ -207,6 +203,11 @@ struct Record {
     /// Keep `live.NNN` run pairs after their holes are filled
     #[arg(long)]
     keep_runs: bool,
+
+    /// Twitch token used for GQL and usher; also stored in `auth.json` so a
+    /// later daemon start does not need it again
+    #[arg(long)]
+    auth_token: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -257,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(base) = cfg.debug.as_deref() {
         constants::use_edge(base);
     }
+
     match &cfg.command {
         Command::Play(args) => Box::pin(play(&cfg, args)).await?,
         Command::Record(args) => record(&cfg, args).await?,
@@ -329,6 +331,10 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     let client = Rc::new(Client::new());
     let arena = Rc::new(ArenaSet::new());
     let wakes = WakeSet::new();
+    // `play` is an ad-hoc mode, so its token comes from the flag; giving one
+    // also seeds `auth.json`, which is the only way a daemon start learns it
+    // (its own command line must never carry a secret).
+    let auth_token = auth::resolve(args.auth_token.clone());
 
     let (variants, broadcast_id) = if let Some((_, variants)) = mock {
         (variants, 0)
@@ -338,7 +344,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
         match get_variants(
             &client,
             cfg.client_id.as_deref(),
-            cfg.auth_token.as_deref(),
+            auth_token.as_deref(),
             &args.channel,
             cfg.low_latency,
         )
@@ -477,9 +483,12 @@ async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::E
     let login = args.channel.to_ascii_lowercase();
     let client = Rc::new(Client::new());
     let debug = debug_mode(cfg);
+    // The flag is the ad-hoc mode's token; it is also written to `auth.json`,
+    // which is how a daemon start learns it without a command-line secret.
+    let auth_token = auth::resolve(args.auth_token.clone());
 
     let Some((variants, broadcast_id)) =
-        resolve_record_variants(cfg, &client, &login, args).await?
+        resolve_record_variants(cfg, auth_token.as_deref(), &client, &login, args).await?
     else {
         return Ok(());
     };
@@ -603,6 +612,7 @@ async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::E
 /// error rather than a wait).
 async fn resolve_record_variants(
     cfg: &Config,
+    auth_token: Option<&str>,
     client: &Rc<Client>,
     login: &str,
     args: &Record,
@@ -613,7 +623,7 @@ async fn resolve_record_variants(
     match get_variants(
         client,
         cfg.client_id.as_deref(),
-        cfg.auth_token.as_deref(),
+        auth_token,
         login,
         cfg.low_latency,
     )
@@ -635,7 +645,7 @@ async fn resolve_record_variants(
                 match get_variants(
                     client,
                     cfg.client_id.as_deref(),
-                    cfg.auth_token.as_deref(),
+                    auth_token,
                     login,
                     cfg.low_latency,
                 )
@@ -764,7 +774,32 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     // Loaded before the registry because the recording settings live in the
     // persisted config: a `--output` on the command line is a dev override only.
     let config_path = config::default_path(config::APP_ID);
-    let config = config::load(&config_path);
+    let mut config = config::load(&config_path);
+    // The daemon has no `--auth-token`: the token lives in `auth.json`, so no
+    // command line and no startup entry carries a secret.
+    let auth_token = auth::load();
+    // The token's identity is cached in the config so the daemon does not have
+    // to ask Twitch for it on every start; a file that already has it is left
+    // alone, and a failure here only means the id is unknown.
+    if config.account.is_none()
+        && let Some(token) = auth_token.as_deref()
+    {
+        match auth::validate(&client, token).await {
+            Ok(account) => {
+                tracing::info!(
+                    target: "auth",
+                    "token belongs to {} ({})",
+                    account.login,
+                    account.user_id
+                );
+                config.account = Some(account);
+                if let Err(error) = config::save(&config, &config_path).await {
+                    error!(%error, "failed to persist the account");
+                }
+            }
+            Err(error) => tracing::info!(target: "auth", "could not resolve the account: {error}"),
+        }
+    }
     let registry = Rc::new(Registry::new(
         Rc::clone(&client),
         arena,
@@ -772,7 +807,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         Rc::clone(&downloader_metrics),
         RegistryOptions {
             client_id: cfg.client_id.clone(),
-            auth_token: cfg.auth_token.clone(),
+            auth_token: auth_token.clone(),
             low_latency: cfg.low_latency,
             recording: RegistryRecording {
                 output: args
@@ -792,7 +827,6 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     if let Err(error) = pid::write(config::APP_ID) {
         error!(%error, "failed to write the daemon pid file");
     }
-    notifier::register_aumid();
 
     let (accept_tx, accept_rx) = kanal::unbounded();
     if !args.no_admin {
@@ -874,5 +908,23 @@ mod tests {
 
         // `-c` is not a daemon option.
         assert!(Config::try_parse_from(["app", "daemon", "-c", "sunnys"]).is_err());
+        // Nor is the token: it reaches the daemon through `auth.json` only, so
+        // no startup entry ever carries a secret.
+        assert!(Config::try_parse_from(["app", "daemon", "--auth-token", "t"]).is_err());
+
+        // The ad-hoc modes take it directly.
+        let play = Config::try_parse_from(["app", "play", "-c", "sunnys", "--auth-token", "t"])
+            .expect("play token");
+        let Command::Play(args) = play.command else {
+            panic!("expected play");
+        };
+        assert_eq!(args.auth_token.as_deref(), Some("t"));
+
+        let record = Config::try_parse_from(["app", "record", "sunnys", "--auth-token", "t"])
+            .expect("record token");
+        let Command::Record(args) = record.command else {
+            panic!("expected record");
+        };
+        assert_eq!(args.auth_token.as_deref(), Some("t"));
     }
 }

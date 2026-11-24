@@ -86,8 +86,9 @@ impl ChannelDetail {
     /// The UI entity for this channel.
     ///
     /// `channel` is the persisted follow entry, when there is one: it carries
-    /// the three switches the row draws. A resolve with no entry is a pending
-    /// add, which the row does not show yet.
+    /// the record switch. A resolve with no entry is a pending add, which the
+    /// row does not show yet. The notification switches are the client's and
+    /// never cross this boundary.
     #[must_use]
     pub fn view(&self, channel: Option<&siphon_shared::rpc::Channel>) -> ChannelView {
         ChannelView {
@@ -106,8 +107,6 @@ impl ChannelDetail {
             last_live_ms: self.last_live,
             stream_id: self.stream_id,
             error: self.error.clone(),
-            notify_live: channel.is_none_or(|channel| channel.notify_live),
-            notify_titles: channel.is_none_or(|channel| channel.notify_titles),
             record: channel.is_some_and(|channel| channel.record),
         }
     }

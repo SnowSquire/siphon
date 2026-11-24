@@ -23,12 +23,15 @@ use siphon_shared::rpc::ClientEvent;
 use siphon_shared::rpc::ConnHealth;
 use siphon_shared::rpc::DownloaderSummary;
 use siphon_shared::rpc::LogEntry;
-use siphon_shared::rpc::NotificationView;
 use siphon_shared::rpc::PipelineView;
 pub use siphon_shared::rpc::Request;
 use siphon_shared::rpc::Snapshot;
+use siphon_shared::rpc::StreamEvent;
+use siphon_shared::rpc::StreamEventKind;
 use siphon_shared::rpc::Update;
 use siphon_shared::rpc::UpdateView;
+use siphon_shared::settings::ChannelPrefs;
+use siphon_shared::settings::ClientSettings;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
 use zgui::reactive::prelude::*;
@@ -282,18 +285,34 @@ pub struct UiState {
     pub error: RwSignal<Option<String>, LocalStorage>,
     pub update: RwSignal<Option<UpdateView>, LocalStorage>,
     pub channels: RwSignal<Rc<Vec<RwSignal<ChannelView, LocalStorage>>>, LocalStorage>,
-    /// Channel ids this client keeps at the top of the list. Not the daemon's:
-    /// ordering is a preference of the window, and two windows may disagree.
+    /// The client's own document: display, notification policy, per-channel
+    /// switches, pins and connections. One handle, so one writer.
+    pub settings: RwSignal<ClientSettings, LocalStorage>,
+    /// Channel ids this client keeps at the top of the list, mirrored from
+    /// `settings` for the ordering comparators.
     pub pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
     pub pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
     pub pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
     pub arena: RwSignal<ArenaSummary, LocalStorage>,
     pub downloader: RwSignal<DownloaderSummary, LocalStorage>,
-    pub notifications: RwSignal<Rc<Vec<NotificationView>>, LocalStorage>,
+    /// The notification centre. Client state: it does not survive a window
+    /// restart, and nothing in the daemon knows it exists.
+    pub notices: RwSignal<Rc<Vec<Notice>>, LocalStorage>,
     pub logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
-    pub words: RwSignal<Rc<Vec<String>>, LocalStorage>,
-    pub title_changes: RwSignal<bool, LocalStorage>,
-    pub sound: RwSignal<bool, LocalStorage>,
+    /// When each channel was last seen going offline, for the title/game mute.
+    muted: Rc<RefCell<std::collections::HashMap<u64, i64>>>,
+    /// The next notification-centre id.
+    notice_seq: Rc<Cell<u64>>,
+}
+
+/// One entry of the notification centre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub id: u64,
+    /// Milliseconds since the unix epoch.
+    pub at_ms: i64,
+    pub summary: String,
+    pub body: String,
 }
 
 /// A list of rows, each behind its own signal.
@@ -409,38 +428,37 @@ fn order_channels(
     ordered.into_iter().map(|(_, row)| row).collect()
 }
 
-/// Writes the client's pins. A failure is a log line: the order is a
-/// preference, not something worth failing a frame over.
-fn save_pins(ids: &[u64]) {
-    let document = siphon_shared::settings::Pins {
-        version: siphon_shared::settings::Pins::VERSION,
-        ids: ids.to_vec(),
-    };
-    if let Err(error) = siphon_shared::settings::save_pins(crate::service::APP_ID, &document) {
-        tracing::warn!(target: "settings", "could not save pins: {error}");
-    }
+/// The pinned channel ids in a settings document, for the ordering comparators.
+fn pinned_ids(document: &ClientSettings) -> Vec<u64> {
+    document
+        .channels
+        .iter()
+        .filter(|(_, prefs)| prefs.pinned)
+        .filter_map(|(id, _)| id.parse().ok())
+        .collect()
 }
 
 impl UiState {
     /// The state a window starts with, before the first snapshot arrives.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(settings: RwSignal<ClientSettings, LocalStorage>) -> Self {
         let state = empty_snapshot();
+        let pins = pinned_ids(&settings.get_untracked());
         Self {
             conn: RwSignal::new_local(state.conn),
             error: RwSignal::new_local(state.error),
             update: RwSignal::new_local(state.update),
             channels: RwSignal::new_local(Rc::new(Vec::new())),
-            pins: RwSignal::new_local(Rc::new(Vec::new())),
+            settings,
+            pins: RwSignal::new_local(Rc::new(pins)),
             pending: RwSignal::new_local(Rc::new(state.pending)),
             pipelines: RwSignal::new_local(Rc::new(Vec::new())),
             arena: RwSignal::new_local(state.arena),
             downloader: RwSignal::new_local(state.downloader),
-            notifications: RwSignal::new_local(Rc::new(state.notifications)),
+            notices: RwSignal::new_local(Rc::new(Vec::new())),
             logs: RwSignal::new_local(Rc::new(state.logs)),
-            words: RwSignal::new_local(Rc::new(state.config.filtered_words)),
-            title_changes: RwSignal::new_local(state.config.notify_title_changes),
-            sound: RwSignal::new_local(state.config.sound),
+            muted: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            notice_seq: Rc::new(Cell::new(1)),
         }
     }
 
@@ -457,30 +475,149 @@ impl UiState {
         });
         self.arena.set(state.arena);
         self.downloader.set(state.downloader);
-        self.notifications.set(Rc::new(state.notifications));
         self.logs.set(Rc::new(state.logs));
-        self.words.set(Rc::new(state.config.filtered_words));
-        self.title_changes.set(state.config.notify_title_changes);
-        self.sound.set(state.config.sound);
     }
 
-    /// Loads the pins this client persisted and applies them to the list.
-    pub fn set_pins(&self, ids: Vec<u64>) {
-        self.pins.set(Rc::new(ids));
+    /// Re-derives the pinned set after a change to the settings document.
+    fn refresh_pins(&self) {
+        let pins = pinned_ids(&self.settings.get_untracked());
+        self.pins.set(Rc::new(pins));
         self.reorder();
     }
 
     /// Pins a channel to the top, or unpins it, and keeps the file in step.
     pub fn toggle_pin(&self, id: u64) {
-        let mut pins = (*self.pins.get_untracked()).clone();
-        if let Some(index) = pins.iter().position(|pinned| *pinned == id) {
-            pins.remove(index);
-        } else {
-            pins.push(id);
+        crate::settings::update(self.settings, |settings| {
+            settings.toggle_pin(id);
+        });
+        self.refresh_pins();
+    }
+
+    /// Replaces one channel's notification switches.
+    pub fn set_channel_prefs(&self, id: u64, change: impl FnOnce(&mut ChannelPrefs)) {
+        crate::settings::update(self.settings, |settings| {
+            let mut prefs = settings.channel(id);
+            change(&mut prefs);
+            settings.set_channel(id, prefs);
+        });
+    }
+
+    pub fn add_word(&self, word: &str) {
+        let word = word.trim().to_lowercase();
+        if word.is_empty() {
+            return;
         }
-        save_pins(&pins);
-        self.pins.set(Rc::new(pins));
-        self.reorder();
+        crate::settings::update(self.settings, |settings| {
+            let words = &mut settings.notifications.filtered_words;
+            if !words.iter().any(|existing| existing.to_lowercase() == word) {
+                words.push(word);
+            }
+        });
+    }
+
+    pub fn remove_word(&self, word: &str) {
+        crate::settings::update(self.settings, |settings| {
+            settings
+                .notifications
+                .filtered_words
+                .retain(|existing| existing != word);
+        });
+    }
+
+    /// Turns one stream transition into a notification, or drops it.
+    ///
+    /// The daemon publishes every transition; the switches, the word filter and
+    /// the mute window live here, which is what moving notification policy out
+    /// of the daemon means in practice.
+    fn on_stream_event(&self, event: StreamEvent) {
+        let settings = self.settings.get_untracked();
+        let prefs = settings.channel(event.view.id);
+        let policy = settings.notifications;
+        if event.kind == StreamEventKind::Offline {
+            self.muted.borrow_mut().insert(event.view.id, event.at_ms);
+            return;
+        }
+        let (summary, body) = match event.kind {
+            StreamEventKind::Live => {
+                if !prefs.notify_live {
+                    return;
+                }
+                let body = match (event.view.game.as_deref(), event.view.title.as_deref()) {
+                    (Some(game), Some(title)) => format!("{title} — {game}"),
+                    (Some(game), None) => game.to_owned(),
+                    (None, Some(title)) => title.to_owned(),
+                    (None, None) => String::new(),
+                };
+                (format!("[{}] is LIVE", event.view.display_name), body)
+            }
+            StreamEventKind::Title | StreamEventKind::Game => {
+                // Title churn mid-broadcast is noise, and so is the minutes
+                // after a stream ends; a restream is a `Live` event and always
+                // gets through.
+                if !policy.title_changes || !prefs.notify_titles || event.view.live {
+                    return;
+                }
+                if self.muted(
+                    event.view.id,
+                    event.at_ms,
+                    policy.mute_after_stream_down_secs,
+                ) {
+                    return;
+                }
+                let is_title = event.kind == StreamEventKind::Title;
+                let (what, value) = if is_title {
+                    ("title", event.view.title.clone().unwrap_or_default())
+                } else {
+                    ("game", event.view.game.clone().unwrap_or_default())
+                };
+                if is_title
+                    && !policy.filtered_words.is_empty()
+                    && crate::matcher::Matcher::new(&policy.filtered_words).is_match(&value)
+                {
+                    return;
+                }
+                let body = event
+                    .previous
+                    .filter(|old| !old.is_empty())
+                    .map_or_else(|| value.clone(), |old| format!("{old} → {value}"));
+                (
+                    format!("[{}] {what} changed", event.view.display_name),
+                    body,
+                )
+            }
+            StreamEventKind::Offline => return,
+        };
+        let id = self.notice_seq.get();
+        self.notice_seq.set(id.wrapping_add(1));
+        let mut notices = (*self.notices.get_untracked()).clone();
+        notices.push(Notice {
+            id,
+            at_ms: event.at_ms,
+            summary: summary.clone(),
+            body: body.clone(),
+        });
+        if notices.len() > NOTIFICATION_CAP {
+            let drop = notices.len() - NOTIFICATION_CAP;
+            notices.drain(..drop);
+        }
+        self.notices.set(Rc::new(notices));
+        crate::notify::show(
+            &summary,
+            &body,
+            policy.sound,
+            event.view.avatar_path.as_deref(),
+            Some(&event.view.login),
+        );
+    }
+
+    /// Whether a channel's title/game notices are still muted by a recent
+    /// `stream-down`.
+    fn muted(&self, id: u64, now_ms: i64, secs: u64) -> bool {
+        let window = i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000);
+        self.muted
+            .borrow()
+            .get(&id)
+            .is_some_and(|at| now_ms.saturating_sub(*at) < window)
     }
 
     /// Puts the rows in display order. The guard matters: an upsert that does
@@ -529,27 +666,12 @@ impl UiState {
                 }
             }
             // The config names the channels that may exist, so removing one from
-            // it is the only thing that can drop a row here.
+            // it is the only thing that can drop a row here. A per-channel
+            // preference for a channel that is no longer followed is left alone:
+            // it is inert, and pruning it would lose the switches on a re-add.
             Update::Config(config) => {
-                if self.title_changes.get_untracked() != config.notify_title_changes {
-                    self.title_changes.set(config.notify_title_changes);
-                }
-                if self.sound.get_untracked() != config.sound {
-                    self.sound.set(config.sound);
-                }
-                if *self.words.get_untracked() != config.filtered_words {
-                    self.words.set(Rc::new(config.filtered_words));
-                }
                 let ids: Vec<u64> = config.channels.iter().map(|channel| channel.id).collect();
                 retain_rows(self.channels, |channel| ids.contains(&channel.id));
-                let pins = self.pins.get_untracked();
-                if pins.iter().any(|id| !ids.contains(id)) {
-                    let kept: Vec<u64> =
-                        pins.iter().copied().filter(|id| ids.contains(id)).collect();
-                    save_pins(&kept);
-                    self.pins.set(Rc::new(kept));
-                    self.reorder();
-                }
             }
             Update::PipelineUpsert(view) => {
                 let recorded = view.recording || view.disk.is_some();
@@ -582,28 +704,9 @@ impl UiState {
                     self.downloader.set(downloader);
                 }
             }
-            Update::Notification(notification) => {
-                let mut notifications = (*self.notifications.get_untracked()).clone();
-                if !notifications
-                    .iter()
-                    .any(|existing| existing.id == notification.id)
-                {
-                    notifications.push(notification);
-                    if notifications.len() > NOTIFICATION_CAP {
-                        let drop = notifications.len() - NOTIFICATION_CAP;
-                        notifications.drain(..drop);
-                    }
-                    self.notifications.set(Rc::new(notifications));
-                }
-            }
-            Update::NotificationDismissed(id) => {
-                let mut notifications = (*self.notifications.get_untracked()).clone();
-                let before = notifications.len();
-                notifications.retain(|notification| notification.id != id);
-                if notifications.len() != before {
-                    self.notifications.set(Rc::new(notifications));
-                }
-            }
+            // An edge, not state: the daemon publishes it uncoalesced precisely
+            // so this decision can see every transition.
+            Update::StreamEvent(event) => self.on_stream_event(*event),
             Update::Log(entry) => {
                 let mut logs = (*self.logs.get_untracked()).clone();
                 // A reconnect replays the snapshot and then the updates that
@@ -634,12 +737,6 @@ impl UiState {
     }
 }
 
-impl Default for UiState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use siphon_shared::rpc::ChatColor;
@@ -647,6 +744,11 @@ mod tests {
     use zgui::reactive::install;
 
     use super::*;
+
+    /// A window state over a fresh, unsaved settings document.
+    fn state() -> UiState {
+        UiState::new(RwSignal::new_local(ClientSettings::default()))
+    }
 
     fn view(id: u64, viewers: u32) -> ChannelView {
         ChannelView {
@@ -665,8 +767,6 @@ mod tests {
             last_live_ms: None,
             stream_id: None,
             error: None,
-            notify_live: true,
-            notify_titles: true,
             record: false,
         }
     }
@@ -679,7 +779,7 @@ mod tests {
         install().ok();
         let scope = Mounted::new();
         scope.with(|| {
-            let state = UiState::new();
+            let state = state();
             state.reset(Snapshot {
                 channels: vec![view(1, 10)],
                 ..Snapshot::default()
@@ -705,7 +805,7 @@ mod tests {
         install().ok();
         let scope = Mounted::new();
         scope.with(|| {
-            let state = UiState::new();
+            let state = state();
             state.reset(Snapshot {
                 channels: vec![view(1, 10)],
                 ..Snapshot::default()
@@ -730,7 +830,7 @@ mod tests {
         install().ok();
         let scope = Mounted::new();
         scope.with(|| {
-            let state = UiState::new();
+            let state = state();
             state.reset(Snapshot {
                 channels: vec![view(1, 10), view(2, 20)],
                 ..Snapshot::default()

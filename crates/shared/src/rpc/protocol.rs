@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -43,72 +43,68 @@ impl StreamKey {
     }
 }
 
-/// One followed channel, with the three switches the Channels tab draws.
+/// One followed channel.
 ///
 /// `record` is the per-channel monitor: true starts a recording pipeline on
-/// `stream-up`. The two notify switches are narrower than the global ones: a
-/// channel can stay followed and still be silent for just one kind of event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `stream-up`. It is the only switch left here, because it is the only one
+/// that makes the daemon *do* something; the notification switches belong to
+/// the client and live in its settings file (see `notes/config.md`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Channel {
     pub login: String,
     pub id: u64,
     pub display_name: Option<String>,
     pub record: bool,
-    pub notify_live: bool,
-    pub notify_titles: bool,
 }
 
-impl Default for Channel {
-    /// A channel that predates the per-channel switches is a channel the user
-    /// followed to hear about: both start on, which is what the global settings
-    /// did for it before.
-    fn default() -> Self {
-        Self {
-            login: String::new(),
-            id: 0,
-            display_name: None,
-            record: false,
-            notify_live: true,
-            notify_titles: true,
-        }
-    }
-}
-
-/// The three switches a follow carries, as a caller may want them set when the
-/// channel is added.
+/// Who this daemon is acting as, cached from the token.
 ///
-/// This is what makes removing a channel undoable: deleting it drops the entry
-/// and its switches, and re-adding it with these restores both. `None` in
-/// [`Request::AddLogin`] means the ordinary defaults (both notifications on,
-/// recording off), which is what adding a channel by hand means.
+/// Not a credential: the token itself is in `auth.json` and is authoritative.
+/// The id is here because a few queries need the authenticated user's id, and
+/// reading it out of the token would be a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Account {
+    pub login: String,
+    pub user_id: u64,
+}
+
+/// One intent a remote client may invoke.
+///
+/// Anything not listed is local-only, and the destructive ones (`ApplyUpdate`,
+/// `SetRecordDir`) are not here at all: they act on the daemon's own machine,
+/// not on the client's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChannelSwitches {
-    pub notify_live: bool,
-    pub notify_titles: bool,
-    pub record: bool,
+pub enum RemoteCapability {
+    RecordOnce,
+    SetRecord,
+    PipelineControl,
 }
 
-impl Default for ChannelSwitches {
-    fn default() -> Self {
-        Self {
-            notify_live: true,
-            notify_titles: true,
-            record: false,
-        }
-    }
+/// How the admin surface may be reached beyond the local pipe/socket.
+///
+/// `listen` is empty by default: a local install has no network surface at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Network {
+    /// `host:port` addresses to bind the admin transport on.
+    pub listen: Vec<String>,
+    /// What a non-local client may ask for.
+    pub remote_control: Vec<RemoteCapability>,
 }
 
-/// The persisted app configuration.
+/// The persisted daemon configuration.
+///
+/// Only what makes the daemon act belongs here. What the client shows and says
+/// — the notification switches, the word filter, the channel order — is in the
+/// client's own settings file, so two clients on one daemon can differ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
     pub version: u64,
     pub channels: Vec<Channel>,
-    pub notify_title_changes: bool,
-    pub sound: bool,
-    pub filtered_words: Vec<String>,
     /// Where complete broadcasts are recorded, one directory per broadcast.
     /// `None` (or empty) disables recording; the daemon otherwise reports that
     /// recording needs a directory.
@@ -118,11 +114,15 @@ pub struct Config {
     /// only ever adds a second recording. It is a global preference, not a
     /// per-channel one: it never changes *what* is recorded as the primary.
     pub record_dual_format: bool,
+    /// Who this daemon is acting as, cached from the token.
+    pub account: Option<Account>,
+    /// How the admin surface may be reached beyond the local pipe/socket.
+    pub network: Network,
 }
 
 impl Config {
     /// Current on-disk schema.
-    pub const VERSION: u64 = 5;
+    pub const VERSION: u64 = 6;
 }
 
 impl Default for Config {
@@ -130,11 +130,10 @@ impl Default for Config {
         Self {
             version: Self::VERSION,
             channels: Vec::new(),
-            notify_title_changes: true,
-            sound: true,
-            filtered_words: vec!["offline".to_owned()],
             record_dir: None,
             record_dual_format: false,
+            account: None,
+            network: Network::default(),
         }
     }
 }
@@ -191,10 +190,6 @@ impl std::fmt::Display for ChatColor {
 /// One channel row, as the UI renders it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "live plus three independent per-channel switches"
-)]
 pub struct ChannelView {
     pub id: u64,
     pub login: String,
@@ -211,11 +206,21 @@ pub struct ChannelView {
     pub game_id: Option<u64>,
     pub viewers: Option<u32>,
     pub collaboration_viewers: Option<u32>,
-    /// Milliseconds since the unix epoch; `None` while offline.
+    /// The broadcast's real start, from `stream.createdAt`: milliseconds since
+    /// the unix epoch, `None` while offline. An uptime or a duration reads
+    /// this, never [`Self::last_live_ms`].
     pub stream_start_ms: Option<i64>,
-    /// When this channel was last seen live: Twitch's `lastBroadcast`
-    /// `startedAt` while offline (which is the *end* of that broadcast), or
-    /// the moment `stream-down` landed until that poll corrects it.
+    /// When this channel was last seen live — an *ordering key*, not a start.
+    ///
+    /// Twitch's `lastBroadcast.startedAt`, and the name is a misnomer: while
+    /// live it is roughly the broadcast's start, reported a few seconds after
+    /// the real one; while offline it is when that broadcast *ended*. The
+    /// accurate start is [`Self::stream_start_ms`] (`stream.createdAt`), so
+    /// anything user-visible — an uptime, a duration — reads that one.
+    ///
+    /// `stream-down` writes the local end time first, so the row never shows
+    /// the start of a stream that just stopped, and the next baseline poll
+    /// replaces it with Twitch's end time a few seconds off.
     pub last_live_ms: Option<i64>,
     /// Twitch's `BROADCAST-ID` for the active stream; `None` while offline.
     pub stream_id: Option<NonZeroU64>,
@@ -223,8 +228,6 @@ pub struct ChannelView {
     /// connection): the row draws a warning when it is set. Pipeline and disk
     /// failures are carried by their own entities and merged in the UI.
     pub error: Option<String>,
-    pub notify_live: bool,
-    pub notify_titles: bool,
     pub record: bool,
 }
 
@@ -319,18 +322,32 @@ pub struct DiskView {
     pub last_error: Option<String>,
 }
 
-/// One entry of the daemon-owned notification center.
+/// Why a stream event was published.
+///
+/// These are edges, not state: `Update::ChannelUpsert` carries an entity and is
+/// coalesced per channel, so it can drop the transition a notification is made
+/// of. A client applies its own switches and word filter to these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StreamEventKind {
+    Live,
+    Offline,
+    Title,
+    Game,
+}
+
+/// One transition of one channel, with the row as it stood at that moment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NotificationView {
-    pub id: u64,
+pub struct StreamEvent {
+    pub kind: StreamEventKind,
     /// Milliseconds since the unix epoch.
     pub at_ms: i64,
-    pub summary: String,
-    pub body: String,
-    pub login: Option<String>,
-    pub image: Option<String>,
-    pub sound: bool,
+    /// What the value was before a `Title` or `Game` event: the old title, or
+    /// the old game name. Empty when there was none.
+    pub previous: Option<String>,
+    /// The channel as it stood when the event was raised.
+    pub view: Box<ChannelView>,
 }
 
 /// Severity of one event in the daemon's log ring.
@@ -384,7 +401,6 @@ pub struct Snapshot {
     pub pipelines: Vec<PipelineView>,
     pub arena: ArenaSummary,
     pub downloader: DownloaderSummary,
-    pub notifications: Vec<NotificationView>,
     pub logs: Vec<LogEntry>,
     pub error: Option<String>,
     pub update: Option<UpdateView>,
@@ -408,8 +424,8 @@ pub enum Update {
     },
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
-    Notification(NotificationView),
-    NotificationDismissed(u64),
+    /// Append-only: never coalesced, because the transition is the value.
+    StreamEvent(Box<StreamEvent>),
     Log(LogEntry),
     Error(Option<String>),
     Update(Option<UpdateView>),
@@ -428,39 +444,23 @@ pub struct StreamDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Request {
-    /// Follow a login. `switches` restores the per-channel settings of a
-    /// channel that was just removed; `None` is a fresh follow with defaults.
+    /// Follow a login. The client's per-channel switches live in its own
+    /// settings, so an undone removal restores them without the daemon knowing.
     AddLogin {
         login: String,
-        switches: Option<ChannelSwitches>,
     },
     RemoveChannel(u64),
-    SetNotifyTitleChanges(bool),
-    SetSound(bool),
     /// Point new recordings at this directory; `None` disables recording.
     /// Recordings already running keep writing where they started.
     SetRecordDir(Option<String>),
     /// Record both orientations of dual-format broadcasts.
     SetRecordDualFormat(bool),
-    AddFilteredWord(String),
-    RemoveFilteredWord(String),
     /// Turn the per-channel recording monitor on or off.
     SetRecord {
         channel: u64,
         record: bool,
     },
-    /// Notify when this channel goes live.
-    SetNotifyLive {
-        channel: u64,
-        notify: bool,
-    },
-    /// Notify when this channel's title or game changes.
-    SetNotifyTitles {
-        channel: u64,
-        notify: bool,
-    },
     ClearError,
-    DismissNotification(u64),
     ApplyUpdate,
     /// Stop serving; `force` also disconnects the viewers. The recording
     /// monitor (if any) stays desired.
@@ -576,14 +576,18 @@ mod tests {
     #[test]
     fn config_defaults_to_the_current_version() {
         assert_eq!(Config::default().version, Config::VERSION);
-        assert_eq!(Config::VERSION, 5);
+        assert_eq!(Config::VERSION, 6);
     }
 
     #[test]
-    fn a_channel_defaults_to_notify_only() {
+    fn a_channel_defaults_to_not_recording() {
         let channel = Channel::default();
         assert!(!channel.record);
-        assert!(channel.notify_live);
-        assert!(channel.notify_titles);
+        assert!(channel.id == 0);
+    }
+
+    #[test]
+    fn a_local_install_listens_on_nothing() {
+        assert!(Network::default().listen.is_empty());
     }
 }

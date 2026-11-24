@@ -8,8 +8,10 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use siphon_shared::rpc::Account;
 use siphon_shared::rpc::Channel;
 use siphon_shared::rpc::Config;
+use siphon_shared::rpc::Network;
 use siphon_shared::store;
 use siphon_shared::store::StoreError;
 use thiserror::Error;
@@ -20,9 +22,6 @@ use thiserror::Error;
 pub const APP_ID: &str = "com.iken.siphon.debug";
 #[cfg(not(debug_assertions))]
 pub const APP_ID: &str = "com.iken.siphon";
-
-/// The one default in the schema: files older than v2 gain word filtering.
-const DEFAULT_FILTERED_WORD: &str = "offline";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -41,11 +40,10 @@ pub enum ConfigError {
 struct RawConfig {
     version: Option<u64>,
     channels: Option<Vec<Channel>>,
-    notify_title_changes: Option<bool>,
-    sound: Option<bool>,
-    filtered_words: Option<Vec<String>>,
     record_dir: Option<String>,
     record_dual_format: Option<bool>,
+    account: Option<Account>,
+    network: Option<Network>,
 }
 
 /// The config path under the platform config directory.
@@ -68,7 +66,7 @@ pub fn load(path: &Path) -> Config {
 }
 
 fn load_versioned(path: &Path) -> Result<Config, ConfigError> {
-    let mut raw: RawConfig = store::read(path)?
+    let raw: RawConfig = store::read(path)?
         .ok_or_else(|| ConfigError::Invalid(format!("no config at {}", path.display())))?;
     let from = raw.version.unwrap_or(0);
     if from > Config::VERSION {
@@ -76,27 +74,21 @@ fn load_versioned(path: &Path) -> Result<Config, ConfigError> {
             "ignoring config version {from}"
         )));
     }
-    // v1 files predate word filtering: add the default only when the file
-    // never had the field. An explicitly cleared list stays empty.
-    if from < 2 && raw.filtered_words.is_none() {
-        raw.filtered_words = Some(vec![DEFAULT_FILTERED_WORD.to_owned()]);
-    }
     // v2 -> v3: `Channel::record` is missing from older files and serde
-    // defaults it to false (notify-only). v3 -> v4: `Channel::notifyLive` and
-    // `notifyTitles` are missing and `Channel::default` has both on, so an
-    // existing follow keeps the behaviour the global switches gave it.
-    // v4 -> v5: `recordDir` and `recordDualFormat` are new; recording stays off
-    // until a directory is set, and the second orientation is opt-in.
+    // defaults it to false. v4 -> v5: `recordDir` and `recordDualFormat` are
+    // new; recording stays off until a directory is set, and the second
+    // orientation is opt-in. v5 -> v6: the notification switches, the word
+    // filter and the per-channel notify switches move to the client's settings
+    // file, and `account` and `network` are new. Nothing here reads the old
+    // fields: serde ignores what it is not told to keep, and a client's first
+    // run after the move starts with the defaults.
     let config = Config {
         version: Config::VERSION,
         channels: raw.channels.unwrap_or_default(),
-        notify_title_changes: raw.notify_title_changes.unwrap_or(true),
-        sound: raw.sound.unwrap_or(true),
-        filtered_words: raw
-            .filtered_words
-            .unwrap_or_else(|| vec![DEFAULT_FILTERED_WORD.to_owned()]),
         record_dir: raw.record_dir,
         record_dual_format: raw.record_dual_format.unwrap_or(false),
+        account: raw.account,
+        network: raw.network.unwrap_or_default(),
     };
     if from < Config::VERSION {
         tracing::info!(
@@ -152,10 +144,9 @@ mod tests {
                 ["alice"],
                 "{name}"
             );
-            assert_eq!(config.filtered_words, ["offline"], "{name}");
             assert!(!config.channels[0].record, "{name}");
-            assert!(config.channels[0].notify_live, "{name}");
-            assert!(config.channels[0].notify_titles, "{name}");
+            assert!(config.account.is_none(), "{name}");
+            assert!(config.network.listen.is_empty(), "{name}");
             std::fs::remove_file(&path).ok();
         }
     }
@@ -178,23 +169,24 @@ mod tests {
     }
 
     #[test]
-    fn current_version_keeps_an_explicitly_cleared_filter_list() {
-        let path = scratch_path("cleared");
+    fn a_v5_file_loses_its_notification_fields_without_losing_channels() {
+        let path = scratch_path("v5");
         std::fs::write(
             &path,
-            format!(
-                r#"{{"version":{},"channels":[],"filteredWords":[]}}"#,
-                Config::VERSION
-            ),
+            r#"{"version":5,"channels":[{"login":"alice","id":7,"notifyLive":false,
+                "notifyTitles":false,"record":true}],
+                "notifyTitleChanges":false,"sound":false,"filteredWords":["brb"]}"#,
         )
         .unwrap();
         let config = load(&path);
-        assert_eq!(config.filtered_words, Vec::<String>::new());
+        assert_eq!(config.version, Config::VERSION);
+        assert_eq!(config.channels.len(), 1);
+        assert!(config.channels[0].record);
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn v2_channels_default_to_notify_only_and_keep_record_when_present() {
+    fn v2_channels_default_to_not_recording_and_keep_record_when_present() {
         let path = scratch_path("record");
         std::fs::write(
             &path,
@@ -219,10 +211,11 @@ mod tests {
                 id: 7,
                 display_name: Some("Alice".to_owned()),
                 record: true,
-                ..Channel::default()
             }],
-            filtered_words: vec!["spoiler".to_owned()],
-            sound: false,
+            account: Some(Account {
+                login: "alice".to_owned(),
+                user_id: 7,
+            }),
             ..Config::default()
         };
         compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -231,8 +224,7 @@ mod tests {
         let loaded = load(&path);
         assert_eq!(loaded.channels.len(), 1);
         assert!(loaded.channels[0].record);
-        assert_eq!(loaded.filtered_words, ["spoiler"]);
-        assert!(!loaded.sound);
+        assert_eq!(loaded.account.expect("account").user_id, 7);
         std::fs::remove_file(&path).ok();
     }
 }

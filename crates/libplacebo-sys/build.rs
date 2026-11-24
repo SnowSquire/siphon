@@ -346,7 +346,13 @@ fn splat_includes(splat: &Path) -> Vec<PathBuf> {
     if msvc.is_dir() && kits.is_dir() {
         let msvc = msvc.join(latest(&msvc)).join("include");
         let kits = kits.join(latest(&kits));
-        return [kits.join("ucrt"), kits.join("um"), kits.join("shared"), msvc].into();
+        return [
+            kits.join("ucrt"),
+            kits.join("um"),
+            kits.join("shared"),
+            msvc,
+        ]
+        .into();
     }
     let sdk = splat.join("sdk/include");
     [

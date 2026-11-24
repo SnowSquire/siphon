@@ -50,10 +50,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
-# OS toasts and the AUMID/install registry keys. The backend is the only
-# process that shows notifications, so these stay here rather than in the UI.
+# `winreg` reads the install marker for the updater; `windows-sys` is DPAPI for
+# the token. The toasts and the AUMID live in the UI now.
 [target.'cfg(windows)'.dependencies]
-tauri-winrt-notification = "0.8"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+] }
 winreg = "0.55"
 
 [lints]

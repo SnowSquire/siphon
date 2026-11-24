@@ -323,7 +323,6 @@ mod tests {
                         id: 7,
                         display_name: Some("Sunnys".to_owned()),
                         record: false,
-                        ..Channel::default()
                     }],
                     ..Config::default()
                 },

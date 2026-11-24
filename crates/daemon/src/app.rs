@@ -1,5 +1,5 @@
-//! The Siphon backend: configuration, GQL, Hermes, notifications, the stream
-//! registry and the admin connections.
+//! The Siphon backend: configuration, GQL, Hermes, the stream registry and the
+//! admin connections.
 //!
 //! Everything that owns state runs in this one loop: admin connections, the
 //! registry and the snapshot projection. Spawned components (schedulers, disk,
@@ -18,19 +18,19 @@ use futures_util::FutureExt as _;
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use siphon_shared::rpc::ArenaSummary;
-use siphon_shared::rpc::ChannelSwitches;
 use siphon_shared::rpc::ChannelView;
 use siphon_shared::rpc::Config;
 use siphon_shared::rpc::ConnHealth;
 use siphon_shared::rpc::DownloaderSummary;
 use siphon_shared::rpc::LogLevel;
-use siphon_shared::rpc::NotificationView;
 use siphon_shared::rpc::PipelineView;
 use siphon_shared::rpc::Request;
 use siphon_shared::rpc::Response;
 use siphon_shared::rpc::RpcError;
 use siphon_shared::rpc::ServerMessage;
 use siphon_shared::rpc::Snapshot;
+use siphon_shared::rpc::StreamEvent;
+use siphon_shared::rpc::StreamEventKind;
 use siphon_shared::rpc::StreamKey;
 use siphon_shared::rpc::Update;
 use siphon_shared::rpc::UpdateView;
@@ -39,7 +39,6 @@ use tracing::info;
 use crate::bus::Bus;
 use crate::config;
 use crate::config::ConfigError;
-use crate::constants::NOTIFICATION_CAP;
 use crate::gql;
 use crate::gql::ChannelDetail;
 use crate::gql::GqlError;
@@ -49,8 +48,6 @@ use crate::hermes::SubState;
 use crate::hermes::Topic;
 use crate::http::Client;
 use crate::http::ws::WsStream;
-use crate::matcher::Matcher;
-use crate::notifier;
 use crate::registry::Registry;
 use crate::rpc;
 use crate::time::now_ms;
@@ -122,14 +119,9 @@ pub struct AppInit {
 
 /// One finished background job.
 pub enum JobDone {
-    AddResolved(
-        String,
-        Option<ChannelSwitches>,
-        Box<Result<Option<ChannelDetail>, GqlError>>,
-    ),
+    AddResolved(String, Box<Result<Option<ChannelDetail>, GqlError>>),
     LiveRefreshed(u64, Result<Vec<ChannelDetail>, GqlError>),
     SaveFinished(Result<(), ConfigError>),
-    ToastShown,
     UpdateCheckFinished(Result<update::Release, update::UpdateError>),
     UpdateDownloadFinished(Result<PathBuf, update::UpdateError>),
     SubscribeCheckDue(Topic, NanoId, u64),
@@ -164,7 +156,6 @@ pub struct App {
     pub(crate) hermes_enabled: bool,
     pub(crate) error: Option<String>,
 
-    pub(crate) matcher: Matcher,
     pub(crate) socket: Option<WsStream>,
     pub(crate) welcomed: bool,
     pub(crate) connecting: bool,
@@ -172,15 +163,9 @@ pub struct App {
     pub(crate) last_message: Instant,
     pub(crate) reconnect_at: Instant,
     pub(crate) reconnect_attempt: u32,
-    /// Per channel: a title/game toast mute that expires `HERMES_OFFLINE_QUIET`
-    /// after a `stream-down`. Live notifications ignore it.
-    pub(crate) quiet_until: HashMap<u64, Instant>,
     pub(crate) sub_ids: HashMap<Topic, SubEntry>,
     pub(crate) sub_gen: u64,
     pub(crate) rng: CheapRng,
-
-    pub(crate) notifications: Vec<NotificationView>,
-    pub(crate) next_notification: u64,
 
     pub(crate) update: Option<update::Release>,
     pub(crate) update_busy: bool,
@@ -210,7 +195,6 @@ impl App {
             jobs_tx,
             client_id,
         } = init;
-        let matcher = crate::hermes::build_matcher(&config.filtered_words);
         // Hermes is wanted whenever there is a channel to watch; the endpoint is
         // whatever the edge is (Twitch, or the mock under `--debug`).
         let hermes_enabled = !config.channels.is_empty();
@@ -238,7 +222,6 @@ impl App {
             conn,
             hermes_enabled,
             error: None,
-            matcher,
             socket: None,
             welcomed: false,
             connecting: false,
@@ -246,7 +229,6 @@ impl App {
             last_message: Instant::now(),
             reconnect_at: Instant::now(),
             reconnect_attempt: 0,
-            quiet_until: HashMap::new(),
             sub_ids: HashMap::new(),
             sub_gen: 0,
             rng: CheapRng::new(
@@ -256,8 +238,6 @@ impl App {
                         u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
                     }),
             ),
-            notifications: Vec::new(),
-            next_notification: 1,
             update: None,
             update_busy: false,
             update_check_at: Instant::now(),
@@ -549,8 +529,8 @@ impl App {
 
     async fn handle_job(&mut self, done: JobDone) {
         match done {
-            JobDone::AddResolved(login, switches, result) => {
-                self.complete_add_login(login, switches, *result).await;
+            JobDone::AddResolved(login, result) => {
+                self.complete_add_login(login, *result).await;
             }
             JobDone::LiveRefreshed(id, result) => {
                 self.complete_live_refresh(id, result);
@@ -564,7 +544,6 @@ impl App {
                     self.spawn_save();
                 }
             }
-            JobDone::ToastShown => {}
             JobDone::UpdateCheckFinished(result) => {
                 self.update_busy = false;
                 match result {
@@ -630,23 +609,11 @@ impl App {
 
     fn handle_request(&mut self, request: Request) -> Result<Response, RpcError> {
         match request {
-            Request::AddLogin { login, switches } => {
-                self.request_add_login(&login, switches);
+            Request::AddLogin { login } => {
+                self.request_add_login(&login);
                 Ok(Response::Ack)
             }
             Request::RemoveChannel(channel) => self.apply_remove_channel(channel),
-            Request::SetNotifyTitleChanges(value) => {
-                self.config.notify_title_changes = value;
-                self.publish_config();
-                self.queue_save();
-                Ok(Response::Ack)
-            }
-            Request::SetSound(value) => {
-                self.config.sound = value;
-                self.publish_config();
-                self.queue_save();
-                Ok(Response::Ack)
-            }
             Request::SetRecordDir(dir) => {
                 // An empty path is how a settings field clears itself.
                 let dir = dir.filter(|dir| !dir.trim().is_empty());
@@ -663,20 +630,11 @@ impl App {
                 self.queue_save();
                 Ok(Response::Ack)
             }
-            Request::AddFilteredWord(word) => Ok(self.apply_add_filtered_word(&word)),
-            Request::RemoveFilteredWord(word) => self.apply_remove_filtered_word(&word),
             Request::SetRecord { channel, record } => self.apply_set_record(channel, record),
-            Request::SetNotifyLive { channel, notify } => {
-                self.apply_set_notify_live(channel, notify)
-            }
-            Request::SetNotifyTitles { channel, notify } => {
-                self.apply_set_notify_titles(channel, notify)
-            }
             Request::ClearError => {
                 self.clear_error();
                 Ok(Response::Ack)
             }
-            Request::DismissNotification(id) => self.dismiss_notification(id),
             Request::ApplyUpdate => {
                 self.handle_apply_update();
                 Ok(Response::Ack)
@@ -741,8 +699,6 @@ impl App {
                     last_live_ms: None,
                     stream_id: None,
                     error: None,
-                    notify_live: channel.notify_live,
-                    notify_titles: channel.notify_titles,
                     record: channel.record,
                 },
                 |detail| detail.view(Some(channel)),
@@ -757,7 +713,6 @@ impl App {
             pipelines: self.registry.views(),
             arena: self.registry.arena_summary(),
             downloader: self.registry.downloader_summary(),
-            notifications: self.notifications.clone(),
             logs: self.bus.logs(),
             error: self.error.clone(),
             update: self.update.as_ref().map(update_view),
@@ -853,80 +808,28 @@ impl App {
         self.spawn_job(async move { JobDone::SaveFinished(config::save(&config, &path).await) });
     }
 
-    pub fn queue_notification(
-        &mut self,
-        summary: String,
-        body: String,
-        image: Option<String>,
-        login: Option<String>,
+    /// Publishes one transition, with the row as it stands.
+    ///
+    /// A notification is an edge, and `ChannelUpsert` is coalesced per channel,
+    /// so the event carries the whole view rather than relying on the update
+    /// that accompanies it. The client applies its own switches and word filter.
+    pub(crate) fn publish_event(
+        &self,
+        kind: StreamEventKind,
+        previous: Option<String>,
+        view: ChannelView,
     ) {
-        let id = self.next_notification;
-        self.next_notification = self.next_notification.wrapping_add(1);
-        let notification = NotificationView {
-            id,
+        self.bus.publish(Update::StreamEvent(Box::new(StreamEvent {
+            kind,
             at_ms: now_ms(),
-            summary: summary.clone(),
-            body: body.clone(),
-            login: login.clone(),
-            image: image.clone(),
-            sound: self.config.sound,
-        };
-        self.notifications.push(notification.clone());
-        if self.notifications.len() > NOTIFICATION_CAP {
-            let oldest = self.notifications.remove(0);
-            self.bus.publish(Update::NotificationDismissed(oldest.id));
-        }
-        self.bus.log_channel(
-            LogLevel::Info,
-            "notify",
-            if body.is_empty() {
-                summary.clone()
-            } else {
-                format!("{summary}: {body}")
-            },
-            login.clone(),
-            None,
-        );
-        self.bus.publish(Update::Notification(notification));
-
-        let client = Rc::clone(&self.client);
-        let sound = self.config.sound;
-        self.spawn_job(async move {
-            notifier::show(
-                &client,
-                &summary,
-                &body,
-                sound,
-                image.as_deref(),
-                login.as_deref(),
-            )
-            .await;
-            JobDone::ToastShown
-        });
-    }
-
-    fn dismiss_notification(&mut self, id: u64) -> Result<Response, RpcError> {
-        let before = self.notifications.len();
-        self.notifications
-            .retain(|notification| notification.id != id);
-        if self.notifications.len() == before {
-            return Err(RpcError::NotFound);
-        }
-        self.bus.publish(Update::NotificationDismissed(id));
-        Ok(Response::Ack)
+            previous,
+            view: Box::new(view),
+        })));
     }
 
     /// Validates an add request and queues the single resolve. Duplicates,
     /// in-flight resolves and empty input are ignored without touching disk.
-    ///
-    /// `switches` is how an undone removal comes back with the settings it
-    /// had: the daemon applies them when the resolve lands, so the row never
-    /// shows the defaults for a frame.
-    pub fn request_add_login(
-        &mut self,
-        login: &str,
-        switches: Option<ChannelSwitches>,
-    ) -> Option<String> {
+    pub fn request_add_login(&mut self, login: &str) -> Option<String> {
         let login = login.trim().to_lowercase();
         if login.chars().count() > 25 {
             self.set_error("a Twitch login is at most 25 characters");
@@ -953,7 +856,7 @@ impl App {
         let job_login = login.clone();
         self.spawn_job(async move {
             let result = gql::fetch_channel(&client, client_id.as_deref(), &job_login).await;
-            JobDone::AddResolved(job_login, switches, Box::new(result))
+            JobDone::AddResolved(job_login, Box::new(result))
         });
         Some(login)
     }
@@ -961,7 +864,6 @@ impl App {
     pub(crate) async fn complete_add_login(
         &mut self,
         login: String,
-        switches: Option<ChannelSwitches>,
         result: Result<Option<ChannelDetail>, GqlError>,
     ) {
         if !self
@@ -992,7 +894,6 @@ impl App {
                     return;
                 }
                 let id = user.id;
-                let switches = switches.unwrap_or_default();
                 self.bus.log(
                     LogLevel::Info,
                     "channel",
@@ -1002,18 +903,13 @@ impl App {
                     login: user.login.clone(),
                     id,
                     display_name: Some(user.display_name.clone()),
-                    record: switches.record,
-                    notify_live: switches.notify_live,
-                    notify_titles: switches.notify_titles,
+                    record: false,
                 });
                 self.publish_config();
                 self.track_channel(user);
                 self.queue_save();
                 self.ensure_subs(id);
                 self.sync_channels();
-                if switches.record && self.registry.can_record() {
-                    self.registry.set_record(&login, true);
-                }
                 if self.welcomed {
                     self.subscribe_channel(id).await;
                 }
@@ -1091,48 +987,6 @@ impl App {
         }
     }
 
-    fn apply_add_filtered_word(&mut self, word: &str) -> Response {
-        let word = word.trim().to_owned();
-        if word.is_empty() {
-            return Response::Ack;
-        }
-        let folded = word.to_lowercase();
-        if self
-            .config
-            .filtered_words
-            .iter()
-            .any(|existing| existing.to_lowercase() == folded)
-        {
-            return Response::Ack;
-        }
-        self.config.filtered_words.push(word);
-        self.config.version = Config::VERSION;
-        self.matcher = crate::hermes::build_matcher(&self.config.filtered_words);
-        self.publish_config();
-        self.queue_save();
-        Response::Ack
-    }
-
-    fn apply_remove_filtered_word(&mut self, word: &str) -> Result<Response, RpcError> {
-        // By value, not by position: the view can be stale by the time the
-        // click lands, and removing a position would delete a word the user
-        // never saw.
-        let Some(position) = self
-            .config
-            .filtered_words
-            .iter()
-            .position(|entry| entry == word)
-        else {
-            return Err(RpcError::Failed(format!("no filtered word {word:?}")));
-        };
-        self.config.filtered_words.remove(position);
-        self.config.version = Config::VERSION;
-        self.matcher = crate::hermes::build_matcher(&self.config.filtered_words);
-        self.publish_config();
-        self.queue_save();
-        Ok(Response::Ack)
-    }
-
     fn apply_record_once(
         &self,
         login: &str,
@@ -1192,44 +1046,6 @@ impl App {
         } else {
             self.registry.set_record(&login, false);
         }
-        Ok(Response::Ack)
-    }
-
-    fn apply_set_notify_live(&mut self, channel: u64, notify: bool) -> Result<Response, RpcError> {
-        let Some(entry) = self
-            .config
-            .channels
-            .iter_mut()
-            .find(|candidate| candidate.id == channel)
-        else {
-            return Err(RpcError::NotFound);
-        };
-        entry.notify_live = notify;
-        let flags = entry.clone();
-        self.publish_config();
-        self.publish_channel_flags(&flags);
-        self.queue_save();
-        Ok(Response::Ack)
-    }
-
-    fn apply_set_notify_titles(
-        &mut self,
-        channel: u64,
-        notify: bool,
-    ) -> Result<Response, RpcError> {
-        let Some(entry) = self
-            .config
-            .channels
-            .iter_mut()
-            .find(|candidate| candidate.id == channel)
-        else {
-            return Err(RpcError::NotFound);
-        };
-        entry.notify_titles = notify;
-        let flags = entry.clone();
-        self.publish_config();
-        self.publish_channel_flags(&flags);
-        self.queue_save();
         Ok(Response::Ack)
     }
 

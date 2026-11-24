@@ -1,6 +1,10 @@
 //! Hermes pubsub: the batched baseline, the websocket lifecycle (welcome,
-//! keepalives, reconnect backoff), subscription replay and live/title
-//! notifications.
+//! keepalives, reconnect backoff), subscription replay and the transitions the
+//! client turns into notifications.
+//!
+//! The daemon decides nothing about notifications: it publishes `StreamEvent`s
+//! (live, offline, title, game) with the row at that moment, and the client
+//! applies its own switches and word filter.
 
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -8,6 +12,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use siphon_shared::rpc::LogLevel;
+use siphon_shared::rpc::StreamEventKind;
 use siphon_shared::rpc::Update;
 use sonic_rs::JsonValueTrait as _;
 use sonic_rs::Value;
@@ -20,7 +25,6 @@ use crate::gql::ChannelDetail;
 use crate::gql::GqlError;
 use crate::gql::StreamGame;
 use crate::http::ws::WsStream;
-use crate::matcher::Matcher;
 use crate::time::now_iso;
 use crate::utils::NanoId;
 
@@ -33,9 +37,6 @@ pub fn url() -> String {
 }
 use crate::constants::HERMES_KEEPALIVE_MISSES as KEEPALIVE_MISSED_LIMIT;
 use crate::constants::HERMES_MAX_RECONNECT_DELAY as MAX_RECONNECT_DELAY;
-/// How long after a `stream-down` a channel's title/game toasts stay muted:
-/// the churn around a broadcast ending is noise, going live again is not.
-use crate::constants::HERMES_OFFLINE_QUIET as OFFLINE_QUIET;
 use crate::constants::HERMES_WELCOME_TIMEOUT as WELCOME_TIMEOUT;
 
 /// One Hermes pubsub subscription: title/game updates or live/viewer updates
@@ -90,33 +91,7 @@ pub struct ConnectOutcome {
     pub socket: Option<WsStream>,
 }
 
-/// Builds the matcher over `words`. Called once at startup and again on every
-/// filter change, so the live matcher always reflects the persisted list.
-pub fn build_matcher(words: &[String]) -> Matcher {
-    Matcher::new(
-        &words
-            .iter()
-            .filter(|word| !word.is_empty())
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-}
-
 impl App {
-    /// Whether a channel's title/game toasts are muted by a recent
-    /// `stream-down`. A restream is never muted: only the title/game churn
-    /// around the end of a broadcast is.
-    fn quiet(&mut self, id: u64) -> bool {
-        match self.quiet_until.get(&id) {
-            Some(until) if Instant::now() < *until => true,
-            Some(_) => {
-                self.quiet_until.remove(&id);
-                false
-            }
-            None => false,
-        }
-    }
-
     pub fn start_connect(&mut self) {
         let mut ids: Vec<u64> = self
             .config
@@ -360,7 +335,6 @@ impl App {
     /// Drops one id's row and topics, returning the removed subscriptions for
     /// unsubscribing.
     pub fn drop_channel(&mut self, id: u64) -> Vec<(NanoId, Topic)> {
-        self.quiet_until.remove(&id);
         let mut removed = Vec::new();
         for topic in Topic::for_channel(id) {
             if let Some(entry) = self.sub_ids.remove(&topic) {
@@ -452,11 +426,10 @@ impl App {
                     self.keepalive_secs
                 );
                 self.publish_conn_health();
-                self.queue_notification(
-                    summary.to_owned(),
-                    format!("watching {} channel(s)", self.channels.len()),
-                    None,
-                    None,
+                tracing::info!(
+                    target: "hermes",
+                    "{summary}, watching {} channel(s)",
+                    self.channels.len()
                 );
                 self.resubscribe_all().await;
             }
@@ -637,49 +610,18 @@ impl App {
 
     fn on_broadcast_settings_update(&mut self, id: u64, pubsub: &Value) {
         let status = pubsub["status"].as_str().unwrap_or_default().to_owned();
-        let old_status = pubsub["old_status"].as_str().unwrap_or_default();
+        let old_status = pubsub["old_status"].as_str().unwrap_or_default().to_owned();
         let game = pubsub["game"]
             .as_str()
             .filter(|game| !game.is_empty())
             .map(str::to_owned);
-        let old_game = pubsub["old_game"].as_str().unwrap_or_default();
-        let title_filtered = self.matcher.is_match(&status);
-        let notify_titles = self.config.notify_title_changes;
+        let old_game = pubsub["old_game"].as_str().unwrap_or_default().to_owned();
         let channel = self.channel_config(id);
-        let channel_notifies = channel.as_ref().is_none_or(|channel| channel.notify_titles);
-        let quiet = self.quiet(id);
         let Some(user) = self.channels.get_mut(&id) else {
             return;
         };
         let title_changed = user.stream_title.as_deref() != Some(status.as_str());
         let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
-        let can_notify = notify_titles && channel_notifies && !user.live && !quiet;
-        let filtered = title_changed && title_filtered;
-        let toast = if can_notify && (title_changed || game_changed) && !filtered {
-            let mut lines = Vec::new();
-            if title_changed {
-                lines.push(format!("{old_status} → {status}"));
-            }
-            if game_changed {
-                lines.push(format!("{old_game} → {}", game.as_deref().unwrap_or("")));
-            }
-            let what = [
-                title_changed.then_some("title"),
-                game_changed.then_some("game"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" & ");
-            Some((
-                format!("[{}] {what} changed", user.display_name),
-                lines.join("\n"),
-                user.profile_image_url.clone(),
-                user.login.clone(),
-            ))
-        } else {
-            None
-        };
         let mut changes = Vec::new();
         if title_changed {
             changes.push(format!("title → {status}"));
@@ -699,7 +641,8 @@ impl App {
                 display_name: game_display_name.unwrap_or_default(),
             });
         let view = user.view(channel.as_ref());
-        self.bus.publish(Update::ChannelUpsert(Box::new(view)));
+        self.bus
+            .publish(Update::ChannelUpsert(Box::new(view.clone())));
         if !changes.is_empty() {
             self.bus.log_channel(
                 LogLevel::Info,
@@ -709,12 +652,20 @@ impl App {
                 stream_id,
             );
         }
-        if let Some((summary, body, avatar, login)) = toast {
-            self.queue_notification(
-                summary,
-                body,
-                Some(avatar).filter(|url| !url.is_empty()),
-                Some(login),
+        // One event per moved value, each carrying the old one: the client
+        // decides whether either is worth a toast.
+        if title_changed {
+            self.publish_event(
+                StreamEventKind::Title,
+                Some(old_status).filter(|old| !old.is_empty()),
+                view.clone(),
+            );
+        }
+        if game_changed {
+            self.publish_event(
+                StreamEventKind::Game,
+                Some(old_game).filter(|old| !old.is_empty()),
+                view,
             );
         }
     }
@@ -745,17 +696,15 @@ impl App {
                     return;
                 };
                 let login = user.login.clone();
-                let display_name = user.display_name.clone();
-                let game = user.game.clone();
-                let title = user.stream_title.clone();
-                let avatar = user.profile_image_url.clone();
                 let stream_id = user.stream_id;
                 let Some(user) = self.channels.get_mut(&id) else {
                     return;
                 };
                 user.live = true;
                 let view = user.view(channel.as_ref());
-                self.bus.publish(Update::ChannelUpsert(Box::new(view)));
+                self.bus
+                    .publish(Update::ChannelUpsert(Box::new(view.clone())));
+                self.publish_event(StreamEventKind::Live, None, view);
                 self.publish_conn_health();
                 self.bus.log_channel(
                     LogLevel::Info,
@@ -764,17 +713,6 @@ impl App {
                     Some(login.clone()),
                     stream_id,
                 );
-                if channel.as_ref().is_none_or(|channel| channel.notify_live) {
-                    self.notify_live(
-                        &display_name,
-                        game.as_ref(),
-                        title.as_deref(),
-                        &avatar,
-                        Some(&login),
-                    );
-                } else {
-                    tracing::info!(target: "hermes", "stream-up for {id} muted by channel");
-                }
                 if channel.as_ref().is_some_and(|channel| channel.record) {
                     self.registry.monitor_live(&login);
                 }
@@ -792,7 +730,6 @@ impl App {
                 };
                 let login = user.login.clone();
                 let stream_id = user.stream_id;
-                self.quiet_until.insert(id, Instant::now() + OFFLINE_QUIET);
                 if let Some(user) = self.channels.get_mut(&id) {
                     user.live = false;
                     user.collaboration_viewers = None;
@@ -805,7 +742,9 @@ impl App {
                     // live 6h ago" for a stream that just stopped.
                     user.last_live = Some(crate::time::now_ms());
                     let view = user.view(channel.as_ref());
-                    self.bus.publish(Update::ChannelUpsert(Box::new(view)));
+                    self.bus
+                        .publish(Update::ChannelUpsert(Box::new(view.clone())));
+                    self.publish_event(StreamEventKind::Offline, None, view);
                 }
                 self.bus.log_channel(
                     LogLevel::Info,
@@ -835,27 +774,20 @@ impl App {
                 };
                 user.live = true;
                 let known = self.channels.contains_key(&id);
-                let notifies = self
-                    .channel_config(id)
-                    .is_none_or(|channel| channel.notify_live);
-                if !known && notifies {
-                    let display_name = user.display_name.clone();
-                    let game = user.game.clone();
-                    let title = user.stream_title.clone();
-                    let avatar = user.profile_image_url.clone();
-                    self.notify_live(
-                        &display_name,
-                        game.as_ref(),
-                        title.as_deref(),
-                        &avatar,
-                        Some(user.login.as_str()),
-                    );
-                }
                 let record = self
                     .channel_config(id)
                     .is_some_and(|channel| channel.record);
                 let login = user.login.clone();
                 self.track_channel(user);
+                // First sight of the channel *is* the live transition when the
+                // stream was already running at startup.
+                if !known {
+                    let flags = self.channel_config(id);
+                    if let Some(detail) = self.channels.get(&id) {
+                        let view = detail.view(flags.as_ref());
+                        self.publish_event(StreamEventKind::Live, None, view);
+                    }
+                }
                 if record {
                     // StreamMetadata lags `stream-up` by seconds, so the monitor
                     // the notification started may have found the channel still
@@ -878,29 +810,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// "is LIVE" notification shared by the optimistic and fallback paths.
-    fn notify_live(
-        &mut self,
-        display_name: &str,
-        game: Option<&StreamGame>,
-        title: Option<&str>,
-        avatar: &str,
-        login: Option<&str>,
-    ) {
-        let body = match (game, title) {
-            (Some(game), Some(title)) => format!("{title} — {}", game.name),
-            (Some(game), None) => game.name.clone(),
-            (None, Some(title)) => title.to_owned(),
-            (None, None) => String::new(),
-        };
-        self.queue_notification(
-            format!("[{display_name}] is LIVE"),
-            body,
-            Some(avatar.to_owned()).filter(|url| !url.is_empty()),
-            login.map(str::to_owned),
-        );
     }
 }
 

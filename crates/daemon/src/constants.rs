@@ -203,9 +203,6 @@ pub const SEGMENT_RING: usize = 64;
 /// Event-log lines a snapshot carries.
 pub const LOG_CAP: usize = 512;
 
-/// Notifications kept for the UI center.
-pub const NOTIFICATION_CAP: usize = 50;
-
 /// Manifest poll bounds while the playlist is at the live edge.
 pub const EDGE_POLL_MIN: Duration = Duration::from_millis(200);
 pub const EDGE_POLL_MAX: Duration = Duration::from_secs(5);
@@ -221,10 +218,6 @@ pub const HERMES_WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HERMES_KEEPALIVE_MISSES: u64 = 2;
 /// Longest reconnect backoff.
 pub const HERMES_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
-/// How long after a `stream-down` a channel's title/game toasts stay muted.
-/// The title/game churn when a broadcast ends is noise; a restream inside the
-/// window still notifies.
-pub const HERMES_OFFLINE_QUIET: Duration = Duration::from_mins(10);
 
 /// Update check cadence, request timeout and the release feed.
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);

@@ -39,6 +39,10 @@ zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36
 # The Win32 shell: the tray, the single-instance handover and the DXGI chain.
 [target.'cfg(windows)'.dependencies]
 app-single-instance = "0.1"
+# OS toasts: the window decides and raises them, the daemon only publishes the
+# transition. `winreg` writes the per-user AUMID.
+tauri-winrt-notification = "0.8"
+winreg = "0.55"
 windows = { version = "0.62.2", features = [
   "Win32_Devices_Display",
   "Win32_Foundation",

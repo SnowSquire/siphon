@@ -159,7 +159,6 @@ enum Key {
     Pipeline(u64, Option<String>),
     Arena,
     Downloader,
-    Notification(u64),
     Error,
     Update,
 }
@@ -179,13 +178,12 @@ impl Key {
             Update::PipelineRemove(key) => Some(Self::Pipeline(key.channel, key.quality.clone())),
             Update::Arena(_) => Some(Self::Arena),
             Update::Downloader(_) => Some(Self::Downloader),
-            Update::Notification(notification) => Some(Self::Notification(notification.id)),
-            Update::NotificationDismissed(id) => Some(Self::Notification(*id)),
             Update::Error(_) => Some(Self::Error),
             Update::Update(_) => Some(Self::Update),
-            // The segment ring and the event log are append-only; coalescing
-            // would lose entries.
-            Update::Segment { .. } | Update::Log(_) => None,
+            // The segment ring, the event log and stream events are
+            // append-only; coalescing would lose entries, and for a stream
+            // event the transition *is* the value.
+            Update::Segment { .. } | Update::Log(_) | Update::StreamEvent(_) => None,
         }
     }
 }
