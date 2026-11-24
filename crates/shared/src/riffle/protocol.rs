@@ -59,6 +59,122 @@ impl StreamKey {
     }
 }
 
+/// Where a lane is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PlaybackPosition {
+    /// The live edge. Never faster than the source, so this is where a viewer
+    /// that has caught up sits.
+    Live,
+    /// An absolute point, in milliseconds since the start of the broadcast.
+    Absolute { pts_ms: u64 },
+}
+
+/// What a lane is doing, sent when it changes and as a drift correction every
+/// five seconds. The daemon predicts the playhead from this; it is the whole of
+/// the flow control.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamPlayback {
+    pub position: PlaybackPosition,
+    /// `0.25..=4.0`. Above 1.0 is catch-up; the client stalls when it runs dry.
+    pub rate: f32,
+    /// How far ahead of the playhead the client may be pushed. This is the
+    /// client's RAM, clamped to `1_000..=120_000` by the daemon.
+    pub buffer_ms: u32,
+}
+
+/// One codec's configuration record, sent once and reliably before any object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VideoCodec {
+    H264,
+    H265,
+    Av1,
+}
+
+/// Video configuration. `extradata` is the raw `avcC` / `hvcC` / `av1C` record,
+/// which is bit-for-bit what `avcodec_open2` takes, so the daemon never models
+/// parameter sets and a new codec needs no new message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoConfig {
+    pub codec: VideoCodec,
+    pub extradata: Vec<u8>,
+    pub timescale: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Audio configuration: raw AAC, no ADTS, with the `AudioSpecificConfig` in
+/// `extradata`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioConfig {
+    pub extradata: Vec<u8>,
+    pub timescale: u32,
+    pub sample_rate: u32,
+    pub channels: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamConfig {
+    pub video: Option<VideoConfig>,
+    pub audio: Option<AudioConfig>,
+}
+
+/// Ask for a position. The daemon aligns to the GOP's keyframe, so the answer
+/// is [`StreamStarted`], not this position verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSeek {
+    pub target: PlaybackPosition,
+}
+
+/// Where the daemon actually started.
+///
+/// The client discards decoded frames until its own target. `trimmed` is true
+/// when the request had to be clamped forward because it fell outside the
+/// retained window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamStarted {
+    pub start_pts_ms: u64,
+    pub start_sequence: u64,
+    pub trimmed: bool,
+}
+
+/// One attached lane, for the UI's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LaneState {
+    Attached,
+    /// Feeding, but the client's buffer is full.
+    Paused,
+    /// The window no longer holds the position.
+    Starved,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneView {
+    pub key: StreamKey,
+    pub state: LaneState,
+    /// Where the client says it is.
+    pub position_ms: u64,
+    /// Where the daemon thinks it is, after rate and elapsed time.
+    pub playhead_ms: u64,
+    /// How far ahead of the playhead the daemon has pushed.
+    pub buffered_ahead_ms: u64,
+    pub rate: f32,
+    pub dropped_video: u32,
+    pub dropped_audio: u32,
+    /// True while the picture is smeared and waiting for the next IDR.
+    pub recovering: bool,
+    pub started_ms: u64,
+}
+
 /// One followed channel.
 ///
 /// `record` is the per-channel monitor: true starts a recording pipeline on

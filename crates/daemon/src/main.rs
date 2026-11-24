@@ -45,9 +45,9 @@ mod update;
 #[allow(dead_code, clippy::future_not_send)]
 mod http;
 #[allow(clippy::future_not_send)]
-mod playlist;
-#[allow(clippy::future_not_send)]
 mod media;
+#[allow(clippy::future_not_send)]
+mod playlist;
 #[allow(clippy::future_not_send)]
 mod scheduler;
 #[allow(clippy::future_not_send)]
