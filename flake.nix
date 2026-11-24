@@ -180,6 +180,16 @@
               depsDebug = "2";
             }
           ).package;
+
+          # One machine's tuning: every C and Rust translation unit built for
+          # Zen 4 (`-march=znver4`, so AVX-512 and the rest of what that core
+          # has), with libplacebo's archive linked into the executable instead
+          # of loaded as a DLL. Nothing here runs on a CPU older than Zen 4.
+          msvc-zen4 = callPackage ./nix/msvc.nix {
+            cpu = "znver4";
+            libplaceboLink = "static";
+          };
+          windows-zen4 = callPackage ./nix/windows.nix { msvc = msvc-zen4; };
           windows-installer = callPackage ./nix/windows-installer.nix {
             windows = windows.package;
           };
@@ -197,6 +207,7 @@
             linux = linux.package;
             windows = windows.package;
             inherit windows-full-debug;
+            windows-zen4 = windows-zen4.package;
             inherit windows-installer;
             inherit windows-installer-sha;
             default = linux.package;
@@ -206,6 +217,7 @@
             # binaries (which change on every commit).
             linux-deps = linux.deps;
             windows-deps = windows.deps;
+            windows-zen4-deps = windows-zen4.deps;
 
             # The full-workspace lints. They are here as well as in `checks`
             # because `nix build .#foo` only inserts the system for `packages`

@@ -21,6 +21,13 @@
   llvmPackages_23,
   vulkan-headers,
   sources,
+  # `-march=` for every C/C++ translation unit and `-C target-cpu=` for rustc,
+  # e.g. `"znver4"`. `null` keeps the release artifact's generic x86-64, which
+  # is the one that has to run on a stranger's machine.
+  cpu ? null,
+  # `shared` ships `libplacebo-<api>.dll` beside the executables; `static` links
+  # the archive into `siphon.exe` instead, which drops the DLL from the payload.
+  libplaceboLink ? "shared",
 }:
 let
   # The MSVC STL in the pinned toolset refuses anything older than clang 22
@@ -62,16 +69,34 @@ let
 
   vulkanInclude = "${sources.vulkanSdk}/Include";
 
+  # One CPU choice, in every flag list a build reads: clang-cl's `-march` for
+  # the crates' C shims, the CMake toolchain file shaderc gets, meson's cross
+  # file for libplacebo, bindgen's view of the headers, and rustc's
+  # `-C target-cpu`. A build that tuned only the Rust half would still call into
+  # a generic libplacebo, and one that tuned only C would leave the pipeline on
+  # the baseline ISA.
+  march = lib.optionalString (cpu != null) " -march=${cpu}";
+  cpuRust = lib.optionalString (cpu != null) " -C target-cpu=${cpu}";
+  staticPlacebo = libplaceboLink == "static";
+
   # clang-cl takes `/imsvc`; libclang in bindgen's GNU driver mode wants
   # `-isystem` and the target triple.
-  clangFlags = lib.concatMapStrings (dir: " /imsvc${dir}") (msvcIncludeDirs ++ [ vulkanInclude ]);
-  bindgenFlags = lib.concatMapStrings (dir: " -isystem ${dir}") (
-    msvcIncludeDirs
-    ++ [
-      vulkanInclude
-    ]
-  );
-  rustLinkFlags = lib.concatMapStrings (dir: " -Lnative=${dir}") msvcLibDirs;
+  clangFlags =
+    lib.concatMapStrings (dir: " /imsvc${dir}") (msvcIncludeDirs ++ [ vulkanInclude ]) + march;
+  bindgenFlags =
+    lib.concatMapStrings (dir: " -isystem ${dir}") (
+      msvcIncludeDirs
+      ++ [
+        vulkanInclude
+      ]
+    )
+    + march;
+  # `-Lnative=` for the SDK's import libraries, shaderc's archive when a static
+  # libplacebo has to name it, and the CPU, which rustc spells differently.
+  rustLinkFlags =
+    lib.concatMapStrings (dir: " -Lnative=${dir}") msvcLibDirs
+    + lib.optionalString staticPlacebo " -Lnative=${shaderc}/lib"
+    + cpuRust;
 
   # The C/C++ build scripts (shaderc's CMake, libplacebo's meson) read the SDK
   # from these, so the cross files above do not have to repeat the paths.
@@ -92,7 +117,13 @@ let
     set(CMAKE_RC_COMPILER ${llvmBin}/bin/llvm-rc)
     set(CMAKE_MT ${llvmBin}/bin/llvm-mt)
     set(CMAKE_C_COMPILER_TARGET x86_64-pc-windows-msvc)
-    set(CMAKE_CXX_COMPILER_TARGET x86_64-pc-windows-msvc)
+    set(CMAKE_CXX_COMPILER_TARGET x86_64-pc-windows-msvc)${
+      lib.optionalString (cpu != null) ''
+
+        # shaderc is the only CMake build here; its flags come from this file.
+        set(CMAKE_C_FLAGS_INIT "-march=${cpu}")
+        set(CMAKE_CXX_FLAGS_INIT "-march=${cpu}")''
+    }
   '';
 
   # The meson cross file. `needs_exe_wrapper` is here because nothing the build
@@ -116,11 +147,11 @@ let
 
     [built-in options]
     c_args = ['--target=x86_64-pc-windows-msvc', '-fuse-ld=lld'${
-      lib.concatMapStrings (dir: ", '/imsvc${dir}'") (msvcIncludeDirs ++ [ vulkanInclude ])
-    }]
+      lib.optionalString (cpu != null) ", '-march=${cpu}'"
+    }${lib.concatMapStrings (dir: ", '/imsvc${dir}'") (msvcIncludeDirs ++ [ vulkanInclude ])}]
     cpp_args = ['--target=x86_64-pc-windows-msvc', '-fuse-ld=lld'${
-      lib.concatMapStrings (dir: ", '/imsvc${dir}'") (msvcIncludeDirs ++ [ vulkanInclude ])
-    }]
+      lib.optionalString (cpu != null) ", '-march=${cpu}'"
+    }${lib.concatMapStrings (dir: ", '/imsvc${dir}'") (msvcIncludeDirs ++ [ vulkanInclude ])}]
     c_link_args = [${lib.concatMapStrings (dir: "'/libpath:${dir}', ") msvcLibDirs}]
     cpp_link_args = [${lib.concatMapStrings (dir: "'/libpath:${dir}', ") msvcLibDirs}]
 
@@ -232,7 +263,7 @@ let
         --libdir=lib \
         --bindir=bin \
         --buildtype=release \
-        -Dvulkan=enabled \
+        ${lib.optionalString staticPlacebo "-Ddefault_library=static \\\n        "}-Dvulkan=enabled \
         -Dvk-proc-addr=disabled \
         -Dvulkan-registry=${vulkan-headers}/share/vulkan/registry/vk.xml \
         -Db_vscrt=md \
@@ -267,7 +298,9 @@ let
 
 in
 {
-  inherit libplacebo;
+  # `windows.nix` reads `staticPlacebo` to decide whether a DLL belongs in the
+  # payload; `cpu` is only here so a caller can see what it asked for.
+  inherit libplacebo cpu staticPlacebo;
 
   # The environment a cargo invocation for the target needs. `windows.nix`
   # turns it into the package's `env`; the dev shell exports it verbatim.
@@ -292,7 +325,11 @@ in
 
     LIBCLANG_PATH = "${lib.getLib libclang}/lib";
     BINDGEN_EXTRA_CLANG_ARGS = "--target=x86_64-pc-windows-msvc${bindgenFlags}";
-  };
+  }
+  # `libplacebo-sys` defaults to a dynamic link, so only the static build says
+  # anything; an unconditional variable would change the release derivation's
+  # environment for no reason.
+  // lib.optionalAttrs staticPlacebo { LIBPLACEBO_LINK = "static"; };
 
   nativeBuildInputs = [
     llvmBin

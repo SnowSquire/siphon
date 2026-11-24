@@ -299,7 +299,18 @@ fn windows() {
     let link = Link::from_env();
 
     if source == Source::Prefix {
-        use_prefix(&explicit_prefix(), "libplacebo");
+        // The name the linker is asked for follows the artefact the prefix
+        // holds: a shared build installs the import library meson generates for
+        // `libplacebo-<api>.dll`, `libplacebo.lib`, while a static one installs
+        // `libplacebo.a` -- `placebo` with the GNU `lib` prefix, which rustc
+        // resolves for `static=` by that name. There is no cross-aware
+        // pkg-config to read the `.pc`'s `-lplacebo` on this target.
+        let lib = if link == Link::Static {
+            "placebo"
+        } else {
+            "libplacebo"
+        };
+        use_prefix(&explicit_prefix(), lib);
     }
 
     let deps = probe(source, link, "libplacebo");
@@ -319,7 +330,16 @@ fn windows() {
         includes.push(prefix("FFMPEG_DIR", default_ffmpeg()).join("include"));
     }
     includes.extend(splat_includes(&splat));
-    let defines = deps.all_defines();
+    let mut defines = deps.all_defines();
+    // A static prefix has no pkg-config `Cflags.private` for system-deps to read
+    // (there is no cross-aware pkg-config for the target), so the `-DPL_STATIC`
+    // meson puts there is this side's job: without it `PL_API` is
+    // `__declspec(dllimport)` and the shim would call through an import table a
+    // static archive does not have.
+    let static_define: Option<String> = None;
+    if link == Link::Static {
+        defines.push(("PL_STATIC", &static_define));
+    }
 
     bindings(&includes, &defines);
     shim(&includes, &defines);
@@ -331,6 +351,24 @@ fn windows() {
         && let Some(prefix) = dll_prefix(&deps)
     {
         copy_dll(&prefix);
+    }
+
+    if link == Link::Static {
+        // A DLL carries its own imports; an archive does not, and these are the
+        // ones the objects reference beyond the CRT. `shlwapi`, `kernel32` and
+        // `ntdll` are all `src/log.c`: the path helper, the critical sections
+        // and the stack walk. shaderc is the GLSL compiler meson links into the
+        // shared build, and dbghelp is loaded by name at run time, so it needs
+        // no import library. The C++ runtime arrives through the objects' own
+        // `/DEFAULTLIB` directives.
+        //
+        // `shaderc_combined.lib` lives in the shaderc prefix, which the caller
+        // is expected to put on the link search path (the flake passes
+        // `-Lnative=...` in `RUSTFLAGS`, the same way the SDK directories get
+        // there); the Windows SDK's import libraries are already on it.
+        for library in ["shlwapi", "kernel32", "ntdll", "shaderc_combined"] {
+            println!("cargo:rustc-link-lib={library}");
+        }
     }
 }
 

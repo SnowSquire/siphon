@@ -1,6 +1,6 @@
 # The Windows payload: `siphon.exe`, `siphon-daemon.exe`, the libplacebo DLL
 # they load, and the release PDBs -- cross-built on Linux with clang-cl and
-# lld-link.
+# lld-link. A `libplaceboLink = "static"` cross environment drops the DLL.
 #
 # Three derivations, so that editing one crate does not redo the others:
 #
@@ -122,7 +122,9 @@ let
       exe,
       pdb,
       # `libplacebo-sys` copies the DLL it links next to the executable, and a
-      # Windows process only finds it there. Only the UI links it.
+      # Windows process only finds it there. Only the UI links libplacebo, and
+      # only a shared build has a DLL to copy: `libplaceboLink = "static"` links
+      # the archive in instead, so the payload is two executables.
       dll ? false,
     }:
     craneLib.buildPackage (
@@ -155,7 +157,7 @@ let
           cp "$target/${exe}" $out/bin/
           cp "$pdb" $out/symbols/
         ''
-        + lib.optionalString dll ''
+        + lib.optionalString (dll && !msvc.staticPlacebo) ''
           cp "$target"/libplacebo-*.dll $out/bin/
         '';
       }

@@ -12,6 +12,7 @@ two that had to be kept in agreement.
 ```sh
 nix build .#linux              # siphon (Linux UI) + siphon-daemon in result/bin
 nix build .#windows            # siphon.exe + siphon-daemon.exe + libplacebo-*.dll
+nix build .#windows-zen4       # the same, built for Zen 4 with a static libplacebo
 nix build .#windows-installer  # the setup, the portable zip, the symbols zip
 nix build                      # .#linux
 nix develop                    # the Linux toolchain, without the -devel packages
@@ -106,6 +107,42 @@ Four pieces are Nix-only plumbing worth knowing about:
   it. The one hand-written file is shaderc's `.pc`, because `shaderc_combined`
   is not the target upstream's own file describes — and `libplacebo-sys` reaches
   the same library through `system-deps` rather than ad-hoc probing.
+
+## A CPU-tuned, statically linked payload
+
+`.#windows-zen4` builds the same two executables for one machine rather than
+for a stranger's: `nix/msvc.nix` takes `cpu` and `libplaceboLink`, and the flake
+instantiates it as `cpu = "znver4"` with a static libplacebo.
+
+`cpu` is one choice reaching five flag lists, because tuning half a binary is
+worse than tuning none:
+
+| place | flag |
+|---|---|
+| `CFLAGS_x86_64_pc_windows_msvc` / `CXXFLAGS_...` | `-march=znver4` for the crates' C shims |
+| the CMake toolchain file (`CMAKE_C_FLAGS_INIT`) | shaderc |
+| meson's cross file (`c_args` / `cpp_args`) | libplacebo |
+| `RUSTFLAGS` | `-C target-cpu=znver4` |
+| `BINDGEN_EXTRA_CLANG_ARGS` | `-march=znver4`, so the headers see the same ISA |
+
+`libplaceboLink = "static"` builds the archive instead of the DLL, so the
+payload is two files. Three things only the DLL used to provide move to
+`libplacebo-sys`: the name the linker asks for (`libplacebo.lib` is the import
+library meson generates for the DLL; a static clang-cl build installs
+`libplacebo.a`, the GNU name rustc resolves from `static=placebo`),
+`-DPL_STATIC` (meson writes it into the `.pc`'s `Cflags.private`, and a prefix
+probed without pkg-config never reads that file), and the archive's own imports
+— `shlwapi`, `kernel32` and `ntdll` for `src/log.c`, plus `shaderc_combined`,
+the GLSL compiler meson links in (dbghelp is `LoadLibrary`'d, and the C++
+runtime comes in through the objects' `/DEFAULTLIB` directives). `shaderc`'s
+`lib/` joins `RUSTFLAGS` as a `-Lnative=` directory for the same reason the
+SDK's do.
+
+Everything downstream is a separate derivation: the changed `RUSTFLAGS` move the
+dependency layer's hash, so all ~500 crates are compiled from scratch for Zen 4
+— that is the point of the output, and also why it is a second output and not a
+knob on `.#windows`. The installer keeps taking `.#windows`: the release has to
+run on a CPU from this decade.
 
 ## xwin, and why it is pinned here
 
