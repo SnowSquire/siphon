@@ -42,6 +42,7 @@ pub use protocol::ChatColor;
 pub use protocol::ClientMessage;
 pub use protocol::Config;
 pub use protocol::ConnHealth;
+pub use protocol::ConnStats;
 pub use protocol::DiskView;
 pub use protocol::DownloaderSummary;
 pub use protocol::FetchOutcome;

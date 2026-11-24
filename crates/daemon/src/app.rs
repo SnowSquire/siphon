@@ -21,6 +21,7 @@ use siphon_shared::riffle::ArenaSummary;
 use siphon_shared::riffle::ChannelView;
 use siphon_shared::riffle::Config;
 use siphon_shared::riffle::ConnHealth;
+use siphon_shared::riffle::ConnStats;
 use siphon_shared::riffle::DownloaderSummary;
 use siphon_shared::riffle::LogLevel;
 use siphon_shared::riffle::PipelineView;
@@ -722,6 +723,7 @@ impl App {
         Snapshot {
             config: self.config.clone(),
             conn: self.conn,
+            conn_stats: ConnStats::default(),
             channels,
             pending: self.pending.clone(),
             pipelines: self.registry.views(),

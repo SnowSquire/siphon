@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -269,6 +269,33 @@ pub enum ConnHealth {
     NoChannels,
 }
 
+/// Live statistics for one Riffle connection.
+///
+/// Datamosh makes dropped video normal, so the counts have to be visible: without
+/// them "the picture is smearing because the link is lossy" is indistinguishable
+/// from "it is smearing because something is broken".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConnStats {
+    pub rtt_us: u32,
+    pub cwnd_bytes: u32,
+    pub lost: u32,
+    pub dropped_video: u32,
+    pub dropped_audio: u32,
+    /// Milliseconds since the last dropped object, saturating; `u32::MAX` when
+    /// nothing has been dropped.
+    pub last_drop_age_ms: u32,
+}
+
+impl ConnStats {
+    /// Whether the picture is still recovering: something was dropped recently
+    /// enough that the reference chain has probably not healed at an IDR yet.
+    #[must_use]
+    pub const fn recovering(self) -> bool {
+        self.dropped_video > 0 && self.last_drop_age_ms < 4_000
+    }
+}
+
 /// The colour a channel's switches and chevron take.
 ///
 /// Two producers, one value: Twitch's `chatColor` is `#RRGGBB`, and a channel
@@ -516,6 +543,8 @@ pub struct UpdateView {
 pub struct Snapshot {
     pub config: Config,
     pub conn: ConnHealth,
+    /// Counters for this Riffle connection itself, not for Twitch.
+    pub conn_stats: ConnStats,
     pub channels: Vec<ChannelView>,
     pub pending: Vec<String>,
     pub pipelines: Vec<PipelineView>,
@@ -709,5 +738,52 @@ mod tests {
     #[test]
     fn a_local_install_listens_on_nothing() {
         assert_eq!(Network::default().listen.len(), 0);
+    }
+
+    #[test]
+    fn connection_stats_default_to_nothing_dropped_and_not_recovering() {
+        let stats = ConnStats::default();
+        assert_eq!(
+            (
+                stats.rtt_us,
+                stats.cwnd_bytes,
+                stats.lost,
+                stats.dropped_video,
+                stats.dropped_audio,
+                stats.last_drop_age_ms
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert!(!stats.recovering());
+    }
+
+    #[test]
+    fn a_drop_a_hundred_milliseconds_ago_is_recovering() {
+        let stats = ConnStats {
+            dropped_video: 1,
+            last_drop_age_ms: 100,
+            ..ConnStats::default()
+        };
+        assert!(stats.recovering());
+    }
+
+    #[test]
+    fn a_drop_four_seconds_ago_is_healed() {
+        let stats = ConnStats {
+            dropped_video: 1,
+            last_drop_age_ms: 4_000,
+            ..ConnStats::default()
+        };
+        assert!(!stats.recovering());
+    }
+
+    #[test]
+    fn a_fresh_drop_with_no_video_dropped_is_not_recovering() {
+        let stats = ConnStats {
+            dropped_audio: 3,
+            last_drop_age_ms: 10,
+            ..ConnStats::default()
+        };
+        assert!(!stats.recovering());
     }
 }
