@@ -104,7 +104,7 @@ playlists. The mock's Hermes socket is on its own port, so point the daemon at i
 with `SIPHON_HERMES_URL=ws://127.0.0.1:8001/v1`.
 
 1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere). `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
-2. `cargo run -p daemon -- daemon -d http://127.0.0.2:8000`; the pipeline starts on the mock's `stream-up`. There is no viewer until Riffle's media lane exists, so the end-to-end checks are the pipeline rows, the logs and whatever recording is enabled.
+2. `cargo run -p daemon -- daemon -d http://127.0.0.2:8000`; the pipeline starts on the mock's `stream-up`. A viewer still has nothing to draw with: the media lane pushes datagrams (`media/lane.rs`) but the UI has no receiver, so the end-to-end checks are the pipeline rows, the logs, the lane datagrams a test collects and whatever recording is enabled.
 3. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
 
 ## Worktrees
@@ -139,7 +139,9 @@ detail: `notes/architecture.md`.
 - `app.rs`, `bus.rs`, `riffle.rs`, `metrics.rs` — the backend app loop, entity update bus, Riffle control-plane server and telemetry.
 - `registry.rs` — the stream registry and monitors behind `daemon` mode (`notes/daemon-mode.md`).
 - `downloader.rs` — bounded fetch workers streaming into spools.
-- `media/` — the TS demuxer, the codec configs and the DVR timeline (`notes/ts-demux.md`). RTSP and its RTP packetizers are gone; the demuxer is the input side of the Riffle media lane and is not wired to a consumer yet.
+- `media/` — the TS demuxer, the codec configs, the DVR timeline
+  (`notes/ts-demux.md`) and the Riffle media lane: `media/lane.rs` is one producer
+  per lane (demux → pack → offer) plus the one datagram sender per connection.
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/shared` (`siphon-shared`) — what both sides agree on: `riffle/` (the
   typed protocol, postcard framing, the object header, the UI-side client, and

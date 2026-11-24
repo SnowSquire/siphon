@@ -405,6 +405,18 @@ impl Fmp4Demuxer {
         }
     }
 
+    /// The media timescale of a track, by `tkhd` track ID. `None` for a track
+    /// the init segment does not declare, which is a malformed fragment rather
+    /// than a track.
+    #[must_use]
+    pub fn timescale(&self, track: u32) -> Option<u32> {
+        self.init
+            .tracks
+            .iter()
+            .find(|declared| declared.id == track)
+            .map(Track::timescale)
+    }
+
     /// Demux one complete media segment, appending its samples to `store`.
     ///
     /// The segment is fed whole: there is no carry between calls and no

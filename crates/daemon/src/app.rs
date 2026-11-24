@@ -491,10 +491,14 @@ impl App {
     /// Lanes are per connection, so a UI that goes away must not leave a
     /// watch-only runtime running: the claim is the only thing keeping it up.
     fn close_conn(&self, conns: &mut [Option<riffle::Conn>], id: usize) {
-        let Some(conn) = conns[id].take() else {
+        let Some(mut conn) = conns[id].take() else {
             return;
         };
-        for key in conn.lanes.iter() {
+        // Collect first: stopping a producer mutates the connection while the
+        // lane set is borrowed.
+        let keys: Vec<StreamKey> = conn.lanes.iter().cloned().collect();
+        for key in &keys {
+            conn.stop_lane(key);
             self.registry.detach(key);
         }
     }
@@ -550,7 +554,7 @@ impl App {
                     info!(%app_version, "rpc: client connected");
                     // A fresh connection starts with no lanes; this only ever
                     // carries the snapshot's own (empty) set.
-                    let snapshot = self.snapshot(&conn.lanes);
+                    let snapshot = self.snapshot(&conn.lanes, conn.stats(Instant::now()));
                     let queued = conn.push(&ServerMessage::Welcome {
                         protocol: siphon_shared::riffle::PROTOCOL_VERSION,
                         server_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -635,7 +639,7 @@ impl App {
         info!(target: "rpc", %name, %spki, "quic: paired a new client");
 
         conn.provisional = None;
-        let snapshot = self.snapshot(&conn.lanes);
+        let snapshot = self.snapshot(&conn.lanes, conn.stats(Instant::now()));
         let queued = conn.push(&ServerMessage::Welcome {
             protocol: siphon_shared::riffle::PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -866,7 +870,9 @@ impl App {
             Request::StreamUpdate { key, playback } => self.stream_update(conn, &key, playback),
             Request::StreamClose { key } => self.stream_close(conn, key),
             Request::StreamSeek { key, target } => self.stream_seek(conn, &key, target),
-            Request::GetSnapshot => Ok(Response::Snapshot(Box::new(self.snapshot(&conn.lanes)))),
+            Request::GetSnapshot => Ok(Response::Snapshot(Box::new(
+                self.snapshot(&conn.lanes, conn.stats(Instant::now())),
+            ))),
             Request::GetStreamDetail(key) => self
                 .registry
                 .detail(&key, 256)
@@ -889,28 +895,68 @@ impl App {
         }
     }
 
-    /// Attaches a lane, or updates one already attached on this connection.
+    /// Attaches a lane, or updates one already attached on this connection,
+    /// and starts the task that feeds it.
     ///
     /// Re-opening is idempotent: the lane set is checked before `attach`,
     /// because the registry counts claims on a pipeline and knows nothing about
     /// lanes, so a second `attach` would be a second claim that no close would
     /// ever release.
+    ///
+    /// A connection with no datagram channel has nowhere to push media. That is
+    /// a typed refusal *before* the pipeline is attached: the local pipe carries
+    /// control only, and a lane that attached and then fed nothing would look
+    /// like a live stream that produces no picture.
     async fn stream_open(
         &self,
         conn: &mut riffle::Conn,
         key: StreamKey,
         playback: StreamPlayback,
     ) -> Result<Response, RpcError> {
+        let Some(media) = conn.media() else {
+            return Err(if conn.is_quic() {
+                quic_without_datagrams()
+            } else {
+                pipe_has_no_media()
+            });
+        };
         let now = Instant::now();
-        let place = if conn.lanes.contains(&key) {
-            self.registry.place(&key)
-        } else {
+        let opened = !conn.lanes.contains(&key);
+        let (place, runtime) = if opened {
             let runtime = self.registry.attach(&key).await?;
-            Some(runtime.place())
+            (Some(runtime.place()), Some(runtime))
+        } else {
+            (self.registry.place(&key), None)
         };
         let position_ms = position_of(playback.position, place);
-        conn.lanes
-            .open(key.clone(), playback, position_ms, now, wall_ms());
+        let live_edge_ms = place.map_or(0, |place| place.position_ms);
+        conn.lanes.open(
+            key.clone(),
+            playback,
+            position_ms,
+            live_edge_ms,
+            now,
+            wall_ms(),
+        );
+        if let Some(runtime) = runtime {
+            let Some(handle) = conn.lanes.handle(&key) else {
+                return Err(RpcError::NotFound);
+            };
+            let Some(consumer) = runtime.lane_consumer() else {
+                conn.lanes.remove(&key);
+                self.registry.detach(&key);
+                return Err(RpcError::Failed(
+                    "the pipeline has no scheduler left".to_owned(),
+                ));
+            };
+            if !conn.start_lane(key.clone(), handle, consumer, Rc::new(media)) {
+                conn.lanes.remove(&key);
+                self.registry.detach(&key);
+                return Err(RpcError::Failed(
+                    "the pipeline stopped before the lane could register".to_owned(),
+                ));
+            }
+        }
         if !Self::push_lane(conn, &key, now, place) {
             return Err(RpcError::Disconnected);
         }
@@ -931,18 +977,26 @@ impl App {
         let now = Instant::now();
         let place = self.registry.place(key);
         let position_ms = position_of(playback.position, place);
-        conn.lanes
-            .open(key.clone(), playback, position_ms, now, wall_ms());
+        let live_edge_ms = place.map_or(0, |place| place.position_ms);
+        conn.lanes.open(
+            key.clone(),
+            playback,
+            position_ms,
+            live_edge_ms,
+            now,
+            wall_ms(),
+        );
         if !Self::push_lane(conn, key, now, place) {
             return Err(RpcError::Disconnected);
         }
         Ok(Response::Ack)
     }
 
-    /// Closes a lane and releases its claim. Closing twice is an ack, not an
-    /// error: the lane is simply not there any more.
+    /// Closes a lane, stops its producer and releases its claim. Closing twice
+    /// is an ack, not an error: the lane is simply not there any more.
     fn stream_close(&self, conn: &mut riffle::Conn, key: StreamKey) -> Result<Response, RpcError> {
         if conn.lanes.remove(&key) {
+            conn.stop_lane(&key);
             self.registry.detach(&key);
             if !conn.push(&ServerMessage::Update(Update::LaneRemove(key))) {
                 return Err(RpcError::Disconnected);
@@ -1008,7 +1062,7 @@ impl App {
     /// `lanes` is the asking connection's own set: lanes are per connection, so
     /// there is no global list to read here.
     #[must_use]
-    pub fn snapshot(&self, lanes: &Lanes) -> Snapshot {
+    pub fn snapshot(&self, lanes: &Lanes, stats: ConnStats) -> Snapshot {
         let mut channels = Vec::with_capacity(self.config.channels.len());
         for channel in &self.config.channels {
             let view = self.channels.get(&channel.id).map_or_else(
@@ -1040,7 +1094,7 @@ impl App {
         Snapshot {
             config: self.config.clone(),
             conn: self.conn,
-            conn_stats: ConnStats::default(),
+            conn_stats: stats,
             channels,
             pending: self.pending.clone(),
             pipelines: self.registry.views(),
@@ -1508,6 +1562,22 @@ fn wall_ms() -> u64 {
     u64::try_from(now_ms()).unwrap_or_default()
 }
 
+/// The refusal a lane opened over the local pipe gets.
+///
+/// The pipe is the fast carrier for control and, later, for zero-copy arena
+/// slots; it has no datagram channel, so it cannot carry a media lane today.
+/// Saying so is better than a lane that attaches and receives nothing.
+fn pipe_has_no_media() -> RpcError {
+    RpcError::NoMediaCarrier(
+        "the local pipe carries control only; a media lane needs a QUIC connection".to_owned(),
+    )
+}
+
+/// The refusal a QUIC connection that never negotiated DATAGRAM gets.
+fn quic_without_datagrams() -> RpcError {
+    RpcError::NoMediaCarrier("this connection did not negotiate QUIC DATAGRAM".to_owned())
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use std::path::PathBuf;
@@ -1573,6 +1643,7 @@ mod tests {
             StreamKey::new(1, None),
             playback(),
             1_000,
+            0,
             Instant::now(),
             0,
         );
@@ -1581,19 +1652,25 @@ mod tests {
             StreamKey::new(2, None),
             playback(),
             1_000,
+            0,
             Instant::now(),
             0,
         );
 
-        let mine_view = app.snapshot(&mine).lanes;
+        let mine_view = app.snapshot(&mine, ConnStats::default()).lanes;
         assert_eq!(mine_view.len(), 1);
         assert_eq!(mine_view[0].key.channel, 1);
 
-        let theirs_view = app.snapshot(&theirs).lanes;
+        let theirs_view = app.snapshot(&theirs, ConnStats::default()).lanes;
         assert_eq!(theirs_view.len(), 1);
         assert_eq!(theirs_view[0].key.channel, 2);
 
-        assert_eq!(app.snapshot(&Lanes::default()).lanes.len(), 0);
+        assert_eq!(
+            app.snapshot(&Lanes::default(), ConnStats::default())
+                .lanes
+                .len(),
+            0
+        );
     }
 }
 

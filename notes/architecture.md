@@ -20,7 +20,7 @@ crate-wide). The driver owns the threads (IOCP on Windows, io_uring on Linux).
 
 ```
 manifest poll (scheduler) ──► downloader queue ──► spool ──► consumers
-       │                                             ├─ RTSP media engine
+       │                                             ├─ Riffle media lane
        └─ variant resolution (GQL + usher)           └─ disk recorder
 ```
 
@@ -28,7 +28,13 @@ The scheduler polls the media playlist, parses Twitch's tags, dispatches
 segment/prefetch/init fetches and fans the resulting spools out to registered
 consumers. A consumer registers over a channel and owns a bounded
 `Sender<SegmentMessage>`; the queue bound is the lag policy (a full queue can
-drop the consumer or, for the lossy RTSP consumer, one message).
+drop the consumer or, for a lossy consumer such as a media lane, one message).
+
+A Riffle media lane is the consumer that a viewer is
+(`media::lane`, `notes/riffle.md` "The media lane"): one producer task per lane
+demuxes each spool and packs access units into QUIC datagrams, and the
+connection's one sender drains audio and edge-lane traffic first. It re-registers
+whenever the push rule pauses it, so a lane holds a reader only while it reads.
 
 ## `scheduler.rs`
 

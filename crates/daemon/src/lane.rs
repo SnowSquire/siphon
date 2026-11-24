@@ -3,10 +3,15 @@
 //!
 //! A lane is a reader position and a rate, not a queue (`notes/riffle.md`,
 //! "Push, not pull"). The client reports where it is and how fast it is going;
-//! the daemon keeps the estimate and will push while
-//! `sent_position < predicted_playhead + buffer_ms`. Nothing here pushes: this
-//! module is the bookkeeping the media lane will read, and the value the UI
-//! draws a row from.
+//! the daemon keeps the estimate and pushes while
+//! `sent_position < predicted_playhead + buffer_ms`.
+//!
+//! The estimate lives here and the pushing happens in
+//! [`crate::media::lane`]: a lane's playback numbers are copied *in* to a
+//! [`LaneHandle`] when the client reports, and the counters the producer task
+//! writes are copied *out* when a row is built. That is why nothing borrows a
+//! `RefCell` across an `.await` — the handle is a set of `Cell`s, so a read is
+//! a copy and a write is a store, from either task.
 //!
 //! Lanes live on the connection that opened them, in [`riffle::Conn`], so one
 //! UI cannot see or close another's. The claim a lane holds on a pipeline is
@@ -15,30 +20,43 @@
 //!
 //! [`riffle::Conn`]: crate::riffle::Conn
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
 
+use siphon_shared::riffle::ConnStats;
 use siphon_shared::riffle::LaneState;
 use siphon_shared::riffle::LaneView;
 use siphon_shared::riffle::StreamKey;
 use siphon_shared::riffle::StreamPlayback;
+
+use crate::media::wire::Track;
 
 /// The client's buffer is clamped to these, in milliseconds
 /// (`notes/riffle.md`, "Push, not pull").
 pub const MIN_BUFFER_MS: u32 = 1_000;
 pub const MAX_BUFFER_MS: u32 = 120_000;
 
+/// A lane this close to the live edge is an edge lane and gets its datagrams
+/// queued ahead of a catch-up lane's (`notes/riffle.md`, "Multiple lanes").
+pub const EDGE_MARGIN_MS: u64 = 2_000;
+
+/// A dropped video object keeps the picture smeared for about a GOP, so a lane
+/// with a video drop inside this window is "recovering".
+pub const RECOVERY_MS: u64 = 4_000;
+
 /// The rate a lane may report. A modulator nudges 0.98–1.02; anything further
 /// is catch-up or a stall, and a zero or negative rate would freeze the
 /// estimate instead of advancing it.
-const MIN_RATE: f32 = 0.25;
+pub const MIN_RATE: f32 = 0.25;
 const MAX_RATE: f32 = 4.0;
 
-/// One attached lane's state.
-pub struct Lane {
-    /// The pipeline this lane watches.
-    key: StreamKey,
+/// What the client last reported, plus when. One `Copy` value, so it moves
+/// between the app and the producer task by value and never behind a borrow.
+#[derive(Clone, Copy, Debug)]
+pub struct Playback {
     /// The position last reported, with `PlaybackPosition::Live` already
     /// resolved to the pipeline's live edge at that moment.
     reported_ms: u64,
@@ -48,11 +66,9 @@ pub struct Lane {
     /// When `reported_ms` was reported. The estimate is `reported_ms` advanced
     /// by `rate` over the time since.
     at: Instant,
-    /// Unix milliseconds when the lane was opened.
-    started_ms: u64,
 }
 
-impl Lane {
+impl Playback {
     /// Where the daemon thinks the client is: the reported position, advanced by
     /// the reported rate over the elapsed time.
     ///
@@ -68,46 +84,277 @@ impl Lane {
             .saturating_add(u64::try_from(advance).unwrap_or(u64::MAX))
     }
 
-    /// The client's position as it last reported it.
     #[must_use]
     pub const fn position_ms(&self) -> u64 {
         self.reported_ms
     }
 
-    /// Whether the retained window still holds the reported position.
+    #[must_use]
+    pub const fn buffer_ms(&self) -> u32 {
+        self.buffer_ms
+    }
+
+    #[must_use]
+    pub const fn rate(&self) -> f32 {
+        self.rate
+    }
+}
+
+/// One lane's live state: the app writes the playback numbers, the lane's
+/// producer task writes the counters, and both read the other side as plain
+/// values.
+///
+/// Every field is a `Cell`, so a handle can be cloned into the producer and
+/// still be read by the app's loop and the snapshot without a borrow existing
+/// across an await. Nothing here is large enough for a lock to be worth it, and
+/// there is one reactor thread anyway.
+#[derive(Debug, Default)]
+struct Shared {
+    playback: Cell<Option<Playback>>,
+    /// End of the newest live segment, in broadcast milliseconds; `0` when the
+    /// pipeline has published nothing yet.
+    live_edge_ms: Cell<u64>,
+    /// The media timestamp of the last access unit handed to the sender, in
+    /// broadcast milliseconds, per track — indexed by [`Track`]'s slot. Per
+    /// track because video and audio are timed independently and an access unit
+    /// at the same millisecond on the other track is not the same unit.
+    sent_ms: [Cell<u64>; 2],
+    sent_any: [Cell<bool>; 2],
+    dropped_video: Cell<u32>,
+    dropped_audio: Cell<u32>,
+    /// When the last object was dropped, for `recovering` and
+    /// [`ConnStats::last_drop_age_ms`].
+    last_drop: Cell<Option<Instant>>,
+}
+
+/// The index [`Shared::sent_ms`] keeps one track's position under.
+const fn slot(track: Track) -> usize {
+    match track {
+        Track::Video => 0,
+        Track::Audio => 1,
+    }
+}
+
+/// A cloneable view of one lane's state, for the task that feeds it.
+///
+/// The methods that return `_ms` are the push rule's inputs and outputs; the
+/// ones that start with `note_` are the producer's writes.
+#[derive(Clone, Debug, Default)]
+pub struct LaneHandle(Rc<Shared>);
+
+impl LaneHandle {
+    /// The current estimate, or `None` before the app has written one.
+    #[must_use]
+    pub fn playback(&self) -> Option<Playback> {
+        self.0.playback.get()
+    }
+
+    #[must_use]
+    pub fn playhead_ms(&self, now: Instant) -> u64 {
+        self.0
+            .playback
+            .get()
+            .map_or(0, |playback| playback.playhead_ms(now))
+    }
+
+    #[must_use]
+    pub fn buffer_ms(&self) -> u32 {
+        self.0
+            .playback
+            .get()
+            .map_or(MIN_BUFFER_MS, |playback| playback.buffer_ms())
+    }
+
+    /// Where the pipeline is, in broadcast milliseconds; `0` when unknown.
+    #[must_use]
+    pub fn live_edge_ms(&self) -> u64 {
+        self.0.live_edge_ms.get()
+    }
+
+    /// Whether this lane is at the live edge, and so is queued ahead of a lane
+    /// that is catching up.
     ///
-    /// `window_start_ms` is the oldest position the pipeline can still serve;
-    /// `0` means it is not known yet (no segment has been published, or the
-    /// runtime is gone), which never starves a lane. A position the window has
-    /// moved past is [`LaneState::Starved`], and `notes/riffle.md` says the
-    /// media lane clamps it forward and reports that through `StreamStarted`.
-    const fn state(&self, window_start_ms: u64) -> LaneState {
-        // `Paused` is not produced: it means "feeding, but the client's buffer
-        // is full", and nothing is filling a buffer yet. The media lane will
-        // report it once `buffered_ahead_ms` is real.
-        if window_start_ms > 0 && self.reported_ms < window_start_ms {
-            LaneState::Starved
-        } else {
-            LaneState::Attached
+    /// A pipeline with no published segment yet has no edge to be behind, so a
+    /// lane on it counts as an edge lane: there is nothing to demote it below.
+    #[must_use]
+    pub fn at_edge(&self, now: Instant) -> bool {
+        let edge = self.0.live_edge_ms.get();
+        edge == 0 || edge.saturating_sub(self.playhead_ms(now)) <= EDGE_MARGIN_MS
+    }
+
+    /// The push rule: send while the last thing sent is still inside the
+    /// client's buffer.
+    ///
+    /// `true` before anything has been sent, because an empty buffer is never
+    /// full. At the live edge this reduces to "forward on arrival": the rule
+    /// compares against a playhead moving at real time and a send position that
+    /// cannot pass the edge, because the data does not exist yet.
+    #[must_use]
+    pub fn may_send(&self, now: Instant) -> bool {
+        if !self.has_sent() {
+            return true;
         }
+        self.sent_ms()
+            < self
+                .playhead_ms(now)
+                .saturating_add(u64::from(self.buffer_ms()))
+    }
+
+    /// Whether any access unit has been handed to the sender yet.
+    #[must_use]
+    pub fn has_sent(&self) -> bool {
+        self.0.sent_any[0].get() || self.0.sent_any[1].get()
+    }
+
+    /// Whether this track has already received an access unit at or after
+    /// `media_ms` — i.e. whether this one is part of a window being replayed.
+    ///
+    /// A paused lane re-registers against the retained window so it can pick up
+    /// where it stopped, and that window starts before what it has already
+    /// sent. Those units are neither dropped nor sent again.
+    #[must_use]
+    pub fn already_sent(&self, track: Track, media_ms: u64) -> bool {
+        let index = slot(track);
+        self.0.sent_any[index].get() && media_ms <= self.0.sent_ms[index].get()
+    }
+
+    /// An access unit this far behind the playhead is superseded and skipped
+    /// whole — the datamosh drop (`notes/riffle.md`, "Video: unreliable ordered").
+    ///
+    /// The margin is a moment, not a GOP: an AU that just went by is the one the
+    /// client is about to present, and dropping it would stutter far more often
+    /// than it saves a byte. One second of slack covers a report interval and a
+    /// segment's jitter without ever shipping a whole segment of the past.
+    #[must_use]
+    pub fn superseded(&self, media_ms: u64, now: Instant) -> bool {
+        media_ms.saturating_add(SUPERSEDE_MARGIN_MS) < self.playhead_ms(now)
+    }
+
+    /// The newest media timestamp handed to the sender, across both tracks.
+    #[must_use]
+    pub fn sent_ms(&self) -> u64 {
+        self.0.sent_ms[0].get().max(self.0.sent_ms[1].get())
+    }
+
+    /// What was pushed past the playhead, for `LaneView::buffered_ahead_ms`.
+    #[must_use]
+    pub fn buffered_ahead_ms(&self, now: Instant) -> u64 {
+        self.sent_ms().saturating_sub(self.playhead_ms(now))
+    }
+
+    /// Counts one access unit handed to the carrier.
+    pub fn note_sent(&self, track: Track, media_ms: u64) {
+        let index = slot(track);
+        self.0.sent_ms[index].set(media_ms);
+        self.0.sent_any[index].set(true);
+    }
+
+    /// Counts one access unit skipped because the playhead had already passed
+    /// it.
+    pub fn note_drop(&self, track: Track, now: Instant) {
+        match track {
+            Track::Video => self
+                .0
+                .dropped_video
+                .set(self.0.dropped_video.get().saturating_add(1)),
+            Track::Audio => self
+                .0
+                .dropped_audio
+                .set(self.0.dropped_audio.get().saturating_add(1)),
+        }
+        self.0.last_drop.set(Some(now));
+    }
+
+    #[must_use]
+    pub fn dropped_video(&self) -> u32 {
+        self.0.dropped_video.get()
+    }
+
+    #[must_use]
+    pub fn dropped_audio(&self) -> u32 {
+        self.0.dropped_audio.get()
+    }
+
+    /// Milliseconds since the last object of any class was dropped, or
+    /// [`ConnStats::last_drop_age_ms`]'s sentinel.
+    #[must_use]
+    pub fn last_drop_age_ms(&self, now: Instant) -> u32 {
+        self.0.last_drop.get().map_or(u32::MAX, |at| {
+            let elapsed = now.saturating_duration_since(at).as_millis();
+            u32::try_from(elapsed).unwrap_or(u32::MAX)
+        })
+    }
+
+    fn write(&self, playback: Playback, live_edge_ms: u64) {
+        self.0.playback.set(Some(playback));
+        self.0.live_edge_ms.set(live_edge_ms);
+    }
+}
+
+/// How far behind the playhead an access unit is still worth sending.
+const SUPERSEDE_MARGIN_MS: u64 = 1_000;
+
+/// One attached lane's state.
+pub struct Lane {
+    /// The pipeline this lane watches.
+    key: StreamKey,
+    /// The playback estimate and the counters, shared with the producer task.
+    handle: LaneHandle,
+    /// Unix milliseconds when the lane was opened.
+    started_ms: u64,
+}
+
+impl Lane {
+    /// Where the daemon thinks the client is: the reported position, advanced by
+    /// the reported rate over the elapsed time.
+    #[must_use]
+    pub fn playhead_ms(&self, now: Instant) -> u64 {
+        self.handle.playhead_ms(now)
+    }
+
+    /// The client's position as it last reported it.
+    #[must_use]
+    pub fn position_ms(&self) -> u64 {
+        self.handle
+            .playback()
+            .map_or(0, |playback| playback.position_ms())
+    }
+
+    /// The state the row shows.
+    ///
+    /// `Paused` is real now: it means the producer has pushed the whole of the
+    /// client's buffer and is waiting for the playhead to advance.
+    #[must_use]
+    pub fn state(&self, now: Instant, window_start_ms: u64) -> LaneState {
+        if window_start_ms > 0 && self.position_ms() < window_start_ms {
+            return LaneState::Starved;
+        }
+        let buffer = u64::from(self.handle.buffer_ms());
+        if buffer > 0 && self.handle.buffered_ahead_ms(now) >= buffer {
+            return LaneState::Paused;
+        }
+        LaneState::Attached
     }
 
     #[must_use]
     pub fn view(&self, now: Instant, window_start_ms: u64) -> LaneView {
         LaneView {
             key: self.key.clone(),
-            state: self.state(window_start_ms),
-            position_ms: self.reported_ms,
+            state: self.state(now, window_start_ms),
+            position_ms: self.position_ms(),
             playhead_ms: self.playhead_ms(now),
-            // Nothing is being pushed yet, so nothing is ahead of the playhead.
-            // The media lane fills this from what it has sent per lane.
-            buffered_ahead_ms: 0,
-            rate: self.rate,
-            // Whole-AU drops are a property of the carrier, and there is no
-            // carrier yet.
-            dropped_video: 0,
-            dropped_audio: 0,
-            recovering: false,
+            buffered_ahead_ms: self.handle.buffered_ahead_ms(now),
+            rate: self
+                .handle
+                .playback()
+                .map_or(1.0, |playback| playback.rate()),
+            dropped_video: self.handle.dropped_video(),
+            dropped_audio: self.handle.dropped_audio(),
+            // A video drop inside one GOP's worth of time is what "recovering"
+            // means: the picture smears for about that long and then heals at an
+            // IDR (`notes/riffle.md`, "Video: unreliable ordered").
+            recovering: self.handle.dropped_video() > 0
+                && self.handle.last_drop_age_ms(now) < u32::try_from(RECOVERY_MS).unwrap_or(0),
             started_ms: self.started_ms,
         }
     }
@@ -124,38 +371,47 @@ pub struct Lanes {
 impl Lanes {
     /// Attaches a lane, or updates the one already attached: re-opening a key
     /// is idempotent. `position_ms` is the caller's resolved position, already
-    /// mapped from the reported `PlaybackPosition`.
+    /// mapped from the reported `PlaybackPosition`, and `live_edge_ms` is where
+    /// the pipeline is right now (`0` when it has published nothing).
     ///
-    /// `true` means the key was new, so the caller has to attach the pipeline.
+    /// `true` means the key was new, so the caller has to attach the pipeline
+    /// and spawn the lane's producer.
     pub fn open(
         &mut self,
         key: StreamKey,
         playback: StreamPlayback,
         position_ms: u64,
+        live_edge_ms: u64,
         now: Instant,
         wall_ms: u64,
     ) -> bool {
-        let rate = sanitise_rate(playback.rate);
-        let buffer_ms = playback.buffer_ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS);
+        let state = Playback {
+            reported_ms: position_ms,
+            rate: sanitise_rate(playback.rate),
+            buffer_ms: playback.buffer_ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS),
+            at: now,
+        };
         if let Some(lane) = self.lanes.get_mut(&key) {
-            lane.reported_ms = position_ms;
-            lane.rate = rate;
-            lane.buffer_ms = buffer_ms;
-            lane.at = now;
+            lane.handle.write(state, live_edge_ms);
             return false;
         }
+        let handle = LaneHandle::default();
+        handle.write(state, live_edge_ms);
         self.lanes.insert(
             key.clone(),
             Lane {
                 key,
-                reported_ms: position_ms,
-                rate,
-                buffer_ms,
-                at: now,
+                handle,
                 started_ms: wall_ms,
             },
         );
         true
+    }
+
+    /// One lane's shared state, for the task that feeds it.
+    #[must_use]
+    pub fn handle(&self, key: &StreamKey) -> Option<LaneHandle> {
+        self.lanes.get(key).map(|lane| lane.handle.clone())
     }
 
     #[must_use]
@@ -202,6 +458,33 @@ impl Lanes {
     pub fn iter(&self) -> impl Iterator<Item = &StreamKey> {
         self.lanes.keys()
     }
+
+    /// The connection's drop counters, summed over its lanes.
+    ///
+    /// Datamosh makes drops normal, so they are reported: without them "smearing
+    /// because the link is lossy" is indistinguishable from "smearing because
+    /// something is broken" (`notes/riffle.md`, "Telemetry"). Datagram send
+    /// failures are the carrier's, not a lane's, and the caller adds them.
+    #[must_use]
+    pub fn stats(&self, now: Instant) -> ConnStats {
+        let mut stats = ConnStats {
+            // Nothing has been dropped yet, which is what the sentinel means.
+            last_drop_age_ms: u32::MAX,
+            ..ConnStats::default()
+        };
+        for lane in self.lanes.values() {
+            stats.dropped_video = stats
+                .dropped_video
+                .saturating_add(lane.handle.dropped_video());
+            stats.dropped_audio = stats
+                .dropped_audio
+                .saturating_add(lane.handle.dropped_audio());
+            stats.last_drop_age_ms = stats
+                .last_drop_age_ms
+                .min(lane.handle.last_drop_age_ms(now));
+        }
+        stats
+    }
 }
 
 /// A rate from the wire, clamped to what the estimate can use.
@@ -240,6 +523,7 @@ mod tests {
             key(7),
             playback(PlaybackPosition::Absolute { pts_ms: 10_000 }, 1.0, 30_000),
             10_000,
+            0,
             start,
             1_000,
         );
@@ -255,6 +539,7 @@ mod tests {
             key(7),
             playback(PlaybackPosition::Absolute { pts_ms: 10_000 }, 0.5, 30_000),
             10_000,
+            0,
             start,
             1_000,
         );
@@ -268,6 +553,7 @@ mod tests {
             key(7),
             playback(PlaybackPosition::Absolute { pts_ms: 20_000 }, 1.0, 30_000),
             20_000,
+            0,
             rate_two,
             1_000,
         );
@@ -287,12 +573,14 @@ mod tests {
             key(7),
             playback(PlaybackPosition::Live, 1.0, 30_000),
             5_000,
+            5_000,
             start,
             1_000,
         ));
         assert!(!lanes.open(
             key(7),
             playback(PlaybackPosition::Absolute { pts_ms: 1_000 }, 2.0, 60_000),
+            1_000,
             1_000,
             start,
             2_000,
@@ -311,6 +599,7 @@ mod tests {
         lanes.open(
             key(7),
             playback(PlaybackPosition::Live, 1.0, 30_000),
+            0,
             0,
             Instant::now(),
             1_000,
@@ -333,6 +622,7 @@ mod tests {
             key(7),
             playback(PlaybackPosition::Absolute { pts_ms: 10_000 }, 1.0, 30_000),
             10_000,
+            0,
             start,
             1_000,
         );
@@ -359,20 +649,166 @@ mod tests {
             key(7),
             playback(PlaybackPosition::Live, f32::NAN, 0),
             0,
+            0,
             start,
             1_000,
         );
         let view = lanes.view(&key(7), start, 0).unwrap();
         assert_eq!(view.rate, 1.0);
-        assert_eq!(lanes.lanes[&key(7)].buffer_ms, MIN_BUFFER_MS);
+        assert_eq!(lanes.handle(&key(7)).unwrap().buffer_ms(), MIN_BUFFER_MS);
 
         lanes.open(
             key(7),
             playback(PlaybackPosition::Live, 1.0, u32::MAX),
             0,
+            0,
             start,
             1_000,
         );
-        assert_eq!(lanes.lanes[&key(7)].buffer_ms, MAX_BUFFER_MS);
+        assert_eq!(lanes.handle(&key(7)).unwrap().buffer_ms(), MAX_BUFFER_MS);
+    }
+
+    /// The push rule, read off the handle exactly as the producer reads it.
+    #[test]
+    fn the_push_rule_stops_at_the_buffer_and_resumes_when_the_playhead_advances() {
+        let start = Instant::now();
+        let mut lanes = Lanes::default();
+        lanes.open(
+            key(7),
+            playback(PlaybackPosition::Absolute { pts_ms: 0 }, 1.0, 1_000),
+            0,
+            0,
+            start,
+            1_000,
+        );
+        let handle = lanes.handle(&key(7)).unwrap();
+
+        assert!(handle.may_send(start), "an empty buffer is never full");
+        handle.note_sent(Track::Video, 999);
+        assert!(handle.may_send(start), "inside the buffer");
+        handle.note_sent(Track::Video, 1_000);
+        assert!(!handle.may_send(start), "the buffer is full");
+
+        // A second of playback opens a second of buffer.
+        let later = start + Duration::from_secs(1);
+        assert!(handle.may_send(later));
+        assert_eq!(handle.buffered_ahead_ms(later), 0);
+        handle.note_sent(Track::Video, 1_500);
+        assert_eq!(handle.buffered_ahead_ms(later), 500);
+        // An access unit the replay window hands back is not sent twice.
+        assert!(handle.already_sent(Track::Video, 900));
+        assert!(!handle.already_sent(Track::Video, 1_501));
+        assert!(!handle.already_sent(Track::Audio, 0));
+    }
+
+    /// An access unit the playhead has already passed is superseded, and it is
+    /// counted on the track it was dropped from.
+    #[test]
+    fn an_access_unit_behind_the_playhead_is_superseded() {
+        let start = Instant::now();
+        let mut lanes = Lanes::default();
+        lanes.open(
+            key(7),
+            playback(PlaybackPosition::Absolute { pts_ms: 10_000 }, 1.0, 30_000),
+            10_000,
+            0,
+            start,
+            1_000,
+        );
+        let handle = lanes.handle(&key(7)).unwrap();
+
+        assert!(!handle.superseded(10_000, start));
+        assert!(
+            !handle.superseded(9_500, start),
+            "a moment behind is on time"
+        );
+        assert!(handle.superseded(8_000, start));
+
+        handle.note_drop(Track::Video, start);
+        handle.note_drop(Track::Video, start);
+        handle.note_drop(Track::Audio, start);
+        assert_eq!(handle.dropped_video(), 2);
+        assert_eq!(handle.dropped_audio(), 1);
+
+        let view = lanes.view(&key(7), start, 0).unwrap();
+        assert_eq!(view.dropped_video, 2);
+        assert_eq!(view.dropped_audio, 1);
+        assert!(view.recovering, "a video drop now is a smear now");
+        let after = start + Duration::from_secs(RECOVERY_MS / 1_000 + 1);
+        assert!(!lanes.view(&key(7), after, 0).unwrap().recovering);
+    }
+
+    /// The connection's stats are the lanes' counters summed, and a lane that
+    /// has not dropped anything does not make the connection look recovering.
+    #[test]
+    fn the_connection_stats_sum_the_lanes() {
+        let start = Instant::now();
+        let mut lanes = Lanes::default();
+        assert_eq!(lanes.stats(start).last_drop_age_ms, u32::MAX);
+        assert!(!lanes.stats(start).recovering());
+
+        lanes.open(
+            key(7),
+            playback(PlaybackPosition::Live, 1.0, 30_000),
+            0,
+            0,
+            start,
+            1_000,
+        );
+        lanes.open(
+            key(8),
+            playback(PlaybackPosition::Live, 1.0, 30_000),
+            0,
+            0,
+            start,
+            1_000,
+        );
+        lanes
+            .handle(&key(7))
+            .unwrap()
+            .note_drop(Track::Video, start);
+        lanes
+            .handle(&key(8))
+            .unwrap()
+            .note_drop(Track::Audio, start);
+
+        let stats = lanes.stats(start);
+        assert_eq!(stats.dropped_video, 1);
+        assert_eq!(stats.dropped_audio, 1);
+        assert_eq!(stats.last_drop_age_ms, 0);
+        assert!(stats.recovering(), "a video drop a moment ago");
+    }
+
+    /// A lane with everything it was sent is paused, not attached: that is what
+    /// the producer's stop looks like from the UI.
+    #[test]
+    fn a_full_buffer_reads_as_paused() {
+        let start = Instant::now();
+        let mut lanes = Lanes::default();
+        lanes.open(
+            key(7),
+            playback(PlaybackPosition::Absolute { pts_ms: 0 }, 1.0, 1_000),
+            0,
+            0,
+            start,
+            1_000,
+        );
+        lanes
+            .handle(&key(7))
+            .unwrap()
+            .note_sent(Track::Video, 1_000);
+        assert_eq!(
+            lanes.view(&key(7), start, 0).unwrap().state,
+            LaneState::Paused
+        );
+        assert_eq!(
+            lanes.view(&key(7), start, 0).unwrap().buffered_ahead_ms,
+            1_000
+        );
+        // Starvation outranks a full buffer: nothing can be sent at all.
+        assert_eq!(
+            lanes.view(&key(7), start, 1).unwrap().state,
+            LaneState::Starved
+        );
     }
 }

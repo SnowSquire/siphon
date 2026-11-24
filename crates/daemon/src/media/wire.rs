@@ -1,10 +1,11 @@
 //! From a segment's bytes to the Riffle media objects.
 //!
-//! This is the seam the transport will sit on. A [`SegmentSource`] demuxes one
-//! HLS segment with whichever container it is — MPEG-TS through [`crate::media::ts`],
-//! fMP4 through [`crate::media::fmp4`] — and yields access units in file order;
-//! a [`Packer`] turns each one into the [`Object`]s the media lane ships. There
-//! is no socket, task or QUIC here: the carrier is a later task's job.
+//! A [`SegmentSource`] demuxes one HLS segment with whichever container it is —
+//! MPEG-TS through [`crate::media::ts`], fMP4 through [`crate::media::fmp4`] —
+//! and yields access units in file order; a [`Packer`] turns each one into the
+//! [`Object`]s the media lane ships. There is no socket, task or QUIC here: the
+//! lane ([`crate::media::lane`]) owns the demuxer for its lane, the packer for
+//! its lane, and the carrier.
 //!
 //! # The payload prefix
 //!
@@ -19,8 +20,17 @@
 //! The prefix is part of `total_len`, so it fragments like any other payload
 //! byte and reassembly is the plain concatenation of the fragments in
 //! `frag_offset` order. The first fragment always holds the whole prefix
-//! because the budget ([`FRAGMENT_PAYLOAD`]) is far above 16; [`timestamps`]
-//! reads it back.
+//! because the budget is far above 16; [`timestamps`] reads it back.
+//!
+//! # The budget
+//!
+//! The fragment payload is not a constant: QUIC's [`Datagrams::max_size`] is the
+//! application budget of one DATAGRAM frame on the current path, and it is
+//! smaller over a loopback handshake than [`DATAGRAM_BUDGET`] assumes. A
+//! [`Packer`] is therefore built from that number and re-sized when the path
+//! changes; packing against a constant sends datagrams the carrier refuses.
+//!
+//! [`Datagrams::max_size`]: siphon_shared::riffle::quic::Datagrams::max_size
 //!
 //! # Inputs
 //!
@@ -52,9 +62,16 @@ pub const TIMESTAMP_PREFIX: usize = 16;
 /// AEAD overhead, so this number is the *application* datagram and nothing
 /// above it is free. Sizing the payload at 1200 instead put 1218 bytes on the
 /// wire, which cannot fit a 1280-byte path once QUIC frames it.
+///
+/// This is the **reference** budget: the real one is
+/// [`siphon_shared::riffle::quic::Datagrams::max_size`], which is per path and moves with
+/// PMTU discovery. [`Packer`] is always built from that.
 pub const DATAGRAM_BUDGET: usize = 1200;
 
-/// Payload bytes per datagram: the budget less the header.
+/// Payload bytes per datagram at [`DATAGRAM_BUDGET`]: the budget less the
+/// header. The packer is driven by a carrier's budget, so this is the reference
+/// figure the tests pack against, not something the media path may assume.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const FRAGMENT_PAYLOAD: usize = DATAGRAM_BUDGET - DATAGRAM_HEADER;
 
 /// The container a segment is in.
@@ -118,11 +135,32 @@ pub struct AccessUnit<'a> {
     pub pts: i64,
     /// Decode time, in the track's timescale.
     pub dts: i64,
+    /// Ticks of the track's own clock per second: 90 000 for MPEG-TS, the
+    /// `mdhd` timescale for fMP4. Video and audio tracks may differ, which is
+    /// why this rides on the access unit rather than being a constant.
+    pub timescale: u32,
     /// A random access point, as the elementary stream says (an IDR for H.264,
     /// any IRAP for H.265).
     pub keyframe: bool,
     /// The bytes to ship: Annex B for video, one raw AAC frame for audio.
     pub data: &'a [u8],
+}
+
+impl AccessUnit<'_> {
+    /// Presentation time on the broadcast's millisecond timeline.
+    ///
+    /// This is what the push rule and the supersede check compare: the lane's
+    /// playhead is in milliseconds and the container's clock is not.
+    /// A timestamp before zero (an fMP4 edit list can produce one) is `0`.
+    #[must_use]
+    pub fn pts_ms(&self) -> u64 {
+        if self.timescale == 0 {
+            return 0;
+        }
+        let ticks = i128::from(self.pts.max(0));
+        let ms = ticks * 1000 / i128::from(self.timescale);
+        u64::try_from(ms).unwrap_or(0)
+    }
 }
 
 /// Why a segment could not be turned into access units, or an access unit into
@@ -132,6 +170,7 @@ pub struct AccessUnit<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// [`Container::detect`] matched neither container.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[error("unknown segment container")]
     UnknownContainer,
     /// An fMP4 media segment was handed over without its init segment.
@@ -202,6 +241,7 @@ impl SegmentSource {
     ///
     /// [`Error::UnknownContainer`], plus everything [`SegmentSource::new`] and
     /// [`SegmentSource::feed`] return.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(segment: &[u8], init: Option<&[u8]>) -> Result<Self, Error> {
         let container = Container::detect(segment).ok_or(Error::UnknownContainer)?;
         let mut source = Self::new(container, init)?;
@@ -250,11 +290,15 @@ impl SegmentSource {
     /// The access units of the last fed segment, in demux order.
     #[must_use]
     pub const fn access_units(&self) -> AccessUnits<'_> {
-        let samples = match &self.inner {
-            Inner::Ts { store, .. } => Samples::Ts(store),
-            Inner::Fmp4 { store, .. } => Samples::Fmp4(store),
+        let (samples, timescales) = match &self.inner {
+            Inner::Ts { store, .. } => (Samples::Ts(store), Timescales::Ts),
+            Inner::Fmp4 { demuxer, store } => (Samples::Fmp4(store), Timescales::Fmp4(demuxer)),
         };
-        AccessUnits { samples, index: 0 }
+        AccessUnits {
+            samples,
+            timescales,
+            index: 0,
+        }
     }
 }
 
@@ -263,9 +307,26 @@ enum Samples<'a> {
     Fmp4(&'a fmp4::SampleStore),
 }
 
+/// The clock each sample is timed in.
+enum Timescales<'a> {
+    /// MPEG-TS PES timestamps are 90 kHz for every stream.
+    Ts,
+    Fmp4(&'a fmp4::Fmp4Demuxer),
+}
+
+impl Timescales<'_> {
+    fn of(&self, track: u32) -> u32 {
+        match self {
+            Self::Ts => ts::TIMESCALE,
+            Self::Fmp4(demuxer) => demuxer.timescale(track).unwrap_or(ts::TIMESCALE),
+        }
+    }
+}
+
 /// The access units of one fed segment.
 pub struct AccessUnits<'a> {
     samples: Samples<'a>,
+    timescales: Timescales<'a>,
     index: usize,
 }
 
@@ -286,22 +347,26 @@ impl<'a> Iterator for AccessUnits<'a> {
         match &self.samples {
             Samples::Ts(store) => {
                 let sample = *store.samples().get(self.index)?;
+                let timescale = self.timescales.of(0);
                 self.index += 1;
                 Some(AccessUnit {
                     track: track(sample.is_video()),
                     pts: sample.pts(),
                     dts: sample.dts(),
+                    timescale,
                     keyframe: sample.keyframe(),
                     data: store.data(sample),
                 })
             }
             Samples::Fmp4(store) => {
                 let sample = *store.samples().get(self.index)?;
+                let timescale = self.timescales.of(sample.track());
                 self.index += 1;
                 Some(AccessUnit {
                     track: track(sample.is_video()),
                     pts: sample.pts(),
                     dts: sample.dts(),
+                    timescale,
                     keyframe: sample.keyframe(),
                     data: store.data(sample),
                 })
@@ -325,6 +390,9 @@ const fn track(video: bool) -> Track {
 ///
 /// `None` means fewer than [`TIMESTAMP_PREFIX`] bytes were passed, which only a
 /// fragment other than the first can be.
+// Nothing in the daemon reads a timestamp back — the receiver is the UI — so the
+// test build is what keeps this honest.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub fn timestamps(payload: &[u8]) -> Option<(i64, i64)> {
     let pts = payload.get(..8)?;
@@ -335,34 +403,64 @@ pub fn timestamps(payload: &[u8]) -> Option<(i64, i64)> {
     ))
 }
 
-/// One lane's object ids.
+/// One lane's object ids and fragment size.
 ///
 /// `obj_id` is monotonic for the life of a Riffle connection and never reset
 /// (`notes/riffle.md`, "One header"), so the packer that fills one lane owns
 /// the counter. A connection with several lanes either shares one packer or
 /// seeds the others with [`Packer::from_id`]/[`Packer::next_id`].
-#[derive(Debug, Default)]
+///
+/// The fragment size comes from the transport, not from a constant: build the
+/// packer with the carrier's [`siphon_shared::riffle::quic::Datagrams::max_size`] and
+/// resize it when the path's budget moves.
+#[derive(Debug)]
 pub struct Packer {
     next_id: u64,
+    /// Payload bytes one fragment may carry.
+    payload: usize,
+}
+
+impl Default for Packer {
+    fn default() -> Self {
+        Self::new(DATAGRAM_BUDGET)
+    }
 }
 
 impl Packer {
-    /// A packer whose first object is id 0.
+    /// A packer whose first object is id 0 and whose datagrams may be
+    /// `datagram_budget` bytes on the wire.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { next_id: 0 }
+    pub const fn new(datagram_budget: usize) -> Self {
+        Self::from_id(0, datagram_budget)
     }
 
     /// A packer that continues at `next_id`.
     #[must_use]
-    pub const fn from_id(next_id: u64) -> Self {
-        Self { next_id }
+    pub const fn from_id(next_id: u64, datagram_budget: usize) -> Self {
+        Self {
+            next_id,
+            payload: payload_of(datagram_budget),
+        }
     }
 
     /// The id the next object will carry.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub const fn next_id(&self) -> u64 {
         self.next_id
+    }
+
+    /// Payload bytes each fragment may carry right now.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub const fn fragment_payload(&self) -> usize {
+        self.payload
+    }
+
+    /// Follow the carrier's budget: it moves with path-MTU discovery, so this
+    /// is re-applied rather than read once for the life of the connection.
+    pub const fn set_datagram_budget(&mut self, datagram_budget: usize) {
+        self.payload = payload_of(datagram_budget);
     }
 
     /// Turn one access unit into its fragments, written into `scratch`.
@@ -409,10 +507,23 @@ impl Packer {
             },
             obj_id,
             total_len,
-            remaining: fragment_count(total_len, FRAGMENT_PAYLOAD),
+            remaining: fragment_count(total_len, self.payload),
+            payload_size: self.payload,
             frag_offset: 0,
             payload: scratch,
         })
+    }
+}
+
+/// Payload bytes per fragment: the datagram budget less the object header.
+///
+/// A budget below the header leaves one byte, so a mis-sized carrier cannot
+/// produce a zero-length fragment and divide by zero in
+/// [`fragment_count`].
+const fn payload_of(datagram_budget: usize) -> usize {
+    match datagram_budget.checked_sub(DATAGRAM_HEADER) {
+        Some(payload) if payload > 0 => payload,
+        _ => 1,
     }
 }
 
@@ -423,6 +534,8 @@ pub struct Fragments<'a> {
     obj_id: u64,
     total_len: u32,
     remaining: u32,
+    /// Payload bytes per fragment, as the packer was built.
+    payload_size: usize,
     frag_offset: u32,
     payload: &'a [u8],
 }
@@ -437,7 +550,9 @@ impl<'a> Iterator for Fragments<'a> {
         // `total_len` is past the prefix and inside `MAX_OBJECT`, so the
         // offset and the fragment length both fit their header fields.
         let start = usize::try_from(self.frag_offset).ok()?;
-        let end = start.checked_add(FRAGMENT_PAYLOAD)?.min(self.payload.len());
+        let end = start
+            .checked_add(self.payload_size)?
+            .min(self.payload.len());
         let payload = self.payload.get(start..end)?;
         let len = u32::try_from(payload.len()).ok()?;
 
@@ -555,7 +670,7 @@ mod tests {
                 );
                 assert_ne!(object.payload.len(), 0, "a fragment carries bytes");
                 assert!(
-                    object.payload.len() <= FRAGMENT_PAYLOAD,
+                    object.payload.len() <= packer.fragment_payload(),
                     "a fragment is {} bytes, past the budget",
                     object.payload.len()
                 );
@@ -598,7 +713,7 @@ mod tests {
 
             assert_eq!(
                 emitted,
-                fragment_count(total_len, FRAGMENT_PAYLOAD),
+                fragment_count(total_len, packer.fragment_payload()),
                 "the packer agrees with fragment_count exactly"
             );
             assert_eq!(
@@ -650,10 +765,11 @@ mod tests {
             track: Track::Video,
             pts: 90_001,
             dts: 89_999,
+            timescale: ts::TIMESCALE,
             keyframe: true,
             data: &[0, 0, 0, 1, 0x65, 1, 2, 3],
         };
-        let mut packer = Packer::new();
+        let mut packer = Packer::new(DATAGRAM_BUDGET);
         let mut scratch = Vec::new();
 
         let objects: Vec<_> = packer.pack(unit, &mut scratch).unwrap().collect();
@@ -676,6 +792,7 @@ mod tests {
             track: Track::Audio,
             pts: 1,
             dts: 1,
+            timescale: ts::TIMESCALE,
             keyframe: true,
             data: &[0xAA; 400],
         };
@@ -693,10 +810,11 @@ mod tests {
             track: Track::Video,
             pts: 1,
             dts: 2,
+            timescale: ts::TIMESCALE,
             keyframe: true,
             data: &data,
         };
-        let mut packer = Packer::new();
+        let mut packer = Packer::new(DATAGRAM_BUDGET);
         let mut scratch = Vec::new();
         let objects: Vec<_> = packer.pack(unit, &mut scratch).unwrap().collect();
 
@@ -739,10 +857,11 @@ mod tests {
             track: Track::Video,
             pts: 0,
             dts: 0,
+            timescale: ts::TIMESCALE,
             keyframe: true,
             data: &data,
         };
-        let mut packer = Packer::from_id(7);
+        let mut packer = Packer::from_id(7, DATAGRAM_BUDGET);
         let mut scratch = Vec::new();
         assert!(matches!(
             packer.pack(unit, &mut scratch),
@@ -777,7 +896,7 @@ mod tests {
 
         let source = SegmentSource::open(&bytes, None).expect("the TS segment demuxes");
         assert_eq!(source.container(), Container::Ts);
-        let mut packer = Packer::new();
+        let mut packer = Packer::new(DATAGRAM_BUDGET);
         let mut scratch = Vec::new();
         let report = pack_all(&source, &mut packer, &mut scratch);
         print_report("servermock/live/000000.ts", &report);
@@ -819,7 +938,7 @@ mod tests {
 
         let source = SegmentSource::open(&segment, Some(&init)).expect("the fMP4 segment demuxes");
         assert_eq!(source.container(), Container::Fmp4);
-        let mut packer = Packer::new();
+        let mut packer = Packer::new(DATAGRAM_BUDGET);
         let mut scratch = Vec::new();
         let report = pack_all(&source, &mut packer, &mut scratch);
         print_report("servermock-fmp4/landscape/live/000000.m4s", &report);
@@ -851,7 +970,7 @@ mod tests {
         assert_eq!(Container::detect(&segment), Some(Container::Fmp4));
 
         let source = SegmentSource::open(&segment, Some(&init)).expect("the fMP4 segment demuxes");
-        let mut packer = Packer::new();
+        let mut packer = Packer::new(DATAGRAM_BUDGET);
         let mut scratch = Vec::new();
         let report = pack_all(&source, &mut packer, &mut scratch);
         print_report("ozeniken/1795300590544.m4s", &report);

@@ -12,6 +12,8 @@ use crate::media::h264::H264Config;
 
 pub const TS_PACKET: usize = 188;
 pub const TS_SYNC: u8 = 0x47;
+/// MPEG-TS PES timestamps are 90 kHz for every stream, video and audio alike.
+pub const TIMESCALE: u32 = 90_000;
 const PID_PAT: u16 = 0x0000;
 const STREAM_TYPE_H264: u8 = 0x1B;
 const STREAM_TYPE_AAC: u8 = 0x0F;

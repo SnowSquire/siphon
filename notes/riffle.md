@@ -1,15 +1,18 @@
 # Riffle: the daemon↔UI protocol
 
-Status: Part I is designed and the *lane control plane* is built — the
-per-connection state machine behind `StreamOpen`/`StreamUpdate`/`StreamClose`/
-`StreamSeek`, the playhead estimate and the `LaneView` rows. There is still no
-packet transport, no demuxer wiring and no GOP alignment: the carrier's datagram
-channel exists (below), but nothing fragments an access unit into it. RTSP is
-gone — `play`, the RTSP listener and the RTP packetizers were removed — so there
-is no viewer path at all until that lands. Parts II and III are implemented, and
-so is the **QUIC carrier for the control plane**: self-signed certificates on
-both sides, a pin per key, mutual authentication against `peers.json` and the
-typed-code pairing that fills it. The ALPN is `riffle/1`.
+Status: Part I is designed and the **media lane is built** — the per-connection
+state machine behind `StreamOpen`/`StreamUpdate`/`StreamClose`/`StreamSeek`, the
+playhead estimate, the `LaneView` rows, and the path that actually pushes media:
+one producer task per lane demuxes the pipeline's segments, packs access units
+into objects and hands them to one datagram sender per connection, which drains
+audio and edge-lane traffic first. What is *not* built yet: GOP alignment on
+join and seek (a lane that opens while the pipeline has no edge waits for the
+next segment), the UI's receiver and decoder, and the zero-copy pipe path. RTSP
+is gone — `play`, the RTSP listener and the RTP packetizers were removed — so the
+only viewer path is this one. Parts II and III are implemented, and so is the
+**QUIC carrier for the control plane**: self-signed certificates on both sides, a
+pin per key, mutual authentication against `peers.json` and the typed-code
+pairing that fills it. The ALPN is `riffle/1`.
 It is one protocol: the RPC is the control plane (`Class::Control`) and media is
 the same framing with media classes, over a carrier that can lose datagrams.
 
@@ -41,19 +44,49 @@ together. That round trip exists only to satisfy RTSP.
 pinned. The pipe is not the second-class path — it is the fast one, and the only
 one that can hand over arena slots.
 
-The datagram channel is built on the QUIC carrier and unused by any packer yet:
-`quic::Datagrams` (`session.datagrams()`) sends, receives and reports the
-payload budget, and both endpoints advertise DATAGRAM in their
-`TransportConfig` (`max_datagram_frame_size` derived from a 256 KiB receive
-buffer, so 65535 on the wire). `max_size()` is quinn's per-path budget — the
-peer's parameter and the current MTU, minus the DATAGRAM frame header and the
-QUIC/IP overhead — 1162 bytes on loopback after a default handshake, so a
-fragmenter sizes from it rather than from a constant. `send` copies the payload
-because quinn frees it only after transmission; `TooLarge` carries the size and
-the budget, `Unsupported` means the peer never advertised DATAGRAM, `Closed`
-means the connection is gone. A QUIC `Client` keeps the same handle
+The datagram channel is what media rides on: `quic::Datagrams`
+(`session.datagrams()`) sends, receives and reports the payload budget, and both
+endpoints advertise DATAGRAM in their `TransportConfig`
+(`max_datagram_frame_size` derived from a 256 KiB receive buffer, so 65535 on the
+wire). `max_size()` is quinn's per-path budget — the peer's parameter and the
+current MTU, minus the DATAGRAM frame header and the QUIC/IP overhead — 1162
+bytes on loopback after a default handshake. **The packer is driven by that
+number, never by a constant**: `media::wire::Packer` is built from it and
+re-reads it per segment, because it moves with PMTU discovery, and the
+loopback figure is below the 1200-byte reference `DATAGRAM_BUDGET` (a fragment
+sized from 1200 is refused by the carrier as `TooLarge`). `send` copies the
+payload because quinn frees it only after transmission; `TooLarge` carries the
+size and the budget, `Unsupported` means the peer never advertised DATAGRAM,
+`Closed` means the connection is gone. A QUIC `Client` keeps the same handle
 (`Client::datagrams()`), so the control stream and the media lane share one
-connection. The pipe has no datagram channel.
+connection. The pipe has no datagram channel: `Conn` carries `Option<Datagrams>`
+and a `StreamOpen` there is refused with `RpcError::NoMediaCarrier` before any
+pipeline is attached. The zero-copy pipe path is still a later task.
+
+## The media lane
+
+Two tasks per connection, and the split is what makes priority decidable in one
+place:
+
+- **a lane producer** per attached lane (`media::lane::LaneProducer`) registers
+  as a spool consumer, reads each published segment into a reusable buffer,
+  demuxes it with `SegmentSource` (TS or fMP4, detected from the bytes; fMP4
+  uses the `EXT-X-MAP` init segment the scheduler delivers as
+  `SegmentMessage::Init`), packs each access unit with a `Packer` and offers the
+  fragments to the sender. One demuxer and one packer per lane, so the MPEG-TS
+  PMT, the fMP4 running decode time and the object ids are per lane.
+- **one media sender** per QUIC connection (`media::lane::MediaSender`) owns the
+  `Datagrams` handle and two bounded queues. Everything that sends a datagram
+  goes through it, so the ordering is in one place: `high` (audio, and video from
+  a lane at the edge) is drained completely before `low` (video from a lane that
+  is catching up). A caught-up burst fills a queue, and the producer waits for
+  room rather than dropping: a fragment of a keyframe is not cheaper than the
+  whole access unit, it is a broken picture.
+
+`StreamOpen` over QUIC attaches the pipeline, spawns the producer and starts the
+sender lazily; `StreamClose`, a closed connection and `Registry::detach` stop
+both. A producer stops when its segment channel closes, which is the same signal
+the scheduler sees: a closed consumer, never a full one.
 
 Only elementary stream crosses either carrier. No MPEG-TS, no fMP4: containers
 exist on disk and inside the fetch path only. The demuxer is incremental and
@@ -140,6 +173,24 @@ daemon, because it has nothing more to send.
 There is no credit protocol and no window on the wire. This rule *is* the flow
 control, which is also why "unlimited lanes" is cheap on the daemon side.
 
+### How it is enforced
+
+`sent_position` is per lane and per track, in broadcast milliseconds: the media
+timestamp of the last access unit handed to the carrier, with the container's
+clock mapped onto the playlist's by a per-track offset taken from the first
+access unit seen. The producer checks the rule before every access unit, and when
+it fails there is no queue to fill: the rest of the segment is dropped and the
+lane's consumer registration is **torn down**, so the scheduler stops dispatching
+and no spool slot is pinned by a lane that is not reading. It waits on a
+computed deadline (capped at 500 ms, so a `StreamUpdate` is noticed) and then
+registers again — with the retained window, because a lane that was paused is
+behind by construction. Access units it already sent are recognised and skipped,
+so the replay neither duplicates nor counts as loss.
+
+That is why `LaneState::Paused` is real now: it is a lane whose producer has
+pushed the whole buffer and is waiting, which is exactly `buffered_ahead_ms >=
+buffer_ms`. `Starved` still outranks it.
+
 ## Video: unreliable ordered, and it never gives up
 
 Drops are whole AUs. A truncated AU is not a broken picture, it is a broken
@@ -159,6 +210,18 @@ Keyframes are one `keyframe` bit — the same fact `AV_PKT_FLAG_KEY` carries, se
 any IRAP including HEVC CRA. The UI drops RASL pictures itself when it starts at a
 CRA; the transport does not model IDR vs CRA vs BLA.
 
+### The supersede drop, as built
+
+An access unit more than a moment behind the playhead is skipped whole and
+counted: `dropped_video` in `LaneView`, summed per lane into `ConnStats`, and
+`recovering` is true while a video drop is inside the last 4 s. The margin is one
+second — an AU that just went by is the one the client is about to present, so
+dropping it would stutter far more often than it saves a byte, and one second of
+slack covers a report interval and a segment's jitter. Nothing else is trimmed:
+an object is shipped or not shipped. Datagram send failures are counted too, on
+`ConnStats::lost`, because a carrier that refuses a datagram is the local half of
+"lost" and has to be visible beside the network's half.
+
 ## Audio
 
 Separate class, same lane, never sharing video's fate. ~400 B per AAC frame, so it
@@ -168,6 +231,9 @@ a round trip, and a round trip is the only thing that could make it late.
 Audio has absolute priority inside the lane: when the congestion window cannot
 carry both, a video AU is dropped. Audio also drives the playback clock; video is
 presented to match it.
+
+Both halves are built: the producer offers every audio fragment twice into the
+high queue, and the sender drains high before low.
 
 ## Seek, join and the window
 
@@ -206,12 +272,23 @@ client's playback modulator nudges each with small rate corrections (0.98–1.02
 which is why a rate change must never cause a burst or a gap.
 
 Edge lanes get strict priority over catching-up lanes. A catch-up has no deadline;
-a live lane does.
+a live lane does. As built, that is one bit at offer time — `Priority::of(class,
+at_edge)`, where `at_edge` is "within 2 s of the newest published segment" — and
+two queues in the connection's sender, drained high first. It is not a scheduler
+and it is not preemptive: an access unit already handed to quinn cannot be
+reordered, which is enough because the only thing that matters is that audio and
+the live lane never queue behind a catch-up burst.
 
 `StreamKey` becomes `{ channel, stream_id, quality }`. The stream id (Twitch's
 `BROADCAST-ID`) is the identity, so a restream is a different stream and an old
 lane never inherits a new broadcast. The channel rides along for attribution,
 because a lane whose broadcast just ended must still be able to name its channel.
+
+Object ids are unique per connection: each lane's packer starts at a disjoint
+range (`lane << 40`), so two lanes can never emit the same `obj_id`. The datagram
+header still carries no lane tag, so a client that watches two lanes on one
+connection has to demultiplex by something else — the next header change is a lane
+id or a per-lane obj_id base the client is told in `StreamConfig`.
 
 ## Blobs and avatars
 

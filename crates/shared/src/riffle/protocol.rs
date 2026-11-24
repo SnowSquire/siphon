@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -67,8 +67,13 @@ impl StreamKey {
 }
 
 /// Where a lane is playing.
+///
+/// Externally tagged, not `#[serde(tag = ...)]`: an internally tagged enum is
+/// deserialized through `deserialize_any`, which postcard refuses
+/// (`WontImplement`), so a tagged version makes every `StreamOpen`/
+/// `StreamUpdate`/`StreamSeek` undecodable on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub enum PlaybackPosition {
     /// The live edge. Never faster than the source, so this is where a viewer
     /// that has caught up sits.
@@ -718,6 +723,9 @@ pub enum RpcError {
     NotFound,
     /// The backend does not implement this query yet.
     Unsupported,
+    /// This connection cannot carry media: the local pipe is control-only, and
+    /// a QUIC peer that did not advertise DATAGRAM cannot be sent a datagram.
+    NoMediaCarrier(String),
     /// A new pipeline would exceed `--max-streams`.
     Capacity,
     /// The backend hit an expected failure (config save, update download, ...).
@@ -732,6 +740,7 @@ impl std::fmt::Display for RpcError {
             Self::BadRequest(message) | Self::Failed(message) => write!(formatter, "{message}"),
             Self::NotFound => formatter.write_str("not found"),
             Self::Unsupported => formatter.write_str("unsupported"),
+            Self::NoMediaCarrier(message) => formatter.write_str(message),
             Self::Capacity => formatter.write_str("stream capacity reached"),
             Self::Disconnected => formatter.write_str("backend disconnected"),
         }

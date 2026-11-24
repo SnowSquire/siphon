@@ -47,6 +47,7 @@ use crate::disk::DiskOutput;
 use crate::downloader::ToDownloader;
 use crate::http::Client;
 use crate::media::dvr::Dvr;
+use crate::media::lane::LaneConsumer;
 use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::metrics::StreamMetrics;
@@ -134,6 +135,13 @@ pub struct Registry {
     gate: Gate,
     /// Where a [`Job`] goes: the app loop's queue, drained every pass.
     jobs: kanal::Sender<Box<JobDone>>,
+    /// Test-only: the next pipeline spawned serves its consumers from here
+    /// instead of a playlist, so the media lane can be fed fixture segments.
+    #[cfg(all(test, not(miri)))]
+    fixture: RefCell<Option<kanal::AsyncReceiver<crate::scheduler::SegmentMessage>>>,
+    /// Test-only: how many consumers that feed currently serves.
+    #[cfg(all(test, not(miri)))]
+    fixture_consumers: Rc<Cell<usize>>,
 }
 
 /// A channel row: the followed preference, the identity, and once fetched, the
@@ -240,6 +248,19 @@ impl StreamRuntime {
         self.recording.borrow().is_some()
     }
 
+    /// Everything a media lane needs to read this pipeline: the registration
+    /// channel and a wake registered with the spools' wake set.
+    ///
+    /// `None` once the scheduler has gone, which is a pipeline that will never
+    /// publish again: a lane opened on it could not be fed, so the caller has to
+    /// fail the open rather than serve a lane that produces nothing.
+    pub fn lane_consumer(&self) -> Option<LaneConsumer> {
+        let slot = self.registration.borrow().clone()?;
+        let wake = ConsumerWake::new();
+        self.wakes.register(&wake);
+        Some(LaneConsumer { slot, wake })
+    }
+
     fn stop(&self) {
         self.stopped.set(true);
         self.dvr.stop();
@@ -323,7 +344,29 @@ impl Registry {
             streams: RefCell::new(HashMap::new()),
             gate: Gate::default(),
             jobs,
+            #[cfg(all(test, not(miri)))]
+            fixture: RefCell::new(None),
+            #[cfg(all(test, not(miri)))]
+            fixture_consumers: Rc::new(Cell::new(0)),
         }
+    }
+
+    /// Test-only: the next pipeline spawned reads from `source` instead of the
+    /// playlist, and reports how many consumers it is serving.
+    ///
+    /// This is the seam the media lane's end-to-end test uses: the registry,
+    /// the app loop, the QUIC carrier and the lane are all real; only the
+    /// segment source is a fixture, which is what a `--debug` run would be.
+    #[cfg(all(test, not(miri)))]
+    pub fn fixture_source(
+        &self,
+    ) -> (
+        kanal::Sender<crate::scheduler::SegmentMessage>,
+        Rc<Cell<usize>>,
+    ) {
+        let (tx, rx) = kanal::unbounded();
+        *self.fixture.borrow_mut() = Some(rx.to_async());
+        (tx, Rc::clone(&self.fixture_consumers))
     }
 
     /// Mirrors the persisted follow list onto the channel table. Called at
@@ -589,6 +632,8 @@ impl Registry {
         let (registration, receive) = kanal::unbounded();
         let reader_wake = ConsumerWake::new();
 
+        #[cfg(all(test, not(miri)))]
+        let feed_receive = receive.clone();
         let scheduler = StreamScheduler::new(
             Rc::clone(&self.client),
             Rc::clone(&self.arena),
@@ -600,6 +645,21 @@ impl Registry {
         )
         .with_live_window(Rc::clone(&live_window))
         .with_metrics(Rc::clone(&metrics));
+        // A test can serve this pipeline's consumers from fixture segments
+        // instead of the playlist, so the media lane is exercised end to end
+        // without an HTTP edge.
+        #[cfg(all(test, not(miri)))]
+        let fixture = self.fixture.borrow_mut().take();
+        #[cfg(all(test, not(miri)))]
+        let fixture_consumers = Rc::clone(&self.fixture_consumers);
+        #[cfg(all(test, not(miri)))]
+        match fixture {
+            Some(source) => {
+                crate::media::lane::spawn_fixture_feed(feed_receive, source, fixture_consumers);
+            }
+            None => compio::runtime::spawn(scheduler.main()).detach(),
+        }
+        #[cfg(not(all(test, not(miri))))]
         compio::runtime::spawn(scheduler.main()).detach();
 
         let runtime = Rc::new(StreamRuntime {

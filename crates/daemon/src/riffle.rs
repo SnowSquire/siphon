@@ -8,6 +8,7 @@
 //! A listener task does one thing — accept — and hands the raw stream to the
 //! loop through a kanal queue.
 
+use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
 use std::time::Instant;
@@ -18,8 +19,10 @@ use compio::buf::IoBufMut;
 use compio::io::AsyncRead;
 use compio::io::AsyncWrite;
 use compio::io::AsyncWriteExt as _;
+use siphon_shared::riffle::ConnStats;
 use siphon_shared::riffle::FrameDecoder;
 use siphon_shared::riffle::ServerMessage;
+use siphon_shared::riffle::StreamKey;
 use siphon_shared::riffle::codec;
 use siphon_shared::riffle::quic;
 use siphon_shared::riffle::quic::PairingWindow;
@@ -31,6 +34,10 @@ use tracing::info;
 use tracing::warn;
 
 use crate::lane::Lanes;
+use crate::media::lane::LaneProducer;
+use crate::media::lane::MediaSender;
+use crate::media::lane::ProducerHandle;
+use crate::media::lane::Sink;
 
 /// The local admin transport: a socket on Unix, a named pipe on Windows.
 #[cfg(unix)]
@@ -104,6 +111,10 @@ impl AsyncWrite for AdminWriter {
 pub struct AdminStream {
     pub reader: AdminReader,
     pub writer: AdminWriter,
+    /// The connection's datagram channel, when it is QUIC. The pipe is a byte
+    /// stream and has none, which is what makes a lane on it a typed refusal
+    /// rather than a silent no-op.
+    pub datagrams: Option<quic::Datagrams>,
     /// Set when the client's key is not in `peers.json`: the connection may
     /// send one `PairConfirm` and nothing else, and is dropped when the
     /// window ends.
@@ -128,16 +139,20 @@ impl AdminStream {
         Self {
             reader: AdminReader::Pipe(Rc::clone(&stream)),
             writer: AdminWriter::Pipe(stream),
+            datagrams: None,
             provisional: None,
         }
     }
 
-    /// One bidirectional QUIC stream.
+    /// One bidirectional QUIC stream, plus the datagram channel of the
+    /// connection it rides on.
     fn quic(session: quic::Session, provisional: Option<Provisional>) -> Self {
+        let datagrams = session.datagrams();
         let (reader, writer) = session.into_stream().split();
         Self {
             reader: AdminReader::Quic(reader),
             writer: AdminWriter::Quic(writer),
+            datagrams: Some(datagrams),
             provisional,
         }
     }
@@ -169,6 +184,17 @@ pub struct Conn {
     /// reader position on one UI: it is not daemon state, and one UI cannot see
     /// or close another's.
     pub lanes: Lanes,
+    /// The datagram channel of a QUIC connection. `None` on the pipe, so a lane
+    /// here cannot be fed and `StreamOpen` fails with a typed error.
+    datagrams: Option<quic::Datagrams>,
+    /// The one task that sends this connection's media, created with the first
+    /// lane. Dropping it (with the connection) ends the sender.
+    media: Option<MediaSender>,
+    /// One producer per attached lane. Dropping a handle stops its producer.
+    producers: HashMap<StreamKey, ProducerHandle>,
+    /// How many lanes this connection has opened, for the disjoint object-id
+    /// range each one gets.
+    lanes_opened: u64,
     /// Set while the connection is a pairing attempt: it may send exactly one
     /// `PairConfirm` and nothing else.
     pub provisional: Option<Provisional>,
@@ -186,8 +212,68 @@ impl Conn {
             ready: false,
             writing: false,
             lanes: Lanes::default(),
+            datagrams: stream.datagrams,
+            media: None,
+            producers: HashMap::new(),
+            lanes_opened: 0,
             provisional: stream.provisional,
         }
+    }
+
+    /// The media sender of this connection, created on first use.
+    ///
+    /// `None` means the carrier cannot send media at all: the local pipe is
+    /// bytes only, and a QUIC peer that never advertised DATAGRAM cannot be
+    /// sent a datagram either. Both are the caller's typed refusal, not a lane
+    /// that silently produces nothing.
+    pub fn media(&mut self) -> Option<MediaSender> {
+        if self.media.is_none() {
+            let datagrams = self.datagrams.clone()?;
+            // A peer without DATAGRAM would fail every send; refuse the lane
+            // instead.
+            datagrams.max_size()?;
+            self.media = Some(MediaSender::spawn(datagrams));
+        }
+        self.media.clone()
+    }
+
+    /// Registers one lane's producer, stopping any producer already there.
+    pub fn start_lane<S: Sink + 'static>(
+        &mut self,
+        key: StreamKey,
+        handle: crate::lane::LaneHandle,
+        consumer: crate::media::lane::LaneConsumer,
+        sink: Rc<S>,
+    ) -> bool {
+        let lane = self.lanes_opened;
+        let Some(producer) = LaneProducer::spawn(key.clone(), handle, consumer, sink, lane) else {
+            return false;
+        };
+        self.lanes_opened = self.lanes_opened.wrapping_add(1);
+        self.producers.insert(key, producer);
+        true
+    }
+
+    /// Stops one lane's producer. Idempotent.
+    pub fn stop_lane(&mut self, key: &StreamKey) {
+        self.producers.remove(key);
+    }
+
+    /// Whether the carrier is QUIC, i.e. whether this connection could carry a
+    /// media lane at all.
+    #[must_use]
+    pub const fn is_quic(&self) -> bool {
+        self.datagrams.is_some()
+    }
+
+    /// This connection's counters: the lanes' drops plus the carrier's refusals.
+    #[must_use]
+    pub fn stats(&self, now: Instant) -> ConnStats {
+        let mut stats = self.lanes.stats(now);
+        if let Some(media) = &self.media {
+            stats.lost = media.stats().failed();
+        }
+        stats
     }
 
     /// Takes the read half to arm the next read. A connection has at most one
@@ -515,8 +601,11 @@ mod tests {
     use siphon_shared::riffle::Client;
     use siphon_shared::riffle::ClientEvent;
     use siphon_shared::riffle::Config;
+    use siphon_shared::riffle::PlaybackPosition;
     use siphon_shared::riffle::Request;
     use siphon_shared::riffle::Response;
+    use siphon_shared::riffle::RpcError;
+    use siphon_shared::riffle::StreamPlayback;
     use siphon_shared::riffle::Update;
     use siphon_shared::riffle::quic;
 
@@ -676,7 +765,39 @@ mod tests {
             next_pipeline(events, 7, false).await;
             next_config(second_events).await;
 
-            let key = siphon_shared::riffle::StreamKey::new(7, None);
+            let key = StreamKey::new(7, None);
+            let before = client.request(Request::GetSnapshot).await.unwrap();
+            let Response::Snapshot(before) = before else {
+                panic!("a snapshot");
+            };
+            // The pipe carries control only. A media lane over it is a typed
+            // refusal, and it must attach nothing: a lane that attached and
+            // then pushed nothing would look like a live stream with no picture.
+            let refused = client
+                .request(Request::StreamOpen {
+                    key: key.clone(),
+                    playback: StreamPlayback {
+                        position: PlaybackPosition::Live,
+                        rate: 1.0,
+                        buffer_ms: 30_000,
+                    },
+                })
+                .await;
+            assert!(
+                matches!(refused, Err(RpcError::NoMediaCarrier(_))),
+                "the pipe has no datagram channel: {refused:?}"
+            );
+            let response = client.request(Request::GetSnapshot).await.unwrap();
+            let Response::Snapshot(snapshot) = response else {
+                panic!("a snapshot");
+            };
+            assert_eq!(snapshot.lanes.len(), 0);
+            assert_eq!(
+                snapshot.pipelines.len(),
+                before.pipelines.len(),
+                "a refused lane claims no pipeline"
+            );
+
             let response = client.request(Request::GetDisk(key.clone())).await.unwrap();
             assert!(matches!(response, Response::Disk(_)));
 
@@ -727,6 +848,11 @@ mod tests {
         /// The snapshot the listener's verifier reads; the app loop refreshes it
         /// every second, and tests call [`Self::refresh`] to skip the wait.
         shared: SharedTrust,
+        /// Fixture segments for the first pipeline this daemon spawns, and how
+        /// many consumers it is serving. The registry is inside the app, so the
+        /// source is created here and handed over.
+        fixture: kanal::Sender<crate::scheduler::SegmentMessage>,
+        fixture_consumers: Rc<std::cell::Cell<usize>>,
     }
 
     impl QuicDaemon {
@@ -772,6 +898,9 @@ mod tests {
             vec![debug_variant("mock"), debug_portrait_variant("mock")],
             42,
         );
+        // The pipeline this daemon spawns is fed from the test rather than the
+        // playlist, which is what a `--debug` run does with the mock edge.
+        let (fixture, fixture_consumers) = registry.fixture_source();
 
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
@@ -853,6 +982,8 @@ mod tests {
             identity: client_identity,
             trust,
             shared,
+            fixture,
+            fixture_consumers,
         }
     }
 
@@ -909,6 +1040,198 @@ mod tests {
             assert!(matches!(response, Response::Snapshot(_)));
         });
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A real QUIC connection opens a lane, and media flows: the fixture
+    /// segment is demuxed, packed and pushed as datagrams on the same
+    /// connection as the control plane, where the client's `recv` sees valid
+    /// object headers with monotonic ids and the keyframe bit on the segment's
+    /// opening access unit.
+    #[test]
+    fn a_lane_pushes_media_datagrams_over_quic() {
+        let dir = scratch_dir("quic-media");
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let Some(segment) = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../captures/servermock/live/000000.ts"),
+            )
+            .ok() else {
+                println!("captures/ is absent; skipping the media lane test");
+                return;
+            };
+            let daemon = quic_daemon(&dir).await;
+            Peers::load(daemon.trust.peers())
+                .unwrap()
+                .add("test", daemon.identity.pin())
+                .unwrap();
+            daemon.refresh().await;
+
+            let (client, _) =
+                Client::connect_quic(&daemon.endpoint, &daemon.pin, &daemon.identity, "test")
+                    .await
+                    .expect("quic connect");
+            let key = StreamKey::new(7, None);
+            let response = client
+                .request(Request::StreamOpen {
+                    key: key.clone(),
+                    playback: StreamPlayback {
+                        position: PlaybackPosition::Live,
+                        rate: 1.0,
+                        buffer_ms: 30_000,
+                    },
+                })
+                .await
+                .expect("stream open");
+            assert!(matches!(response, Response::Ack));
+
+            // One HLS segment, as the scheduler would have spooled it.
+            let arena = Rc::new(ArenaSet::new());
+            daemon
+                .fixture
+                .send(crate::scheduler::SegmentMessage::Segment(spooled(
+                    &arena, &segment, 0,
+                )))
+                .expect("fixture segment");
+            let send = |arena: &Rc<ArenaSet>, timestamp_ms: u64| {
+                daemon
+                    .fixture
+                    .send(crate::scheduler::SegmentMessage::Segment(spooled(
+                        arena,
+                        &segment,
+                        timestamp_ms,
+                    )))
+                    .expect("fixture segment");
+            };
+
+            // Collect until the lane goes quiet; the whole segment is inside
+            // the client's buffer, so the producer sends all of it.
+            let datagrams = client.datagrams().expect("a datagram channel");
+            let budget = datagrams.max_size().expect("a negotiated budget");
+            let mut received = Vec::new();
+            while let Ok(Some(datagram)) =
+                compio::time::timeout(Duration::from_millis(300), datagrams.recv()).await
+            {
+                received.push(datagram);
+            }
+            assert!(
+                received.len() > 1,
+                "a 2 s segment is many datagrams, got {}",
+                received.len()
+            );
+
+            // Every datagram is one object, within the path's budget.
+            let mut objects = Vec::new();
+            for datagram in &received {
+                assert!(
+                    datagram.len() <= budget,
+                    "a datagram is {} bytes, past the {budget} byte budget",
+                    datagram.len()
+                );
+                objects.push(
+                    siphon_shared::riffle::Object::decode_datagram(datagram)
+                        .expect("a valid object header"),
+                );
+            }
+            // Audio is sent twice, so the same id repeats; every id is distinct
+            // otherwise and arrives in order.
+            let mut ids: Vec<u64> = objects.iter().map(|object| object.obj_id).collect();
+            ids.dedup();
+            assert!(
+                ids.windows(2).all(|pair| pair[0] < pair[1]),
+                "obj_id increases across the segment"
+            );
+            let first_video = objects
+                .iter()
+                .enumerate()
+                .find(|(_, object)| object.class == siphon_shared::riffle::Class::Video)
+                .map(|(index, _)| index)
+                .expect("the fixture has video");
+            assert!(
+                objects[first_video]
+                    .flags
+                    .contains(siphon_shared::riffle::Flags::KEYFRAME),
+                "the segment's first access unit is an IDR"
+            );
+            assert!(
+                objects
+                    .iter()
+                    .any(|object| object.class == siphon_shared::riffle::Class::Audio),
+                "the fixture has audio"
+            );
+            assert_eq!(
+                daemon.fixture_consumers.get(),
+                1,
+                "the lane is one consumer of the pipeline"
+            );
+
+            // The counters the UI reads come from the same path.
+            let response = client.request(Request::GetSnapshot).await.unwrap();
+            let Response::Snapshot(snapshot) = response else {
+                panic!("a snapshot");
+            };
+            assert_eq!(snapshot.lanes.len(), 1, "this connection's lane");
+            assert!(
+                snapshot.lanes[0].buffered_ahead_ms > 0,
+                "what was pushed past the playhead is reported"
+            );
+            assert_eq!(snapshot.lanes[0].dropped_video, 0);
+            assert_eq!(snapshot.conn_stats.dropped_video, 0);
+            assert_eq!(
+                snapshot.conn_stats.lost, 0,
+                "every datagram was queued for the carrier"
+            );
+            assert!(!snapshot.conn_stats.recovering());
+
+            // Closing the lane releases the pipeline and unregisters the
+            // consumer; a later segment reaches nobody.
+            let response = client.request(Request::StreamClose { key }).await.unwrap();
+            assert!(matches!(response, Response::Ack));
+            let response = client.request(Request::GetSnapshot).await.unwrap();
+            let Response::Snapshot(snapshot) = response else {
+                panic!("a snapshot");
+            };
+            assert_eq!(snapshot.lanes.len(), 0);
+            assert_eq!(snapshot.pipelines.len(), 0, "the claim was released");
+
+            // A closed lane's consumer is gone, so a later segment is
+            // dispatched to nobody: the producer ended, it was not left parked.
+            send(&arena, 2_000);
+            for _ in 0..50 {
+                if daemon.fixture_consumers.get() == 0 {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                daemon.fixture_consumers.get(),
+                0,
+                "the lane unregistered when it closed"
+            );
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writes one segment into a spool, as a completed fetch leaves it.
+    fn spooled(arena: &Rc<ArenaSet>, bytes: &[u8], timestamp_ms: u64) -> crate::scheduler::Segment {
+        let wakes = crate::spool::WakeSet::new();
+        let (mut writer, reader) = crate::spool::Spool::open(arena, &wakes).expect("spool");
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let tail = writer.tail().expect("spool capacity");
+            let len = tail.len().min(bytes.len() - offset);
+            tail[..len].copy_from_slice(&bytes[offset..offset + len]);
+            writer.commit(len);
+            offset += len;
+        }
+        drop(writer);
+        crate::scheduler::Segment {
+            timestamp_ms,
+            pdt_ms: 0,
+            duration_ms: 2_000,
+            sequence_num: 1,
+            reader,
+        }
     }
 
     /// No allowlist entry and no window: the handshake is refused, so the
