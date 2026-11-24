@@ -30,16 +30,32 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamKey {
-    /// Twitch channel id.
+    /// Twitch channel id. Display and attribution; it is not the identity of a
+    /// broadcast, so a restream reuses it.
     pub channel: u64,
+    /// Twitch's `BROADCAST-ID`. This *is* the identity: a streamer who ends and
+    /// restarts is a different stream, and a lane watching the old one must not
+    /// silently inherit the new one. Zero means "not resolved yet".
+    pub stream_id: u64,
     /// `STABLE-VARIANT-ID` (`chunked`, `720p60`, `audio_only`, ...).
     pub quality: Option<String>,
 }
 
 impl StreamKey {
+    /// A key for a request that has not resolved its broadcast yet.
     #[must_use]
     pub const fn new(channel: u64, quality: Option<String>) -> Self {
-        Self { channel, quality }
+        Self {
+            channel,
+            stream_id: 0,
+            quality,
+        }
+    }
+
+    /// The same key, pinned to the broadcast it turned out to be.
+    #[must_use]
+    pub fn with_stream(self, stream_id: u64) -> Self {
+        Self { stream_id, ..self }
     }
 }
 

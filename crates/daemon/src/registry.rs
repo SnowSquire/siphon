@@ -506,6 +506,7 @@ impl Registry {
         variant: &Variant,
         record: bool,
     ) -> Rc<StreamRuntime> {
+        let key = key.clone().with_stream(data.broadcast_id);
         let metrics = StreamMetrics::new(
             key.clone(),
             Some(variant.id.to_string()),
@@ -946,7 +947,11 @@ impl Registry {
         };
         let login = runtime.login.clone();
         runtime.stop();
-        self.publish_removed(key);
+        // Publish the runtime's own key, not the caller's: a caller may hold an
+        // unresolved one (stream id 0), and the UI keys its rows on what the
+        // snapshot gave it.
+        let _ = key;
+        self.publish_removed(&runtime.key);
         self.prune_channel(&login);
     }
 
