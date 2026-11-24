@@ -173,7 +173,7 @@ that says nothing while the container says BT.2020/PQ). Audio stays out of scope
 2. Startup capability probe: VA-API profiles from FFmpeg plus libplacebo's
    `PL_HANDLE_DMA_BUF` import cap, with the RPM Fusion hint on failure.
 3. Linux zero-copy path end to end: a captured TS file first, then a live channel
-   once the transport question (`notes/media-transport.md`) is settled.
+   off Riffle's media lane (`notes/riffle.md`).
 4. Windows D3D12 Video on the existing device and import path, verified on the
    desktop against the Vulkan Video path it replaces.
 5. Delete `crates/video`. (Done; the crate is gone.)

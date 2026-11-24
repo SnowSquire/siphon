@@ -221,7 +221,7 @@ struct DvrState {
     live_variant: Option<LiveVariant>,
 }
 
-/// The discovered DVR playlist shared by the refresh task, the RTSP output and
+/// The discovered DVR playlist shared by the refresh task, the media lane and
 /// the disk output.
 pub struct Dvr {
     state: RefCell<DvrState>,
@@ -262,7 +262,7 @@ impl Dvr {
     }
 
     /// Subscribe to URL/timeline changes. Only the disk output needs this; the
-    /// RTSP seek path reads the current snapshot on demand.
+    /// media lane's seek path reads the current snapshot on demand.
     pub fn subscribe(&self, wake: &Rc<ConsumerWake>) {
         *self.wake.borrow_mut() = Some(Rc::clone(wake));
     }

@@ -1149,12 +1149,6 @@ was meant to open. The procedure calls the handler the window installs, so Show,
 Restart and Quit all work while hidden — Quit wakes the loop through ZGUI's own
 command waker.
 
-Tray actions run in the tray's window procedure, not through a channel, for the
-same no-frames reason: an action queued for a frame would wait for the window it
-was meant to open. The procedure calls the handler the window installs, so Show,
-Restart and Quit all work while hidden — Quit wakes the loop through ZGUI's own
-command waker.
-
 The window icon is set from the bundled `icon.ico` with `WM_SETICON` (a small
 image for the title bar, a large one for Alt-Tab and the taskbar, each the size
 the desktop asks for). The `.ico` rather than `icon.png` because the window wants

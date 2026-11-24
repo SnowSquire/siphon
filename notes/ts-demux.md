@@ -56,8 +56,8 @@ The elementary stream leaves through Riffle (`notes/riffle.md`).
 - TS: PES PTS/DTS are already 90 kHz.
 - fMP4: DTS from `tfdt` + `trun` durations, PTS = DTS + composition offsets, in the
   track's own media timescale (`Sample` carries counts, `Track::timescale` converts).
-- The per-track RTP base, SSRC and clock-to-NTP mapping live in the sink
-  (`notes/rtsp-output.md`).
+- The presentation and decode timestamps travel in every media object's 16-byte
+  prefix, `pts` then `dts` in the track's own timescale (`notes/riffle.md`).
 
 ## `#EXT-X-MAP` / init handling
 

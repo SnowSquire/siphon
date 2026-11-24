@@ -131,7 +131,7 @@ pub struct Registry {
     bus: Rc<Bus>,
     downloader_metrics: Rc<DownloaderMetrics>,
     /// Every channel the registry serves: the followed ones from config, plus
-    /// any an RTSP DESCRIBE pulled in on demand.
+    /// any a stream request pulled in on demand.
     channels: RefCell<Vec<Channel>>,
     /// Live streams, by `(login, quality)`. At most a handful, so the scan is
     /// cheaper than hashing two strings.
@@ -154,7 +154,7 @@ pub struct Registry {
 struct Channel {
     login: String,
     /// Twitch channel id: what a stream is keyed by. Known from the follow list,
-    /// or learned from GQL for a channel an RTSP DESCRIBE pulled in.
+    /// or learned from GQL for a channel a stream request pulled in.
     id: Option<u64>,
     /// Display name, from the follow list or GQL.
     title: Option<String>,
@@ -163,7 +163,7 @@ struct Channel {
     /// The user stopped this broadcast. Compared against the broadcast id, so a
     /// restream (a new id) is not suppressed.
     stopped: Option<NonZeroU64>,
-    /// False for a channel an RTSP DESCRIBE pulled in, so it can be dropped
+    /// False for a channel a stream request pulled in, so it can be dropped
     /// when its last pipeline goes away.
     followed: bool,
     data: Option<Rc<ChannelData>>,

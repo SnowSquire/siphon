@@ -48,14 +48,14 @@ struct PrefetchSegment {
 #[derive(Debug)]
 pub struct ConsumerRegistration {
     pub tx: Sender<SegmentMessage>,
-    /// Replay the current window before live segments. Disk and the raw-TS
-    /// output want this; a live RTSP session does not (it would start ~30 s
-    /// behind and never catch up at the 1x pacer).
+    /// Replay the current window before live segments. The disk output wants
+    /// this; a live viewer does not (it would start ~30 s behind and never
+    /// catch up at the 1x pacer).
     pub backlog: bool,
     /// Drop individual messages when the bounded queue is full instead of
-    /// disconnecting. RTSP keeps only the newest live segment during normal
-    /// playback and replays the live window at a DVR handover, so losing a
-    /// message during a download stall must not kill the output.
+    /// disconnecting. A live viewer keeps only the newest live segment and
+    /// replays the live window at a DVR handover, so losing a message during a
+    /// download stall must not kill the lane.
     pub lossy: bool,
 }
 
@@ -93,8 +93,9 @@ impl Consumer {
 
 #[derive(Clone, Debug)]
 pub struct Segment {
-    /// Presentation time since the start of the broadcast. The RTSP output maps
-    /// this to NPT so clients can show the absolute position in the stream.
+    /// Presentation time since the start of the broadcast. The media lane
+    /// places its playhead by this, so a viewer can show the absolute position
+    /// in the stream.
     pub timestamp_ms: u64,
     /// Absolute `EXT-X-PROGRAM-DATE-TIME` (Unix epoch ms), or `0` when the
     /// playlist publishes none. The disk output aligns live and DVR by this.
@@ -118,13 +119,13 @@ pub enum SegmentMessage {
     },
     Discontinuity(),
     /// The stream's `#EXT-X-MAP` segment, which every consumer must see before
-    /// media. The disk output records it; the RTSP sink is TS-only and ignores
-    /// it.
+    /// media. The disk output records it; the media lane reads its codec
+    /// configuration.
     Init {
         reader: Reader,
     },
-    /// Seek request from the RTSP control plane (broadcast milliseconds). Only
-    /// the RTSP consumer sends this; the scheduler never does.
+    /// Seek request from the control plane (broadcast milliseconds). Only the
+    /// viewer's lane sends this; the scheduler never does.
     Seek(u64),
 }
 
@@ -212,9 +213,9 @@ pub struct StreamScheduler {
     /// build an fMP4 demuxer without waiting for a consumer message.
     init_window: Rc<RefCell<Option<Reader>>>,
 
-    /// Snapshot of `segments` for the RTSP engine. When VOD playback reaches
-    /// the end of the DVR playlist, the segments between there and the live
-    /// edge are still in the live window; replaying them bridges the DVR lag
+    /// Snapshot of `segments` for the media lane. When playback reaches the
+    /// end of the DVR playlist, the segments between there and the live edge
+    /// are still in the live window; replaying them bridges the DVR lag
     /// instead of jumping to the newest live segment.
     live_window: Rc<RefCell<Vec<Segment>>>,
 
@@ -268,7 +269,7 @@ impl StreamScheduler {
     }
 
     /// Share the scheduler's live playlist window with another consumer (the
-    /// RTSP engine, which bridges the DVR lag at a seek handover).
+    /// media lane, which bridges the DVR lag at a seek handover).
     #[must_use]
     pub fn with_live_window(mut self, live_window: Rc<RefCell<Vec<Segment>>>) -> Self {
         self.live_window = live_window;

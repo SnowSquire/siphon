@@ -3,9 +3,9 @@
 Status: implemented. This is the detail behind `AGENTS.md`'s one-line module
 list: the pipeline, the scheduler, the downloader, the daemon and the
 listeners. The arena/spool rationale is in the `arena.rs`/`spool.rs` module
-docs; the HTTP, RTSP and disk details have their own notes
-(`tls-client-api.md`, `rtsp-output.md` + `ts-demux.md` / `daemon-mode.md`,
-`disk-complete-recording.md`).
+docs; the HTTP, TS and disk details have their own notes
+(`tls-client-api.md`, `ts-demux.md`, `disk-complete-recording.md`), and the
+registry's own is `daemon-mode.md`.
 
 ## One thread
 
@@ -77,7 +77,7 @@ after the last viewer leaves; the registry releases it when the recorder
 finishes. `recordDualFormat` adds a second pipeline for the other orientation,
 keyed by its variant id, started and stopped with the primary recording.
 
-## `disk.rs`
+## `disk/`
 
 A recording directory records one complete, ad-free archive per broadcast:
 `<dir>/<stream_id>/<variant>/{segs,index}` — the variant is a directory because a

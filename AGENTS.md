@@ -5,8 +5,8 @@ Twitch HLS live-stream client (Rust, single-threaded `compio` reactor) plus
 been removed; Riffle (`notes/riffle.md`) replaces it — the carrier, pairing,
 lanes and the media path are implemented and tested, and the client reassembles
 whole access units, but there is no decoder or player yet, so nothing displays a
-stream. Disk output is disabled and being rebuilt from
-`notes/disk-complete-recording.md`.
+stream. Disk recording is implemented (`crates/daemon/src/disk/`) and opt-in
+through `recordDir`; nothing records until a directory is configured.
 
 ## Who writes what
 
@@ -33,8 +33,12 @@ stream. Disk output is disabled and being rebuilt from
   seam, the measurements, the experiments already ruled out, and the rules.
 - `video-decode.md` — the planned UI video path: VA-API / D3D12 Video, libav.
 - `riffle.md` — the whole daemon↔UI protocol, in three parts: the media
-  transport (designed, nothing built), the control plane (implemented), and the
-  UI presentation path. Replaces `rpc.md` and `media-transport.md`.
+  transport (lane, object framing and the datagram path built; the zero-copy
+  pipe path not), the control plane, and the UI presentation path.
+- `daemon-one-loop.md` — the one-loop daemon: config, registry, listeners and
+  monitors owned by a single loop.
+- `nix-build.md` — the Nix payload, the clippy and installer derivations, and
+  the pins behind them.
 
 ## Commands
 
@@ -45,10 +49,10 @@ stream. Disk output is disabled and being rebuilt from
   workflow installs Nix and calls it, so there are no xwin/shaderc/libplacebo
   shell scripts to keep in sync. `notes/nix-build.md` has the pieces and pins.
 - Build/check: `cargo clippy -p daemon`, `cargo build -p daemon`
-- Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml enables `pedantic`/`nursery`/`suspicious`/`cargo` groups as warn; keep it clean. Whole-workspace lints (what CI runs) are `nix build .#linux-clippy` and `.#windows-clippy`, which reuse the dependency layer.
+- Lint: `cargo clippy -p daemon --all-targets` — Cargo.toml turns on the `all`, `pedantic` and `nursery` groups at deny plus the project's own list; keep it clean. Whole-workspace lints (what CI runs) are `nix build .#linux-clippy` and `.#windows-clippy`, which reuse the dependency layer.
 - Format: `cargo +nightly fmt` — `crates/daemon/rustfmt.toml` uses unstable options (import grouping/granularity, `reorder_impl_items`, LF) that stable `cargo fmt` silently ignores.
 - One-channel recorder: `siphon-daemon record <login> [variant] [--mode live|dvr|both]
-  [--list] --output <dir>` — one variant, no config, no RPC, no RTSP. Without
+  [--list] --output <dir>` — one variant, no config, no control plane. Without
   `[variant]` it takes the highest-scoring one; `--list` prints the live master's
   variants and exits. `--mode` picks the live playlist, the DVR, or both (the
   default). It waits for the channel to go live and exits when the recording ends.
@@ -57,8 +61,7 @@ stream. Disk output is disabled and being rebuilt from
   The shipped binaries come from `nix build .#windows`, whose derivation sets
   `CARGO_PROFILE_RELEASE_LTO=fat` and `..._CODEGEN_UNITS=1`, so a Nix build is
   much slower than the local one and is worth backgrounding.
-- Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server).
-- Benchmark: `cargo test -p daemon --release -- --ignored --nocapture throughput` (demux/packetize over `captures/servermock`, the built fixtures). Cross-compile: `cargo zigbuild --release --tests -p daemon --target x86_64-unknown-linux-musl`.
+- Tests: `cargo test -p daemon` (arena/spool, playlist/utils/variant parsing, an HTTP client suite against a loopback server). A test that needs the mock's fixtures (`captures/servermock`, built by `pnpm run build:fixtures` in `servermock/`) prints a skip line when they are absent.
 - Miri: `cargo +nightly miri test -p daemon` — the check for the arena's `unsafe` blocks; network tests are `cfg(not(miri))`.
 - Windows cross-check: `nix develop .#windows -c cargo clippy --workspace
   --all-targets` (or `nix build .#windows` for the payload). The shell exports
@@ -105,7 +108,7 @@ usher and OAuth at a mock edge such as `http://127.0.0.2:8000` and replays its
 playlists. The mock's Hermes socket is on its own port, so point the daemon at it
 with `SIPHON_HERMES_URL=ws://127.0.0.1:8001/v1`.
 
-1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere). `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
+1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere). `SPEED=8` by default (`SPEED=1` replays at real time); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
 2. `cargo run -p daemon -- daemon -d http://127.0.0.2:8000`; the pipeline starts on the mock's `stream-up`. A viewer still has nothing to draw with: the media lane pushes objects (`media/lane.rs`) — datagrams over QUIC, class-1 frames on the pipe — and the UI's `MediaReceiver` (`crates/ui/src/media.rs`) reassembles them into whole access units, but there is no decoder or player, so the end-to-end checks are the pipeline rows, the logs, the receiver's counters, the objects a test collects and whatever recording is enabled.
 3. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
 
@@ -144,11 +147,11 @@ detail: `notes/architecture.md`.
 - `media/` — the TS demuxer, the codec configs, the DVR timeline
   (`notes/ts-demux.md`) and the Riffle media lane: `media/lane.rs` is one producer
   per lane (demux → pack → offer) plus the one datagram sender per connection.
-- `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
+- `disk/` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/shared` (`siphon-shared`) — what both sides agree on: `riffle/` (the
   typed protocol, postcard framing, the object header, the UI-side client, and
-  `quic.rs`, the pinned QUIC carrier), `settings/` (the
-  per-client settings schema) and `store/` (the JSON file layer).
+  `quic.rs`, the pinned QUIC carrier), `settings.rs` (the per-client settings
+  schema) and `store.rs` (the JSON file layer).
 - `crates/ui` (`siphon-ui`, binary `siphon`) — the ZGUI window presented through the DXGI flip chain ported from the video spike, the native tray, the Riffle client worker, and the daemon lifecycle (auto-start, PID-file restart). Builds on Linux too; `notes/riffle.md` has the split and the SDR/HDR state.
 
 ## Rules (do not "simplify")

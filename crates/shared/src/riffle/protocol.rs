@@ -15,7 +15,7 @@ use serde::Serialize;
 pub const PROTOCOL_VERSION: u16 = 6; // Arbitrary until release.
 
 /// First field of `Hello`; a cheap guard against a client that connected to
-/// the RTSP port or some unrelated loopback service.
+/// the wrong endpoint or some unrelated local service.
 pub const MAGIC: u32 = 0x5349_5048; // "SIPH"
 
 /// Largest accepted frame. Rejected before allocating the payload.
@@ -32,8 +32,8 @@ pub const MAX_AVATAR: usize = 512 * 1024;
 /// `STABLE-VARIANT-ID`. `None` means the monitor's best variant.
 ///
 /// The id, not the login: the daemon already holds `config.channels[].id`, and
-/// a login is a name the RTSP URI and the Channels list can resolve, not an
-/// identity. The UI resolves the login for display from its channel list.
+/// a login is a name the Channels list can resolve, not an identity. The UI
+/// resolves the login for display from its channel list.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamKey {
@@ -645,7 +645,7 @@ pub enum Request {
         force: bool,
     },
     PipelineRestart(StreamKey),
-    /// Disconnect every RTSP session without touching the pipeline.
+    /// Drop every viewer without touching the pipeline.
     DisconnectViewers(StreamKey),
     /// Record this stream only; nothing is persisted and it ends at
     /// `stream-down`.

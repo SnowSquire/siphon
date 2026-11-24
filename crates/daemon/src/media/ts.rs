@@ -1,6 +1,6 @@
 //! MPEG-TS demuxer for the Twitch H.264 + AAC source.
 //!
-//! Everything the RTSP output needs is in the elementary stream: PAT/PMT give
+//! Everything a viewer needs is in the elementary stream: PAT/PMT give
 //! the PIDs, PES headers carry the 90 kHz PTS/DTS, H.264 arrives as Annex B and
 //! AAC as ADTS. The demuxer is fed the raw bytes of each HLS segment and emits
 //! one [`Sample`] per PES access unit.

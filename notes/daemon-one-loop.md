@@ -1,13 +1,7 @@
 # Daemon: one loop, one owner
 
-Status: the first two passes are implemented and committed in the
-`daemon-one-loop` worktree (`otwutqxw`, `qullqoys`). `cargo test -p daemon` is
-141 green, clippy is clean, and the mock's new routes were exercised by hand with
-curl. This is the plan we settled on in the design conversation, written down so
-the reasoning survives the session that produced it.
-
-**MORNING: read § "The runtime-struct question" at the end. That is the one you
-said you were too tired to work through, and it is the only open decision left.**
+Status: implemented — this is the reasoning the one-loop daemon was built from.
+`architecture.md` is the short version of what the code does now.
 
 ## The shape
 
@@ -180,9 +174,9 @@ Demux baseline on this box, for measuring the sample-store work:
 
 ## The runtime-struct question
 
-This is the one that got skipped. The question is what the per-stream runtime
-struct holds after all of the above, and specifically whether its independent
-booleans should become a state enum.
+This was the open decision when the plan was written; it is settled below. The
+question is what the per-stream runtime struct holds after all of the above, and
+specifically whether its independent booleans should become a state enum.
 
 Today (`StreamRuntime`) it is an AoS of cells: `recording: Cell<bool>`,
 `disk: RefCell<Option<Rc<DiskOutput>>>`, `disk_metrics:
@@ -206,7 +200,7 @@ Three options:
 3. **Leave the fields** and only delete what the rest of the plan deletes
    (`debug`, `broadcast_id`, the sets).
 
-Recommendation, for the morning: **1**. `Option<Recorder>` is the real coupling
+Recommendation: **1**. `Option<Recorder>` is the real coupling
 (the disk and its metrics are one thing), and the spawn flags are genuinely
 independent facts about two different tasks, not states of a machine. The enum in
 (2) buys nothing that the type system was not already giving us, and it would

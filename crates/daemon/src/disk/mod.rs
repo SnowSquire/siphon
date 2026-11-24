@@ -170,7 +170,8 @@ pub enum DiskOutputError {
 
 impl DiskOutputError {
     /// A stale/incompatible index is the only error that exits the process; a
-    /// full disk or a failed fetch stops the disk subsystem and keeps RTSP.
+    /// full disk or a failed fetch stops the disk subsystem and leaves the
+    /// pipeline running.
     const fn fatal(&self) -> bool {
         matches!(self, Self::InvalidHeader)
     }

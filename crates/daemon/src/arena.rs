@@ -819,7 +819,7 @@ mod tests {
     }
 
     /// `assert_invariants` only exists with debug assertions; release builds
-    /// (where the throughput benchmark runs) skip the check.
+    /// (the fixture-backed tests included) skip the check.
     fn check(set: &ArenaSet) {
         #[cfg(debug_assertions)]
         set.assert_invariants();

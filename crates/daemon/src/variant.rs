@@ -364,7 +364,7 @@ pub struct Variant {
 
 /// The highest-`SCORE` variant, which is what a recording takes when no id is
 /// named. `SCORE` is Twitch's own ranking; `choose_variant` prefers the first
-/// variant instead, which is what an unqualified RTSP request means.
+/// variant instead, which is what a stream key without a quality asks for.
 #[must_use]
 pub fn best_variant(variants: &[Variant]) -> Option<&Variant> {
     variants

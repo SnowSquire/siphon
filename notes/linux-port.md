@@ -161,9 +161,9 @@ feature is on.
 
 Deferred. The backend is settled: **VA-API on Linux, D3D12 Video on Windows**, with
 libplacebo importing decoded frames without a copy — `notes/video-decode.md` has
-the plan, the measurements and the driver trap. Transport is a purpose-built
-elementary-stream channel on the admin RPC, not RTSP (`notes/media-transport.md`);
-nothing is built yet.
+the plan, the measurements and the driver trap. Transport is Riffle's media lane
+over the admin connection (`notes/riffle.md`): the UI reassembles whole access
+units, but nothing decodes them yet.
 
 ## Environment
 

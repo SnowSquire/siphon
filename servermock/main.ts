@@ -100,7 +100,7 @@ const fixtures: Record<string, GroupFixture> = FMP4
   : { ts: { live: manifest.live!, chunks: manifest.chunks! } };
 
 // Wall-clock multiplier for the simulated broadcast. Set SPEED=1 to replay at
-// real time (the RTSP pacer honors it); the default races ahead.
+// real time (the daemon's pacer honors it); the default races ahead.
 const SPEED = Number(process.env.SPEED ?? 8);
 // Pretend the broadcast started this many milliseconds ago, so the debug loop
 // joins mid-broadcast and exercises prefill/holes/copies.

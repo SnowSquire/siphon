@@ -1,8 +1,8 @@
 # Siphon
 
 Twitch HLS live-stream client: a single-threaded `compio` daemon that follows
-channels, records broadcasts and serves them over RTSP, and a ZGUI desktop window
-that drives it over an RPC connection.
+channels, records broadcasts and serves them to its own window over Riffle, and
+a ZGUI desktop window that drives it over the same connection.
 
 The development contract and the build, test and lint commands are in
 [`AGENTS.md`](AGENTS.md); subsystem design notes are in [`notes/`](notes).
@@ -33,7 +33,7 @@ shall be dual licensed as above, without any additional terms or conditions.
 
 ### Third party
 
-`crates/daemon/src/rtsp/h264.rs` and `crates/daemon/src/rtsp/aac.rs` are ported
+`crates/daemon/src/media/h264.rs` and `crates/daemon/src/media/aac.rs` are ported
 from [mediacommon](https://github.com/bluenviron/mediacommon) and
 [gortsplib](https://github.com/bluenviron/gortsplib), both MIT, Copyright (c) 2023
 aler9 and Copyright (c) 2020 aler9 respectively.

@@ -123,7 +123,7 @@ struct Config {
 enum Command {
     /// Record one channel to disk, exit when its broadcast ends
     Record(Record),
-    /// Serve any channel through `rtsp://host/<channel>/<quality>/`
+    /// Run the backend: pipelines, the stream registry and the Riffle listener
     Daemon(Daemon),
     /// Open a window in which one remote UI can pair, and approve it by code
     Pair(Pair),
@@ -285,7 +285,7 @@ const fn debug_dvr_url(_: &Config, _: &Variant) -> Option<String> {
     None
 }
 
-/// One channel, served at the root of every loopback RTSP address.
+/// One channel, recorded to disk with no control plane and no viewer.
 #[allow(clippy::future_not_send)]
 async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::Error>> {
     let login = args.channel.to_ascii_lowercase();

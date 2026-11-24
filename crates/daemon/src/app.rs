@@ -1608,8 +1608,8 @@ impl App {
             Ok(path) => match update::install_and_relaunch(&path) {
                 Ok(()) => {
                     tracing::info!(target: "update", "installer launched, stopping for upgrade");
-                    // The RTSP listener has no shutdown path; exiting releases
-                    // the binaries the installer replaces.
+                    // The Riffle listener has no shutdown path; exiting
+                    // releases the binaries the installer replaces.
                     std::process::exit(0);
                 }
                 Err(error) => {

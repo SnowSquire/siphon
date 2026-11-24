@@ -38,8 +38,8 @@ pub const DEBUG_PORTRAIT_VARIANT_ID: &str = "1080p-portrait";
 pub const DOWNLOAD_TASKS: usize = 8;
 
 /// A consumer whose queue holds this many segments is more than ~40 s behind the
-/// live edge and gets dropped. The RTSP consumer registers as lossy and drops the
-/// individual message instead, so this only bites a strict consumer.
+/// live edge and gets dropped. The viewer's lane registers as lossy and drops
+/// the individual message instead, so this only bites a strict consumer.
 pub const MAX_CONSUMER_LAG: usize = 20;
 
 /// Bytes per slot: `188 * 1024`.
