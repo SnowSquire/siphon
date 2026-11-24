@@ -386,13 +386,17 @@ async fn serve_connection(
     events: &kanal::Sender<UiEvent>,
 ) -> End {
     let client = Rc::new(client);
-    // QUIC carries media on the same connection; the local pipe has no
-    // datagram channel. The receiver is its own task, so a media burst never
-    // holds up the control-plane events, and it ends when `recv` sees the
-    // connection close.
-    if let Some(datagrams) = client.datagrams().cloned() {
+    // Media rides the same connection as the control plane on both carriers: a
+    // QUIC datagram channel, or class-1 frames on the pipe. The receiver is its
+    // own task, so a media burst never holds up the control-plane events, and it
+    // ends when the carrier closes.
+    let source = client.datagrams().cloned().map_or_else(
+        || client.frames().cloned().map(crate::media::Source::Frames),
+        |datagrams| Some(crate::media::Source::Datagrams(datagrams)),
+    );
+    if let Some(source) = source {
         let events = events.clone();
-        compio::runtime::spawn(crate::media::run(datagrams, events)).detach();
+        compio::runtime::spawn(crate::media::run(source, events)).detach();
     }
     let stream = client.events().clone();
     let queue: Rc<RefCell<VecDeque<ClientEvent>>> = Rc::new(RefCell::new(VecDeque::new()));

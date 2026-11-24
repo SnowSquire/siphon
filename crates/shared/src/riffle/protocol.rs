@@ -723,8 +723,9 @@ pub enum RpcError {
     NotFound,
     /// The backend does not implement this query yet.
     Unsupported,
-    /// This connection cannot carry media: the local pipe is control-only, and
-    /// a QUIC peer that did not advertise DATAGRAM cannot be sent a datagram.
+    /// This connection cannot carry media: a QUIC peer that did not advertise
+    /// DATAGRAM. (The local pipe carries media on the control connection, so it
+    /// is never this.)
     NoMediaCarrier(String),
     /// A new pipeline would exceed `--max-streams`.
     Capacity,

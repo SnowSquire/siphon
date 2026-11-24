@@ -1,9 +1,10 @@
 //! The object header every carrier shares.
 //!
 //! A Riffle object is one access unit, one audio frame or one blob. On a QUIC
-//! datagram the header is 20 bytes; on a stream or the local pipe it is the same
-//! header behind a `u32` length, so the object layer never learns which carrier
-//! it is on.
+//! datagram the object is the frame, header first. On the pipe and the QUIC
+//! control stream it is the payload of a class-1 frame (`riffle::codec`): a
+//! `u32` length and a class byte in front of exactly these bytes, so the object
+//! layer never learns which carrier it is on.
 //!
 //! `lane` is what a QUIC DATAGRAM frame has none of: the frame carries no stream
 //! association, so the header has to name the lane. Control objects use lane 0;
@@ -24,8 +25,6 @@ use std::fmt;
 /// Bytes in the datagram form: class, lane, flags, id, total length, fragment
 /// offset.
 pub const DATAGRAM_HEADER: usize = 20;
-/// Bytes in the stream and pipe form, including the `u32` length prefix.
-pub const STREAM_HEADER: usize = DATAGRAM_HEADER + 4;
 /// Sanity ceiling for one object. A 1080p keyframe is around 1 MiB.
 pub const MAX_OBJECT: u32 = 4 * 1024 * 1024;
 /// The payload prefix a media object opens with: `pts`, then `dts`, each a
@@ -213,35 +212,6 @@ impl<'a> Object<'a> {
         Ok(written)
     }
 
-    /// Parses the stream and pipe form: `u32` length, then the datagram form.
-    pub fn decode_frame(buf: &'a [u8]) -> Result<Self, ObjectError> {
-        if buf.len() < STREAM_HEADER {
-            return Err(ObjectError::Short);
-        }
-        let mut len = [0u8; 4];
-        len.copy_from_slice(&buf[..4]);
-        let len = u32::from_be_bytes(len) as usize;
-        let end = 4usize.checked_add(len).ok_or(ObjectError::Short)?;
-        if buf.len() < end {
-            return Err(ObjectError::Short);
-        }
-        Self::decode_datagram(&buf[4..end])
-    }
-
-    /// Writes the stream and pipe form into `out`, returning the bytes written.
-    pub fn encode_frame(&self, out: &mut [u8]) -> Result<usize, ObjectError> {
-        self.validate()?;
-        let body = DATAGRAM_HEADER + self.payload.len();
-        let written = 4 + body;
-        if out.len() < written {
-            return Err(ObjectError::NoSpace);
-        }
-        let body = u32::try_from(body).map_err(|_| ObjectError::NoSpace)?;
-        out[..4].copy_from_slice(&body.to_be_bytes());
-        self.encode_datagram(&mut out[4..written])?;
-        Ok(written)
-    }
-
     fn validate(&self) -> Result<(), ObjectError> {
         if self.total_len == 0 || self.total_len > MAX_OBJECT {
             return Err(ObjectError::TotalLen(self.total_len));
@@ -304,7 +274,6 @@ mod tests {
     #[test]
     fn the_datagram_budget_holds_with_the_lane_field() {
         assert_eq!(DATAGRAM_HEADER, 20);
-        assert_eq!(STREAM_HEADER, 24);
         let payload = [9u8; 1200 - DATAGRAM_HEADER];
         let object = Object {
             total_len: u32::try_from(payload.len()).unwrap(),
@@ -322,29 +291,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_roundtrip_and_length_prefix() {
-        let object = sample();
-        let mut buf = [0u8; 512];
-        let written = object.encode_frame(&mut buf).unwrap();
-        assert_eq!(written, STREAM_HEADER + 300);
-        assert_eq!(&buf[..4], &320u32.to_be_bytes());
-        assert_eq!(Object::decode_frame(&buf[..written]).unwrap(), object);
-    }
-
-    #[test]
-    fn short_buffers_are_rejected() {
+    fn a_short_datagram_is_rejected() {
         assert_eq!(
             Object::decode_datagram(&[0u8; DATAGRAM_HEADER - 1]),
             Err(ObjectError::Short)
         );
-        assert_eq!(
-            Object::decode_frame(&[0u8; STREAM_HEADER - 1]),
-            Err(ObjectError::Short)
-        );
-        // A length prefix that runs past the slice is short, not a panic.
-        let mut buf = [0u8; 32];
-        buf[..4].copy_from_slice(&1000u32.to_be_bytes());
-        assert_eq!(Object::decode_frame(&buf), Err(ObjectError::Short));
     }
 
     #[test]

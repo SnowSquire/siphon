@@ -47,6 +47,7 @@ use futures_util::future::select;
 use futures_util::pin_mut;
 use siphon_shared::riffle::Class;
 use siphon_shared::riffle::StreamKey;
+use siphon_shared::riffle::codec;
 use siphon_shared::riffle::object::DATAGRAM_HEADER;
 use siphon_shared::riffle::quic::Datagrams;
 use tracing::debug;
@@ -61,6 +62,7 @@ use crate::media::wire::DATAGRAM_BUDGET;
 use crate::media::wire::Packer;
 use crate::media::wire::SegmentSource;
 use crate::media::wire::Track;
+use crate::riffle::Outbound;
 use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::Segment;
 use crate::scheduler::SegmentMessage;
@@ -185,10 +187,138 @@ impl MediaStats {
     pub const fn failed(&self) -> u32 {
         self.failed.get()
     }
+
+    fn note_failed(&self) {
+        self.failed.set(self.failed.get().saturating_add(1));
+    }
 }
 
-/// The one task per connection that turns queued datagrams into DATAGRAM
-/// frames.
+/// Bytes one pipe media frame may carry.
+///
+/// A pipe has no path MTU, so a fragment is not sized by one: 64 KiB keeps the
+/// frame count and the 5-byte framing amortised over a whole access unit without
+/// making the loop's write buffer lumpy. QUIC's budget comes from the path and
+/// is read per segment instead.
+pub const PIPE_BUDGET: usize = 64 * 1024;
+
+/// How much of a pipe connection's out buffer media may take.
+///
+/// The buffer belongs to the control plane too, and `MAX_OUT` drops a
+/// connection that outgrows it. Media stops at half, so a lane can never be the
+/// reason a connection loses control frames: the tail the control plane gets is
+/// always at least this much, whatever the lane is doing.
+pub const PIPE_MEDIA_OUT: usize = crate::riffle::MAX_OUT / 2;
+
+/// Wakes the daemon loop when a pipe frame has been queued.
+///
+/// The loop owns the writer, so it is the only thing that can arm a write; a
+/// bucket of media that arrived while it was parked must not wait for the next
+/// deadline. One waiter, like the client's wake, so an idle loop cannot grow it.
+#[derive(Default)]
+pub struct PipeSignal {
+    queued: Cell<bool>,
+    waker: Cell<Option<Waker>>,
+}
+
+impl PipeSignal {
+    /// A frame is queued: the loop has something to write.
+    fn signal(&self) {
+        self.queued.set(true);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    /// Resolves once a frame has been queued since the last call.
+    pub async fn wait(&self) {
+        poll_fn(|context| {
+            if self.queued.replace(false) {
+                return Poll::Ready(());
+            }
+            self.waker.set(Some(context.waker().clone()));
+            // A signal between the check above and the park would otherwise be
+            // lost; the flag is the latch, and the waker only saves a poll.
+            if self.queued.replace(false) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+/// What a datagram handed to the carrier became.
+enum Carried {
+    /// The carrier took the whole frame.
+    Queued,
+    /// There is no room right now; the caller keeps it and tries again.
+    Full,
+    /// The carrier refused it, so it is lost and counted.
+    Failed,
+}
+
+/// Where one connection's media goes: one frame per object fragment either way,
+/// but two very different writers.
+#[derive(Clone)]
+enum Carrier {
+    /// QUIC: one DATAGRAM frame per fragment, sent from the sender task.
+    Datagrams(Datagrams),
+    /// The local pipe: a class-1 frame appended to the connection's out buffer,
+    /// the same one the control plane writes, so one writer carries both.
+    Pipe {
+        out: Outbound,
+        /// Wakes the loop after a drain pass: nothing else may write `out`.
+        wake: Rc<PipeSignal>,
+    },
+}
+
+impl Carrier {
+    /// The most one frame may carry, which is what the packer is built from.
+    fn budget(&self) -> usize {
+        match self {
+            Self::Datagrams(datagrams) => datagrams.max_size().unwrap_or(DATAGRAM_BUDGET),
+            Self::Pipe { .. } => PIPE_BUDGET,
+        }
+    }
+
+    fn send(&self, datagram: &[u8]) -> Carried {
+        match self {
+            Self::Datagrams(datagrams) => match datagrams.send(datagram) {
+                Ok(()) => Carried::Queued,
+                Err(error) => {
+                    debug!(%error, "media: datagram not queued");
+                    Carried::Failed
+                }
+            },
+            Self::Pipe { out, .. } => {
+                let mut out = out.borrow_mut();
+                if out.len() + codec::FRAME_PREFIX + datagram.len() > PIPE_MEDIA_OUT {
+                    return Carried::Full;
+                }
+                if codec::encode_media(datagram, &mut out).is_err() {
+                    return Carried::Failed;
+                }
+                Carried::Queued
+            }
+        }
+    }
+
+    /// Tells the loop the out buffer has something to write. A no-op for QUIC,
+    /// whose frames are the carrier's own queue.
+    fn notify(&self) {
+        if let Self::Pipe { wake, .. } = self {
+            wake.signal();
+        }
+    }
+
+    const fn is_pipe(&self) -> bool {
+        matches!(self, Self::Pipe { .. })
+    }
+}
+
+/// The one task per connection that turns queued datagrams into frames on the
+/// carrier.
 ///
 /// Cloneable: every lane's producer holds one to offer into. The task drains
 /// `high` completely before it looks at `low`, so a video burst from a
@@ -202,7 +332,7 @@ pub struct MediaSender {
     /// The sender drained: wake the producers waiting for space.
     space: Rc<Wakes>,
     pool: DatagramPool,
-    datagrams: Datagrams,
+    carrier: Carrier,
     stats: Rc<MediaStats>,
 }
 
@@ -213,7 +343,20 @@ impl MediaSender {
     /// close, which happens when the connection — and every producer holding a
     /// clone of this — is dropped.
     #[must_use]
-    pub fn spawn(datagrams: Datagrams) -> Self {
+    pub fn spawn_datagrams(datagrams: Datagrams) -> Self {
+        Self::spawn(Carrier::Datagrams(datagrams))
+    }
+
+    /// Starts the sender for one pipe connection.
+    ///
+    /// `out` is the connection's own out buffer, shared with the control plane,
+    /// and `wake` is how the loop is told to write it.
+    #[must_use]
+    pub fn spawn_pipe(out: Outbound, wake: Rc<PipeSignal>) -> Self {
+        Self::spawn(Carrier::Pipe { out, wake })
+    }
+
+    fn spawn(carrier: Carrier) -> Self {
         let (high_tx, high_rx) = kanal::bounded(QUEUE_DEPTH);
         let (low_tx, low_rx) = kanal::bounded(QUEUE_DEPTH);
         let queued = Rc::new(Wakes::default());
@@ -225,7 +368,7 @@ impl MediaSender {
             low_rx,
             Rc::clone(&queued),
             Rc::clone(&space),
-            datagrams.clone(),
+            carrier.clone(),
             pool.clone(),
             Rc::clone(&stats),
         ))
@@ -236,7 +379,7 @@ impl MediaSender {
             queued,
             space,
             pool,
-            datagrams,
+            carrier,
             stats,
         }
     }
@@ -246,18 +389,18 @@ impl MediaSender {
         Rc::clone(&self.stats)
     }
 
-    /// The carrier's current budget for a whole datagram.
-    fn datagram_budget(&self) -> usize {
-        self.datagrams
-            .max_size()
-            .unwrap_or(DATAGRAM_BUDGET)
-            .max(DATAGRAM_HEADER + 1)
+    /// Room was made in the out buffer: a pipe lane may fill it again. A no-op
+    /// for QUIC, whose queue is the carrier's rather than the loop's.
+    pub fn resume(&self) {
+        if self.carrier.is_pipe() {
+            self.queued.wake_all();
+        }
     }
 }
 
 impl Sink for MediaSender {
     fn budget(&self) -> usize {
-        self.datagram_budget()
+        self.carrier.budget().max(DATAGRAM_HEADER + 1)
     }
 
     async fn offer(&self, priority: Priority, datagram: &[u8]) {
@@ -288,43 +431,51 @@ impl Sink for MediaSender {
             // slot; the next `offer` waits again. `Err` is the sender task
             // gone, and that datagram is lost.
             Ok(false) => {}
-            Err(_) => {
-                self.stats
-                    .failed
-                    .set(self.stats.failed.get().saturating_add(1));
-            }
+            Err(_) => self.stats.note_failed(),
         }
     }
 }
 
-/// Sends one encoded datagram and returns the buffer for reuse.
-fn send(datagrams: &Datagrams, pool: &DatagramPool, stats: &MediaStats, buffer: Vec<u8>) {
-    if let Err(error) = datagrams.send(&buffer) {
-        debug!(%error, "media: datagram not queued");
-        stats.failed.set(stats.failed.get().saturating_add(1));
-    }
-    pool.give(buffer);
-}
-
-/// Drains everything currently queued, high first. `true` means at least one
-/// datagram left a queue, so a producer waiting for room may now have it.
-fn drain(
-    high: &kanal::Receiver<Vec<u8>>,
-    low: &kanal::Receiver<Vec<u8>>,
-    datagrams: &Datagrams,
+/// Sends everything one priority has that the carrier will take, oldest first.
+///
+/// `held` is the item the carrier had no room for last time: it is tried before
+/// the queue, so a priority is never reordered and nothing is dropped to make
+/// room. `true` means at least one frame left, so a producer waiting for space
+/// may now have it.
+fn send_priority(
+    carrier: &Carrier,
     pool: &DatagramPool,
     stats: &MediaStats,
+    held: &mut Option<Vec<u8>>,
+    queue: &kanal::Receiver<Vec<u8>>,
 ) -> bool {
-    let mut drained = false;
-    while let Ok(Some(buffer)) = high.try_recv() {
-        send(datagrams, pool, stats, buffer);
-        drained = true;
+    let mut sent = false;
+    loop {
+        let buffer = if let Some(buffer) = held.take() {
+            buffer
+        } else {
+            match queue.try_recv() {
+                Ok(Some(buffer)) => buffer,
+                Ok(None) | Err(_) => break,
+            }
+        };
+        match carrier.send(&buffer) {
+            Carried::Queued => {
+                pool.give(buffer);
+                sent = true;
+            }
+            Carried::Full => {
+                *held = Some(buffer);
+                break;
+            }
+            Carried::Failed => {
+                stats.note_failed();
+                pool.give(buffer);
+                sent = true;
+            }
+        }
     }
-    while let Ok(Some(buffer)) = low.try_recv() {
-        send(datagrams, pool, stats, buffer);
-        drained = true;
-    }
-    drained
+    sent
 }
 
 async fn run(
@@ -332,15 +483,22 @@ async fn run(
     low: kanal::Receiver<Vec<u8>>,
     queued: Rc<Wakes>,
     space: Rc<Wakes>,
-    datagrams: Datagrams,
+    carrier: Carrier,
     pool: DatagramPool,
     stats: Rc<MediaStats>,
 ) {
+    // An item the carrier had no room for. It is invisible to the latch below:
+    // until the loop drains the out buffer (`resume`), retrying it would spin.
+    let mut held_high: Option<Vec<u8>> = None;
+    let mut held_low: Option<Vec<u8>> = None;
     loop {
         let open = poll_fn(|context| {
-            if drain(&high, &low, &datagrams, &pool, &stats) {
+            let sent = send_priority(&carrier, &pool, &stats, &mut held_high, &high)
+                | send_priority(&carrier, &pool, &stats, &mut held_low, &low);
+            if sent {
                 // Room was freed: every producer waiting for it may go on.
                 space.wake_all();
+                carrier.notify();
             }
             if high.is_closed() && low.is_closed() {
                 return Poll::Ready(false);
@@ -349,10 +507,12 @@ async fn run(
             // The queue is the latch: a datagram offered between the drain
             // above and the park is still in it, so this second look is what
             // closes the race. The waker only saves a poll.
-            if high.is_empty() && low.is_empty() {
-                Poll::Pending
-            } else {
+            let pending = (held_high.is_none() && !high.is_empty())
+                || (held_low.is_none() && !low.is_empty());
+            if pending {
                 Poll::Ready(true)
+            } else {
+                Poll::Pending
             }
         })
         .await;

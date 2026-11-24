@@ -1,10 +1,17 @@
-//! The UI's receiving half of the media lane: datagrams back into access units.
+//! The UI's receiving half of the media lane: objects back into access units.
 //!
-//! A QUIC DATAGRAM frame carries no stream association, so the header names the
-//! lane (`crates/shared/src/riffle/object.rs`) and this module demultiplexes by
-//! `(lane, class)` before reassembling by `obj_id` and `frag_offset`. Fragments
-//! may arrive out of order, and two objects or two lanes may interleave; the
-//! reassembly is per object, not per connection.
+//! The daemon pushes one object per frame, and this module reassembles: the
+//! header names the lane (`crates/shared/src/riffle/object.rs`), so it
+//! demultiplexes by `(lane, class)` before reassembling by `obj_id` and
+//! `frag_offset`. Fragments may arrive out of order, and two objects or two
+//! lanes may interleave; the reassembly is per object, not per connection.
+//!
+//! # Two carriers, one assembler
+//!
+//! The bytes are the same either way. A QUIC DATAGRAM frame carries one object;
+//! on the local pipe, one object is the payload of a class-1 frame on the
+//! control stream. [`Source`] is the only place that difference exists, so the
+//! reassembly, the deadlines and the counters are shared.
 //!
 //! # Whole objects only
 //!
@@ -37,6 +44,7 @@ use std::time::Instant;
 
 use siphon_shared::riffle::Class;
 use siphon_shared::riffle::Flags;
+use siphon_shared::riffle::codec::Frame;
 use siphon_shared::riffle::object::Object;
 use siphon_shared::riffle::object::TIMESTAMP_PREFIX;
 use siphon_shared::riffle::quic::Datagrams;
@@ -295,8 +303,10 @@ impl<S: Sink> MediaReceiver<S> {
         self.stats.view(now)
     }
 
-    /// Feeds one datagram. A whole object is delivered to the sink, if this
-    /// fragment completed one; otherwise nothing happens but bookkeeping.
+    /// Feeds one object in its datagram form: a QUIC datagram, or the payload
+    /// of a class-1 frame on the pipe. A whole object is delivered to the sink
+    /// if this fragment completed one; otherwise nothing happens but
+    /// bookkeeping.
     pub fn push(&mut self, datagram: &[u8], now: Instant) {
         // A live stream delivers often enough that this is the only expiry
         // needed; the network task's tick covers an idle connection.
@@ -426,16 +436,54 @@ fn timestamps(payload: &[u8]) -> Option<(i64, i64)> {
     ))
 }
 
-/// Reads datagrams until the connection closes, then reports the final
-/// counters. Runs on the RPC worker's compio thread, never the frame loop.
-pub async fn run(datagrams: Datagrams, events: kanal::Sender<UiEvent>) {
+/// Where media objects arrive from.
+///
+/// The two carriers hand over the same bytes — one object in the datagram form
+/// — so this is the whole of the difference between them.
+pub enum Source {
+    /// The datagram channel of a QUIC connection.
+    Datagrams(Datagrams),
+    /// Class-1 frames on the local pipe, taken off the control stream.
+    Frames(kanal::AsyncReceiver<Frame>),
+}
+
+/// What one wait produced.
+enum Arrival {
+    Datagram(Vec<u8>),
+    Frame(Frame),
+    /// The carrier is gone: the connection closed.
+    Closed,
+    /// Nothing arrived before the tick.
+    Idle,
+}
+
+async fn arrive(source: &Source) -> Arrival {
+    match source {
+        Source::Datagrams(datagrams) => match compio::time::timeout(TICK, datagrams.recv()).await {
+            Ok(Some(datagram)) => Arrival::Datagram(datagram),
+            Ok(None) => Arrival::Closed,
+            Err(_) => Arrival::Idle,
+        },
+        Source::Frames(frames) => match compio::time::timeout(TICK, frames.recv()).await {
+            Ok(Ok(frame)) => Arrival::Frame(frame),
+            Ok(Err(_)) => Arrival::Closed,
+            Err(_) => Arrival::Idle,
+        },
+    }
+}
+
+/// Reads objects from either carrier until the connection closes, then reports
+/// the final counters. Runs on the RPC worker's compio thread, never the frame
+/// loop.
+pub async fn run(source: Source, events: kanal::Sender<UiEvent>) {
     let mut receiver = MediaReceiver::new(());
     let mut last_report = Instant::now();
     loop {
-        match compio::time::timeout(TICK, datagrams.recv()).await {
-            Ok(Some(datagram)) => receiver.push(&datagram, Instant::now()),
-            Ok(None) => break,
-            Err(_) => receiver.expire(Instant::now()),
+        match arrive(&source).await {
+            Arrival::Datagram(datagram) => receiver.push(&datagram, Instant::now()),
+            Arrival::Frame(frame) => receiver.push(frame.payload(), Instant::now()),
+            Arrival::Closed => break,
+            Arrival::Idle => receiver.expire(Instant::now()),
         }
         let now = Instant::now();
         if now.saturating_duration_since(last_report) >= REPORT_INTERVAL {
@@ -684,6 +732,43 @@ mod tests {
         assert_eq!(unit.bytes, data, "the prefix is not part of the bytes");
         assert_eq!(receiver.view(now).last_lane, Some(6));
         assert_eq!(receiver.view(now).last_pts, Some(-90_123));
+    }
+
+    /// The pipe delivers one object per class-1 frame on the control stream.
+    /// Framed and read back the way the worker does it, the assembler must
+    /// produce exactly the unit the datagram path produces — same bytes, same
+    /// times, same keyframe bit.
+    #[test]
+    fn a_pipe_frame_delivers_the_same_access_unit_as_a_datagram() {
+        use siphon_shared::riffle::codec::FrameClass;
+        use siphon_shared::riffle::codec::FrameDecoder;
+        use siphon_shared::riffle::codec::encode_media;
+
+        let now = Instant::now();
+        let data = vec![0x4C; 250];
+        let datagrams = fragments(3, Class::Video, 12, (90_000, 89_998), true, &data, 100);
+
+        let mut from_datagrams = receiver();
+        for datagram in &datagrams {
+            from_datagrams.push(datagram, now);
+        }
+
+        // What the daemon writes: each object framed, class byte included.
+        let mut wire = Vec::new();
+        for datagram in &datagrams {
+            encode_media(datagram, &mut wire).expect("a media frame encodes");
+        }
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&wire);
+        let mut from_pipe = receiver();
+        while let Some(frame) = decoder.next_frame().expect("a whole frame") {
+            assert_eq!(frame.class(), FrameClass::Media);
+            from_pipe.push(frame.payload(), now);
+        }
+
+        assert_eq!(from_pipe.sink.units.len(), 1);
+        assert_eq!(from_pipe.sink.units, from_datagrams.sink.units);
+        assert_eq!(from_pipe.stats.delivered(), 1);
     }
 
     #[test]

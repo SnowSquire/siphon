@@ -47,7 +47,7 @@ together. That round trip exists only to satisfy RTSP.
 pinned. The pipe is not the second-class path — it is the fast one, and the only
 one that can hand over arena slots.
 
-The datagram channel is what media rides on: `quic::Datagrams`
+The datagram channel is what media rides on over QUIC: `quic::Datagrams`
 (`session.datagrams()`) sends, receives and reports the payload budget, and both
 endpoints advertise DATAGRAM in their `TransportConfig`
 (`max_datagram_frame_size` derived from a 256 KiB receive buffer, so 65535 on the
@@ -62,9 +62,25 @@ payload because quinn frees it only after transmission; `TooLarge` carries the
 size and the budget, `Unsupported` means the peer never advertised DATAGRAM,
 `Closed` means the connection is gone. A QUIC `Client` keeps the same handle
 (`Client::datagrams()`), so the control stream and the media lane share one
-connection. The pipe has no datagram channel: `Conn` carries `Option<Datagrams>`
-and a `StreamOpen` there is refused with `RpcError::NoMediaCarrier` before any
-pipeline is attached. The zero-copy pipe path is still a later task.
+connection.
+
+**The pipe carries media on the same connection as the control plane.** Both
+carriers use one frame — `u32` payload length, a one-byte class, then the
+payload (`riffle::codec`) — where class 0 is a `postcard` control message and
+class 1 is one object in the datagram form. The frame prefix changed without a
+`PROTOCOL_VERSION` bump: it is framing, not a message, and both ends are one
+build. On the pipe the daemon's media sender appends class-1 frames to the
+connection's own out buffer, the one `Conn::push` writes control frames into, so
+one writer carries both and there is no second ordering to keep. Media stops at
+half of `MAX_OUT`, so a lane can never be why a connection overflows and loses
+its control frames; the sender asks the loop to write through `PipeSignal`
+rather than waiting for the next tick, and `MediaSender::resume` lets it refill
+once the loop has swapped the buffer into a write.
+
+The datagram path is still the only one for a remote client, and `NoMediaCarrier`
+is now only the QUIC peer that never advertised DATAGRAM. The zero-copy pipe
+path — a frame naming an arena slot instead of a byte range — is still a later
+task; today's pipe frame is a copy, and a local one.
 
 ## The media lane
 
@@ -78,17 +94,21 @@ place:
   `SegmentMessage::Init`), packs each access unit with a `Packer` and offers the
   fragments to the sender. One demuxer and one packer per lane, so the MPEG-TS
   PMT, the fMP4 running decode time and the object ids are per lane.
-- **one media sender** per QUIC connection (`media::lane::MediaSender`) owns the
-  `Datagrams` handle and two bounded queues. Everything that sends a datagram
-  goes through it, so the ordering is in one place: `high` (audio, and video from
-  a lane at the edge) is drained completely before `low` (video from a lane that
-  is catching up). A caught-up burst fills a queue, and the producer waits for
-  room rather than dropping: a fragment of a keyframe is not cheaper than the
-  whole access unit, it is a broken picture.
+- **one media sender** per connection (`media::lane::MediaSender`) owns the
+  carrier — the `Datagrams` handle over QUIC, the connection's out buffer on the
+  pipe — and two bounded queues. Everything that sends media goes through it, so
+  the ordering is in one place: `high` (audio, and video from a lane at the edge)
+  is drained completely before `low` (video from a lane that is catching up). A
+  caught-up burst fills a queue, and the producer waits for room rather than
+  dropping: a fragment of a keyframe is not cheaper than the whole access unit,
+  it is a broken picture. On the pipe the sender writes class-1 frames straight
+  into `Conn::out` until media holds half of `MAX_OUT`, then holds the frame and
+  waits — so control frames are never behind a picture, and nothing is dropped.
+  `PipeSignal` wakes the loop, which is the only writer, to arm the write.
 
-`StreamOpen` over QUIC attaches the pipeline, spawns the producer and starts the
-sender lazily; `StreamClose`, a closed connection and `Registry::detach` stop
-both. A producer stops when its segment channel closes, which is the same signal
+`StreamOpen` over either carrier attaches the pipeline, spawns the producer and
+starts the sender lazily; `StreamClose`, a closed connection and
+`Registry::detach` stop both. A producer stops when its segment channel closes, which is the same signal
 the scheduler sees: a closed consumer, never a full one.
 
 Only elementary stream crosses either carrier. No MPEG-TS, no fMP4: containers
@@ -114,7 +134,10 @@ Datagram: 20 B, ~1.7% of a 1200-byte payload.
 u8 class | u16 lane | u8 flags | u64 obj_id | u32 total_len | u32 frag_offset | payload
 ```
 
-Stream and pipe frames prepend `u32 len`, so they are 24 B of header. `lane` is
+A pipe or control-stream frame is `u32 payload_len | u8 frame_class | payload`:
+five bytes of framing, then the same object bytes as a datagram's payload
+(frame class 1) or a `postcard` message (class 0). So an object on the pipe is
+25 B of framing rather than 20. `lane` is
 what a QUIC DATAGRAM frame has none of: the frame carries no stream association,
 so the header names the lane. Control objects use lane 0, and a media lane's
 number is the same one its `obj_id` range is seeded from. `obj_id` is monotonic
@@ -229,9 +252,12 @@ an object is shipped or not shipped. Datagram send failures are counted too, on
 
 ### The receive half, as built
 
-The UI's `MediaReceiver` demultiplexes by `(lane, class)` and reassembles each
-object by `obj_id` and `frag_offset`, so fragments may arrive out of order and
-two objects or two lanes may interleave. An object is never delivered partial:
+The UI's `MediaReceiver` takes one object in its datagram form from whichever
+carrier the connection has — a QUIC DATAGRAM frame, or the payload of a class-1
+frame on the pipe (`media::Source`) — and demultiplexes by `(lane, class)`,
+reassembling each object by `obj_id` and `frag_offset`, so fragments may arrive
+out of order and two objects or two lanes may interleave. An object is never
+delivered partial:
 if a fragment is missing when a newer `obj_id` on the lane completes, or the
 500 ms deadline passes, the whole object is dropped and counted by class. An
 `obj_id` at or below the lane's high-water mark is discarded, which is also what
@@ -514,8 +540,10 @@ Siphon UI (ZGUI)  ── typed RPC ──  Siphon backend (compio)
 - No HTTP, WebSocket or gRPC: the client and server are both compio in this
   workspace, and the only missing part is an envelope. No auth beyond the
   pipe/socket permissions.
-- Frame: `u32` big-endian payload length, then a `postcard`-encoded message.
-  Cap the frame (`RPC_MAX_FRAME`, 1 MiB) and reject before allocating. The
+- Frame: `u32` big-endian payload length, then a one-byte class, then the
+  payload — `postcard` for class 0, one object's datagram form for class 1
+  (`PROTOCOL_VERSION` 6). Each class is capped (1 MiB for control,
+  `object::MAX_OBJECT` for media) and rejected before the payload is read. The
   codec is one module, so the encoding can be swapped without touching the
   message types.
 - First exchange is `Hello`/`Welcome`: magic, `PROTOCOL_VERSION`, app version.

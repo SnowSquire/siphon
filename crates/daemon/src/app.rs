@@ -78,6 +78,9 @@ enum Event {
     Job(Option<Box<JobDone>>),
     /// Something published on the bus.
     Bus,
+    /// A pipe connection's media sender queued a frame: there is something to
+    /// write.
+    Media,
     /// The nearest deadline came due.
     Deadline,
 }
@@ -220,6 +223,10 @@ pub struct App {
     trust_shared: SharedTrust,
     /// When the trust snapshot is next due to be re-read.
     trust_at: Instant,
+    /// Set when a pipe connection's media sender has queued frames. The loop is
+    /// the only writer of a connection's out buffer, so this is what arms the
+    /// next write instead of leaving a picture to arrive at the next tick.
+    media_wake: Rc<crate::media::lane::PipeSignal>,
 }
 
 impl App {
@@ -296,6 +303,7 @@ impl App {
             trust,
             trust_shared,
             trust_at: Instant::now(),
+            media_wake: Rc::new(crate::media::lane::PipeSignal::default()),
         }
     }
 
@@ -312,6 +320,8 @@ impl App {
             }
 
             let deadline = self.next_deadline(&conns);
+            // An owned clone, so the select does not borrow `self` twice.
+            let media_wake = Rc::clone(&self.media_wake);
             let event = {
                 // Biased, socket first: a completed read is never dropped for a
                 // connection event. The socket cannot move into the op set,
@@ -327,9 +337,10 @@ impl App {
                 let ops_fut = ops.next().fuse();
                 let jobs = self.jobs.clone();
                 let job_fut = jobs.recv().fuse();
+                let media_fut = media_wake.wait().fuse();
                 let timer = compio::time::sleep(deadline).fuse();
 
-                futures_util::pin_mut!(socket_fut, ops_fut, job_fut, timer);
+                futures_util::pin_mut!(socket_fut, ops_fut, job_fut, media_fut, timer);
                 futures_util::select_biased! {
                     message = socket_fut => Event::Socket(message),
                     some = ops_fut => match some {
@@ -337,6 +348,7 @@ impl App {
                         None => break,
                     },
                     job = job_fut => Event::Job(job.ok()),
+                    () = media_fut => Event::Media,
                     () = timer => Event::Deadline,
                 }
             };
@@ -355,6 +367,9 @@ impl App {
                 Event::Job(None) => break,
                 Event::Job(Some(done)) => self.handle_job(*done).await,
                 Event::Bus => ops.push(bus_op(Rc::clone(&self.bus))),
+                // The frames are already queued: `flush_bus` below arms the
+                // write that carries them.
+                Event::Media => {}
                 Event::Deadline => {
                     self.on_tick().await;
                     // A provisional connection that has not confirmed by the
@@ -511,16 +526,24 @@ impl App {
             let Some(conn) = conns[id].as_mut() else {
                 return;
             };
-            let payload = match conn.decoder.next_frame() {
-                Ok(Some(payload)) => payload,
+            let frame = match conn.decoder.next_frame() {
+                Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(_) => {
                     close = true;
                     break;
                 }
             };
+            // Media is the daemon's direction. A client that sends a class-1
+            // frame is not speaking this protocol, and the frame is not a
+            // message to guess at.
+            if frame.class() != siphon_shared::riffle::FrameClass::Control {
+                warn!(target: "rpc", class = %frame.class(), "rpc: a client sent a media frame");
+                close = true;
+                break;
+            }
             match siphon_shared::riffle::codec::decode::<siphon_shared::riffle::ClientMessage>(
-                &payload,
+                frame.payload(),
             ) {
                 // Sent instead of `Hello`, and only on a provisional connection.
                 Ok(siphon_shared::riffle::ClientMessage::PairConfirm { sas, name }) => {
@@ -696,7 +719,7 @@ impl App {
             }
             for conn in conns.iter_mut().flatten() {
                 if conn.ready {
-                    conn.out.extend_from_slice(&self.frame);
+                    conn.out.borrow_mut().extend_from_slice(&self.frame);
                 }
             }
         }
@@ -704,7 +727,8 @@ impl App {
             let Some(conn) = slot.as_mut() else {
                 continue;
             };
-            if conn.out.len() > riffle::MAX_OUT {
+            let out_len = conn.out.borrow().len();
+            if out_len > riffle::MAX_OUT {
                 // Closed after this loop: `close_conn` needs all of `conns`, and
                 // this loop holds one connection at a time.
                 overflowed.push(id);
@@ -712,12 +736,15 @@ impl App {
             }
             if conn.ready
                 && !conn.writing
-                && !conn.out.is_empty()
+                && out_len > 0
                 && let Some(writer) = conn.take_writer()
             {
                 conn.writing = true;
-                std::mem::swap(&mut conn.out, &mut conn.spare);
+                std::mem::swap(&mut *conn.out.borrow_mut(), &mut conn.spare);
                 let buf = std::mem::take(&mut conn.spare);
+                // The out buffer is empty again, so a pipe lane that stopped for
+                // room may fill it. The write below carries what was there.
+                conn.resume_media();
                 ops.push(write_op(id, writer, buf));
             }
         }
@@ -910,22 +937,19 @@ impl App {
     /// the lane starts at the keyframe at or before the target, in the segment
     /// that holds it, and its producer is (re)started there.
     ///
-    /// A connection with no datagram channel has nowhere to push media. That is
-    /// a typed refusal *before* the pipeline is attached: the local pipe carries
-    /// control only, and a lane that attached and then fed nothing would look
-    /// like a live stream that produces no picture.
+    /// A connection whose carrier cannot send media at all is a typed refusal
+    /// *before* the pipeline is attached: a lane that attached and then fed
+    /// nothing would look like a live stream that produces no picture. Only a
+    /// QUIC peer without DATAGRAM is that; the pipe carries class-1 frames on
+    /// the connection the control plane is already using.
     async fn stream_open(
         &self,
         conn: &mut riffle::Conn,
         key: StreamKey,
         playback: StreamPlayback,
     ) -> Result<Response, RpcError> {
-        let Some(media) = conn.media() else {
-            return Err(if conn.is_quic() {
-                quic_without_datagrams()
-            } else {
-                pipe_has_no_media()
-            });
+        let Some(media) = conn.media(Rc::clone(&self.media_wake)) else {
+            return Err(quic_without_datagrams());
         };
         let now = Instant::now();
         let opened = !conn.lanes.contains(&key);
@@ -1062,12 +1086,8 @@ impl App {
         if !conn.lanes.contains(key) {
             return Err(RpcError::NotFound);
         }
-        let Some(media) = conn.media() else {
-            return Err(if conn.is_quic() {
-                quic_without_datagrams()
-            } else {
-                pipe_has_no_media()
-            });
+        let Some(media) = conn.media(Rc::clone(&self.media_wake)) else {
+            return Err(quic_without_datagrams());
         };
         let now = Instant::now();
         let place = self.registry.place(key);
@@ -1125,7 +1145,7 @@ impl App {
     /// connection's lanes into every other UI. Everything the bus carries is
     /// daemon-wide and identical for every connection; a lane is neither.
     fn push_lane(
-        conn: &mut riffle::Conn,
+        conn: &riffle::Conn,
         key: &StreamKey,
         now: Instant,
         place: Option<LanePlace>,
@@ -1640,17 +1660,6 @@ fn position_of(position: PlaybackPosition, place: Option<LanePlace>) -> u64 {
 /// which is unsigned while [`now_ms`] is signed for the channel rows.
 fn wall_ms() -> u64 {
     u64::try_from(now_ms()).unwrap_or_default()
-}
-
-/// The refusal a lane opened over the local pipe gets.
-///
-/// The pipe is the fast carrier for control and, later, for zero-copy arena
-/// slots; it has no datagram channel, so it cannot carry a media lane today.
-/// Saying so is better than a lane that attaches and receives nothing.
-fn pipe_has_no_media() -> RpcError {
-    RpcError::NoMediaCarrier(
-        "the local pipe carries control only; a media lane needs a QUIC connection".to_owned(),
-    )
 }
 
 /// The refusal a QUIC connection that never negotiated DATAGRAM gets.

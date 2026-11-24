@@ -23,7 +23,10 @@ use kanal::Sender;
 use thiserror::Error;
 
 use crate::riffle::codec::CodecError;
+use crate::riffle::codec::Frame;
+use crate::riffle::codec::FrameClass;
 use crate::riffle::codec::FrameReader;
+use crate::riffle::codec::decode;
 use crate::riffle::codec::write;
 use crate::riffle::endpoint;
 use crate::riffle::protocol::ClientMessage;
@@ -113,6 +116,8 @@ pub struct Client {
     pending: Pending,
     next_id: Cell<u64>,
     datagrams: Option<quic::Datagrams>,
+    /// Class-1 media frames of a pipe connection, for [`Self::frames`].
+    frames: Option<AsyncReceiver<Frame>>,
 }
 
 impl Client {
@@ -201,10 +206,20 @@ impl Client {
             wake: Rc::new(Wake::new()),
             closed: Cell::new(false),
         });
+        // A pipe carries media as class-1 frames on the control stream; QUIC
+        // carries it as datagrams, so only the pipe needs the frame channel.
+        // The assembler is its own task, and a media burst must never hold up
+        // a control event behind it.
+        let (frames_tx, frames) = if datagrams.is_none() {
+            let (tx, rx) = kanal::unbounded();
+            (Some(tx), Some(rx.to_async()))
+        } else {
+            (None, None)
+        };
         let task_pending = Rc::clone(&pending);
         let task_out = Rc::clone(&out);
         compio::runtime::spawn(async move {
-            drive(stream, reader, task_out, task_pending, events_tx).await;
+            drive(stream, reader, task_out, task_pending, events_tx, frames_tx).await;
         })
         .detach();
 
@@ -215,6 +230,7 @@ impl Client {
                 pending,
                 next_id: Cell::new(0),
                 datagrams,
+                frames,
             },
             snapshot,
         ))
@@ -222,12 +238,23 @@ impl Client {
 
     /// The datagram channel of a QUIC connection, or `None` on the pipe.
     ///
-    /// The pipe is a byte stream: it has no datagram channel, and inventing one
-    /// would be a second framing to keep right. Media over the local carrier is
-    /// not designed yet.
+    /// A QUIC connection keeps the handle it handshook with, so the media lane
+    /// and the control plane ride one connection. The pipe has no datagram
+    /// channel and does not need one: its media is class-1 frames on the same
+    /// stream ([`Self::frames`]).
     #[must_use]
     pub const fn datagrams(&self) -> Option<&quic::Datagrams> {
         self.datagrams.as_ref()
+    }
+
+    /// The class-1 media frames of a pipe connection, or `None` on QUIC.
+    ///
+    /// Each frame is one object in the datagram form, so the UI's assembler
+    /// takes its payload exactly as it takes a datagram. Single consumer: the
+    /// media task owns it for the life of the connection.
+    #[must_use]
+    pub const fn frames(&self) -> Option<&AsyncReceiver<Frame>> {
+        self.frames.as_ref()
     }
 
     /// The stream of `Snapshot`/`Update` events. Closes when the backend
@@ -350,6 +377,7 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
     out: Rc<Outbox>,
     pending: Pending,
     events: Sender<ClientEvent>,
+    frames: Option<Sender<Frame>>,
 ) {
     loop {
         loop {
@@ -364,7 +392,7 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
             break;
         }
 
-        let incoming = reader.read::<ServerMessage, _>(&mut stream).fuse();
+        let incoming = reader.read_frame(&mut stream).fuse();
         let woken = wait_wake(&out.wake).fuse();
         futures_util::pin_mut!(incoming, woken);
         // The read is polled first: a completed frame is never dropped for a
@@ -373,21 +401,31 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
             message = incoming => message,
             () = woken => continue,
         };
-        match selected {
-            Ok(ServerMessage::Update(update)) => {
-                let _ = events.try_send(ClientEvent::Update(Box::new(update)));
-            }
-            Ok(ServerMessage::Snapshot(snapshot)) => {
-                let _ = events.try_send(ClientEvent::Snapshot(snapshot));
-            }
-            Ok(ServerMessage::Response { id, result }) => {
-                if let Some(waiter) = pending.borrow_mut().remove(&id) {
-                    let _ = waiter.try_send(result);
+        let Ok(frame) = selected else { break };
+        match frame.class() {
+            // Media is not a message and never becomes one: it goes to the
+            // assembler, whole, on its own task.
+            FrameClass::Media => {
+                if let Some(frames) = &frames {
+                    let _ = frames.try_send(frame);
                 }
             }
-            // The handshake already consumed the only welcome.
-            Ok(ServerMessage::Welcome { .. } | ServerMessage::Rejected(_)) => {}
-            Err(_) => break,
+            FrameClass::Control => match decode::<ServerMessage>(frame.payload()) {
+                Ok(ServerMessage::Update(update)) => {
+                    let _ = events.try_send(ClientEvent::Update(Box::new(update)));
+                }
+                Ok(ServerMessage::Snapshot(snapshot)) => {
+                    let _ = events.try_send(ClientEvent::Snapshot(snapshot));
+                }
+                Ok(ServerMessage::Response { id, result }) => {
+                    if let Some(waiter) = pending.borrow_mut().remove(&id) {
+                        let _ = waiter.try_send(result);
+                    }
+                }
+                // The handshake already consumed the only welcome.
+                Ok(ServerMessage::Welcome { .. } | ServerMessage::Rejected(_)) => {}
+                Err(_) => break,
+            },
         }
     }
     fail(&out, &pending);

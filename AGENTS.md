@@ -104,7 +104,7 @@ playlists. The mock's Hermes socket is on its own port, so point the daemon at i
 with `SIPHON_HERMES_URL=ws://127.0.0.1:8001/v1`.
 
 1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere). `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
-2. `cargo run -p daemon -- daemon -d http://127.0.0.2:8000`; the pipeline starts on the mock's `stream-up`. A viewer still has nothing to draw with: the media lane pushes datagrams (`media/lane.rs`) and the UI's `MediaReceiver` (`crates/ui/src/media.rs`) reassembles them into whole access units, but there is no decoder or player, so the end-to-end checks are the pipeline rows, the logs, the receiver's counters, the lane datagrams a test collects and whatever recording is enabled.
+2. `cargo run -p daemon -- daemon -d http://127.0.0.2:8000`; the pipeline starts on the mock's `stream-up`. A viewer still has nothing to draw with: the media lane pushes objects (`media/lane.rs`) — datagrams over QUIC, class-1 frames on the pipe — and the UI's `MediaReceiver` (`crates/ui/src/media.rs`) reassembles them into whole access units, but there is no decoder or player, so the end-to-end checks are the pipeline rows, the logs, the receiver's counters, the objects a test collects and whatever recording is enabled.
 3. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
 
 ## Worktrees

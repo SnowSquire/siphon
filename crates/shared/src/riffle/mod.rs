@@ -24,6 +24,8 @@ pub use client::ClientEvent;
 pub use client::ConnectError;
 pub use client::Pairing;
 pub use codec::CodecError;
+pub use codec::Frame;
+pub use codec::FrameClass;
 pub use codec::FrameDecoder;
 pub use codec::FrameReader;
 pub use endpoint::admin_endpoint;
