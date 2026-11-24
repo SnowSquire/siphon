@@ -62,7 +62,7 @@ The Rust step is three derivations, not one (`craneLib` in `flake.nix`):
 
 | derivation | rebuilt when |
 |---|---|
-| `siphon-windows-deps` | `Cargo.lock`, rustc, the cross environment or the profile changes |
+| `siphon-windows-deps` | the dependency set in `Cargo.lock`, rustc, the cross environment or the profile changes — not the workspace version (`depsSrc`) |
 | `siphon-windows-ui` | plus anything under `crates/` the UI depends on |
 | `siphon-windows-daemon` | plus anything under `crates/` the daemon depends on |
 
@@ -138,7 +138,23 @@ What invalidates what, in practice:
 | `crates/daemon/src/**` | `siphon-windows-daemon` |
 | `crates/shared/src/**` | both binaries, not the dependency layer |
 | `Cargo.lock`, `Cargo.toml` | the dependency layer, then both binaries |
+| the workspace version alone | both binaries; **not** the dependency layer (see below) |
 | a note, a workflow, `README.md` | the installer only |
+
+A release bump used to rebuild the dependency layer, because crane hashes the
+manifests it builds from and puts `version` in the derivation name: changing
+`0.5.0` to `0.5.1` and nothing else produced a new `.#windows-deps`. That is
+~500 crates and 20 minutes to change one string, and the cache key could not
+save it because the derivation itself had moved.
+
+`depsSrc` in `flake.nix` is the fix: the same tree with `[workspace.package]
+version` and the three members' `[[package]]` entries in `Cargo.lock` rewritten
+to `0.0.0`. The dependency layers build from it at `version = "0"`, and vendor
+their crates from it too, so the layer is keyed on the dependency *set*. The
+binaries still build from `cargoSrc`, so their names, PDBs and `--version`
+carry the real number. Verified by evaluating `.#windows-deps.drvPath` and
+`.#linux-deps.drvPath` across a version change: identical, while `.#default`
+and `.#windows-installer` move.
 
 For editing code, use the dev shell: it has the same toolchain, CRT/SDK and
 libplacebo, and `cargo build` is an ordinary incremental build against

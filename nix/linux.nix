@@ -23,6 +23,7 @@
   cargoHashes,
   sources,
   cargoSrc,
+  depsSrc,
 }:
 
 let
@@ -35,8 +36,10 @@ let
     # fixtures, neither of which exists in the sandbox.
     doCheck = false;
 
+    # Vendored from the versionless tree, so a release bump re-vendors
+    # nothing (see `depsSrc` in flake.nix).
     cargoVendorDir = craneLib.vendorCargoDeps {
-      src = cargoSrc;
+      src = depsSrc;
       outputHashes = cargoHashes;
     };
     cargoExtraArgs = "--locked";
@@ -73,6 +76,10 @@ let
     commonArgs
     // {
       pname = "siphon-deps";
+      # `depsSrc` plus a fixed version: the layer must not move when only the
+      # release version does (see `depsSrc` in flake.nix).
+      src = depsSrc;
+      version = "0";
       # `buildDepsOnly` otherwise runs `cargo check` and then `cargo build` over
       # every dependency; the binaries only need the second pass.
       buildPhaseCargoCommand = "cargoWithProfile build --locked";

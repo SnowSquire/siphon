@@ -22,6 +22,7 @@
   sources,
   msvc,
   cargoSrc,
+  depsSrc,
 }:
 let
   # The debug normaliser needs xxhash: lld derives the CodeView GUID with it.
@@ -50,8 +51,11 @@ let
     dontPatchELF = true;
     dontFixup = true;
 
+    # Vendored from the versionless tree: a release bump must not re-vendor
+    # either. The dependency set is identical, only the members' version lines
+    # are rewritten (see `depsSrc` in flake.nix).
     cargoVendorDir = craneLib.vendorCargoDeps {
-      src = cargoSrc;
+      src = depsSrc;
       outputHashes = cargoHashes;
     };
     cargoExtraArgs = "--locked --target x86_64-pc-windows-msvc";
@@ -78,6 +82,10 @@ let
     commonArgs
     // {
       pname = "siphon-windows-deps";
+      # `depsSrc` plus a fixed version: the layer must not move when only the
+      # release version does (see `depsSrc` in flake.nix).
+      src = depsSrc;
+      version = "0";
       # `buildDepsOnly` otherwise runs `cargo check` and then `cargo build`
       # over every dependency; the check pass adds nothing to the artifacts the
       # binaries need.

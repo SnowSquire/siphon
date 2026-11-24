@@ -97,6 +97,39 @@
             ];
           };
 
+          # The dependency layer must depend on the dependency *set*, never on
+          # the release version. crane hashes the manifests the layer is built
+          # from and puts `version` in its derivation name, so bumping 0.5.0 to
+          # 0.5.1 with nothing else changed produced a new `.#*-deps` and
+          # recompiled every dependency -- ~20 minutes to change one string.
+          #
+          # This is the same tree with the workspace members' version rewritten
+          # to a constant. Only the dependency layers build from it; the
+          # binaries still use `cargoSrc`, so their names, PDBs and `--version`
+          # carry the real number.
+          depsSrc = pkgs.runCommandLocal "siphon-cargo-src-versionless" { } ''
+            cp -r ${cargoSrc} $out
+            chmod -R u+w $out
+
+            # `[workspace.package] version`, up to the next table header.
+            ${pkgs.gnused}/bin/sed -i \
+              '/^\[workspace\.package\]/,/^\[/ s/^version = .*/version = "0.0.0"/' \
+              $out/Cargo.toml
+
+            # The three workspace members' `[[package]]` entries. A member's
+            # version line always follows its `name` line, and no dependency
+            # shares those names.
+            ${pkgs.gawk}/bin/awk '
+              /^name = / { n = $0 }
+              /^version = / && n ~ /"(daemon|siphon-shared|siphon-ui)"/ {
+                print "version = \"0.0.0\""
+                next
+              }
+              { print }
+            ' $out/Cargo.lock > $out/Cargo.lock.versionless
+            mv $out/Cargo.lock.versionless $out/Cargo.lock
+          '';
+
           # The packaging derivation reads the licences, the fonts' OFL files,
           # the NSIS script and the VC++ bootstrapper; nothing else in the tree
           # belongs in its inputs.
@@ -122,6 +155,7 @@
                 cargoHashes
                 cargoSrc
                 craneLib
+                depsSrc
                 installerSrc
                 sources
                 rustPlatform
