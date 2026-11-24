@@ -1,9 +1,13 @@
 # The three Windows artefacts, packaged from the payload `nix/windows.nix`
 # builds:
 #
-#   siphon-<version>-x64-setup.exe      the per-user NSIS installer
-#   siphon-<version>-x64-portable.zip   the same payload, zipped
-#   siphon-<version>-x64-symbols.zip    the release PDBs
+#   siphon-<version><label>-x64-setup.exe      the per-user NSIS installer
+#   siphon-<version><label>-x64-portable.zip   the same payload, zipped
+#   siphon-<version><label>-x64-symbols.zip    the release PDBs
+#
+# `label` is empty for a release and `-<short commit>` for any other build, so
+# two builds of one version are distinguishable and the tag keeps the plain
+# name the updater looks for.
 #
 # The setup is what the updater downloads: the release asset must keep the
 # `-setup.exe` suffix, and its name carries the version. The portable zip keeps
@@ -22,9 +26,15 @@
   windows,
   installerSrc,
   version,
+  label ? "",
   sources,
 }:
 
+let
+  # The name every artefact, and the portable zip's inner directory, is built
+  # from: `siphon-0.5.1`, or `siphon-0.5.1-18b8dd2` off a branch.
+  base = "siphon-${version}${label}";
+in
 stdenvNoCC.mkDerivation {
   pname = "siphon-windows-installer";
   inherit version;
@@ -42,7 +52,7 @@ stdenvNoCC.mkDerivation {
   buildPhase = ''
     runHook preBuild
     dist=$TMPDIR/dist
-    stage=$dist/siphon-${version}
+    stage=$dist/${base}
     mkdir -p "$stage" "$dist"
 
     cp ${windows}/bin/siphon.exe ${windows}/bin/siphon-daemon.exe "$stage/"
@@ -68,19 +78,19 @@ stdenvNoCC.mkDerivation {
     # both paths handed to `makensis` have to be absolute.
     makensis -V2 -DVERSION=${version} -DPAYLOAD="$stage" \
       -DVCREDIST="$PWD/installer/vcredist.ps1" \
-      -DOUTFILE="$dist/siphon-${version}-x64-setup.exe" "$PWD/installer/siphon.nsi"
+      -DOUTFILE="$dist/${base}-x64-setup.exe" "$PWD/installer/siphon.nsi"
 
     # The portable copy is the same payload zipped under its directory: there is
     # no single exe to ship any more. The name deliberately does not end in
     # `-setup.exe`, so the updater never mistakes it for an installer. `-X`
     # drops the extra fields that carry more of the same timestamps.
-    ( cd "$dist" && zip -qrX "siphon-${version}-x64-portable.zip" "siphon-${version}" )
+    ( cd "$dist" && zip -qrX "${base}-x64-portable.zip" "${base}" )
 
-    symbols="$dist/siphon-${version}-symbols"
+    symbols="$dist/${base}-symbols"
     mkdir -p "$symbols"
     cp ${windows}/symbols/*.pdb "$symbols/"
     find "$symbols" -exec touch -h -d "@$epoch" {} +
-    ( cd "$dist" && zip -qrX "siphon-${version}-x64-symbols.zip" "siphon-${version}-symbols" )
+    ( cd "$dist" && zip -qrX "${base}-x64-symbols.zip" "${base}-symbols" )
 
     runHook postBuild
   '';

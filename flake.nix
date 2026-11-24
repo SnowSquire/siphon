@@ -174,12 +174,21 @@
           windows-installer = callPackage ./nix/windows-installer.nix {
             windows = windows.package;
           };
+
+          # The same three artefacts with the commit in the name. A push to
+          # main builds one of these: two builds of 0.5.1 are otherwise
+          # indistinguishable, and only a tag ships the plain release name.
+          windows-installer-sha = callPackage ./nix/windows-installer.nix {
+            windows = windows.package;
+            label = "-${self.shortRev or self.dirtyShortRev or "dirty"}";
+          };
         in
         {
           packages = {
             linux = linux.package;
             windows = windows.package;
             inherit windows-installer;
+            inherit windows-installer-sha;
             default = linux.package;
 
             # The dependency layers as their own outputs: they only change with

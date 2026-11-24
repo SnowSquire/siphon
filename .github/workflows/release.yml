@@ -157,7 +157,15 @@ jobs:
           save: false
 
       - name: build the artefacts
-        run: nix build .#windows-installer --print-out-paths
+        run: |
+          set -euo pipefail
+          # A tag ships the release names the updater expects; anything else
+          # carries the commit, so two builds of one version can be told apart.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            nix build .#windows-installer --print-out-paths
+          else
+            nix build .#windows-installer-sha --print-out-paths
+          fi
 
       - name: publish
         # `act` sets ACT=true for local runs; there is no token there and no

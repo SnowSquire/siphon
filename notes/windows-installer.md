@@ -10,6 +10,12 @@ result/siphon-<version>-x64-portable.zip
 result/siphon-<version>-x64-symbols.zip
 ```
 
+`<version>` is `0.5.1`, or `0.5.1-18b8dd2` on a build that is not a release:
+`.#windows-installer-sha` takes a `label` holding the short commit, so two
+builds of one version can be told apart and the portable zip's inner directory
+carries it too. Only a `vX.Y.Z` tag builds the plain name, which is the one
+`update::parse_release` expects.
+
 `nix/windows-installer.nix` is the whole packaging step: it stages the payload
 `nix/windows.nix` built, adds the licence texts, runs `makensis`, and zips the
 portable copy and the PDBs. `notes/nix-build.md` covers the toolchain and pins.
