@@ -19,9 +19,6 @@ pub const APP_ID: &str = "com.iken.siphon";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The RTSP listener the daemon binds alongside its admin port.
-const RTSP: &str = "127.0.0.1:7417";
-
 fn endpoint() -> String {
     siphon_shared::riffle::admin_endpoint(APP_ID)
 }
@@ -46,17 +43,6 @@ pub fn reachable() -> bool {
     siphon_shared::riffle::probe(&endpoint())
 }
 
-fn port_open(address: &str) -> bool {
-    let Ok(address) = address.parse() else {
-        return false;
-    };
-    std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
-}
-
-fn healthy() -> bool {
-    reachable() && port_open(RTSP)
-}
-
 /// Starts the daemon when the UI comes up and nothing is listening yet.
 pub fn ensure_running() {
     if !reachable() {
@@ -69,18 +55,18 @@ pub fn ensure_running() {
 pub fn restart() {
     tracing::info!(target: "service", "restarting the daemon");
     terminate();
-    wait_ports_closed(40);
-    if reachable() || port_open(RTSP) {
+    wait_closed(40);
+    if reachable() {
         tracing::warn!(target: "service", "daemon still listening, killing by name");
         kill_by_name();
-        wait_ports_closed(20);
+        wait_closed(20);
     }
-    // A listening socket can linger after the process is killed, so retry the
-    // spawn until both ports answer.
+    // A listening endpoint can linger after the process is killed, so retry the
+    // spawn until it answers.
     for attempt in 1..=3 {
         start();
         for _ in 0..40 {
-            if healthy() {
+            if reachable() {
                 tracing::info!(target: "service", "daemon is up");
                 return;
             }
@@ -91,9 +77,9 @@ pub fn restart() {
     tracing::error!(target: "service", "daemon did not come up after restart");
 }
 
-fn wait_ports_closed(iterations: usize) {
+fn wait_closed(iterations: usize) {
     for _ in 0..iterations {
-        if !reachable() && !port_open(RTSP) {
+        if !reachable() {
             return;
         }
         std::thread::sleep(Duration::from_millis(100));
