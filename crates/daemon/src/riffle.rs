@@ -11,22 +11,115 @@
 use std::io;
 use std::rc::Rc;
 
+use compio::buf::BufResult;
+use compio::buf::IoBuf;
+use compio::buf::IoBufMut;
 use compio::io::AsyncRead;
+use compio::io::AsyncWrite;
 use compio::io::AsyncWriteExt as _;
 use siphon_shared::riffle::FrameDecoder;
 use siphon_shared::riffle::ServerMessage;
 use siphon_shared::riffle::codec;
+use siphon_shared::riffle::quic;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
 use crate::lane::Lanes;
 
-/// The admin transport: a socket on Unix, a named pipe on Windows.
+/// The local admin transport: a socket on Unix, a named pipe on Windows.
 #[cfg(unix)]
-pub type AdminStream = compio::net::UnixStream;
+type PlatformStream = compio::net::UnixStream;
 #[cfg(windows)]
-pub type AdminStream = compio::fs::named_pipe::NamedPipeServer;
+type PlatformStream = compio::fs::named_pipe::NamedPipeServer;
+
+/// The read half of an admin connection.
+///
+/// The halves are owned and shuttled through the loop's events rather than
+/// shared behind `Rc`: a QUIC connection is two separate stream handles, so a
+/// read and a write can be armed at once without an interior-mutable wrapper.
+pub enum AdminReader {
+    /// A pipe or domain socket. The two halves share one `Rc`.
+    Pipe(Rc<PlatformStream>),
+    /// One direction of a QUIC bidirectional stream.
+    Quic(quic::Reader),
+}
+
+impl AsyncRead for AdminReader {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        match self {
+            Self::Pipe(stream) => {
+                let mut stream: &PlatformStream = stream;
+                stream.read(buf).await
+            }
+            Self::Quic(stream) => stream.read(buf).await,
+        }
+    }
+}
+
+/// The write half of an admin connection.
+pub enum AdminWriter {
+    Pipe(Rc<PlatformStream>),
+    Quic(quic::Writer),
+}
+
+impl AsyncWrite for AdminWriter {
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        match self {
+            Self::Pipe(stream) => {
+                let mut stream: &PlatformStream = stream;
+                stream.write(buf).await
+            }
+            Self::Quic(stream) => stream.write(buf).await,
+        }
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Pipe(stream) => {
+                let mut stream: &PlatformStream = stream;
+                stream.flush().await
+            }
+            Self::Quic(stream) => stream.flush().await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            Self::Pipe(stream) => {
+                let mut stream: &PlatformStream = stream;
+                stream.shutdown().await
+            }
+            Self::Quic(stream) => stream.shutdown().await,
+        }
+    }
+}
+
+/// One accepted admin connection, whichever carrier it arrived on.
+pub struct AdminStream {
+    pub reader: AdminReader,
+    pub writer: AdminWriter,
+}
+
+impl AdminStream {
+    /// The local pipe/socket. Both halves are the same handle.
+    fn pipe(stream: PlatformStream) -> Self {
+        let stream = Rc::new(stream);
+        Self {
+            reader: AdminReader::Pipe(Rc::clone(&stream)),
+            writer: AdminWriter::Pipe(stream),
+        }
+    }
+
+    /// One bidirectional QUIC stream.
+    fn quic(stream: quic::Stream) -> Self {
+        let (reader, writer) = stream.split();
+        Self {
+            reader: AdminReader::Quic(reader),
+            writer: AdminWriter::Quic(writer),
+        }
+    }
+}
 
 /// Bytes one read asks for. Control traffic, not a hot loop.
 const READ_CHUNK: usize = 16 * 1024;
@@ -37,7 +130,10 @@ pub const MAX_OUT: usize = 1 << 20;
 
 /// One admin connection's protocol state. Owned by the daemon loop.
 pub struct Conn {
-    pub stream: Rc<AdminStream>,
+    /// The read half, absent only while a read future owns it.
+    pub reader: Option<AdminReader>,
+    /// The write half, absent only while a write future owns it.
+    pub writer: Option<AdminWriter>,
     pub decoder: FrameDecoder,
     /// Encoded frames waiting to be written.
     pub out: Vec<u8>,
@@ -57,7 +153,8 @@ impl Conn {
     #[must_use]
     pub fn new(stream: AdminStream) -> Self {
         Self {
-            stream: Rc::new(stream),
+            reader: Some(stream.reader),
+            writer: Some(stream.writer),
             decoder: FrameDecoder::new(),
             out: Vec::new(),
             spare: Vec::new(),
@@ -65,6 +162,17 @@ impl Conn {
             writing: false,
             lanes: Lanes::default(),
         }
+    }
+
+    /// Takes the read half to arm the next read. A connection has at most one
+    /// read in flight, so `None` only while a future owns it.
+    pub const fn take_reader(&mut self) -> Option<AdminReader> {
+        self.reader.take()
+    }
+
+    /// Takes the write half to arm the next write.
+    pub const fn take_writer(&mut self) -> Option<AdminWriter> {
+        self.writer.take()
     }
 
     /// Queues one frame. `false` means the connection can no longer be used.
@@ -83,11 +191,13 @@ pub enum ConnEvent {
         conn: usize,
         result: io::Result<usize>,
         buf: Vec<u8>,
+        reader: AdminReader,
     },
     Write {
         conn: usize,
         result: io::Result<()>,
         buf: Vec<u8>,
+        writer: AdminWriter,
     },
 }
 
@@ -102,26 +212,27 @@ pub async fn accept(queue: &kanal::AsyncReceiver<AdminStream>) -> ConnEvent {
     )
 }
 
-/// Reads up to [`READ_CHUNK`] bytes. The buffer comes back for reuse.
-pub async fn read(conn: usize, stream: Rc<AdminStream>) -> ConnEvent {
+/// Reads up to [`READ_CHUNK`] bytes. The buffer and the read half come back
+/// for reuse.
+pub async fn read(conn: usize, mut reader: AdminReader) -> ConnEvent {
     let buf = Vec::with_capacity(READ_CHUNK);
-    let mut source: &AdminStream = &stream;
-    let read = source.read(buf).await;
+    let read = reader.read(buf).await;
     ConnEvent::Read {
         conn,
         result: read.0,
         buf: read.1,
+        reader,
     }
 }
 
-/// Writes the whole buffer, which comes back for reuse.
-pub async fn write(conn: usize, stream: Rc<AdminStream>, buf: Vec<u8>) -> ConnEvent {
-    let mut sink: &AdminStream = &stream;
-    let written = sink.write_all(buf).await;
+/// Writes the whole buffer. The buffer and the write half come back for reuse.
+pub async fn write(conn: usize, mut writer: AdminWriter, buf: Vec<u8>) -> ConnEvent {
+    let written = writer.write_all(buf).await;
     ConnEvent::Write {
         conn,
         result: written.0,
         buf: written.1,
+        writer,
     }
 }
 
@@ -159,7 +270,7 @@ pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    if queue.try_send(stream).is_err() {
+                    if queue.try_send(AdminStream::pipe(stream)).is_err() {
                         warn!("rpc: accepting faster than the loop drains");
                     }
                 }
@@ -194,7 +305,7 @@ pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io
                     return;
                 }
             };
-            if queue.try_send(server).is_err() {
+            if queue.try_send(AdminStream::pipe(server)).is_err() {
                 warn!("rpc: accepting faster than the loop drains");
             }
             server = next;
@@ -202,6 +313,60 @@ pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io
     })
     .detach();
     Ok(())
+}
+
+/// Serves every `network.listen` address over QUIC, handing each accepted
+/// control stream to the loop through the same queue as the pipe.
+///
+/// One task per address, and one per connection: a stalled handshake or a peer
+/// that connects but never opens its control stream must not stop anything
+/// else from accepting.
+pub fn spawn_quic_listeners(
+    identity: &Rc<quic::Identity>,
+    addrs: &[String],
+    queue: &kanal::Sender<AdminStream>,
+) {
+    for addr in addrs {
+        spawn_quic_listener(Rc::clone(identity), addr.clone(), queue.clone());
+    }
+}
+
+fn spawn_quic_listener(
+    identity: Rc<quic::Identity>,
+    addr: String,
+    queue: kanal::Sender<AdminStream>,
+) {
+    compio::runtime::spawn(async move {
+        let listener = match quic::Listener::bind(addr.as_str(), &identity).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!(%error, %addr, "quic: bind failed");
+                return;
+            }
+        };
+        match listener.local_addr() {
+            Ok(local) => info!(%local, pin = identity.pin(), "quic: listening"),
+            Err(error) => warn!(%error, %addr, "quic: bound but the local address is unknown"),
+        }
+        loop {
+            let Some(incoming) = listener.incoming().await else {
+                break;
+            };
+            let queue = queue.clone();
+            compio::runtime::spawn(async move {
+                match quic::establish(incoming).await {
+                    Ok(stream) => {
+                        if queue.try_send(AdminStream::quic(stream)).is_err() {
+                            warn!("quic: accepting faster than the loop drains");
+                        }
+                    }
+                    Err(error) => warn!(%error, "quic: connection failed"),
+                }
+            })
+            .detach();
+        }
+    })
+    .detach();
 }
 
 #[cfg(all(test, not(miri)))]
@@ -216,6 +381,7 @@ mod tests {
     use siphon_shared::riffle::Request;
     use siphon_shared::riffle::Response;
     use siphon_shared::riffle::Update;
+    use siphon_shared::riffle::quic;
 
     use super::*;
     use crate::app::App;
@@ -229,8 +395,9 @@ mod tests {
     use crate::variant::debug_portrait_variant;
     use crate::variant::debug_variant;
 
-    fn scratch_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("siphon-rpc-test-{}", std::process::id()));
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("siphon-rpc-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -278,7 +445,7 @@ mod tests {
 
     #[test]
     fn record_and_stop_round_trip_over_the_admin_socket() {
-        let dir = scratch_dir();
+        let dir = scratch_dir("pipe");
         let runtime = compio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let http = Rc::new(HttpClient::new());
@@ -407,6 +574,102 @@ mod tests {
                 .unwrap();
             assert!(matches!(response, Response::Ack));
             next_pipeline(events, 7, true).await;
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole control plane over QUIC: a real [`App`], the existing
+    /// handshake, the snapshot and one query. Only the carrier differs from
+    /// the pipe test above.
+    #[test]
+    fn a_control_plane_round_trip_over_quic() {
+        let dir = scratch_dir("quic");
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let http = Rc::new(HttpClient::new());
+            let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
+            let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
+            crate::downloader::spawn_downloaders::<1>(&http, &downloaders_rx, &downloader_metrics);
+
+            let bus = Bus::new();
+            let registry = Rc::new(Registry::new(
+                Rc::clone(&http),
+                Rc::new(ArenaSet::new()),
+                downloaders_tx.to_async(),
+                downloader_metrics,
+                RegistryOptions {
+                    client_id: None,
+                    auth_token: None,
+                    low_latency: true,
+                    recording: crate::registry::Recording {
+                        output: None,
+                        dual_format: false,
+                    },
+                    notify: None,
+                    keep_runs: false,
+                },
+                Rc::clone(&bus),
+            ));
+            registry.seed_channel(
+                "sunnys",
+                7,
+                false,
+                vec![debug_variant("mock"), debug_portrait_variant("mock")],
+                42,
+            );
+            registry.watch_finished();
+
+            let (accept_tx, accept_rx) = kanal::unbounded();
+            let identity =
+                Rc::new(quic::Identity::load_or_create(&dir.join("net")).expect("identity"));
+            let pin = identity.pin().to_owned();
+            let listener = quic::Listener::bind("127.0.0.1:0", &identity)
+                .await
+                .expect("bind");
+            let endpoint = listener.local_addr().expect("local addr").to_string();
+            let queue = accept_tx.clone();
+            compio::runtime::spawn(async move {
+                while let Some(incoming) = listener.incoming().await {
+                    let queue = queue.clone();
+                    compio::runtime::spawn(async move {
+                        if let Ok(stream) = quic::establish(incoming).await {
+                            let _ = queue.try_send(AdminStream::quic(stream));
+                        }
+                    })
+                    .detach();
+                }
+            })
+            .detach();
+
+            let (jobs_tx, jobs_rx) = kanal::unbounded();
+            let daemon = App::new(AppInit {
+                config: Config {
+                    channels: vec![Channel {
+                        login: "sunnys".to_owned(),
+                        id: 7,
+                        display_name: Some("Sunnys".to_owned()),
+                        record: false,
+                    }],
+                    ..Config::default()
+                },
+                config_path: dir.join("config.json"),
+                client: Rc::clone(&http),
+                registry,
+                bus,
+                accept: accept_rx.to_async(),
+                jobs: jobs_rx.to_async(),
+                jobs_tx,
+                client_id: None,
+            });
+            compio::runtime::spawn(daemon.run()).detach();
+
+            let (client, snapshot) = Client::connect_quic(&endpoint, &pin, "test")
+                .await
+                .expect("quic connect");
+            assert_eq!(snapshot.channels.len(), 1);
+
+            let response = client.request(Request::GetSnapshot).await.unwrap();
+            assert!(matches!(response, Response::Snapshot(_)));
         });
         let _ = std::fs::remove_dir_all(dir);
     }

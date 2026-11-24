@@ -5,7 +5,9 @@ per-connection state machine behind `StreamOpen`/`StreamUpdate`/`StreamClose`/
 `StreamSeek`, the playhead estimate and the `LaneView` rows. There is still no
 packet transport, no demuxer wiring and no GOP alignment. RTSP is gone — `play`,
 the RTSP listener and the RTP packetizers were removed — so there is no viewer
-path at all until that lands. Parts II and III are implemented. The ALPN is
+path at all until that lands. Parts II and III are implemented, and so is the
+**QUIC carrier for the control plane** (self-signed certificate, SPKI pin); the
+pairing flow, client certificates and `peers.json` are not. The ALPN is
 `riffle/1`.
 It is one protocol: the RPC is the control plane (`Class::Control`) and media is
 the same framing with media classes, over a carrier that can lose datagrams.
@@ -663,12 +665,39 @@ One QUIC connection per UI carries both planes: the control plane on a
 bidirectional stream, media as datagrams on the same connection. No second
 credential, no second listener.
 
+The carrier is built in `siphon_shared::riffle::quic`. The daemon's identity is
+one self-signed certificate and one key in the state directory
+(`quic-cert.der`, `quic-key.der`, 0600 on Unix), made on first use and **stable
+across restarts**: a new key is a new pin for every client. It logs the pin
+once per bound address. The pin is the SPKI's SHA-256 as lowercase hex, so a
+re-issued certificate with the same key would not be a false alarm.
+
+The client installs a `rustls` `ServerCertVerifier` that accepts a certificate
+only if its SPKI hashes to the pin; the TLS handshake signature is still checked
+against the presented certificate through rustls' own verifier. The pin is 64
+hex characters, with an optional `sha256:` prefix. A mismatch is a
+typed `quic::Error::PinMismatch` carrying both pins; an empty pin is
+`PinMissing` before any packet is sent. `Client::connect_quic(endpoint, pin,
+version)` takes the pin as a parameter: `ui.json`'s `Connection::Remote` is
+still the place a UI would read it, but that is the pairing task.
+
+One bidirectional stream is the control plane. On accept, the daemon wraps the
+read and write halves in the same `AdminStream` the pipe uses and puts it on the
+same kanal queue, so the app loop, the handshake, the snapshot and the intents
+run unchanged; a connection that opens no stream costs one waiting task and
+nothing else. The `--no-admin` flag disables both carriers.
+
 `network.listen: Vec<String>` is the only switch. Empty means no UDP listener at
 all, and a local install uses the pipe. Non-empty binds those `host:port`s, and
 **remote clients get full capability** — `ApplyUpdate` and `SetRecordDir`
 included, because the operator of a remote daemon is the same person. There is
 no per-intent capability gate; the gate is `listen.is_empty()`, and
-`RemoteCapability` is deleted.
+`RemoteCapability` is deleted. Nothing binds loopback QUIC on the daemon's
+behalf: the pipe is the local transport.
+
+A subtlety worth keeping: quinn does not announce a bidirectional stream to the
+peer until the stream carries bytes. The client writes its `Hello` immediately
+after `open_bi`, which is what completes the server's `accept_bi`.
 
 ### Identity and pinning
 

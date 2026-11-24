@@ -83,12 +83,12 @@ fn accept_op(queue: &kanal::AsyncReceiver<riffle::AdminStream>) -> Op {
     Box::pin(async move { Event::Conn(riffle::accept(&queue).await) })
 }
 
-fn read_op(conn: usize, stream: Rc<riffle::AdminStream>) -> Op {
-    Box::pin(async move { Event::Conn(riffle::read(conn, stream).await) })
+fn read_op(conn: usize, reader: riffle::AdminReader) -> Op {
+    Box::pin(async move { Event::Conn(riffle::read(conn, reader).await) })
 }
 
-fn write_op(conn: usize, stream: Rc<riffle::AdminStream>, buf: Vec<u8>) -> Op {
-    Box::pin(async move { Event::Conn(riffle::write(conn, stream, buf).await) })
+fn write_op(conn: usize, writer: riffle::AdminWriter, buf: Vec<u8>) -> Op {
+    Box::pin(async move { Event::Conn(riffle::write(conn, writer, buf).await) })
 }
 
 fn bus_op(bus: Rc<Bus>) -> Op {
@@ -383,9 +383,8 @@ impl App {
         match event {
             riffle::ConnEvent::Accepted(Ok(stream)) => {
                 let id = insert_conn(conns, riffle::Conn::new(stream));
-                let stream = conns[id].as_ref().map(|conn| Rc::clone(&conn.stream));
-                if let Some(stream) = stream {
-                    ops.push(read_op(id, stream));
+                if let Some(reader) = conns[id].as_mut().and_then(riffle::Conn::take_reader) {
+                    ops.push(read_op(id, reader));
                 }
                 ops.push(accept_op(&self.accept));
             }
@@ -395,6 +394,7 @@ impl App {
                 conn: id,
                 result,
                 buf,
+                reader,
             } => {
                 match result {
                     Ok(0) | Err(_) => {
@@ -402,24 +402,29 @@ impl App {
                         return;
                     }
                     Ok(read) => {
-                        if let Some(conn) = conns[id].as_mut() {
-                            conn.decoder.push(&buf[..read]);
-                        }
+                        let Some(conn) = conns[id].as_mut() else {
+                            return;
+                        };
+                        // The read half is back for the next read.
+                        conn.reader = Some(reader);
+                        conn.decoder.push(&buf[..read]);
                     }
                 }
                 self.handle_frames(id, conns).await;
-                if let Some(conn) = conns[id].as_ref() {
-                    ops.push(read_op(id, Rc::clone(&conn.stream)));
+                if let Some(reader) = conns[id].as_mut().and_then(riffle::Conn::take_reader) {
+                    ops.push(read_op(id, reader));
                 }
             }
             riffle::ConnEvent::Write {
                 conn: id,
                 result,
                 mut buf,
+                writer,
             } => {
                 let Some(conn) = conns[id].as_mut() else {
                     return;
                 };
+                conn.writer = Some(writer);
                 conn.writing = false;
                 if result.is_err() {
                     self.close_conn(conns, id);
@@ -550,12 +555,15 @@ impl App {
                 overflowed.push(id);
                 continue;
             }
-            if conn.ready && !conn.writing && !conn.out.is_empty() {
+            if conn.ready
+                && !conn.writing
+                && !conn.out.is_empty()
+                && let Some(writer) = conn.take_writer()
+            {
                 conn.writing = true;
-                let stream = Rc::clone(&conn.stream);
                 std::mem::swap(&mut conn.out, &mut conn.spare);
                 let buf = std::mem::take(&mut conn.spare);
-                ops.push(write_op(id, stream, buf));
+                ops.push(write_op(id, writer, buf));
             }
         }
         for id in overflowed {

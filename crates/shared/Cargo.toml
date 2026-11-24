@@ -11,10 +11,13 @@ publish = false
 
 [dependencies]
 compio = { version = "0.19", features = ["fs", "net", "time"] }
+compio-quic = "0.8.2"
 dirs = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 kanal = "0.1.1"
 postcard = { version = "1", features = ["use-std"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 sonic-rs = "0.5.8"
 thiserror = "2.0.20"

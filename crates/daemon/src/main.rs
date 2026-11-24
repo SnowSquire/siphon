@@ -632,8 +632,23 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             .admin
             .clone()
             .unwrap_or_else(|| siphon_shared::riffle::admin_endpoint(config::APP_ID));
-        if let Err(error) = riffle::spawn_listener(endpoint, accept_tx) {
+        if let Err(error) = riffle::spawn_listener(endpoint, accept_tx.clone()) {
             error!(%error, "rpc: listener failed");
+        }
+        // The pipe is the local transport and is always bound. QUIC exists for
+        // another machine, so `network.listen` empty means no UDP listener at
+        // all — that emptiness is the whole remote gate.
+        if !config.network.listen.is_empty() {
+            let dir = siphon_shared::riffle::state_dir(config::APP_ID);
+            match siphon_shared::riffle::quic::Identity::load_or_create(&dir) {
+                Ok(identity) => {
+                    let identity = Rc::new(identity);
+                    riffle::spawn_quic_listeners(&identity, &config.network.listen, &accept_tx);
+                }
+                Err(error) => {
+                    error!(%error, "quic: no pinned identity, the remote listener is off");
+                }
+            }
         }
     }
     let (jobs_tx, jobs_rx) = kanal::unbounded();

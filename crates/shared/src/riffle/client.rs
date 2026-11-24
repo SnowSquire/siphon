@@ -51,6 +51,8 @@ pub enum ConnectError {
     Rejected(String),
     #[error("backend sent an unexpected first message")]
     Unexpected,
+    #[error(transparent)]
+    Quic(#[from] crate::riffle::quic::Error),
 }
 
 /// One asynchronous push from the backend.
@@ -112,14 +114,38 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connects, performs the Hello/Welcome exchange, and consumes the first
-    /// snapshot. The remaining traffic is driven by the connection task.
+    /// Connects over the local pipe/socket, performs the Hello/Welcome
+    /// exchange, and consumes the first snapshot. The remaining traffic is
+    /// driven by the connection task.
     pub async fn connect(
         endpoint: &str,
         app_version: &str,
     ) -> Result<(Self, Snapshot), ConnectError> {
-        let mut stream = endpoint::connect(endpoint).await?;
+        let stream = endpoint::connect(endpoint).await?;
+        Self::connect_over(stream, app_version).await
+    }
 
+    /// Connects over QUIC, checking the daemon's SPKI against `pin`.
+    ///
+    /// The pin is the one piece of trust a remote connection has; it is a
+    /// parameter because where a UI keeps it is the pairing flow's business.
+    /// An empty pin is refused before any packet is sent.
+    pub async fn connect_quic(
+        endpoint: &str,
+        pin: &str,
+        app_version: &str,
+    ) -> Result<(Self, Snapshot), ConnectError> {
+        let stream = crate::riffle::quic::connect(endpoint, pin).await?;
+        Self::connect_over(stream, app_version).await
+    }
+
+    /// The handshake both carriers share. From here on the transport is just
+    /// bytes: framing, the snapshot and the update task do not know which one
+    /// they are on.
+    async fn connect_over<S: AsyncRead + AsyncWrite + Unpin + 'static>(
+        mut stream: S,
+        app_version: &str,
+    ) -> Result<(Self, Snapshot), ConnectError> {
         write(
             &mut stream,
             &ClientMessage::Hello {

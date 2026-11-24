@@ -17,6 +17,7 @@ pub mod codec;
 pub mod endpoint;
 pub mod object;
 pub mod protocol;
+pub mod quic;
 
 pub use client::Client;
 pub use client::ClientEvent;

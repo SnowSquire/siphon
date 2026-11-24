@@ -142,7 +142,8 @@ detail: `notes/architecture.md`.
 - `media/` — the TS demuxer, the codec configs and the DVR timeline (`notes/ts-demux.md`). RTSP and its RTP packetizers are gone; the demuxer is the input side of the Riffle media lane and is not wired to a consumer yet.
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/shared` (`siphon-shared`) — what both sides agree on: `riffle/` (the
-  typed protocol, postcard framing, the object header, the UI-side client), `settings/` (the
+  typed protocol, postcard framing, the object header, the UI-side client, and
+  `quic.rs`, the pinned QUIC carrier), `settings/` (the
   per-client settings schema) and `store/` (the JSON file layer).
 - `crates/ui` (`siphon-ui`, binary `siphon`) — the ZGUI window presented through the DXGI flip chain ported from the video spike, the native tray, the Riffle client worker, and the daemon lifecycle (auto-start, PID-file restart). Builds on Linux too; `notes/riffle.md` has the split and the SDR/HDR state.
 
