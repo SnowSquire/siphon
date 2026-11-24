@@ -615,6 +615,32 @@ pub const SHEET: &str = css!(
 
     .stats { gap: 8px; }
 
+    .pair {
+        gap: 6px;
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--border-soft);
+        background-color: var(--surface-panel);
+    }
+
+    .pair__fields {
+        gap: 8px;
+        align-items: center;
+        padding-top: 4px;
+    }
+
+    .pair__endpoint { width: 200px; }
+    .pair__key { flex-grow: 1; }
+    .pair__code { width: 104px; }
+
+    .pair__status {
+        font-size: 12px;
+        color: var(--fg-faint);
+    }
+
+    .pair__status.bad { color: var(--error-fg); }
+    .pair__status.good { color: var(--zui-color-primary); }
+
     .stat {
         flex-grow: 1;
         flex-basis: 0;

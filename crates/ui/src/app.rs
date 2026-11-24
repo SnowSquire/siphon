@@ -46,6 +46,7 @@ use crate::format::format_iso_ms;
 use crate::format::format_time_ms;
 use crate::format::format_uptime;
 use crate::riffle::IntentSender;
+use crate::riffle::PairPhase;
 use crate::riffle::UiEvent;
 use crate::riffle::UiState;
 use crate::settings::Display;
@@ -445,11 +446,18 @@ fn App(
     let channel_filter = RwSignal::new_local(String::new());
     let once_login = RwSignal::new_local(String::new());
     let once_quality = RwSignal::new_local(String::new());
+    // The pairing panel's fields. They live here for the same reason the record
+    // once form does: the panel is one tab's body, and the window owns the text.
+    let pair_endpoint = RwSignal::new_local(String::new());
+    let pair_key = RwSignal::new_local(String::new());
+    let pair_code = RwSignal::new_local(String::new());
+    let pair_phase = state.pair;
 
     let update = Rc::clone(&intents);
     let dismiss = Rc::clone(&intents);
     let channels_intents = Rc::clone(&intents);
     let recordings_intents = Rc::clone(&intents);
+    let logs_intents = Rc::clone(&intents);
     // One clone per tab: the view's `if` bodies are closures, so each one that
     // uses the state has to own its handle.
     let state_channels = state.clone();
@@ -636,6 +644,12 @@ fn App(
                     logs = logs_sig,
                     pipelines = pipelines_sig,
                     lanes = lanes_sig,
+                    intents = Rc::clone(&logs_intents),
+                    pair = pair_phase,
+                    settings = settings_sig,
+                    endpoint = pair_endpoint,
+                    key = pair_key,
+                    code = pair_code,
                 )
             }
             if move || tab.get() == Tab::Settings {
@@ -1759,6 +1773,12 @@ fn LogsTab(
     logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
     pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
     lanes: RwSignal<Rc<Vec<RwSignal<LaneView, LocalStorage>>>, LocalStorage>,
+    intents: Rc<IntentSender>,
+    pair: RwSignal<PairPhase, LocalStorage>,
+    settings: RwSignal<ClientSettings, LocalStorage>,
+    endpoint: RwSignal<String, LocalStorage>,
+    key: RwSignal<String, LocalStorage>,
+    code: RwSignal<String, LocalStorage>,
 ) -> impl IntoView {
     view! {
         column(class = "tabbody") {
@@ -1780,6 +1800,16 @@ fn LogsTab(
                     text(class = "stat__value") {{move || format!("{} / {}", downloader.get().in_flight, downloader.get().capacity)}}
                 }
             }
+            // Connection health is this tab's subject, so the one action that
+            // changes which daemon this window talks to belongs here too.
+            PairPanel(
+                intents = intents,
+                phase = pair,
+                settings = settings,
+                endpoint = endpoint,
+                key = key,
+                code = code,
+            )
             ScrollArea(class = "logs") {
                 column(class = "loglist") {
                     if move || !(*notices.get()).is_empty() {
@@ -1834,6 +1864,121 @@ fn LogsTab(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Pairing with a daemon that is not on this machine.
+///
+/// The protocol makes this two steps, so the one button is: the client has to
+/// complete the handshake before either side can derive a code, and the code is
+/// what a person carries from the daemon's terminal to here. The first press
+/// connects and reports the code; the second sends the typed code back, and the
+/// worker only does that when the two match.
+#[component]
+#[allow(clippy::needless_pass_by_value, clippy::redundant_clone)]
+fn PairPanel(
+    intents: Rc<IntentSender>,
+    phase: RwSignal<PairPhase, LocalStorage>,
+    settings: RwSignal<ClientSettings, LocalStorage>,
+    endpoint: RwSignal<String, LocalStorage>,
+    key: RwSignal<String, LocalStorage>,
+    code: RwSignal<String, LocalStorage>,
+) -> impl IntoView {
+    // One action for the button and for Enter in any of the three fields, chosen
+    // by the phase: a press while the worker is working does nothing at all.
+    let run: Rc<dyn Fn()> = {
+        let intents = Rc::clone(&intents);
+        Rc::new(move || match phase.get_untracked() {
+            PairPhase::Connecting | PairPhase::Confirming => {}
+            PairPhase::Code(_) => {
+                let typed = code.get_untracked().trim().to_owned();
+                if typed.is_empty() {
+                    return;
+                }
+                phase.set(PairPhase::Confirming);
+                intents.pair_confirm(typed);
+            }
+            PairPhase::Idle | PairPhase::Paired(_) | PairPhase::Failed(_) => {
+                let address = endpoint.get_untracked().trim().to_owned();
+                let key = key.get_untracked().trim().to_owned();
+                if address.is_empty() || key.is_empty() {
+                    return;
+                }
+                phase.set(PairPhase::Connecting);
+                intents.pair_begin(address, key);
+            }
+        })
+    };
+
+    // Nothing is sent while the worker is busy, and nothing can be sent on an
+    // empty field: the button says why it is not available instead of failing on
+    // a click nobody can read.
+    let busy = Signal::derive_local(move || phase.get().busy());
+    let disabled = Signal::derive_local(move || match phase.get() {
+        PairPhase::Connecting | PairPhase::Confirming => true,
+        PairPhase::Code(_) => code.get().trim().is_empty(),
+        PairPhase::Idle | PairPhase::Paired(_) | PairPhase::Failed(_) => {
+            endpoint.get().trim().is_empty() || key.get().trim().is_empty()
+        }
+    });
+    let pair_label = Signal::derive_local(move || match phase.get() {
+        PairPhase::Connecting => "Pairing…".to_owned(),
+        PairPhase::Confirming => "Confirming…".to_owned(),
+        PairPhase::Code(_) => "Confirm".to_owned(),
+        _ => "Pair".to_owned(),
+    });
+    let status = Signal::derive_local(move || match phase.get() {
+        PairPhase::Idle => settings.with(|settings| format!("using {}", settings.active().label())),
+        PairPhase::Connecting => "connecting to the pairing window…".to_owned(),
+        PairPhase::Code(sas) => format!(
+            "code {sas} — the daemon's terminal printed the same one. Approve it there, type it here, then Confirm."
+        ),
+        PairPhase::Confirming => "sending the code…".to_owned(),
+        PairPhase::Paired(label) => format!("paired with {label}"),
+        PairPhase::Failed(message) => message,
+    });
+    let bad = Signal::derive_local(move || matches!(phase.get(), PairPhase::Failed(_)));
+    let good = Signal::derive_local(move || matches!(phase.get(), PairPhase::Paired(_)));
+
+    view! {
+        column(class = "pair") {
+            text(class = "section-title") {"Pair a daemon"}
+            text(class = "section-hint") {"Run siphon-daemon pair on that machine: it prints the address and daemon key, and the code once this window is connected. The code is typed, not pasted, because it is what proves the two ends are the ones you meant."}
+            row(class = "pair__fields") {
+                Input(
+                    value = endpoint,
+                    placeholder = "host:port",
+                    class = "pair__endpoint",
+                    disabled = busy,
+                    on:key_down = {
+                        let run = Rc::clone(&run);
+                        move |ev| on_enter(ev, || run())
+                    },
+                )
+                Input(
+                    value = key,
+                    placeholder = "daemon key",
+                    class = "pair__key",
+                    disabled = busy,
+                    on:key_down = {
+                        let run = Rc::clone(&run);
+                        move |ev| on_enter(ev, || run())
+                    },
+                )
+                Input(
+                    value = code,
+                    placeholder = "XXX-XXX",
+                    class = "pair__code",
+                    disabled = busy,
+                    on:key_down = {
+                        let run = Rc::clone(&run);
+                        move |ev| on_enter(ev, || run())
+                    },
+                )
+                Button(disabled = disabled, on:click = move |_| run()) {{move || pair_label.get()}}
+            }
+            text(class = "pair__status", class:bad = bad, class:good = good) {{move || status.get()}}
         }
     }
 }

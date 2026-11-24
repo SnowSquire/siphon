@@ -251,9 +251,14 @@ Non-empty binds those `host:port`s, and **remote clients get full capability** �
 is the same person. `network.remoteControl` and `RemoteCapability` are deleted;
 the gate is `listen.is_empty()`.
 
-The pipe stays bound regardless. `ui.json` already has `Connection::Remote {
-endpoint, fingerprint, label }` and `active_connection`; nothing reads them yet,
-and that is the change.
+The pipe stays bound regardless. `ui.json`'s `Connection::Remote { endpoint,
+fingerprint, label }` and `active_connection` are what the UI worker resolves its
+target from: `Target::of(settings.active(), APP_ID)` is the pipe for `Local` and
+`Client::connect_quic(endpoint, fingerprint, identity)` for `Remote`, read once
+at startup and replaced when a pairing succeeds — the settings file is not
+polled, the pairing event is the only thing that moves it. The window remains
+local-start-only: `service::ensure_running` still spawns a local daemon, and
+there is no switch back to `Local` from the interface yet.
 
 ## Telemetry
 
@@ -758,7 +763,23 @@ after `open_bi`, which is what completes the server's `accept_bi`.
   a "connect anyway". The client half is `riffle::Pairing` — `begin` completes
   the handshake and stops so the code can be shown, `sas()` is what the screen
   displays, `confirm(name)` sends it — over an identity from
-  `service::identity()`. The screen itself is not written.
+  `service::identity()`.
+- The screen is the **Pair a daemon** panel at the top of the Logs tab, under the
+  connection stats. Three fields (address, daemon key, code) and one button,
+  because two facts come from the terminal and one from the handshake: `pair`
+  prints `daemon key:` and the `address:`, and only after the UI has connected
+  does it print `pairing code:`. So the button is a **two-step** one — the first
+  press queues `Intent::PairBegin` (spawned, so the update stream keeps flowing),
+  the worker answers `UiEvent::PairCode`, the panel shows the code and relabels
+  the button `Confirm`, and the second press sends the typed code as
+  `Intent::PairConfirm`. The worker compares it with its own `sas()` before
+  spending the one attempt, so a mistyped code tears the provisional connection
+  down and nothing reaches the daemon. A success is `UiEvent::Paired`: the
+  window calls `remember_remote` and saves `ui.json`, and the worker returns
+  `End::Paired(Target::Remote)` from the served connection and reconnects there.
+  The client identity's public key is what the daemon pins in `peers.json`; the
+  daemon key is not optional input, because `Pairing::begin` verifies the
+  daemon's SPKI against it — there is no first-use trust.
 
 ### What remote costs
 

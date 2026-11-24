@@ -26,6 +26,7 @@ use siphon_shared::riffle::ConnHealth;
 use siphon_shared::riffle::DownloaderSummary;
 use siphon_shared::riffle::LaneView;
 use siphon_shared::riffle::LogEntry;
+use siphon_shared::riffle::Pairing;
 use siphon_shared::riffle::PipelineView;
 pub use siphon_shared::riffle::Request;
 use siphon_shared::riffle::Response;
@@ -38,6 +39,7 @@ use siphon_shared::riffle::Update;
 use siphon_shared::riffle::UpdateView;
 use siphon_shared::settings::ChannelPrefs;
 use siphon_shared::settings::ClientSettings;
+use siphon_shared::settings::Connection;
 use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
 use zgui::reactive::prelude::*;
@@ -59,6 +61,22 @@ pub enum UiEvent {
         key: StreamKey,
         started: StreamStarted,
     },
+    /// A provisional pairing connection is up: this is the code both sides
+    /// derived, which the person compares with the daemon's terminal before
+    /// anything is sent over it.
+    PairCode {
+        sas: String,
+    },
+    /// A pairing finished. The worker connects to that daemon from now on; the
+    /// window is told so it can write the connection down.
+    Paired {
+        endpoint: String,
+        fingerprint: String,
+        label: String,
+    },
+    /// A pairing step failed, or the typed code was not the one the handshake
+    /// derived. The provisional connection is already gone.
+    PairFailed(String),
 }
 
 /// A single-waiter wake, shared between the UI thread (intent sender) and the
@@ -93,10 +111,29 @@ impl Wake {
     }
 }
 
+/// One thing the window asks the RPC worker to do.
+///
+/// An RPC intent travels to the daemon; the pairing steps are the worker's own
+/// business, because the provisional connection and this client's identity live
+/// there and nothing about them is on the wire until the code matches.
+#[derive(Debug, Clone)]
+pub enum Intent {
+    Rpc(Request),
+    /// Completes a provisional handshake with a daemon's pairing window.
+    PairBegin {
+        endpoint: String,
+        pin: String,
+    },
+    /// Sends the code back, if it is the one this handshake derived.
+    PairConfirm {
+        code: String,
+    },
+}
+
 /// The UI's sending end for intents.
 #[derive(Clone)]
 pub struct IntentSender {
-    tx: kanal::Sender<Request>,
+    tx: kanal::Sender<Intent>,
     wake: Arc<Wake>,
 }
 
@@ -108,9 +145,30 @@ impl IntentSender {
     /// Returns `false` when the queue is full or the worker is gone; the caller
     /// is free to ignore that, the intent will simply not be applied.
     pub fn send(&self, request: Request) -> bool {
-        let queued = matches!(self.tx.try_send(request), Ok(true));
+        self.queue(Intent::Rpc(request))
+    }
+
+    fn queue(&self, intent: Intent) -> bool {
+        let queued = matches!(self.tx.try_send(intent), Ok(true));
         self.wake.wake();
         queued
+    }
+
+    /// Opens a provisional connection to a daemon whose pairing window is open.
+    ///
+    /// The code is not known yet: it exists once the handshake has completed, so
+    /// the worker answers it as [`UiEvent::PairCode`] and waits for
+    /// [`Self::pair_confirm`].
+    pub fn pair_begin(&self, endpoint: String, pin: String) {
+        self.queue(Intent::PairBegin { endpoint, pin });
+    }
+
+    /// Sends the code a person read off the daemon's terminal.
+    ///
+    /// The worker compares it with the one it derived before spending the one
+    /// attempt the pairing window allows.
+    pub fn pair_confirm(&self, code: String) {
+        self.queue(Intent::PairConfirm { code });
     }
 
     /// Asks the worker for one avatar's bytes.
@@ -125,7 +183,7 @@ impl IntentSender {
 
 /// Creates the intent channel, its sender and the shared wake.
 #[must_use]
-pub fn intent_channel() -> (IntentSender, kanal::Receiver<Request>, Arc<Wake>) {
+pub fn intent_channel() -> (IntentSender, kanal::Receiver<Intent>, Arc<Wake>) {
     let (tx, rx) = kanal::bounded(INTENT_CAP);
     let wake = Wake::new();
     (
@@ -163,27 +221,84 @@ const INTENT_CAP: usize = 256;
 enum End {
     /// The UI dropped its receiver; the thread is shutting down.
     UiGone,
-    /// The backend went away; reconnect.
-    BackendLost,
+    /// The backend went away; reconnect to the same connection.
+    Lost(String),
+    /// A pairing succeeded: that daemon is this client's connection now.
+    Paired(Target),
 }
+
+/// Where the worker connects.
+///
+/// Resolved once from the client document — the settings file is not polled:
+/// the pairing event is the one thing that changes it while the window runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    /// This install's pipe, or its socket on Unix.
+    Local(String),
+    /// A daemon this client paired with: where it is, and the key it must
+    /// present before a byte is trusted.
+    Remote { endpoint: String, pin: String },
+}
+
+impl Target {
+    /// The connection a client document names as active.
+    fn of(connection: &Connection, app_id: &str) -> Self {
+        match connection {
+            Connection::Local { .. } => Self::Local(siphon_shared::riffle::admin_endpoint(app_id)),
+            Connection::Remote {
+                endpoint,
+                fingerprint,
+                ..
+            } => Self::Remote {
+                endpoint: endpoint.clone(),
+                pin: fingerprint.clone(),
+            },
+        }
+    }
+
+    /// What to log: the pipe's name, or the daemon's address.
+    fn describe(&self) -> &str {
+        match self {
+            Self::Local(endpoint) | Self::Remote { endpoint, .. } => endpoint,
+        }
+    }
+}
+
+/// How long the daemon may take to answer the confirmation.
+///
+/// The operator's approval happens in the daemon's terminal before the click,
+/// so this covers one frame exchange on a connection that already exists, not a
+/// handshake or a person at a keyboard.
+const PAIR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The name this client is enrolled under in the daemon's `peers.json`.
+const PAIRING_NAME: &str = "Siphon UI";
 
 /// Runs forever, reconnecting with backoff. One connection at a time.
 pub async fn run(
-    intents: kanal::Receiver<Request>,
+    intents: kanal::Receiver<Intent>,
     wake: Arc<Wake>,
     events: kanal::Sender<UiEvent>,
 ) {
-    let endpoint = siphon_shared::riffle::admin_endpoint(crate::service::APP_ID);
-    tracing::info!(target: "riffle", %endpoint, "admin endpoint");
+    let settings = siphon_shared::settings::load(crate::service::APP_ID);
+    let mut target = Target::of(settings.active(), crate::service::APP_ID);
     let mut backoff = Duration::from_secs(1);
     loop {
-        let failure = match Client::connect(&endpoint, env!("CARGO_PKG_VERSION")).await {
+        tracing::info!(target: "riffle", endpoint = target.describe(), "backend");
+        let failure = match connect(&target).await {
             Ok((client, snapshot)) => {
                 backoff = Duration::from_secs(1);
                 let _ = events.try_send(UiEvent::Snapshot(Box::new(snapshot)));
                 match serve_connection(client, &intents, &wake, &events).await {
                     End::UiGone => return,
-                    End::BackendLost => Some("backend disconnected".to_owned()),
+                    // The window has already been told, and the file it writes
+                    // is what a later start reads; this connection is finished.
+                    End::Paired(next) => {
+                        target = next;
+                        backoff = Duration::from_secs(1);
+                        continue;
+                    }
+                    End::Lost(message) => Some(message),
                 }
             }
             Err(error) => Some(format!("backend: {error}")),
@@ -199,10 +314,69 @@ pub async fn run(
     }
 }
 
+/// Opens one connection: the pipe, or a pinned QUIC session with this client's
+/// key.
+async fn connect(target: &Target) -> Result<(Client, Snapshot), String> {
+    match target {
+        Target::Local(endpoint) => Client::connect(endpoint, env!("CARGO_PKG_VERSION"))
+            .await
+            .map_err(|error| error.to_string()),
+        Target::Remote { endpoint, pin } => {
+            // Only a remote connection needs this client's key, so a window on
+            // the pipe never generates a certificate nobody asked for.
+            let identity = crate::service::identity().map_err(|error| error.to_string())?;
+            Client::connect_quic(endpoint, pin, &identity, env!("CARGO_PKG_VERSION"))
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+/// A provisional connection between the handshake and the typed code.
+struct Provisional {
+    pairing: Pairing,
+    endpoint: String,
+    /// The daemon's key as the handshake presented it: what `ui.json` keeps,
+    /// rather than the text a person typed.
+    pin: String,
+}
+
+/// Completes a provisional handshake with a daemon whose window is open.
+///
+/// Nothing is sent yet, so the daemon is holding a connection that has said
+/// nothing until the code comes back.
+async fn begin_pairing(endpoint: String, pin: String) -> Result<Provisional, String> {
+    let identity = crate::service::identity().map_err(|error| error.to_string())?;
+    let pairing = Pairing::begin(&endpoint, &pin, &identity)
+        .await
+        .map_err(|error| error.to_string())?;
+    let pin = pairing.pin().to_owned();
+    Ok(Provisional {
+        pairing,
+        endpoint,
+        pin,
+    })
+}
+
+/// Whether a typed code is the one the handshake derived.
+///
+/// Case, the hyphen and stray spaces are the person's business: the two sides
+/// derive the same six characters, and a terminal is not where one learns to
+/// type them exactly as a parser wants.
+fn codes_match(typed: &str, derived: &str) -> bool {
+    let normalise = |code: &str| -> String {
+        code.chars()
+            .filter(|character| !character.is_whitespace() && *character != '-')
+            .flat_map(char::to_uppercase)
+            .collect()
+    };
+    normalise(typed) == normalise(derived)
+}
+
 /// Serves one connection until the backend or the UI goes away.
 async fn serve_connection(
     client: Client,
-    intents: &kanal::Receiver<Request>,
+    intents: &kanal::Receiver<Intent>,
     wake: &Arc<Wake>,
     events: &kanal::Sender<UiEvent>,
 ) -> End {
@@ -236,6 +410,11 @@ async fn serve_connection(
     })
     .detach();
 
+    // The provisional connection, if the window is between the two steps of a
+    // pairing. It lives across intents because the handshake has to finish
+    // before the code exists, and the code comes back in a later one.
+    let provisional: Rc<RefCell<Option<Provisional>>> = Rc::new(RefCell::new(None));
+
     loop {
         wait(wake, || {
             closed.get() || !queue.borrow().is_empty() || !intents.is_empty()
@@ -244,12 +423,12 @@ async fn serve_connection(
 
         let disconnected = closed.get() && queue.borrow().is_empty();
 
-        while let Ok(Some(request)) = intents.try_recv() {
+        while let Ok(Some(intent)) = intents.try_recv() {
             // A picture is the one request whose answer is the point, so it is
             // fetched on its own task: the update stream keeps flowing while the
             // bytes arrive.
-            match request {
-                Request::GetAvatar { id } => {
+            match intent {
+                Intent::Rpc(Request::GetAvatar { id }) => {
                     let client = Rc::clone(&client);
                     let events = events.clone();
                     compio::runtime::spawn(async move {
@@ -261,7 +440,7 @@ async fn serve_connection(
                 // `StreamStarted` is a query's answer rather than an entity
                 // update, so it waits on its own task too: the lane rows keep
                 // flowing while the daemon says where it will start.
-                Request::StreamSeek { key, target } => {
+                Intent::Rpc(Request::StreamSeek { key, target }) => {
                     let client = Rc::clone(&client);
                     let events = events.clone();
                     compio::runtime::spawn(async move {
@@ -286,11 +465,84 @@ async fn serve_connection(
                 // Fire and forget: a slow handler must not stall the update
                 // stream, and the ack would be discarded anyway. A rejected
                 // intent arrives as an `Update`.
-                request => {
+                Intent::Rpc(request) => {
                     if let Err(error) = client.send(request) {
                         let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(
                             error.to_string(),
                         )))));
+                    }
+                }
+                Intent::PairBegin { endpoint, pin } => {
+                    // A second attempt replaces the first: the daemon has room
+                    // for one provisional connection at a time, and dropping it
+                    // here is what tears the old one down.
+                    let previous = provisional.borrow_mut().take();
+                    drop(previous);
+                    let slot = Rc::clone(&provisional);
+                    let events = events.clone();
+                    compio::runtime::spawn(async move {
+                        match begin_pairing(endpoint.clone(), pin).await {
+                            Ok(hold) => {
+                                let sas = hold.pairing.sas().to_owned();
+                                // Stored before the event: the confirm that
+                                // follows the code has to find it.
+                                *slot.borrow_mut() = Some(hold);
+                                let _ = events.try_send(UiEvent::PairCode { sas });
+                            }
+                            Err(error) => {
+                                let _ = events
+                                    .try_send(UiEvent::PairFailed(format!("{endpoint}: {error}")));
+                            }
+                        }
+                    })
+                    .detach();
+                }
+                Intent::PairConfirm { code } => {
+                    let taken = provisional.borrow_mut().take();
+                    let Some(Provisional {
+                        pairing,
+                        endpoint,
+                        pin,
+                    }) = taken
+                    else {
+                        let _ = events
+                            .try_send(UiEvent::PairFailed("no pairing is in progress".to_owned()));
+                        continue;
+                    };
+                    // Nothing is sent on a code that does not match: the
+                    // provisional connection is dropped instead, and the daemon
+                    // never hears a confirmation for this attempt.
+                    if !codes_match(&code, pairing.sas()) {
+                        let _ = events.try_send(UiEvent::PairFailed(
+                            "that is not the code this handshake derived".to_owned(),
+                        ));
+                        continue;
+                    }
+                    let confirmed =
+                        compio::time::timeout(PAIR_CONFIRM_TIMEOUT, pairing.confirm(PAIRING_NAME))
+                            .await;
+                    // Awaited here rather than spawned on its own task: the
+                    // answer is this connection's replacement, which is a return
+                    // value and not something an event could carry. The timeout
+                    // is what keeps a daemon that never answers from parking the
+                    // worker for good.
+                    match confirmed {
+                        Ok(Ok(_)) => {
+                            let _ = events.try_send(UiEvent::Paired {
+                                label: endpoint.clone(),
+                                endpoint: endpoint.clone(),
+                                fingerprint: pin.clone(),
+                            });
+                            return End::Paired(Target::Remote { endpoint, pin });
+                        }
+                        Ok(Err(error)) => {
+                            let _ = events.try_send(UiEvent::PairFailed(error.to_string()));
+                        }
+                        Err(_) => {
+                            let _ = events.try_send(UiEvent::PairFailed(
+                                "the daemon did not answer the confirmation".to_owned(),
+                            ));
+                        }
                     }
                 }
             }
@@ -317,7 +569,7 @@ async fn serve_connection(
         }
 
         if disconnected {
-            return End::BackendLost;
+            return End::Lost("backend disconnected".to_owned());
         }
         if (intents.is_closed() && intents.is_empty()) || events.is_closed() {
             return End::UiGone;
@@ -376,6 +628,13 @@ pub struct UiState {
     /// Where each avatar's bytes live in this client's cache, keyed by the
     /// content id a row carries. A row draws its initials until its id is here.
     pub avatars: RwSignal<Rc<HashMap<String, String>>, LocalStorage>,
+    /// The pairing panel's state: what its button does and what its status line
+    /// says. Driven by the worker's pairing events.
+    pub pair: RwSignal<PairPhase, LocalStorage>,
+    /// The app id whose `ui.json` a successful pairing rewrites. `None` on a
+    /// state a test builds: the assertion is the signal, and no test may
+    /// overwrite the person's document.
+    app_id: Option<&'static str>,
     /// Avatar ids this session has already asked for, so a viewer-count tick
     /// does not ask again. A snapshot clears it: requests a dropped connection
     /// never answered have to be made again.
@@ -397,6 +656,37 @@ pub struct Notice {
     pub at_ms: i64,
     pub summary: String,
     pub body: String,
+}
+
+/// Where the pairing panel is, and so what its one button does.
+///
+/// The two steps are the protocol's, not the interface's: the code does not
+/// exist until the handshake has completed, and the handshake is what the first
+/// step starts. So the first press connects and the second sends the code a
+/// person read off the daemon's terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairPhase {
+    /// Nothing in progress.
+    Idle,
+    /// The provisional handshake is running.
+    Connecting,
+    /// A provisional connection is up and this is the code both sides derived.
+    /// The daemon's terminal shows the same one; nothing has been sent yet.
+    Code(String),
+    /// The confirmation is with the daemon.
+    Confirming,
+    /// The window is on that daemon now.
+    Paired(String),
+    /// A step failed, and this is why.
+    Failed(String),
+}
+
+impl PairPhase {
+    /// Whether the worker is doing something, so the button waits.
+    #[must_use]
+    pub const fn busy(&self) -> bool {
+        matches!(self, Self::Connecting | Self::Confirming)
+    }
 }
 
 /// A list of rows, each behind its own signal.
@@ -544,6 +834,8 @@ impl UiState {
             notices: RwSignal::new_local(Rc::new(Vec::new())),
             logs: RwSignal::new_local(Rc::new(state.logs)),
             avatars: RwSignal::new_local(Rc::new(HashMap::new())),
+            pair: RwSignal::new_local(PairPhase::Idle),
+            app_id: Some(crate::service::APP_ID),
             avatar_requests: Rc::new(RefCell::new(HashSet::new())),
             intents,
             muted: Rc::new(RefCell::new(HashMap::new())),
@@ -885,7 +1177,35 @@ impl UiState {
                 }
             }
             UiEvent::Started { key, started } => self.started.set(Some((key, started))),
+            UiEvent::PairCode { sas } => self.pair.set(PairPhase::Code(sas)),
+            UiEvent::Paired {
+                endpoint,
+                fingerprint,
+                label,
+            } => self.pair_succeeded(&endpoint, &fingerprint, &label),
+            UiEvent::PairFailed(message) => self.pair.set(PairPhase::Failed(message)),
         }
+    }
+
+    /// Records a daemon this window just paired with.
+    ///
+    /// The worker has already switched to it; this is what a later start reads,
+    /// so the document is written as well as updated. Nothing here can fail the
+    /// pairing: a connection that could not be remembered still works until the
+    /// window closes.
+    fn pair_succeeded(&self, endpoint: &str, fingerprint: &str, label: &str) {
+        let mut document = self.settings.get_untracked();
+        document.remember_remote(endpoint, fingerprint, label);
+        self.settings.set(document.clone());
+        // A state a test builds has no document of its own: the assertion is
+        // the signal, and no test may overwrite the person's `ui.json`.
+        let written = self.app_id.map_or(Ok(()), |app_id| {
+            siphon_shared::settings::save(app_id, &document)
+        });
+        if let Err(error) = written {
+            tracing::warn!(target: "settings", "could not save settings: {error}");
+        }
+        self.pair.set(PairPhase::Paired(label.to_owned()));
     }
 }
 
@@ -1084,7 +1404,7 @@ mod tests {
             });
 
             let asked = intent_rx.try_recv().unwrap().expect("a request");
-            assert!(matches!(asked, Request::GetAvatar { id: asked } if asked == id));
+            assert!(matches!(asked, Intent::Rpc(Request::GetAvatar { id: asked }) if asked == id));
 
             state.apply(Update::ChannelUpsert(Box::new(ChannelView {
                 avatar: Some(id.clone()),
@@ -1105,5 +1425,118 @@ mod tests {
             );
         });
         scope.unmount();
+    }
+
+    /// A state that would write the settings document, with the write taken
+    /// out: a test asserts the signal and must not touch the person's file.
+    fn unpersisted() -> UiState {
+        UiState {
+            app_id: None,
+            ..state()
+        }
+    }
+
+    /// The worker connects where the document says. A local document is this
+    /// machine's pipe; a remembered daemon is its address and the key it must
+    /// present, not the pipe.
+    #[test]
+    fn the_worker_follows_the_active_connection() {
+        let app_id = crate::service::APP_ID;
+        let local = ClientSettings::default();
+        assert_eq!(
+            Target::of(local.active(), app_id),
+            Target::Local(siphon_shared::riffle::admin_endpoint(app_id))
+        );
+
+        let mut document = ClientSettings::default();
+        let pin = "ab".repeat(32);
+        document.remember_remote("home.example.net:7418", &pin, "media box");
+        assert_eq!(
+            Target::of(document.active(), app_id),
+            Target::Remote {
+                endpoint: "home.example.net:7418".to_owned(),
+                pin,
+            }
+        );
+
+        // And back: the local connection is still a row, and choosing it again
+        // is what a window that never paired starts with.
+        document.active_connection = Connection::default().id().to_owned();
+        assert_eq!(
+            Target::of(document.active(), app_id),
+            Target::Local(siphon_shared::riffle::admin_endpoint(app_id))
+        );
+    }
+
+    /// A successful pairing is written into the client document, and the daemon
+    /// becomes the connection the next start connects to.
+    #[test]
+    fn a_paired_daemon_is_remembered_and_active() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let state = unpersisted();
+            assert!(state.settings.get_untracked().active().is_local());
+
+            let pin = "cd".repeat(32);
+            state.apply_event(UiEvent::Paired {
+                endpoint: "10.0.0.2:7418".to_owned(),
+                fingerprint: pin.clone(),
+                label: "attic".to_owned(),
+            });
+
+            let document = state.settings.get_untracked();
+            assert_eq!(document.connections.len(), 2, "local plus the daemon");
+            assert_eq!(document.active_connection, document.active().id());
+            assert!(matches!(
+                document.active(),
+                Connection::Remote { endpoint, fingerprint, label, .. }
+                    if endpoint == "10.0.0.2:7418"
+                        && *fingerprint == pin
+                        && label == "attic"
+            ));
+            assert_eq!(
+                state.pair.get_untracked(),
+                PairPhase::Paired("attic".to_owned())
+            );
+        });
+        scope.unmount();
+    }
+
+    /// The two events the panel turns on are the worker's, and a failure has to
+    /// leave the button usable again.
+    #[test]
+    fn the_pairing_events_drive_the_panel() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let state = unpersisted();
+            state.apply_event(UiEvent::PairCode {
+                sas: "7K4Q-2M9X".to_owned(),
+            });
+            assert_eq!(
+                state.pair.get_untracked(),
+                PairPhase::Code("7K4Q-2M9X".to_owned())
+            );
+            assert!(!state.pair.get_untracked().busy());
+
+            state.apply_event(UiEvent::PairFailed("wrong code".to_owned()));
+            assert_eq!(
+                state.pair.get_untracked(),
+                PairPhase::Failed("wrong code".to_owned())
+            );
+        });
+        scope.unmount();
+    }
+
+    /// The typed code is the daemon's, as a person reads it: case, the hyphen
+    /// and stray spaces are not part of the comparison.
+    #[test]
+    fn a_typed_code_is_compared_without_its_formatting() {
+        assert!(codes_match("7K4Q-2M9X", "7K4Q-2M9X"));
+        assert!(codes_match("7k4q-2m9x", "7K4Q-2M9X"));
+        assert!(codes_match(" 7K4Q2M9X ", "7K4Q-2M9X"));
+        assert!(!codes_match("7K4Q-2M9Y", "7K4Q-2M9X"));
+        assert!(!codes_match("", "7K4Q-2M9X"));
     }
 }

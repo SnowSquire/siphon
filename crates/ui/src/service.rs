@@ -36,9 +36,6 @@ fn endpoint() -> String {
 ///
 /// Runs on the RPC worker or the pairing screen, never the frame loop: it is a
 /// one-off file read that may generate a key the first time.
-// The pairing screen is a separate change; nothing in this binary calls this
-// yet, and a certificate nobody asked for should not be generated at startup.
-#[allow(dead_code)]
 pub fn identity() -> Result<quic::Identity, quic::Error> {
     quic::Identity::load_or_create_client(&siphon_shared::riffle::data_dir(APP_ID))
 }
