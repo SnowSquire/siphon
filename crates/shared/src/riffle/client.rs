@@ -35,6 +35,7 @@ use crate::riffle::protocol::RpcError;
 use crate::riffle::protocol::ServerMessage;
 use crate::riffle::protocol::Snapshot;
 use crate::riffle::protocol::Update;
+use crate::riffle::quic;
 
 /// How long one request may wait for its response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,7 +53,7 @@ pub enum ConnectError {
     #[error("backend sent an unexpected first message")]
     Unexpected,
     #[error(transparent)]
-    Quic(#[from] crate::riffle::quic::Error),
+    Quic(#[from] quic::Error),
 }
 
 /// One asynchronous push from the backend.
@@ -122,21 +123,32 @@ impl Client {
         app_version: &str,
     ) -> Result<(Self, Snapshot), ConnectError> {
         let stream = endpoint::connect(endpoint).await?;
-        Self::connect_over(stream, app_version).await
+        Self::connect_over(stream, Self::hello(app_version)).await
     }
 
     /// Connects over QUIC, checking the daemon's SPKI against `pin`.
     ///
-    /// The pin is the one piece of trust a remote connection has; it is a
-    /// parameter because where a UI keeps it is the pairing flow's business.
-    /// An empty pin is refused before any packet is sent.
+    /// The pin is the one piece of trust a remote connection has; where a UI
+    /// keeps it is the pairing screen's business, and it comes from
+    /// [`Pairing::pin`] on the first connection. `identity` is this client's
+    /// key, which the daemon has in `peers.json` — or will, if this is the
+    /// handshake that pairs it, in which case use [`Pairing`] instead.
     pub async fn connect_quic(
         endpoint: &str,
         pin: &str,
+        identity: &quic::Identity,
         app_version: &str,
     ) -> Result<(Self, Snapshot), ConnectError> {
-        let stream = crate::riffle::quic::connect(endpoint, pin).await?;
-        Self::connect_over(stream, app_version).await
+        let stream = quic::connect(endpoint, pin, identity).await?.into_stream();
+        Self::connect_over(stream, Self::hello(app_version)).await
+    }
+
+    fn hello(app_version: &str) -> ClientMessage {
+        ClientMessage::Hello {
+            magic: MAGIC,
+            protocol: PROTOCOL_VERSION,
+            app_version: app_version.to_owned(),
+        }
     }
 
     /// The handshake both carriers share. From here on the transport is just
@@ -144,17 +156,9 @@ impl Client {
     /// they are on.
     async fn connect_over<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         mut stream: S,
-        app_version: &str,
+        first: ClientMessage,
     ) -> Result<(Self, Snapshot), ConnectError> {
-        write(
-            &mut stream,
-            &ClientMessage::Hello {
-                magic: MAGIC,
-                protocol: PROTOCOL_VERSION,
-                app_version: app_version.to_owned(),
-            },
-        )
-        .await?;
+        write(&mut stream, &first).await?;
 
         let mut reader = FrameReader::new();
         let welcome: ServerMessage = reader.read(&mut stream).await?;
@@ -258,6 +262,61 @@ impl Client {
                 Err(RpcError::Failed("request timed out".to_owned()))
             }
         }
+    }
+}
+
+/// The client side of one pairing attempt.
+///
+/// Split from [`Client`] because the code has to be shown before anything is
+/// sent: the connection is completed and both sides have derived the string,
+/// the operator compares this one with the daemon's terminal, and only then
+/// does [`Self::confirm`] send it back. Dropping this closes the provisional
+/// connection, and the daemon forgets it.
+pub struct Pairing {
+    stream: quic::Session,
+}
+
+impl Pairing {
+    /// Completes the handshake with a daemon whose pairing window is open.
+    ///
+    /// Nothing is sent yet, so the daemon is waiting on a provisional
+    /// connection that has said nothing.
+    pub async fn begin(
+        endpoint: &str,
+        pin: &str,
+        identity: &quic::Identity,
+    ) -> Result<Self, ConnectError> {
+        Ok(Self {
+            stream: quic::connect(endpoint, pin, identity).await?,
+        })
+    }
+
+    /// The six characters to compare with the daemon's.
+    #[must_use]
+    pub fn sas(&self) -> &str {
+        self.stream.sas()
+    }
+
+    /// The daemon's key: what `ui.json`'s `Connection::Remote::fingerprint`
+    /// keeps once this succeeds.
+    #[must_use]
+    pub fn pin(&self) -> &str {
+        self.stream.pin()
+    }
+
+    /// Sends the code. The daemon answers `Welcome` and the snapshot when it
+    /// matches, and drops the connection when it does not.
+    pub async fn confirm(self, name: &str) -> Result<(Client, Snapshot), ConnectError> {
+        let sas = self.stream.sas().to_owned();
+        let stream = self.stream.into_stream();
+        Client::connect_over(
+            stream,
+            ClientMessage::PairConfirm {
+                sas,
+                name: name.to_owned(),
+            },
+        )
+        .await
     }
 }
 

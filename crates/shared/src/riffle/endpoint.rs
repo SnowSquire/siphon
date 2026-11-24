@@ -41,6 +41,20 @@ pub fn state_dir(app_id: &str) -> PathBuf {
     base.join(app_id)
 }
 
+/// Where one app id keeps its per-user data: the avatar cache and this
+/// client's QUIC identity.
+///
+/// Windows uses `%LOCALAPPDATA%`; Unix uses `XDG_DATA_HOME` (`~/.local/share`).
+/// The same directory on both sides of one machine is harmless — a cache is
+/// named by content — but not the *same* path on a remote UI, hence the split
+/// from [`state_dir`]: state is per-daemon, data belongs to the client.
+#[must_use]
+pub fn data_dir(app_id: &str) -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(app_id)
+}
+
 /// The daemon's log: everything it prints, plus the panic message that would
 /// otherwise be lost when the UI spawned it with no console.
 #[must_use]

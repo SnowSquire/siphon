@@ -6,9 +6,9 @@ per-connection state machine behind `StreamOpen`/`StreamUpdate`/`StreamClose`/
 packet transport, no demuxer wiring and no GOP alignment. RTSP is gone — `play`,
 the RTSP listener and the RTP packetizers were removed — so there is no viewer
 path at all until that lands. Parts II and III are implemented, and so is the
-**QUIC carrier for the control plane** (self-signed certificate, SPKI pin); the
-pairing flow, client certificates and `peers.json` are not. The ALPN is
-`riffle/1`.
+**QUIC carrier for the control plane**: self-signed certificates on both sides,
+a pin per key, mutual authentication against `peers.json` and the typed-code
+pairing that fills it. The ALPN is `riffle/1`.
 It is one protocol: the RPC is the control plane (`Class::Control`) and media is
 the same framing with media classes, over a carrier that can lose datagrams.
 
@@ -646,10 +646,13 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
 
 ## Remote clients
 
-Status: designed, not implemented. `ui.json`'s `connections` and
-`activeConnection` exist and nothing reads them; `config.json`'s
-`network.listen` is stored and not bound. The protocol is Part I; this is what
-the control plane becomes when the UI is pointed at another machine.
+Status: the carrier and its trust are implemented; the UI does not use them yet.
+`config.json`'s `network.listen` binds QUIC listeners when non-empty, and a
+client is admitted only after pairing (see "Identity and pinning").
+`ui.json`'s `connections` and `activeConnection` exist and
+`ClientSettings::remember_remote` writes them; nothing chooses a connection
+from them yet, and the pairing screen does not exist. This is what the control
+plane becomes when the UI is pointed at another machine.
 
 ### Local
 
@@ -678,8 +681,9 @@ against the presented certificate through rustls' own verifier. The pin is 64
 hex characters, with an optional `sha256:` prefix. A mismatch is a
 typed `quic::Error::PinMismatch` carrying both pins; an empty pin is
 `PinMissing` before any packet is sent. `Client::connect_quic(endpoint, pin,
-version)` takes the pin as a parameter: `ui.json`'s `Connection::Remote` is
-still the place a UI would read it, but that is the pairing task.
+identity, version)` takes the pin as a parameter; the pairing screen keeps it,
+and `Client::connect_quic`'s sibling `riffle::Pairing` is the flow that produces
+it (below).
 
 One bidirectional stream is the control plane. On accept, the daemon wraps the
 read and write halves in the same `AdminStream` the pipe uses and puts it on the
@@ -702,12 +706,52 @@ after `open_bi`, which is what completes the server's `accept_bi`.
 ### Identity and pinning
 
 - A self-signed certificate per side, no CA. The pin is the SPKI's SHA-256: the
-  key, not the certificate wrapper, so a renewal is not a false alarm.
-- Pairing is a typed code, not a pasted string. `siphon-daemon pair` opens a
-  120 s window, the UI connects, the daemon prints the short authentication
-  string, and the user types it into the UI. Part I has the sequence and why the
-  code is proof rather than comparison.
-- A mismatch offers "pair again", never a "connect anyway" button.
+  key, not the certificate wrapper, so a renewal is not a false alarm. The
+  daemon's is in its state directory (`quic-cert.der`, `quic-key.der`); the
+  client's is in its own app data directory (`quic-client-cert.der`,
+  `quic-client-key.der`), both 0600.
+- The client presents its certificate on every connection and the daemon
+  demands one (`ClientCertVerifier`, `client_auth_mandatory`). Its SPKI must be
+  in `peers.json` in the daemon's state directory:
+  `{ "peers": [ { "id", "name", "spki", "added_ms", "last_seen_ms" } ] }`,
+  written pretty so editing it by hand is the supported path. Deleting an entry
+  is revocation — the file is read per handshake, so it takes effect on the
+  next connection — and adding one by hand is the other supported path.
+  `id` is the first 16 hex of `spki`; `last_seen_ms` is refreshed at most once a
+  minute. A malformed file is a startup error, never a silent empty allowlist.
+- Pairing is a typed code, not a pasted string, and it exists because the
+  allowlist starts empty: while a window is open the verifier also admits a key
+  that is *not* in `peers.json`, and that provisional connection may send
+  exactly one `ClientMessage::PairConfirm { sas, name }` and nothing else.
+- The window is `pairing.json` in the state directory — a file, because
+  `siphon-daemon pair` is a second process from the daemon that owns the
+  listener. `pair` writes the window (120 s by default), prints
+  `network.listen` and the daemon's pin, and waits. The daemon's listener
+  publishes the attempt's code there as the handshake completes and logs it;
+  `pair` prints it, asks `y/n`, and writes the answer back. The daemon adds the
+  key only if the client's code repeats its own **and** the operator approved
+  that exact code, so approve in the terminal before confirming in the UI;
+  either answer ends the attempt. A different handshake during the same window
+  replaces the attempt and clears the answer, so an old `y` cannot admit it.
+- The code (`XXX-XXX`, Crockford base32 so no letter is ambiguous) is derived
+  from the TLS exporter (`export_keying_material`, label
+  `EXPORTER-siphon-riffle`, context `riffle/1 pairing`) with both SPKI hashes
+  mixed in, then truncated to 30 bits. The exporter is bound to the whole
+  transcript including both certificates, so an active MITM — two handshakes,
+  two transcripts — produces two different codes and cannot relay the
+  comparison. A fallback of `truncate(H(H(server_spki) || H(client_spki)))`
+  would be equal on both of its legs and would detect only a wrong key.
+- A provisional connection that has not confirmed by the window's end is
+  dropped, and so is any message on it other than `PairConfirm`. A successful
+  pairing closes the window and the connection becomes an ordinary one
+  (`Welcome` plus the snapshot).
+- A `y` with a matching code is the whole enrollment: afterwards the client
+  stores the daemon's pin in `ui.json`'s `Connection::Remote::fingerprint`
+  (`ClientSettings::remember_remote`), and a mismatch there is a refusal, never
+  a "connect anyway". The client half is `riffle::Pairing` — `begin` completes
+  the handshake and stops so the code can be shown, `sas()` is what the screen
+  displays, `confirm(name)` sends it — over an identity from
+  `service::identity()`. The screen itself is not written.
 
 ### What remote costs
 

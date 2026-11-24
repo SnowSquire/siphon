@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -748,6 +748,21 @@ pub enum ClientMessage {
         magic: u32,
         protocol: u16,
         app_version: String,
+    },
+    /// The answer to a pairing challenge, sent instead of `Hello` on a
+    /// connection the daemon admitted only because a pairing window was open.
+    ///
+    /// `sas` is the short authentication string this client derived from the
+    /// handshake (see `riffle::quic::Session::sas`). The daemon compares it
+    /// with its own; a match proves both sides saw the same TLS transcript, so
+    /// an active man in the middle cannot get past it. On a match the
+    /// connection becomes a normal one and `Welcome` and the snapshot follow;
+    /// a mismatch closes it. Any other message on a provisional connection is a
+    /// protocol error.
+    PairConfirm {
+        sas: String,
+        /// What the daemon records in `peers.json`. Display only.
+        name: String,
     },
     Request {
         id: u64,

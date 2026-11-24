@@ -39,7 +39,11 @@ use siphon_shared::riffle::StreamPlayback;
 use siphon_shared::riffle::StreamStarted;
 use siphon_shared::riffle::Update;
 use siphon_shared::riffle::UpdateView;
+use siphon_shared::riffle::quic::PairingWindow;
+use siphon_shared::riffle::quic::Peers;
+use siphon_shared::riffle::quic::Trust;
 use tracing::info;
+use tracing::warn;
 
 use crate::bus::Bus;
 use crate::config;
@@ -122,6 +126,9 @@ pub struct AppInit {
     pub jobs: kanal::AsyncReceiver<Box<JobDone>>,
     pub jobs_tx: kanal::Sender<Box<JobDone>>,
     pub client_id: Option<String>,
+    /// Where a pairing window and the client allowlist live. `None` when the
+    /// daemon has no QUIC listener, so no pairing can be in progress.
+    pub trust: Option<Trust>,
 }
 
 /// One finished background job.
@@ -197,6 +204,8 @@ pub struct App {
 
     save_dirty: bool,
     save_running: bool,
+    /// The allowlist and pairing window a `PairConfirm` is checked against.
+    trust: Option<Trust>,
 }
 
 impl App {
@@ -212,6 +221,7 @@ impl App {
             jobs,
             jobs_tx,
             client_id,
+            trust,
         } = init;
         // Hermes is wanted whenever there is a channel to watch; the endpoint is
         // whatever the edge is (Twitch, or the mock under `--debug`).
@@ -268,6 +278,7 @@ impl App {
             pending_unsubscribes: Vec::new(),
             save_dirty: false,
             save_running: false,
+            trust,
         }
     }
 
@@ -327,7 +338,13 @@ impl App {
                 Event::Job(None) => break,
                 Event::Job(Some(done)) => self.handle_job(*done).await,
                 Event::Bus => ops.push(bus_op(Rc::clone(&self.bus))),
-                Event::Deadline => self.on_tick().await,
+                Event::Deadline => {
+                    self.on_tick().await;
+                    // A provisional connection that has not confirmed by the
+                    // window's end is dropped; the tick is what wakes the loop
+                    // for it.
+                    self.expire_provisional(&mut conns);
+                }
             }
 
             self.flush_bus(&mut conns, &ops);
@@ -369,6 +386,15 @@ impl App {
         }
         if conns.iter().flatten().any(|conn| conn.ready) {
             at = at.min(self.telemetry_at);
+        }
+        // A pairing attempt has a real deadline of its own, shorter than the
+        // minute the loop would otherwise sleep for.
+        for provisional in conns
+            .iter()
+            .flatten()
+            .filter_map(|conn| conn.provisional.as_ref())
+        {
+            at = at.min(provisional.expires + Duration::from_millis(1));
         }
         at.saturating_duration_since(now)
             .max(Duration::from_millis(10))
@@ -470,6 +496,21 @@ impl App {
             match siphon_shared::riffle::codec::decode::<siphon_shared::riffle::ClientMessage>(
                 &payload,
             ) {
+                // Sent instead of `Hello`, and only on a provisional connection.
+                Ok(siphon_shared::riffle::ClientMessage::PairConfirm { sas, name }) => {
+                    if !self.confirm_pairing(conn, &sas, &name) {
+                        close = true;
+                        break;
+                    }
+                }
+                // A provisional connection may send that one message and
+                // nothing else; the daemon serves it no state until the code
+                // matches.
+                Ok(_) if conn.provisional.is_some() => {
+                    warn!(target: "rpc", "quic: a provisional connection sent something else");
+                    close = true;
+                    break;
+                }
                 Ok(siphon_shared::riffle::ClientMessage::Hello {
                     magic,
                     protocol,
@@ -522,6 +563,87 @@ impl App {
             }
         }
         if close {
+            self.close_conn(conns, id);
+        }
+    }
+
+    /// Answers one `PairConfirm`. `false` closes the connection.
+    ///
+    /// Three things must hold: the connection is provisional, the code repeats
+    /// the one the daemon derived for this handshake, and the operator approved
+    /// that code with `siphon-daemon pair`. The code is what rules out a man in
+    /// the middle; the approval is what rules out a client the operator never
+    /// looked at. Only then is the key written to `peers.json`, and the
+    /// connection becomes an ordinary one.
+    ///
+    /// Both files are written synchronously: pairing happens once, on a human's
+    /// keystroke, with no stream traffic waiting on it — it is not a path in
+    /// the loop.
+    fn confirm_pairing(&self, conn: &mut riffle::Conn, sas: &str, name: &str) -> bool {
+        let Some(provisional) = conn.provisional.as_ref() else {
+            warn!(target: "rpc", "rpc: PairConfirm on a connection that was not pairing");
+            return false;
+        };
+        if sas != provisional.sas {
+            warn!(target: "rpc", "quic: the pairing code did not match");
+            return false;
+        }
+        let Some(trust) = self.trust.as_ref() else {
+            warn!(target: "rpc", "quic: pairing is not configured on this daemon");
+            return false;
+        };
+        let approved = PairingWindow::read(trust.pairing())
+            .is_some_and(|pairing| pairing.approved(&provisional.sas));
+        if !approved {
+            warn!(target: "rpc", "quic: the pairing code was not approved by an operator");
+            return false;
+        }
+        let spki = provisional.spki.clone();
+        let mut peers = match Peers::load(trust.peers()) {
+            Ok(peers) => peers,
+            Err(error) => {
+                warn!(target: "rpc", %error, "quic: could not read peers.json to pair a client");
+                return false;
+            }
+        };
+        if let Err(error) = peers.add(name, &spki) {
+            warn!(target: "rpc", %error, "quic: could not write peers.json");
+            return false;
+        }
+        info!(target: "rpc", %name, %spki, "quic: paired a new client");
+
+        conn.provisional = None;
+        let snapshot = self.snapshot(&conn.lanes);
+        let queued = conn.push(&ServerMessage::Welcome {
+            protocol: siphon_shared::riffle::PROTOCOL_VERSION,
+            server_version: env!("CARGO_PKG_VERSION").to_owned(),
+        }) && conn.push(&ServerMessage::Snapshot(Box::new(snapshot)));
+        if queued {
+            conn.ready = true;
+            // The window has done its job: nothing else may be admitted with an
+            // unknown key.
+            if let Err(error) = PairingWindow::close(trust.pairing()) {
+                warn!(target: "rpc", %error, "quic: could not close the pairing window");
+            }
+        }
+        queued
+    }
+
+    /// Drops provisional connections whose window has ended.
+    fn expire_provisional(&self, conns: &mut [Option<riffle::Conn>]) {
+        let now = Instant::now();
+        let expired: Vec<usize> = conns
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.as_ref()
+                    .and_then(|conn| conn.provisional.as_ref())
+                    .is_some_and(|provisional| provisional.expires <= now)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in expired {
+            info!(target: "rpc", "quic: a pairing attempt timed out");
             self.close_conn(conns, id);
         }
     }
@@ -1365,6 +1487,7 @@ mod tests {
             jobs: jobs_rx.to_async(),
             jobs_tx,
             client_id: None,
+            trust: None,
         })
     }
 

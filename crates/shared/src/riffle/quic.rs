@@ -1,28 +1,38 @@
-//! The QUIC carrier for the control plane, pinned by the daemon's key.
+//! The QUIC carrier for the control plane: mutually authenticated, pinned by
+//! both keys and paired with a typed code.
 //!
 //! The pipe is the local transport; this is the one for another machine. One
 //! bidirectional stream per connection carries exactly the frames the pipe
 //! carries, so the handshake, the snapshot and the intents do not know which
 //! carrier they are on.
 //!
-//! There is no CA and no `WebPKI`. The daemon makes one self-signed certificate
+//! There is no CA and no `WebPKI`. Each side makes one self-signed certificate
 //! on first use and the pin is the SHA-256 of its `SubjectPublicKeyInfo` — the
 //! key, not the certificate wrapper, so re-issuing the certificate does not
-//! break a client. The client refuses a key it was not given; a missing pin is
-//! an error, never "connect anyway". Signature verification is still the real
-//! TLS one, against the presented certificate.
+//! break the other side. The client refuses a daemon key it was not given, and
+//! the daemon accepts only client keys in [`Peers`] (`peers.json`). A missing
+//! pin is an error, never "connect anyway"; signature verification is still the
+//! real TLS one, against the presented certificate.
 //!
-//! Pairing (a typed code, client certificates and `peers.json`) is the next
-//! task. The seam is [`Identity`] — the one key the daemon presents — and
-//! [`connect`]'s pin parameter: a future pairing flow replaces where the pin
-//! comes from, not how it is checked.
+//! A key that is in nobody's file cannot connect at all, so the daemon has one
+//! exception: while a [`PairingWindow`] window is open it also accepts a client that
+//! is not in the allowlist. That connection is *provisional*: it may send one
+//! `PairConfirm` carrying the short authentication string both sides derive
+//! from the handshake ([`Session::sas`]), and the daemon adds the key to
+//! `peers.json` if the strings match and the window was approved. The window is
+//! a file because `siphon-daemon pair` is a second process: it opens the
+//! window, the daemon publishes the attempt's code there, and the operator's
+//! `y/n` is written back for the daemon to read.
 
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use compio::buf::BufResult;
 use compio::buf::IoBuf;
@@ -30,10 +40,12 @@ use compio::buf::IoBufMut;
 use compio::io::AsyncRead;
 use compio::io::AsyncWrite;
 use compio::net::ToSocketAddrsAsync;
+use compio_quic::Connection;
 use compio_quic::Endpoint;
 use compio_quic::Incoming;
 use compio_quic::RecvStream;
 use compio_quic::SendStream;
+use rustls::DistinguishedName;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::client::danger::ServerCertVerified;
 use rustls::client::danger::ServerCertVerifier;
@@ -43,8 +55,13 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::UnixTime;
+use rustls::server::danger::ClientCertVerified;
+use rustls::server::danger::ClientCertVerifier;
+use serde::Deserialize;
+use serde::Serialize;
 use thiserror::Error;
 use tracing::info;
+use tracing::warn;
 
 /// The protocol both sides speak, and the only one offered.
 pub const ALPN: &[u8] = b"riffle/1";
@@ -60,10 +77,39 @@ const CERT_FILE: &str = "quic-cert.der";
 /// The private key on disk, PKCS#8 DER, 0600 on Unix.
 const KEY_FILE: &str = "quic-key.der";
 
+/// The UI's own certificate and key. Separate names from the daemon's so a
+/// build that keeps both directories in the same place cannot mix them up.
+const CLIENT_CERT_FILE: &str = "quic-client-cert.der";
+const CLIENT_KEY_FILE: &str = "quic-client-key.der";
+
+/// The daemon's allowlist of client keys, beside its identity.
+pub const PEERS_FILE: &str = "peers.json";
+
+/// The pairing window, beside the identity: the one piece of pairing state
+/// that has to cross a process boundary.
+pub const PAIRING_FILE: &str = "pairing.json";
+
+/// How long a pairing window stays open.
+pub const PAIRING_WINDOW: Duration = Duration::from_secs(120);
+
+/// The TLS exporter label and context both sides call with. Any fixed pair
+/// works; changing either is a protocol break, because the two codes would no
+/// longer be equal.
+const SAS_LABEL: &[u8] = b"EXPORTER-siphon-riffle";
+const SAS_CONTEXT: &[u8] = b"riffle/1 pairing";
+
+/// Crockford's base32: no `I`, `L`, `O` or `U`, so a code read aloud or typed
+/// from a terminal cannot become a different code.
+const SAS_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
 /// How long a handshake may take before the client gives up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A daemon's pinned identity: the certificate it presents and the key.
+///
+/// The same type is the client's identity; only the file names and the
+/// certificate's common name differ, because the pin is the key and nothing
+/// here reads a name.
 pub struct Identity {
     cert: CertificateDer<'static>,
     key: PrivatePkcs8KeyDer<'static>,
@@ -78,15 +124,34 @@ impl Identity {
     /// is therefore an error rather than a silent regeneration — delete both
     /// files to start over, deliberately.
     pub fn load_or_create(dir: &Path) -> Result<Self, Error> {
-        let cert_path = dir.join(CERT_FILE);
-        let key_path = dir.join(KEY_FILE);
+        Self::load_or_create_in(dir, CERT_FILE, KEY_FILE, SERVER_NAME)
+    }
+
+    /// Loads the client's certificate and key, generating them on first use.
+    ///
+    /// This is the key a daemon remembers in `peers.json`, so it must live
+    /// somewhere stable and private: the UI's own app data directory, with the
+    /// same 0600/DPAPI treatment as the daemon's. Regenerating it is a fresh
+    /// pairing on every daemon this client talks to.
+    pub fn load_or_create_client(dir: &Path) -> Result<Self, Error> {
+        Self::load_or_create_in(dir, CLIENT_CERT_FILE, CLIENT_KEY_FILE, "siphon-ui")
+    }
+
+    fn load_or_create_in(
+        dir: &Path,
+        cert_file: &str,
+        key_file: &str,
+        common_name: &str,
+    ) -> Result<Self, Error> {
+        let cert_path = dir.join(cert_file);
+        let key_path = dir.join(key_file);
         let existing = match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
             (Ok(cert), Ok(key)) => Some((cert, key)),
             _ => None,
         };
         match existing {
             Some((cert, key)) => Self::from_der(cert.into(), key.into()),
-            None => Self::generate(&cert_path, &key_path),
+            None => Self::generate(&cert_path, &key_path, common_name),
         }
     }
 
@@ -98,9 +163,9 @@ impl Identity {
         Ok(Self { cert, key, pin })
     }
 
-    fn generate(cert_path: &Path, key_path: &Path) -> Result<Self, Error> {
+    fn generate(cert_path: &Path, key_path: &Path, common_name: &str) -> Result<Self, Error> {
         let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_owned()])
+            rcgen::generate_simple_self_signed(vec![common_name.to_owned()])
                 .map_err(|error| Error::Identity(error.to_string()))?;
         let cert = cert.der().clone();
         let pin = pin_of(&cert)?;
@@ -115,7 +180,7 @@ impl Identity {
         Ok(Self { cert, key, pin })
     }
 
-    /// The SPKI SHA-256 as lowercase hex: what a client pins.
+    /// The SPKI SHA-256 as lowercase hex: what the other side pins.
     #[must_use]
     pub fn pin(&self) -> &str {
         &self.pin
@@ -190,14 +255,469 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::rename(&temporary, path)
 }
 
-/// The QUIC server configuration: TLS 1.3, our certificate, ALPN `riffle/1`,
-/// no client certificate yet and no 0-RTT.
-fn server_config(identity: &Identity) -> Result<compio_quic::ServerConfig, Error> {
+/// Unix milliseconds, for the timestamps these files record.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// One client the daemon accepts: an entry in `peers.json`.
+///
+/// The field names are the file's own, in snake case, because an operator
+/// editing this file by hand is the supported revocation path — and the
+/// supported way of adding a key whose owner is not around to pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Peer {
+    /// Stable within the file: the first 16 hex characters of `spki`, so an
+    /// operator never has to invent one and a rewrite keeps it.
+    pub id: String,
+    /// What the client called itself when it paired. Display only.
+    pub name: String,
+    /// The SPKI SHA-256 as 64 lowercase hex characters.
+    pub spki: String,
+    /// Unix milliseconds.
+    pub added_ms: u64,
+    /// Unix milliseconds, refreshed at most once a minute per peer.
+    pub last_seen_ms: u64,
+}
+
+/// The on-disk shape. `peers` is required: a misspelt key must be a parse
+/// error, not a daemon that silently trusts nobody.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PeersFile {
+    peers: Vec<Peer>,
+}
+
+/// The daemon's allowlist of client keys: `peers.json`.
+///
+/// Revocation is deleting an entry and restarting, or just deleting it — the
+/// file is read again for every handshake, so both work. The other direction
+/// (adding a key by hand) is supported for the same reason.
+#[derive(Debug)]
+pub struct Peers {
+    path: PathBuf,
+    peers: Vec<Peer>,
+}
+
+impl Peers {
+    /// Reads the allowlist.
+    ///
+    /// A missing file is an empty allowlist, which is what a daemon that has
+    /// never paired anybody has. A malformed one is an error: a silent empty
+    /// list looks exactly like "everything was revoked" and would take an hour
+    /// to diagnose, and a startup error names the file instead.
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let path = path.into();
+        let Some(file) = crate::store::read::<PeersFile>(&path)? else {
+            return Ok(Self {
+                path,
+                peers: Vec::new(),
+            });
+        };
+        // Normalise every pin so a hand-written `sha256:` prefix — the spelling
+        // `ui.json` stores — matches a presented one, and reject an entry that
+        // could never match rather than carrying it around.
+        let mut peers = Vec::with_capacity(file.peers.len());
+        for mut peer in file.peers {
+            peer.spki = lower_hex(&parse_pin(&peer.spki)?);
+            peers.push(peer);
+        }
+        Ok(Self { path, peers })
+    }
+
+    /// The file this allowlist is read from and written to.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Every entry, in file order.
+    #[must_use]
+    pub fn entries(&self) -> &[Peer] {
+        &self.peers
+    }
+
+    /// Whether one presented key is allowed to connect.
+    #[must_use]
+    pub fn allows(&self, spki: &str) -> bool {
+        self.peers.iter().any(|peer| peer.spki == spki)
+    }
+
+    /// Adds a key, or refreshes the name of one that is already allowed.
+    pub fn add(&mut self, name: &str, spki: &str) -> Result<(), Error> {
+        let spki = lower_hex(&parse_pin(spki)?);
+        let now = now_ms();
+        if let Some(index) = self.peers.iter().position(|peer| peer.spki == spki) {
+            {
+                let peer = &mut self.peers[index];
+                name.clone_into(&mut peer.name);
+                peer.last_seen_ms = now;
+            }
+            return Self::write(&self.path, &self.peers);
+        }
+        let id = spki.get(..16).unwrap_or(&spki).to_owned();
+        self.peers.push(Peer {
+            id,
+            name: name.to_owned(),
+            spki,
+            added_ms: now,
+            last_seen_ms: now,
+        });
+        Self::write(&self.path, &self.peers)
+    }
+
+    /// Records that one peer connected, at most once a minute.
+    ///
+    /// The throttle is what keeps a reconnect loop from rewriting the file on
+    /// every retry: the field is "roughly when it last connected", not a log.
+    pub fn touch(&mut self, spki: &str) -> Result<(), Error> {
+        const TOUCH_MS: u64 = 60_000;
+        let now = now_ms();
+        let Some(peer) = self.peers.iter_mut().find(|peer| peer.spki == spki) else {
+            return Ok(());
+        };
+        if now.saturating_sub(peer.last_seen_ms) < TOUCH_MS {
+            return Ok(());
+        }
+        peer.last_seen_ms = now;
+        Self::write(&self.path, &self.peers)
+    }
+
+    fn write(path: &Path, peers: &[Peer]) -> Result<(), Error> {
+        crate::store::write(
+            path,
+            &PeersFile {
+                peers: peers.to_vec(),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+/// The one attempt a pairing window is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingAttempt {
+    /// The code the daemon derived for this handshake, as `XXX-XXX`.
+    pub sas: String,
+    /// The client's key, waiting to be added.
+    pub spki: String,
+    pub at_ms: u64,
+}
+
+/// The operator's answer from `siphon-daemon pair`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingDecision {
+    /// The attempt this answers. A decision for a different code is stale and
+    /// is ignored, so an old `y` cannot admit a later attempt.
+    pub sas: String,
+    pub approve: bool,
+}
+
+/// A pairing window: open until `expires_ms`, for one attempt.
+///
+/// This is a file rather than daemon state because the two halves are two
+/// processes. `siphon-daemon pair` creates it, the running daemon's verifier
+/// reads it to admit a key that is not in `peers.json`, the daemon writes the
+/// attempt's code into it, and `pair` writes the operator's answer back. The
+/// window is the only thing that lets an unknown key get as far as a
+/// provisional connection, so an expired window is the same as no window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingWindow {
+    /// Unix milliseconds. The window is open while this is in the future.
+    pub expires_ms: u64,
+    /// The attempt the daemon saw, once one has connected.
+    pub attempt: Option<PairingAttempt>,
+    /// The operator's answer, once `pair` has asked.
+    pub decision: Option<PairingDecision>,
+}
+
+impl PairingWindow {
+    /// Opens a fresh window, replacing any previous one.
+    pub fn open(path: impl Into<PathBuf>, window: Duration) -> Result<Self, Error> {
+        let path = path.into();
+        let expires_ms = now_ms().saturating_add(u64::try_from(window.as_millis()).unwrap_or(0));
+        let pairing = Self {
+            expires_ms,
+            attempt: None,
+            decision: None,
+        };
+        pairing.save(&path)?;
+        Ok(pairing)
+    }
+
+    /// Reads the window. A malformed or absent file is no window at all: this
+    /// is ephemeral state, and failing closed is the only safe default.
+    #[must_use]
+    pub fn read(path: &Path) -> Option<Self> {
+        crate::store::read(path).ok().flatten()
+    }
+
+    /// Records one attempt's code, clearing any answer for an earlier one.
+    ///
+    /// "One attempt at a time" is the file's own shape: a second handshake
+    /// during the same window replaces the attempt, and its code is what the
+    /// daemon will compare against — so the earlier approval cannot be reused.
+    pub fn record_attempt(path: &Path, sas: &str, spki: &str) -> Result<Self, Error> {
+        let Some(mut pairing) = Self::read(path) else {
+            return Err(Error::Pairing("no pairing window is open".to_owned()));
+        };
+        pairing.attempt = Some(PairingAttempt {
+            sas: sas.to_owned(),
+            spki: spki.to_owned(),
+            at_ms: now_ms(),
+        });
+        pairing.decision = None;
+        pairing.save(path)?;
+        Ok(pairing)
+    }
+
+    /// Records the operator's answer for one attempt.
+    pub fn decide(path: &Path, sas: &str, approve: bool) -> Result<Self, Error> {
+        let Some(mut pairing) = Self::read(path) else {
+            return Err(Error::Pairing("no pairing window is open".to_owned()));
+        };
+        pairing.decision = Some(PairingDecision {
+            sas: sas.to_owned(),
+            approve,
+        });
+        pairing.save(path)?;
+        Ok(pairing)
+    }
+
+    /// Ends the window now, keeping the record of what happened in it.
+    pub fn close(path: &Path) -> Result<(), Error> {
+        if let Some(mut pairing) = Self::read(path) {
+            pairing.expires_ms = now_ms();
+            pairing.save(path)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the window still admits an unknown key.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.expires_ms > now_ms()
+    }
+
+    /// How long the window has left; zero once it has expired.
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        Duration::from_millis(self.expires_ms.saturating_sub(now_ms()))
+    }
+
+    /// Whether the operator approved exactly this code.
+    #[must_use]
+    pub fn approved(&self, sas: &str) -> bool {
+        self.decision
+            .as_ref()
+            .is_some_and(|decision| decision.approve && decision.sas == sas)
+    }
+
+    fn save(&self, path: &Path) -> Result<(), Error> {
+        crate::store::write(path, self)?;
+        Ok(())
+    }
+}
+
+/// Where one daemon's client trust lives: its allowlist and its pairing window.
+///
+/// Both processes (`daemon` and `pair`) build this from the same state
+/// directory, which is the whole of how they share it.
+#[derive(Debug, Clone)]
+pub struct Trust {
+    peers: PathBuf,
+    pairing: PathBuf,
+}
+
+impl Trust {
+    #[must_use]
+    pub fn new(state_dir: impl AsRef<Path>) -> Self {
+        let dir = state_dir.as_ref();
+        Self {
+            peers: dir.join(PEERS_FILE),
+            pairing: dir.join(PAIRING_FILE),
+        }
+    }
+
+    #[must_use]
+    pub fn peers(&self) -> &Path {
+        &self.peers
+    }
+
+    #[must_use]
+    pub fn pairing(&self) -> &Path {
+        &self.pairing
+    }
+}
+
+/// The short authentication string for one handshake, as `XXX-XXX`.
+///
+/// # How it is derived, and what that detects
+///
+/// The seed is the TLS exporter (`export_keying_material`), which is bound to
+/// the whole handshake transcript — both certificates, both key shares, both
+/// Finished messages. The two pinned keys are mixed in as well, so the string
+/// is a function of exactly the keys a person pins, and an active MITM cannot
+/// make the two sides agree: it terminates TLS on each leg, so the daemon's
+/// exporter seed and the client's differ, and the codes differ. A man in the
+/// middle relays, but the comparison is what he cannot relay.
+///
+/// A derivation of the form `truncate(H(H(server_spki) || H(client_spki)))`
+/// — the documented fallback if the carrier ever stopped exposing an exporter
+/// — would be computed from the public keys alone. It would still differ
+/// between an honest pair and a swapped key, but it would be *identical* on
+/// both of a MITM's legs, so it detects a wrong key and never an active
+/// attacker. The exporter is what makes the code proof rather than comparison.
+fn sas(seed: &[u8], server_spki: &str, client_spki: &str) -> String {
+    let mut material = Vec::with_capacity(seed.len() + server_spki.len() + client_spki.len());
+    material.extend_from_slice(seed);
+    material.extend_from_slice(server_spki.as_bytes());
+    material.extend_from_slice(client_spki.as_bytes());
+    let digest = sha256(&material);
+    let packed = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    let mut out = String::with_capacity(7);
+    for index in 0..6u32 {
+        if index == 3 {
+            out.push('-');
+        }
+        let shift = 25 - index * 5;
+        let slot = usize::try_from((packed >> shift) & 0x1f).unwrap_or(0);
+        out.push(char::from(SAS_ALPHABET[slot]));
+    }
+    out
+}
+
+/// The code for this connection, from whichever side is asking.
+///
+/// Both sides call the same exporter with the same label, so they get the same
+/// seed; the pin order is fixed (daemon first) so the two arguments agree.
+fn session_sas(connection: &Connection, local_pin: &str, peer_pin: &str) -> Result<String, Error> {
+    let mut seed = [0u8; 32];
+    connection
+        .export_keying_material(&mut seed, SAS_LABEL, SAS_CONTEXT)
+        .map_err(|_| Error::NoExporter)?;
+    let (server_pin, client_pin) = if connection.side().is_server() {
+        (local_pin, peer_pin)
+    } else {
+        (peer_pin, local_pin)
+    };
+    Ok(sas(&seed, server_pin, client_pin))
+}
+
+/// The peer's SPKI pin, from the certificate chain the handshake exchanged.
+fn peer_pin(connection: &Connection) -> Result<String, Error> {
+    let chain = connection.peer_identity().ok_or(Error::NoPeerCertificate)?;
+    let cert = chain.first().ok_or(Error::NoPeerCertificate)?;
+    pin_of(cert)
+}
+
+/// Accepts a client certificate only if its SPKI is in `peers.json`, or while a
+/// pairing window is open.
+///
+/// The window's exception is the only way a key ever gets into `peers.json`:
+/// without it the daemon could never accept a client it does not already know,
+/// so pairing would be impossible rather than merely closed.
+///
+/// The files are read here, once per handshake, deliberately: `peers.json` is
+/// meant to be edited by an operator (and is rewritten by the daemon when it
+/// pairs someone), so a cached copy would need invalidating and a restart to
+/// revoke a client. A handshake is a rare, human-paced event — not a hot path —
+/// and the file is a few hundred bytes. rustls requires the verifier to be
+/// `Send + Sync`; this one holds no interior state at all.
+#[derive(Debug)]
+struct Allowlisted {
+    trust: Trust,
+    algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ClientCertVerifier for Allowlisted {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        // There is no CA to name: the pin is the key, not an issuer.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let presented =
+            pin_of(end_entity).map_err(|error| rustls::Error::General(error.to_string()))?;
+        match Peers::load(self.trust.peers()) {
+            Ok(peers) if peers.allows(&presented) => Ok(ClientCertVerified::assertion()),
+            Ok(_) => {
+                let window = PairingWindow::read(self.trust.pairing())
+                    .filter(|window| window.is_open() && window.decision.is_none());
+                if window.is_some() {
+                    // The listener decides whether this connection is
+                    // provisional; the verifier only lets it through so the
+                    // typed code can be exchanged.
+                    info!(target: "rpc", pin = %presented, "quic: unknown client admitted by the pairing window");
+                    return Ok(ClientCertVerified::assertion());
+                }
+                warn!(target: "rpc", pin = %presented, "quic: refused a client that is not in peers.json");
+                Err(rustls::Error::General(format!(
+                    "siphon: {presented} is not a paired client"
+                )))
+            }
+            Err(error) => {
+                // A broken allowlist refuses everybody, which is the safe
+                // direction; the daemon logs the reason at startup too.
+                warn!(target: "rpc", %error, "quic: could not read peers.json");
+                Err(rustls::Error::General(format!(
+                    "siphon: the allowlist is unreadable: {error}"
+                )))
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+/// The QUIC server configuration: TLS 1.3, our certificate, a client
+/// certificate that must be in the allowlist, ALPN `riffle/1`, no 0-RTT.
+fn server_config(identity: &Identity, trust: &Trust) -> Result<compio_quic::ServerConfig, Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(Allowlisted {
+        trust: trust.clone(),
+        algorithms: provider.signature_verification_algorithms,
+    });
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(Error::Tls)?
-        .with_no_client_auth()
+        .with_client_cert_verifier(verifier)
         .with_single_cert(
             vec![identity.cert.clone()],
             PrivateKeyDer::Pkcs8(identity.key.clone_key()),
@@ -297,7 +817,10 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
-fn client_config(pin: [u8; 32]) -> Result<(compio_quic::ClientConfig, Arc<Refusal>), Error> {
+fn client_config(
+    pin: [u8; 32],
+    identity: &Identity,
+) -> Result<(compio_quic::ClientConfig, Arc<Refusal>), Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let refusal = Arc::new(Refusal::default());
     let verifier = Arc::new(Pinned {
@@ -310,7 +833,11 @@ fn client_config(pin: [u8; 32]) -> Result<(compio_quic::ClientConfig, Arc<Refusa
         .map_err(Error::Tls)?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(
+            vec![identity.cert.clone()],
+            PrivateKeyDer::Pkcs8(identity.key.clone_key()),
+        )
+        .map_err(Error::Tls)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
     // No resumption and no 0-RTT: both would skip the certificate on exactly
     // the reconnects the pin exists to check.
@@ -328,8 +855,15 @@ pub struct Listener {
 
 impl Listener {
     /// Binds one address and is ready to accept.
-    pub async fn bind(addr: impl ToSocketAddrsAsync, identity: &Identity) -> Result<Self, Error> {
-        let config = server_config(identity)?;
+    ///
+    /// `trust` is read for every handshake, so a window opened after the
+    /// listener started still admits one pairing attempt.
+    pub async fn bind(
+        addr: impl ToSocketAddrsAsync,
+        identity: &Identity,
+        trust: &Trust,
+    ) -> Result<Self, Error> {
+        let config = server_config(identity, trust)?;
         let endpoint = Endpoint::server(addr, config).await?;
         Ok(Self { endpoint })
     }
@@ -345,35 +879,124 @@ impl Listener {
     }
 }
 
-/// Completes one incoming handshake and takes its control stream.
+/// One established connection: the control stream plus what the handshake
+/// proves about the peer.
+///
+/// The pin is the peer's key and the code is the pairing string for *this*
+/// handshake. A normal connection only needs the pin (to look it up in the
+/// allowlist); a provisional one sends the code back.
+pub struct Session {
+    stream: Stream,
+    pin: String,
+    sas: String,
+}
+
+impl Session {
+    /// The peer's SPKI SHA-256 as lowercase hex.
+    #[must_use]
+    pub fn pin(&self) -> &str {
+        &self.pin
+    }
+
+    /// The code both sides derived. Compare it, then either send it back as a
+    /// `PairConfirm` or ignore it.
+    #[must_use]
+    pub fn sas(&self) -> &str {
+        &self.sas
+    }
+
+    /// The control stream, for a peer whose key is already trusted.
+    #[must_use]
+    pub fn into_stream(self) -> Stream {
+        self.stream
+    }
+}
+
+/// A completed handshake whose control stream has not been taken yet.
+///
+/// Split from [`Session`] because the daemon has to decide what the connection
+/// may be — and, for an unknown key, publish the pairing code — *before* it
+/// waits for the first frame. A client that is pairing sends nothing until the
+/// operator has compared the code, so waiting for the stream first would
+/// deadlock the one thing pairing needs.
+pub struct Handshake {
+    connection: Connection,
+    pin: String,
+    sas: String,
+}
+
+impl Handshake {
+    /// The peer's SPKI SHA-256 as lowercase hex.
+    #[must_use]
+    pub fn pin(&self) -> &str {
+        &self.pin
+    }
+
+    /// The code both sides derived for this handshake.
+    #[must_use]
+    pub fn sas(&self) -> &str {
+        &self.sas
+    }
+
+    /// Waits for the control stream and takes both halves of it.
+    ///
+    /// quinn does not announce a bidirectional stream until it carries bytes,
+    /// so this completes when the peer writes its first frame (`Hello`, or
+    /// `PairConfirm` on a provisional connection).
+    pub async fn stream(self) -> Result<Session, Error> {
+        let (send, recv) = self
+            .connection
+            .accept_bi()
+            .await
+            .map_err(|error| Error::Stream(error.to_string()))?;
+        Ok(Session {
+            stream: Stream {
+                endpoint: None,
+                send,
+                recv,
+            },
+            pin: self.pin,
+            sas: self.sas,
+        })
+    }
+}
+
+/// Completes one incoming handshake: certificate, exporter, both pins.
 ///
 /// One bidirectional stream is the control plane. More streams and datagrams
 /// belong to the media lane that does not exist yet, so they are ignored.
-pub async fn establish(incoming: Incoming) -> Result<Stream, Error> {
+pub async fn accept(incoming: Incoming, identity: &Identity) -> Result<Handshake, Error> {
     let connection = incoming
         .await
         .map_err(|error| Error::Connect(error.to_string()))?;
-    let (send, recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|error| Error::Stream(error.to_string()))?;
-    Ok(Stream {
-        endpoint: None,
-        send,
-        recv,
+    let pin = peer_pin(&connection)?;
+    let sas = session_sas(&connection, identity.pin(), &pin)?;
+    Ok(Handshake {
+        connection,
+        pin,
+        sas,
     })
+}
+
+/// Completes one incoming handshake and takes its control stream.
+///
+/// The short form of [`accept`] followed by [`Handshake::stream`], for a caller
+/// that admits every connection the handshake allowed.
+pub async fn establish(incoming: Incoming, identity: &Identity) -> Result<Session, Error> {
+    accept(incoming, identity).await?.stream().await
 }
 
 /// Opens the client side: resolve, handshake against the pin, one stream.
 ///
 /// `pin` is the daemon's SPKI SHA-256 as 64 hex characters (either case, with
 /// or without a `sha256:` prefix). It is a parameter here on purpose: where a
-/// UI keeps it (`ui.json`'s `Connection::Remote`) is the pairing task's
+/// UI keeps it (`ui.json`'s `Connection::Remote`) is the pairing screen's
 /// business, and a missing pin is [`Error::PinMissing`] rather than a
-/// connection.
-pub async fn connect(addr: &str, pin: &str) -> Result<Stream, Error> {
+/// connection. `identity` is this client's key, which the daemon either has in
+/// `peers.json` or is about to add.
+pub async fn connect(addr: &str, pin: &str, identity: &Identity) -> Result<Session, Error> {
     let pin = parse_pin(pin)?;
-    let (config, refusal) = client_config(pin)?;
+    let (config, refusal) = client_config(pin, identity)?;
     let remote = resolve(addr).await?;
     let bind = if remote.is_ipv4() {
         "0.0.0.0:0"
@@ -400,13 +1023,19 @@ pub async fn connect(addr: &str, pin: &str) -> Result<Stream, Error> {
         }
         Err(_) => return Err(Error::Timeout),
     };
+    let peer = peer_pin(&connection)?;
+    let sas = session_sas(&connection, identity.pin(), &peer)?;
     let (send, recv) = connection
         .open_bi()
         .map_err(|error| Error::Stream(error.to_string()))?;
-    Ok(Stream {
-        endpoint: Some(endpoint),
-        send,
-        recv,
+    Ok(Session {
+        stream: Stream {
+            endpoint: Some(endpoint),
+            send,
+            recv,
+        },
+        pin: peer,
+        sas,
     })
 }
 
@@ -502,16 +1131,24 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("tls: {0}")]
     Tls(#[from] rustls::Error),
+    #[error("store: {0}")]
+    Store(#[from] crate::store::StoreError),
     #[error("quic: {0}")]
     Config(String),
     #[error("identity: {0}")]
     Identity(String),
+    #[error("pairing: {0}")]
+    Pairing(String),
     #[error("the daemon presented {presented}, but the pinned key is {expected}")]
     PinMismatch { expected: String, presented: String },
     #[error("a pin is required to connect to a remote daemon")]
     PinMissing,
     #[error("the pin must be 64 hex characters, got {0:?}")]
     PinMalformed(String),
+    #[error("the peer presented no certificate")]
+    NoPeerCertificate,
+    #[error("the connection exposed no TLS exporter")]
+    NoExporter,
     #[error("connect: {0}")]
     Connect(String),
     #[error("the handshake timed out")]
@@ -534,6 +1171,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("siphon-quic-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// An allowlist with one key in it, at the path a daemon would read.
+    fn allow(dir: &Path, pin: &str) -> Trust {
+        let trust = Trust::new(dir);
+        let mut peers = Peers::load(trust.peers()).expect("empty allowlist");
+        peers.add("test client", pin).expect("add the client");
+        trust
     }
 
     #[test]
@@ -563,13 +1208,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The UI's identity is the one a daemon remembers, so it is stable too and
+    /// its key has the same permissions as the daemon's.
+    #[test]
+    fn the_client_identity_is_stable_and_owner_only() {
+        let dir = scratch("client-identity");
+        let first = Identity::load_or_create_client(&dir).expect("first client identity");
+        let second = Identity::load_or_create_client(&dir).expect("second client identity");
+        assert_eq!(first.pin(), second.pin());
+        assert_ne!(
+            first.pin(),
+            Identity::load_or_create(&dir)
+                .expect("daemon identity")
+                .pin(),
+            "the daemon and the client must not share a key"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = std::fs::metadata(dir.join(CLIENT_KEY_FILE))
+                .expect("key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the QUIC key must not be group/world readable");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_wrong_pin_is_refused_with_the_typed_error() {
         let dir = scratch("mismatch");
         let runtime = compio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let identity = Identity::load_or_create(&dir).expect("identity");
-            let listener = Listener::bind("127.0.0.1:0", &identity)
+            let client_identity = Identity::load_or_create_client(&dir.join("ui")).expect("client");
+            // The client's key is allowed, so the refusal can only be the pin:
+            // otherwise the server's client-certificate check would fail first
+            // and the client would see a plain handshake error.
+            let trust = allow(&dir, client_identity.pin());
+            let listener = Listener::bind("127.0.0.1:0", &identity, &trust)
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("local addr").to_string();
@@ -578,10 +1257,10 @@ mod tests {
             // client would time out before it ever sees the certificate.
             let accept = async {
                 if let Some(incoming) = listener.incoming().await {
-                    let _ = incoming.await;
+                    let _ = establish(incoming, &identity).await;
                 }
             };
-            let (client, ()) = join(connect(&addr, &wrong), accept).await;
+            let (client, ()) = join(connect(&addr, &wrong, &client_identity), accept).await;
             match client {
                 Ok(_) => panic!("a wrong pin must not produce a stream"),
                 Err(Error::PinMismatch {
@@ -599,19 +1278,22 @@ mod tests {
 
     #[test]
     fn a_missing_or_malformed_pin_never_reaches_the_network() {
+        let dir = scratch("no-pin");
+        let identity = Identity::load_or_create_client(&dir).expect("client identity");
         let runtime = compio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
-            match connect("127.0.0.1:1", "").await {
+            match connect("127.0.0.1:1", "", &identity).await {
                 Err(Error::PinMissing) => {}
                 Ok(_) => panic!("an empty pin must not connect"),
                 Err(other) => panic!("expected a missing pin, got {other}"),
             }
-            match connect("127.0.0.1:1", "not-a-pin").await {
+            match connect("127.0.0.1:1", "not-a-pin", &identity).await {
                 Err(Error::PinMalformed(_)) => {}
                 Ok(_) => panic!("a malformed pin must not connect"),
                 Err(other) => panic!("expected a malformed pin, got {other}"),
             }
         });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -625,9 +1307,11 @@ mod tests {
         let runtime = compio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let identity = Identity::load_or_create(&dir).expect("identity");
+            let client_identity = Identity::load_or_create_client(&dir.join("ui")).expect("client");
+            let trust = allow(&dir, client_identity.pin());
             // The `sha256:` spelling is what a UI may persist beside the key.
             let pin = format!("sha256:{}", identity.pin());
-            let listener = Listener::bind("127.0.0.1:0", &identity)
+            let listener = Listener::bind("127.0.0.1:0", &identity, &trust)
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("local addr").to_string();
@@ -640,18 +1324,27 @@ mod tests {
             // carries bytes, so the client writes its first frame before the
             // server is expected to have a stream to accept.
             let client_fut = async {
-                let mut stream = connect(&addr, &pin).await.expect("client");
-                codec::write(&mut stream, &hello)
+                let mut session = connect(&addr, &pin, &client_identity)
+                    .await
+                    .expect("client");
+                codec::write(&mut session.stream, &hello)
                     .await
                     .expect("write hello");
-                stream
+                session
             };
-            let accept = async { establish(listener.incoming().await.expect("incoming")).await };
+            let accept =
+                async { establish(listener.incoming().await.expect("incoming"), &identity).await };
             let (mut client, server) = join(client_fut, accept).await;
             let mut server = server.expect("server");
+            // Both sides of one handshake derive the same code, which is the
+            // whole pairing proof.
+            assert_eq!(client.sas(), server.sas());
+            assert_eq!(server.pin(), client_identity.pin());
+            assert_eq!(client.pin(), identity.pin());
 
             let mut reader = codec::FrameReader::new();
-            let received: ClientMessage = reader.read(&mut server).await.expect("read hello");
+            let received: ClientMessage =
+                reader.read(&mut server.stream).await.expect("read hello");
             assert!(matches!(
                 received,
                 ClientMessage::Hello { magic, protocol, .. }
@@ -662,17 +1355,163 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 server_version: "test".to_owned(),
             };
-            codec::write(&mut server, &welcome)
+            codec::write(&mut server.stream, &welcome)
                 .await
                 .expect("write welcome");
             let mut reader = codec::FrameReader::new();
             let received: crate::riffle::protocol::ServerMessage =
-                reader.read(&mut client).await.expect("read welcome");
+                reader.read(&mut client.stream).await.expect("read welcome");
             assert!(matches!(
                 received,
                 crate::riffle::protocol::ServerMessage::Welcome { .. }
             ));
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// No allowlist entry and no window: the client certificate is refused
+    /// during the handshake, so the daemon never gets a connection to serve.
+    ///
+    /// The assertion is on the server side because a QUIC client can finish its
+    /// own half of the handshake before the server's verdict arrives; what is
+    /// deterministic is that the server never completes it.
+    #[test]
+    fn an_unpaired_client_is_refused_by_the_handshake() {
+        let dir = scratch("refused");
+        let runtime = compio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let identity = Identity::load_or_create(&dir).expect("identity");
+            let client_identity = Identity::load_or_create_client(&dir.join("ui")).expect("client");
+            let trust = Trust::new(&dir);
+            let listener = Listener::bind("127.0.0.1:0", &identity, &trust)
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local addr").to_string();
+            let accept = async {
+                match listener.incoming().await {
+                    Some(incoming) => establish(incoming, &identity).await.map(|_| ()),
+                    None => Err(Error::Connect("the endpoint closed".to_owned())),
+                }
+            };
+            let (client, server) =
+                join(connect(&addr, identity.pin(), &client_identity), accept).await;
+            assert!(
+                server.is_err(),
+                "an unpaired key must not complete its handshake"
+            );
+            drop(client);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The code is a function of the exporter seed and both keys, which is what
+    /// makes two MITM legs disagree.
+    #[test]
+    fn the_code_is_deterministic_and_bound_to_both_keys() {
+        let seed = [7u8; 32];
+        let daemon = "aa".repeat(32);
+        let client = "bb".repeat(32);
+        let first = sas(&seed, &daemon, &client);
+        assert_eq!(first, sas(&seed, &daemon, &client));
+        assert_eq!(first.len(), 7);
+        assert_eq!(first.as_bytes()[3], b'-');
+        assert!(
+            first
+                .chars()
+                .filter(|c| *c != '-')
+                .all(|c| SAS_ALPHABET.contains(&u8::try_from(c).unwrap_or(0)))
+        );
+
+        // Either key, either order, and the seed itself: all four change it.
+        assert_ne!(first, sas(&seed, &daemon, &"cc".repeat(32)));
+        assert_ne!(first, sas(&seed, &"cc".repeat(32), &client));
+        assert_ne!(first, sas(&seed, &client, &daemon));
+        assert_ne!(first, sas(&[8u8; 32], &daemon, &client));
+    }
+
+    #[test]
+    fn the_allowlist_round_trips_and_revokes_by_deleting_an_entry() {
+        let dir = scratch("peers");
+        let trust = Trust::new(&dir);
+        assert_eq!(
+            Peers::load(trust.peers())
+                .expect("a missing file is an empty allowlist")
+                .entries(),
+            []
+        );
+
+        let key = "ab".repeat(32);
+        Peers::load(trust.peers())
+            .expect("empty")
+            .add("laptop", &key)
+            .expect("add");
+        let peers = Peers::load(trust.peers()).expect("read back");
+        assert!(peers.allows(&key));
+        assert_eq!(peers.entries()[0].spki, key);
+        assert_eq!(peers.entries()[0].id, key[..16]);
+        assert!(peers.entries()[0].added_ms > 0);
+        assert!(!peers.allows(&"cd".repeat(32)));
+        // The file is the operator's, so it is the documented shape.
+        let text = std::fs::read_to_string(trust.peers()).expect("read");
+        assert!(text.contains("\"peers\""));
+        assert!(text.contains("\"last_seen_ms\""));
+        assert!(text.contains("\"added_ms\""));
+
+        std::fs::write(trust.peers(), r#"{"peers":[]}"#).expect("revoke");
+        assert!(!Peers::load(trust.peers()).expect("reload").allows(&key));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_malformed_allowlist_is_an_error_not_an_empty_list() {
+        let dir = scratch("peers-broken");
+        let trust = Trust::new(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        for broken in [
+            r#"{"peer":[]}"#,
+            r#"{"peers":[{"id":"a","name":"b","spki":"not-a-pin","added_ms":0,"last_seen_ms":0}]}"#,
+            "not json",
+        ] {
+            std::fs::write(trust.peers(), broken).expect("write");
+            assert!(
+                Peers::load(trust.peers()).is_err(),
+                "{broken} must be rejected"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_window_expires_and_only_approves_the_code_it_was_asked_about() {
+        let dir = scratch("window");
+        let trust = Trust::new(&dir);
+        let window = PairingWindow::open(trust.pairing(), Duration::from_secs(1)).expect("open");
+        assert!(window.is_open());
+
+        PairingWindow::record_attempt(trust.pairing(), "ABC-123", &"ee".repeat(32))
+            .expect("attempt");
+        let attempt = PairingWindow::read(trust.pairing()).expect("read").attempt;
+        assert_eq!(attempt.expect("attempt").sas, "ABC-123");
+
+        PairingWindow::decide(trust.pairing(), "ABC-123", true).expect("decide");
+        let pairing = PairingWindow::read(trust.pairing()).expect("read");
+        assert!(pairing.approved("ABC-123"));
+        assert!(
+            !pairing.approved("XYZ-789"),
+            "a different attempt is not approved"
+        );
+
+        // A second attempt during the same window clears the first answer, so
+        // an old `y` cannot admit it.
+        PairingWindow::record_attempt(trust.pairing(), "XYZ-789", &"ff".repeat(32))
+            .expect("attempt");
+        let pairing = PairingWindow::read(trust.pairing()).expect("read");
+        assert!(!pairing.approved("XYZ-789"));
+        assert!(!pairing.approved("ABC-123"));
+
+        PairingWindow::close(trust.pairing()).expect("close");
+        let pairing = PairingWindow::read(trust.pairing()).expect("read");
+        assert!(!pairing.is_open());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

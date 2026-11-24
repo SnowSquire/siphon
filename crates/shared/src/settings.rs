@@ -238,6 +238,41 @@ impl ClientSettings {
                 |connection| connection,
             )
     }
+
+    /// Records a daemon this client has paired with, and makes it the active
+    /// connection. Returns its id.
+    ///
+    /// Keyed by endpoint: pairing the same daemon again — after its key
+    /// changed, or to retry — refreshes the fingerprint and the label rather
+    /// than adding a second row that names the same machine twice.
+    pub fn remember_remote(&mut self, endpoint: &str, fingerprint: &str, label: &str) -> String {
+        let id = remote_id(endpoint);
+        let connection = Connection::Remote {
+            id: id.clone(),
+            endpoint: endpoint.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            label: label.to_owned(),
+        };
+        match self.connections.iter_mut().find(|existing| {
+            matches!(existing, Connection::Remote { endpoint: seen, .. } if seen == endpoint)
+        }) {
+            Some(existing) => *existing = connection,
+            None => self.connections.push(connection),
+        }
+        self.active_connection.clone_from(&id);
+        id
+    }
+}
+
+/// A short, stable id for one remote endpoint: FNV-1a over its text, so the id
+/// in `activeConnection` survives a restart and a re-pair.
+fn remote_id(endpoint: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in endpoint.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("remote-{:08x}", hash & 0xffff_ffff)
 }
 
 /// A `Connection::Local` for the one case a document cannot supply: an empty
@@ -380,5 +415,32 @@ mod tests {
         let copy = render;
         assert_eq!(copy, render);
         assert_eq!(render.hdr, HdrMode::On);
+    }
+
+    #[test]
+    fn re_pairing_one_endpoint_updates_its_row_and_activates_it() {
+        let mut settings = ClientSettings::default();
+        let id = settings.remember_remote("home.example.net:7418", "sha256:aa", "media box");
+        assert_eq!(settings.active().id(), id);
+        assert!(matches!(
+            settings.active(),
+            Connection::Remote { endpoint, fingerprint, .. }
+                if endpoint == "home.example.net:7418" && fingerprint == "sha256:aa"
+        ));
+
+        // A second pairing of the same daemon is a refresh, not a second row.
+        settings.remember_remote("home.example.net:7418", "sha256:bb", "media box 2");
+        assert_eq!(settings.connections.len(), 2, "local plus one remote");
+        assert!(matches!(
+            settings.active(),
+            Connection::Remote { fingerprint, label, .. }
+                if fingerprint == "sha256:bb" && label == "media box 2"
+        ));
+
+        // A different daemon is its own row.
+        let other = settings.remember_remote("10.0.0.2:7418", "sha256:cc", "attic");
+        assert_ne!(other, id);
+        assert_eq!(settings.connections.len(), 3);
+        assert_eq!(settings.active_connection, other);
     }
 }

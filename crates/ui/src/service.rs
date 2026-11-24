@@ -9,6 +9,8 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::Duration;
 
+use siphon_shared::riffle::quic;
+
 #[cfg(debug_assertions)]
 pub const APP_ID: &str = "com.iken.siphon.debug";
 #[cfg(not(debug_assertions))]
@@ -22,6 +24,23 @@ const RTSP: &str = "127.0.0.1:7417";
 
 fn endpoint() -> String {
     siphon_shared::riffle::admin_endpoint(APP_ID)
+}
+
+/// This client's QUIC identity: the certificate a paired daemon remembers.
+///
+/// Made on first use and stable across restarts, exactly like the daemon's: a
+/// new key is a fresh pairing on every daemon this client talks to, so the file
+/// is never regenerated on purpose. It lives in the app data directory beside
+/// the avatar cache, not in the daemon's state directory, because it is this
+/// client's own.
+///
+/// Runs on the RPC worker or the pairing screen, never the frame loop: it is a
+/// one-off file read that may generate a key the first time.
+// The pairing screen is a separate change; nothing in this binary calls this
+// yet, and a certificate nobody asked for should not be generated at startup.
+#[allow(dead_code)]
+pub fn identity() -> Result<quic::Identity, quic::Error> {
+    quic::Identity::load_or_create_client(&siphon_shared::riffle::data_dir(APP_ID))
 }
 
 /// Whether the daemon's admin endpoint accepts a connection.

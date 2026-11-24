@@ -125,6 +125,8 @@ enum Command {
     Record(Record),
     /// Serve any channel through `rtsp://host/<channel>/<quality>/`
     Daemon(Daemon),
+    /// Open a window in which one remote UI can pair, and approve it by code
+    Pair(Pair),
 }
 
 /// One channel, no UI: wait for it to go live, record it, exit when it ends.
@@ -199,6 +201,13 @@ struct Daemon {
     keep_runs: bool,
 }
 
+#[derive(Args, Debug)]
+struct Pair {
+    /// How long the window stays open, in seconds
+    #[arg(long, default_value_t = 120)]
+    timeout: u64,
+}
+
 #[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init(config::APP_ID);
@@ -219,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &cfg.command {
         Command::Record(args) => record(&cfg, args).await?,
         Command::Daemon(args) => daemon(&cfg, args).await?,
+        Command::Pair(args) => pair(args)?,
     }
     Ok(())
 }
@@ -627,6 +637,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     }
 
     let (accept_tx, accept_rx) = kanal::unbounded();
+    let mut trust = None;
     if !args.no_admin {
         let endpoint = args
             .admin
@@ -640,10 +651,20 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         // all — that emptiness is the whole remote gate.
         if !config.network.listen.is_empty() {
             let dir = siphon_shared::riffle::state_dir(config::APP_ID);
+            let daemon_trust = siphon_shared::riffle::quic::Trust::new(&dir);
+            // A malformed allowlist is a startup error: the alternative is a
+            // daemon that trusts nobody for a reason nobody can see.
+            siphon_shared::riffle::quic::Peers::load(daemon_trust.peers())?;
             match siphon_shared::riffle::quic::Identity::load_or_create(&dir) {
                 Ok(identity) => {
                     let identity = Rc::new(identity);
-                    riffle::spawn_quic_listeners(&identity, &config.network.listen, &accept_tx);
+                    riffle::spawn_quic_listeners(
+                        &identity,
+                        &daemon_trust,
+                        &config.network.listen,
+                        &accept_tx,
+                    );
+                    trust = Some(daemon_trust);
                 }
                 Err(error) => {
                     error!(%error, "quic: no pinned identity, the remote listener is off");
@@ -662,12 +683,108 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         jobs: jobs_rx.to_async(),
         jobs_tx,
         client_id: cfg.client_id.clone(),
+        trust,
     });
     compio::runtime::spawn(app.run()).detach();
 
     // Nothing else owns the process now: the app loop and the downloaders run
     // detached, so park here rather than returning and tearing them down.
     std::future::pending::<Result<(), Box<dyn std::error::Error>>>().await
+}
+
+/// Opens a pairing window and approves one client by the code both sides
+/// derived from its handshake.
+///
+/// The window is a file, because the daemon that owns the QUIC listener is a
+/// separate process: this writes `pairing.json` into the state directory, the
+/// running daemon's verifier reads it to admit one unknown key, the daemon
+/// writes the attempt's code back, and this prints it and writes the answer.
+/// Nothing else is started — no registry, no HTTP client, no UI.
+///
+/// Deliberately synchronous: nothing else runs in this process, so the one
+/// thread it owns can block on the console. It never touches the daemon's
+/// reactor, which is in the other process.
+fn pair(args: &Pair) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+
+    use siphon_shared::riffle::quic::Identity;
+    use siphon_shared::riffle::quic::PairingWindow;
+    use siphon_shared::riffle::quic::Trust;
+
+    /// How often the window file is looked at. A person is typing at one end,
+    /// so this is the cheap half of a two-process handshake, not a hot loop.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+    let config = config::load(&config::default_path(config::APP_ID));
+    if config.network.listen.is_empty() {
+        return Err(
+            "network.listen is empty in config.json: this daemon has no remote listener to pair with"
+                .into(),
+        );
+    }
+    let state = siphon_shared::riffle::state_dir(config::APP_ID);
+    std::fs::create_dir_all(&state)?;
+    let trust = Trust::new(&state);
+    // The same key the daemon presents: the client pins it, and printing it
+    // here is what lets an operator compare what the UI remembered.
+    let identity = Identity::load_or_create(&state)?;
+    // The same allowlist the daemon's verifier reads, and the same rule: a
+    // malformed file is an error, not "everybody is revoked".
+    let peers = siphon_shared::riffle::quic::Peers::load(trust.peers())?;
+
+    println!("daemon key: {}", identity.pin());
+    for addr in &config.network.listen {
+        println!("address:    {addr}");
+    }
+    println!("paired:     {} client(s)", peers.entries().len());
+    let window = std::time::Duration::from_secs(args.timeout.max(1));
+    let opened = PairingWindow::open(trust.pairing(), window)?;
+    println!(
+        "window open for {} s; waiting for a client to connect...",
+        window.as_secs()
+    );
+
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        std::thread::sleep(POLL);
+        let Some(current) = PairingWindow::read(trust.pairing()) else {
+            return Err("the pairing window was removed".into());
+        };
+        // Another `pair` replaced the window: this one is no longer the window
+        // the daemon is looking at.
+        if current.expires_ms != opened.expires_ms {
+            return Err("another pairing window replaced this one".into());
+        }
+        let Some(attempt) = current.attempt else {
+            if std::time::Instant::now() >= deadline {
+                let _ = PairingWindow::close(trust.pairing());
+                println!("no client connected before the window closed");
+                return Ok(());
+            }
+            continue;
+        };
+        if current.decision.is_some() {
+            // Already answered (this process wrote it and is about to exit).
+            return Ok(());
+        }
+
+        println!();
+        println!("pairing code: {}", attempt.sas);
+        println!("client key:   {}", attempt.spki);
+        print!("approve this client? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let approve = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        PairingWindow::decide(trust.pairing(), &attempt.sas, approve)?;
+        if approve {
+            println!("approved: the client finishes the handshake on its side");
+        } else {
+            println!("refused; the client is dropped");
+            let _ = PairingWindow::close(trust.pairing());
+        }
+        return Ok(());
+    }
 }
 
 #[cfg(all(test, not(miri)))]
@@ -721,5 +838,16 @@ mod tests {
             panic!("expected record");
         };
         assert_eq!(args.auth_token.as_deref(), Some("t"));
+
+        let pair = Config::try_parse_from(["app", "pair"]).expect("pair");
+        let Command::Pair(args) = pair.command else {
+            panic!("expected pair");
+        };
+        assert_eq!(args.timeout, 120);
+        let pair = Config::try_parse_from(["app", "pair", "--timeout", "30"]).expect("pair");
+        let Command::Pair(args) = pair.command else {
+            panic!("expected pair");
+        };
+        assert_eq!(args.timeout, 30);
     }
 }

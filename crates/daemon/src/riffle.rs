@@ -10,6 +10,7 @@
 
 use std::io;
 use std::rc::Rc;
+use std::time::Instant;
 
 use compio::buf::BufResult;
 use compio::buf::IoBuf;
@@ -21,6 +22,9 @@ use siphon_shared::riffle::FrameDecoder;
 use siphon_shared::riffle::ServerMessage;
 use siphon_shared::riffle::codec;
 use siphon_shared::riffle::quic;
+use siphon_shared::riffle::quic::PairingWindow;
+use siphon_shared::riffle::quic::Peers;
+use siphon_shared::riffle::quic::Trust;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -99,6 +103,21 @@ impl AsyncWrite for AdminWriter {
 pub struct AdminStream {
     pub reader: AdminReader,
     pub writer: AdminWriter,
+    /// Set when the client's key is not in `peers.json`: the connection may
+    /// send one `PairConfirm` and nothing else, and is dropped when the
+    /// window ends.
+    pub provisional: Option<Provisional>,
+}
+
+/// One pairing attempt, as the listener saw it.
+#[derive(Debug, Clone)]
+pub struct Provisional {
+    /// The code the daemon derived; a `PairConfirm` must repeat it exactly.
+    pub sas: String,
+    /// The client's key, to add on a match.
+    pub spki: String,
+    /// The moment the pairing window closes and this connection is dropped.
+    pub expires: Instant,
 }
 
 impl AdminStream {
@@ -108,15 +127,17 @@ impl AdminStream {
         Self {
             reader: AdminReader::Pipe(Rc::clone(&stream)),
             writer: AdminWriter::Pipe(stream),
+            provisional: None,
         }
     }
 
     /// One bidirectional QUIC stream.
-    fn quic(stream: quic::Stream) -> Self {
-        let (reader, writer) = stream.split();
+    fn quic(session: quic::Session, provisional: Option<Provisional>) -> Self {
+        let (reader, writer) = session.into_stream().split();
         Self {
             reader: AdminReader::Quic(reader),
             writer: AdminWriter::Quic(writer),
+            provisional,
         }
     }
 }
@@ -147,6 +168,9 @@ pub struct Conn {
     /// reader position on one UI: it is not daemon state, and one UI cannot see
     /// or close another's.
     pub lanes: Lanes,
+    /// Set while the connection is a pairing attempt: it may send exactly one
+    /// `PairConfirm` and nothing else.
+    pub provisional: Option<Provisional>,
 }
 
 impl Conn {
@@ -161,6 +185,7 @@ impl Conn {
             ready: false,
             writing: false,
             lanes: Lanes::default(),
+            provisional: stream.provisional,
         }
     }
 
@@ -323,21 +348,28 @@ pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io
 /// else from accepting.
 pub fn spawn_quic_listeners(
     identity: &Rc<quic::Identity>,
+    trust: &Trust,
     addrs: &[String],
     queue: &kanal::Sender<AdminStream>,
 ) {
     for addr in addrs {
-        spawn_quic_listener(Rc::clone(identity), addr.clone(), queue.clone());
+        spawn_quic_listener(
+            Rc::clone(identity),
+            trust.clone(),
+            addr.clone(),
+            queue.clone(),
+        );
     }
 }
 
 fn spawn_quic_listener(
     identity: Rc<quic::Identity>,
+    trust: Trust,
     addr: String,
     queue: kanal::Sender<AdminStream>,
 ) {
     compio::runtime::spawn(async move {
-        let listener = match quic::Listener::bind(addr.as_str(), &identity).await {
+        let listener = match quic::Listener::bind(addr.as_str(), &identity, &trust).await {
             Ok(listener) => listener,
             Err(error) => {
                 error!(%error, %addr, "quic: bind failed");
@@ -353,20 +385,114 @@ fn spawn_quic_listener(
                 break;
             };
             let queue = queue.clone();
+            let trust = trust.clone();
+            let identity = Rc::clone(&identity);
             compio::runtime::spawn(async move {
-                match quic::establish(incoming).await {
-                    Ok(stream) => {
-                        if queue.try_send(AdminStream::quic(stream)).is_err() {
-                            warn!("quic: accepting faster than the loop drains");
+                let handshake = match quic::accept(incoming, &identity).await {
+                    Ok(handshake) => handshake,
+                    Err(error) => {
+                        warn!(%error, "quic: handshake failed");
+                        return;
+                    }
+                };
+                let Some(admission) = admit(&handshake, &trust) else {
+                    return;
+                };
+                let (session, provisional) = match admission {
+                    Admission::Trusted => match handshake.stream().await {
+                        Ok(session) => (session, None),
+                        Err(error) => {
+                            warn!(%error, "quic: the client opened no control stream");
+                            return;
+                        }
+                    },
+                    Admission::Provisional(provisional) => {
+                        // The code has been published; the client sends its
+                        // `PairConfirm` once a person has compared the two, so
+                        // this waits for that frame and only until the window
+                        // closes.
+                        let wait = provisional
+                            .expires
+                            .saturating_duration_since(Instant::now());
+                        match compio::time::timeout(wait, handshake.stream()).await {
+                            Ok(Ok(session)) => (session, Some(provisional)),
+                            Ok(Err(error)) => {
+                                warn!(%error, "quic: the pairing client opened no stream");
+                                return;
+                            }
+                            Err(_) => {
+                                info!(target: "rpc", "quic: a pairing attempt timed out");
+                                return;
+                            }
                         }
                     }
-                    Err(error) => warn!(%error, "quic: connection failed"),
+                };
+                if queue
+                    .try_send(AdminStream::quic(session, provisional))
+                    .is_err()
+                {
+                    warn!("quic: accepting faster than the loop drains");
                 }
             })
             .detach();
         }
     })
     .detach();
+}
+
+/// What the allowlist says about one completed handshake.
+enum Admission {
+    /// A key in `peers.json`: an ordinary connection.
+    Trusted,
+    /// An unknown key, admitted by an open pairing window: one `PairConfirm`
+    /// and nothing else.
+    Provisional(Provisional),
+}
+
+/// Decides what one handshake is allowed to be.
+///
+/// A key in the allowlist is an ordinary connection. Anything else — the
+/// verifier only let it this far because a pairing window is open — is a
+/// provisional one, and its code is published in `pairing.json` for
+/// `siphon-daemon pair` to print. `None` drops it: an unknown key with no open
+/// window, or a window that cannot be read, is not a connection.
+fn admit(handshake: &quic::Handshake, trust: &Trust) -> Option<Admission> {
+    let pin = handshake.pin().to_owned();
+    let sas = handshake.sas().to_owned();
+    let mut peers = match Peers::load(trust.peers()) {
+        Ok(peers) => peers,
+        Err(error) => {
+            error!(%error, "quic: refusing every client, peers.json is unreadable");
+            return None;
+        }
+    };
+    if peers.allows(&pin) {
+        if let Err(error) = peers.touch(&pin) {
+            warn!(%error, "quic: could not record when a peer last connected");
+        }
+        info!(%pin, "quic: client connected");
+        return Some(Admission::Trusted);
+    }
+
+    let pairing = PairingWindow::read(trust.pairing())
+        .filter(|window| window.is_open() && window.decision.is_none())?;
+    match PairingWindow::record_attempt(trust.pairing(), &sas, &pin) {
+        Ok(_) => info!(
+            target: "rpc",
+            %sas,
+            %pin,
+            "quic: pairing attempt, compare the code with the client"
+        ),
+        Err(error) => {
+            warn!(%error, "quic: could not record the pairing attempt");
+            return None;
+        }
+    }
+    Some(Admission::Provisional(Provisional {
+        sas,
+        spki: pin,
+        expires: Instant::now() + pairing.remaining(),
+    }))
 }
 
 #[cfg(all(test, not(miri)))]
@@ -508,6 +634,7 @@ mod tests {
                 jobs: jobs_rx.to_async(),
                 jobs_tx,
                 client_id: None,
+                trust: None,
             });
             compio::runtime::spawn(daemon.run()).detach();
 
@@ -578,6 +705,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A daemon with the admin pipe left silent and one QUIC listener, plus the
+    /// two keys and the trust paths the tests need.
+    struct QuicDaemon {
+        endpoint: String,
+        pin: String,
+        identity: quic::Identity,
+        trust: Trust,
+    }
+
+    /// Builds the daemon: a real [`App`], a registry with one seeded channel,
+    /// and the listener task wired exactly as `spawn_quic_listener` wires it.
+    async fn quic_daemon(dir: &std::path::Path) -> QuicDaemon {
+        let http = Rc::new(HttpClient::new());
+        let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
+        let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
+        crate::downloader::spawn_downloaders::<1>(&http, &downloaders_rx, &downloader_metrics);
+
+        let bus = Bus::new();
+        let registry = Rc::new(Registry::new(
+            Rc::clone(&http),
+            Rc::new(ArenaSet::new()),
+            downloaders_tx.to_async(),
+            downloader_metrics,
+            RegistryOptions {
+                client_id: None,
+                auth_token: None,
+                low_latency: true,
+                recording: crate::registry::Recording {
+                    output: None,
+                    dual_format: false,
+                },
+                notify: None,
+                keep_runs: false,
+            },
+            Rc::clone(&bus),
+        ));
+        registry.seed_channel(
+            "sunnys",
+            7,
+            false,
+            vec![debug_variant("mock"), debug_portrait_variant("mock")],
+            42,
+        );
+        registry.watch_finished();
+
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let trust = Trust::new(&state);
+        let (accept_tx, accept_rx) = kanal::unbounded();
+        let identity = Rc::new(quic::Identity::load_or_create(&state).expect("identity"));
+        let client_identity =
+            quic::Identity::load_or_create_client(&dir.join("ui")).expect("client identity");
+        let listener = quic::Listener::bind("127.0.0.1:0", &identity, &trust)
+            .await
+            .expect("bind");
+        let endpoint = listener.local_addr().expect("local addr").to_string();
+        let queue = accept_tx.clone();
+        let listener_identity = Rc::clone(&identity);
+        let listener_trust = trust.clone();
+        compio::runtime::spawn(async move {
+            while let Some(incoming) = listener.incoming().await {
+                let queue = queue.clone();
+                let identity = Rc::clone(&listener_identity);
+                let trust = listener_trust.clone();
+                compio::runtime::spawn(async move {
+                    let Ok(handshake) = quic::accept(incoming, &identity).await else {
+                        return;
+                    };
+                    let Some(admission) = admit(&handshake, &trust) else {
+                        return;
+                    };
+                    let (session, provisional) = match admission {
+                        Admission::Trusted => {
+                            let Ok(session) = handshake.stream().await else {
+                                return;
+                            };
+                            (session, None)
+                        }
+                        Admission::Provisional(provisional) => {
+                            let wait = provisional
+                                .expires
+                                .saturating_duration_since(Instant::now());
+                            match compio::time::timeout(wait, handshake.stream()).await {
+                                Ok(Ok(session)) => (session, Some(provisional)),
+                                _ => return,
+                            }
+                        }
+                    };
+                    let _ = queue.try_send(AdminStream::quic(session, provisional));
+                })
+                .detach();
+            }
+        })
+        .detach();
+
+        let (jobs_tx, jobs_rx) = kanal::unbounded();
+        let daemon = App::new(AppInit {
+            config: Config {
+                channels: vec![Channel {
+                    login: "sunnys".to_owned(),
+                    id: 7,
+                    display_name: Some("Sunnys".to_owned()),
+                    record: false,
+                }],
+                ..Config::default()
+            },
+            config_path: dir.join("config.json"),
+            client: Rc::clone(&http),
+            registry,
+            bus,
+            accept: accept_rx.to_async(),
+            jobs: jobs_rx.to_async(),
+            jobs_tx,
+            client_id: None,
+            trust: Some(trust.clone()),
+        });
+        compio::runtime::spawn(daemon.run()).detach();
+
+        QuicDaemon {
+            endpoint,
+            pin: identity.pin().to_owned(),
+            identity: client_identity,
+            trust,
+        }
+    }
+
+    /// Waits for the daemon to publish a pairing attempt, as `pair` does.
+    async fn published_attempt(trust: &Trust) -> quic::PairingAttempt {
+        for _ in 0..100 {
+            if let Some(attempt) = PairingWindow::read(trust.pairing()).and_then(|w| w.attempt) {
+                return attempt;
+            }
+            compio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the daemon never published a pairing attempt");
+    }
+
+    /// The client half of one pairing attempt, as the UI's screen would make it.
+    async fn begin_pairing(daemon: &QuicDaemon) -> siphon_shared::riffle::Pairing {
+        siphon_shared::riffle::Pairing::begin(&daemon.endpoint, &daemon.pin, &daemon.identity)
+            .await
+            .expect("provisional handshake")
+    }
+
     /// The whole control plane over QUIC: a real [`App`], the existing
     /// handshake, the snapshot and one query. Only the carrier differs from
     /// the pipe test above.
@@ -586,90 +857,117 @@ mod tests {
         let dir = scratch_dir("quic");
         let runtime = compio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let http = Rc::new(HttpClient::new());
-            let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
-            let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
-            crate::downloader::spawn_downloaders::<1>(&http, &downloaders_rx, &downloader_metrics);
+            let daemon = quic_daemon(&dir).await;
+            // The daemon's allowlist is the only thing that admits a client.
+            Peers::load(daemon.trust.peers())
+                .unwrap()
+                .add("test", daemon.identity.pin())
+                .unwrap();
 
-            let bus = Bus::new();
-            let registry = Rc::new(Registry::new(
-                Rc::clone(&http),
-                Rc::new(ArenaSet::new()),
-                downloaders_tx.to_async(),
-                downloader_metrics,
-                RegistryOptions {
-                    client_id: None,
-                    auth_token: None,
-                    low_latency: true,
-                    recording: crate::registry::Recording {
-                        output: None,
-                        dual_format: false,
-                    },
-                    notify: None,
-                    keep_runs: false,
-                },
-                Rc::clone(&bus),
-            ));
-            registry.seed_channel(
-                "sunnys",
-                7,
-                false,
-                vec![debug_variant("mock"), debug_portrait_variant("mock")],
-                42,
-            );
-            registry.watch_finished();
-
-            let (accept_tx, accept_rx) = kanal::unbounded();
-            let identity =
-                Rc::new(quic::Identity::load_or_create(&dir.join("net")).expect("identity"));
-            let pin = identity.pin().to_owned();
-            let listener = quic::Listener::bind("127.0.0.1:0", &identity)
-                .await
-                .expect("bind");
-            let endpoint = listener.local_addr().expect("local addr").to_string();
-            let queue = accept_tx.clone();
-            compio::runtime::spawn(async move {
-                while let Some(incoming) = listener.incoming().await {
-                    let queue = queue.clone();
-                    compio::runtime::spawn(async move {
-                        if let Ok(stream) = quic::establish(incoming).await {
-                            let _ = queue.try_send(AdminStream::quic(stream));
-                        }
-                    })
-                    .detach();
-                }
-            })
-            .detach();
-
-            let (jobs_tx, jobs_rx) = kanal::unbounded();
-            let daemon = App::new(AppInit {
-                config: Config {
-                    channels: vec![Channel {
-                        login: "sunnys".to_owned(),
-                        id: 7,
-                        display_name: Some("Sunnys".to_owned()),
-                        record: false,
-                    }],
-                    ..Config::default()
-                },
-                config_path: dir.join("config.json"),
-                client: Rc::clone(&http),
-                registry,
-                bus,
-                accept: accept_rx.to_async(),
-                jobs: jobs_rx.to_async(),
-                jobs_tx,
-                client_id: None,
-            });
-            compio::runtime::spawn(daemon.run()).detach();
-
-            let (client, snapshot) = Client::connect_quic(&endpoint, &pin, "test")
-                .await
-                .expect("quic connect");
+            let (client, snapshot) =
+                Client::connect_quic(&daemon.endpoint, &daemon.pin, &daemon.identity, "test")
+                    .await
+                    .expect("quic connect");
             assert_eq!(snapshot.channels.len(), 1);
 
             let response = client.request(Request::GetSnapshot).await.unwrap();
             assert!(matches!(response, Response::Snapshot(_)));
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// No allowlist entry and no window: the handshake is refused, so the
+    /// daemon never serves the client anything.
+    #[test]
+    fn an_unlisted_client_is_refused_by_the_handshake() {
+        let dir = scratch_dir("quic-refused");
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let daemon = quic_daemon(&dir).await;
+            let result =
+                Client::connect_quic(&daemon.endpoint, &daemon.pin, &daemon.identity, "test").await;
+            assert!(result.is_err(), "an unlisted key must not connect");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole pairing flow: the daemon publishes the code, the operator
+    /// approves it, the client sends it back, and the key lands in
+    /// `peers.json`.
+    #[test]
+    fn a_matching_pairing_code_adds_the_client() {
+        let dir = scratch_dir("quic-pair");
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let daemon = quic_daemon(&dir).await;
+            PairingWindow::open(daemon.trust.pairing(), Duration::from_secs(120)).unwrap();
+
+            let pairing = begin_pairing(&daemon).await;
+            let attempt = published_attempt(&daemon.trust).await;
+            assert_eq!(attempt.sas, pairing.sas(), "both sides derive one code");
+            PairingWindow::decide(daemon.trust.pairing(), &attempt.sas, true).unwrap();
+
+            let (client, snapshot) = pairing.confirm("test-ui").await.expect("paired");
+            assert_eq!(snapshot.channels.len(), 1);
+            // The connection is ordinary from here: a request round-trips.
+            let response = client.request(Request::GetSnapshot).await.unwrap();
+            assert!(matches!(response, Response::Snapshot(_)));
+
+            let peers = Peers::load(daemon.trust.peers()).unwrap();
+            assert_eq!(peers.entries().len(), 1, "the key was written");
+            assert_eq!(peers.entries()[0].spki, daemon.identity.pin());
+            assert_eq!(peers.entries()[0].name, "test-ui");
+            assert!(peers.entries()[0].added_ms > 0);
+            assert!(
+                !PairingWindow::read(daemon.trust.pairing())
+                    .unwrap()
+                    .is_open(),
+                "a successful pairing closes the window"
+            );
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A code that is not the daemon's closes the connection and writes
+    /// nothing.
+    #[test]
+    fn a_mismatched_pairing_code_adds_nothing() {
+        let dir = scratch_dir("quic-pair-wrong");
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            use siphon_shared::riffle::ClientMessage;
+            use siphon_shared::riffle::codec;
+
+            let daemon = quic_daemon(&dir).await;
+            PairingWindow::open(daemon.trust.pairing(), Duration::from_secs(120)).unwrap();
+
+            let session = quic::connect(&daemon.endpoint, &daemon.pin, &daemon.identity)
+                .await
+                .expect("provisional handshake");
+            published_attempt(&daemon.trust).await;
+            let mut stream = session.into_stream();
+            codec::write(
+                &mut stream,
+                &ClientMessage::PairConfirm {
+                    sas: "000-000".to_owned(),
+                    name: "impostor".to_owned(),
+                },
+            )
+            .await
+            .expect("write the wrong code");
+            // The daemon drops the connection rather than answering.
+            let mut reader = siphon_shared::riffle::FrameReader::new();
+            let reply: Result<ServerMessage, _> = reader.read(&mut stream).await;
+            assert!(reply.is_err(), "a wrong code must not be answered");
+            assert!(
+                PairingWindow::read(daemon.trust.pairing())
+                    .unwrap()
+                    .decision
+                    .is_none(),
+                "nothing approved this attempt"
+            );
+            let peers = Peers::load(daemon.trust.peers()).unwrap();
+            assert!(peers.entries().is_empty(), "no key was written");
         });
         let _ = std::fs::remove_dir_all(dir);
     }
