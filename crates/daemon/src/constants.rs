@@ -216,3 +216,8 @@ pub const HERMES_STABLE_UP: Duration = Duration::from_secs(30);
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
 pub const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/siphon/releases/latest";
+
+/// How often the QUIC verifier's trust snapshot is re-read from `peers.json`
+/// and `pairing.json`. The verifier itself never touches a file, so this is
+/// what bounds how long an operator's edit — or a revocation — takes to apply.
+pub const TRUST_REFRESH: Duration = Duration::from_secs(1);

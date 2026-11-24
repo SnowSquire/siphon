@@ -23,6 +23,12 @@
 //! a file because `siphon-daemon pair` is a second process: it opens the
 //! window, the daemon publishes the attempt's code there, and the operator's
 //! `y/n` is written back for the daemon to read.
+//!
+//! The files are read and written off the handshake path. rustls calls the
+//! verifier synchronously, on the reactor thread, so it consults a
+//! [`TrustSnapshot`] in memory and nothing else; the daemon's loop re-reads
+//! `peers.json` and `pairing.json` with `compio::fs` and publishes a new
+//! snapshot when they change.
 
 use std::io;
 use std::net::SocketAddr;
@@ -293,8 +299,8 @@ struct PeersFile {
 
 /// The daemon's allowlist of client keys: `peers.json`.
 ///
-/// Revocation is deleting an entry and restarting, or just deleting it — the
-/// file is read again for every handshake, so both work. The other direction
+/// Revocation is deleting an entry, and the daemon's refresh picks that up, so
+/// it takes effect within a second and needs no restart. The other direction
 /// (adding a key by hand) is supported for the same reason.
 #[derive(Debug)]
 pub struct Peers {
@@ -311,7 +317,20 @@ impl Peers {
     /// to diagnose, and a startup error names the file instead.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, Error> {
         let path = path.into();
-        let Some(file) = crate::store::read::<PeersFile>(&path)? else {
+        let file = crate::store::read::<PeersFile>(&path)?;
+        Self::from_file(path, file)
+    }
+
+    /// [`Self::load`] with `compio::fs`: the way anything on the reactor reads
+    /// this file.
+    pub async fn load_async(path: impl Into<PathBuf>) -> Result<Self, Error> {
+        let path = path.into();
+        let file = crate::store::read_async::<PeersFile>(&path).await?;
+        Self::from_file(path, file)
+    }
+
+    fn from_file(path: PathBuf, file: Option<PeersFile>) -> Result<Self, Error> {
+        let Some(file) = file else {
             return Ok(Self {
                 path,
                 peers: Vec::new(),
@@ -348,15 +367,25 @@ impl Peers {
 
     /// Adds a key, or refreshes the name of one that is already allowed.
     pub fn add(&mut self, name: &str, spki: &str) -> Result<(), Error> {
+        self.insert(name, spki)?;
+        Self::write(&self.path, &self.peers)
+    }
+
+    /// [`Self::add`] with `compio::fs`.
+    pub async fn add_async(&mut self, name: &str, spki: &str) -> Result<(), Error> {
+        self.insert(name, spki)?;
+        Self::write_async(&self.path, &self.peers).await
+    }
+
+    /// Adds one entry to this in-memory list without writing it.
+    fn insert(&mut self, name: &str, spki: &str) -> Result<(), Error> {
         let spki = lower_hex(&parse_pin(spki)?);
         let now = now_ms();
         if let Some(index) = self.peers.iter().position(|peer| peer.spki == spki) {
-            {
-                let peer = &mut self.peers[index];
-                name.clone_into(&mut peer.name);
-                peer.last_seen_ms = now;
-            }
-            return Self::write(&self.path, &self.peers);
+            let peer = &mut self.peers[index];
+            name.clone_into(&mut peer.name);
+            peer.last_seen_ms = now;
+            return Ok(());
         }
         let id = spki.get(..16).unwrap_or(&spki).to_owned();
         self.peers.push(Peer {
@@ -366,7 +395,7 @@ impl Peers {
             added_ms: now,
             last_seen_ms: now,
         });
-        Self::write(&self.path, &self.peers)
+        Ok(())
     }
 
     /// Records that one peer connected, at most once a minute.
@@ -374,16 +403,32 @@ impl Peers {
     /// The throttle is what keeps a reconnect loop from rewriting the file on
     /// every retry: the field is "roughly when it last connected", not a log.
     pub fn touch(&mut self, spki: &str) -> Result<(), Error> {
+        if self.mark_seen(spki) {
+            Self::write(&self.path, &self.peers)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::touch`] with `compio::fs`.
+    pub async fn touch_async(&mut self, spki: &str) -> Result<(), Error> {
+        if self.mark_seen(spki) {
+            Self::write_async(&self.path, &self.peers).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `spki` was due a `last_seen_ms`, and stamps it when it was.
+    fn mark_seen(&mut self, spki: &str) -> bool {
         const TOUCH_MS: u64 = 60_000;
         let now = now_ms();
         let Some(peer) = self.peers.iter_mut().find(|peer| peer.spki == spki) else {
-            return Ok(());
+            return false;
         };
         if now.saturating_sub(peer.last_seen_ms) < TOUCH_MS {
-            return Ok(());
+            return false;
         }
         peer.last_seen_ms = now;
-        Self::write(&self.path, &self.peers)
+        true
     }
 
     fn write(path: &Path, peers: &[Peer]) -> Result<(), Error> {
@@ -393,6 +438,17 @@ impl Peers {
                 peers: peers.to_vec(),
             },
         )?;
+        Ok(())
+    }
+
+    async fn write_async(path: &Path, peers: &[Peer]) -> Result<(), Error> {
+        crate::store::write_async(
+            path,
+            &PeersFile {
+                peers: peers.to_vec(),
+            },
+        )
+        .await?;
         Ok(())
     }
 }
@@ -419,11 +475,12 @@ pub struct PairingDecision {
 /// A pairing window: open until `expires_ms`, for one attempt.
 ///
 /// This is a file rather than daemon state because the two halves are two
-/// processes. `siphon-daemon pair` creates it, the running daemon's verifier
-/// reads it to admit a key that is not in `peers.json`, the daemon writes the
-/// attempt's code into it, and `pair` writes the operator's answer back. The
-/// window is the only thing that lets an unknown key get as far as a
-/// provisional connection, so an expired window is the same as no window.
+/// processes. `siphon-daemon pair` creates it, the daemon's refresh reads it
+/// into the verifier's snapshot so an unknown key is admitted while it is open,
+/// the daemon writes the attempt's code into it, and `pair` writes the
+/// operator's answer back. The window is the only thing that lets an unknown key
+/// get as far as a provisional connection, so an expired window is the same as
+/// no window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingWindow {
     /// Unix milliseconds. The window is open while this is in the future.
@@ -455,6 +512,12 @@ impl PairingWindow {
         crate::store::read(path).ok().flatten()
     }
 
+    /// [`Self::read`] with `compio::fs`, for the reactor. Same rule: anything
+    /// unreadable is no window.
+    pub async fn read_async(path: &Path) -> Option<Self> {
+        crate::store::read_async(path).await.ok().flatten()
+    }
+
     /// Records one attempt's code, clearing any answer for an earlier one.
     ///
     /// "One attempt at a time" is the file's own shape: a second handshake
@@ -464,14 +527,28 @@ impl PairingWindow {
         let Some(mut pairing) = Self::read(path) else {
             return Err(Error::Pairing("no pairing window is open".to_owned()));
         };
-        pairing.attempt = Some(PairingAttempt {
+        pairing.set_attempt(sas, spki);
+        pairing.save(path)?;
+        Ok(pairing)
+    }
+
+    /// [`Self::record_attempt`] with `compio::fs`.
+    pub async fn record_attempt_async(path: &Path, sas: &str, spki: &str) -> Result<Self, Error> {
+        let Some(mut pairing) = Self::read_async(path).await else {
+            return Err(Error::Pairing("no pairing window is open".to_owned()));
+        };
+        pairing.set_attempt(sas, spki);
+        pairing.save_async(path).await?;
+        Ok(pairing)
+    }
+
+    fn set_attempt(&mut self, sas: &str, spki: &str) {
+        self.attempt = Some(PairingAttempt {
             sas: sas.to_owned(),
             spki: spki.to_owned(),
             at_ms: now_ms(),
         });
-        pairing.decision = None;
-        pairing.save(path)?;
-        Ok(pairing)
+        self.decision = None;
     }
 
     /// Records the operator's answer for one attempt.
@@ -492,6 +569,15 @@ impl PairingWindow {
         if let Some(mut pairing) = Self::read(path) {
             pairing.expires_ms = now_ms();
             pairing.save(path)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::close`] with `compio::fs`.
+    pub async fn close_async(path: &Path) -> Result<(), Error> {
+        if let Some(mut pairing) = Self::read_async(path).await {
+            pairing.expires_ms = now_ms();
+            pairing.save_async(path).await?;
         }
         Ok(())
     }
@@ -520,12 +606,20 @@ impl PairingWindow {
         crate::store::write(path, self)?;
         Ok(())
     }
+
+    async fn save_async(&self, path: &Path) -> Result<(), Error> {
+        crate::store::write_async(path, self).await?;
+        Ok(())
+    }
 }
 
-/// Where one daemon's client trust lives: its allowlist and its pairing window.
+/// Where one daemon's client trust lives **on disk**: its allowlist and its
+/// pairing window.
 ///
 /// Both processes (`daemon` and `pair`) build this from the same state
-/// directory, which is the whole of how they share it.
+/// directory, which is the whole of how they share it. Startup, `pair` and the
+/// daemon's refresh are the only readers; the QUIC verifier never sees these
+/// paths, only the [`TrustSnapshot`] the daemon publishes from them.
 #[derive(Debug, Clone)]
 pub struct Trust {
     peers: PathBuf,
@@ -551,6 +645,144 @@ impl Trust {
     pub fn pairing(&self) -> &Path {
         &self.pairing
     }
+
+    /// Both files as one snapshot, read synchronously.
+    ///
+    /// This is for startup and `siphon-daemon pair`, neither of which is on the
+    /// reactor. A malformed `peers.json` is an error here, which is what makes
+    /// it a startup error; the reactor uses [`Self::refresh`].
+    pub fn snapshot(&self) -> Result<TrustSnapshot, Error> {
+        let peers = Peers::load(&self.peers)?;
+        Ok(TrustSnapshot::new(
+            peers.entries(),
+            PairingWindow::read(&self.pairing).as_ref(),
+        ))
+    }
+
+    /// Re-reads both files with `compio::fs` and publishes the result into
+    /// `shared`, returning whether it changed.
+    ///
+    /// # Why the verifier does not do this
+    ///
+    /// rustls calls `verify_client_cert` synchronously on the reactor thread,
+    /// so reading a file there is exactly the blocking I/O the daemon must not
+    /// do. The verifier therefore reads the snapshot and nothing else, and this
+    /// is what keeps it honest: an operator's edit to `peers.json` — including
+    /// deleting a device to revoke it — takes effect on the next refresh, once
+    /// a second, instead of being re-read at every handshake or needing a
+    /// restart.
+    ///
+    /// A malformed `peers.json` is an error and leaves the previous snapshot in
+    /// place: somebody halfway through editing the file must not silently
+    /// revoke every client. The startup check is where it is fatal.
+    pub async fn refresh(&self, shared: &SharedTrust) -> Result<bool, Error> {
+        let peers = Peers::load_async(&self.peers).await?;
+        let window = PairingWindow::read_async(&self.pairing).await;
+        Ok(shared.replace(TrustSnapshot::new(peers.entries(), window.as_ref())))
+    }
+}
+
+/// The trust state as the verifier sees it: the allowed keys and whether a
+/// pairing window is open, as of the last refresh.
+///
+/// A snapshot is comparable, so a refresh that parsed the same files into the
+/// same value is a no-op rather than a wake-up for nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustSnapshot {
+    /// Every allowed client key, normalised to 64 lowercase hex characters.
+    peers: Vec<String>,
+    /// When the pairing window closes, in Unix milliseconds, if one was open
+    /// and unanswered at the last refresh.
+    pairing_open_until_ms: Option<u64>,
+}
+
+impl TrustSnapshot {
+    fn new(peers: &[Peer], window: Option<&PairingWindow>) -> Self {
+        Self {
+            peers: peers.iter().map(|peer| peer.spki.clone()).collect(),
+            pairing_open_until_ms: window
+                .filter(|window| window.is_open() && window.decision.is_none())
+                .map(|window| window.expires_ms),
+        }
+    }
+
+    /// Whether the allowlist names this key.
+    #[must_use]
+    pub fn allows(&self, spki: &str) -> bool {
+        self.peers.iter().any(|peer| peer == spki)
+    }
+
+    /// When the pairing window closes, if it is still open.
+    ///
+    /// The snapshot cannot be re-read from inside the verifier, so expiry is
+    /// decided here, against the clock, rather than being baked in at refresh
+    /// time: a window that ran out between two refreshes is closed.
+    #[must_use]
+    pub fn pairing_open_until_ms(&self) -> Option<u64> {
+        self.pairing_open_until_ms.filter(|until| *until > now_ms())
+    }
+
+    /// Whether an unknown key would be admitted for one pairing attempt.
+    #[must_use]
+    pub fn pairing_open(&self) -> bool {
+        self.pairing_open_until_ms().is_some()
+    }
+}
+
+/// The live [`TrustSnapshot`] the QUIC verifier consults.
+///
+/// This is the only way a handshake reaches trust state, and it is a lock plus
+/// a comparison: no filesystem, no `.await`, nothing that could block the
+/// reactor. The mutex is rustls' `Send + Sync` requirement, not a shared
+/// reactor resource — the verifier and the refresh both run on the one compio
+/// thread, the lock is uncontended, and it is never held across an `.await`.
+#[derive(Debug, Clone, Default)]
+pub struct SharedTrust(Arc<Mutex<TrustSnapshot>>);
+
+impl SharedTrust {
+    #[must_use]
+    pub fn new(snapshot: TrustSnapshot) -> Self {
+        Self(Arc::new(Mutex::new(snapshot)))
+    }
+
+    /// What the snapshot says about one presented key.
+    fn judge(&self, spki: &str) -> Verdict {
+        // A poisoned lock means something else panicked, and every panic is
+        // fatal here, so there is no healthy state to recover to: fail closed.
+        let Ok(snapshot) = self.0.lock() else {
+            return Verdict::Refused;
+        };
+        if snapshot.allows(spki) {
+            Verdict::Allowed
+        } else if snapshot.pairing_open() {
+            Verdict::Pairing
+        } else {
+            Verdict::Refused
+        }
+    }
+
+    /// Publishes a new snapshot, returning whether it differs from the old one.
+    fn replace(&self, snapshot: TrustSnapshot) -> bool {
+        let Ok(mut slot) = self.0.lock() else {
+            return false;
+        };
+        if *slot == snapshot {
+            return false;
+        }
+        *slot = snapshot;
+        true
+    }
+}
+
+/// What one snapshot says about a presented key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The key is in the allowlist.
+    Allowed,
+    /// Not in the allowlist, but a pairing window is open.
+    Pairing,
+    /// Neither: the handshake is refused.
+    Refused,
 }
 
 /// The short authentication string for one handshake, as `XXX-XXX`.
@@ -614,22 +846,21 @@ fn peer_pin(connection: &Connection) -> Result<String, Error> {
     pin_of(cert)
 }
 
-/// Accepts a client certificate only if its SPKI is in `peers.json`, or while a
-/// pairing window is open.
+/// Accepts a client certificate only if the snapshot allows its SPKI, or while
+/// the snapshot says a pairing window is open.
 ///
 /// The window's exception is the only way a key ever gets into `peers.json`:
 /// without it the daemon could never accept a client it does not already know,
 /// so pairing would be impossible rather than merely closed.
 ///
-/// The files are read here, once per handshake, deliberately: `peers.json` is
-/// meant to be edited by an operator (and is rewritten by the daemon when it
-/// pairs someone), so a cached copy would need invalidating and a restart to
-/// revoke a client. A handshake is a rare, human-paced event — not a hot path —
-/// and the file is a few hundred bytes. rustls requires the verifier to be
-/// `Send + Sync`; this one holds no interior state at all.
+/// rustls calls this synchronously, on the reactor thread, once per handshake,
+/// so the verifier touches no files: it takes [`SharedTrust`]'s lock, compares
+/// the presented pin against the snapshot and returns. The daemon's loop keeps
+/// that snapshot current ([`Trust::refresh`]), which is what makes an edit to
+/// `peers.json` — including a revocation — take effect within a second.
 #[derive(Debug)]
 struct Allowlisted {
-    trust: Trust,
+    trust: SharedTrust,
     algorithms: WebPkiSupportedAlgorithms,
 }
 
@@ -655,29 +886,19 @@ impl ClientCertVerifier for Allowlisted {
     ) -> Result<ClientCertVerified, rustls::Error> {
         let presented =
             pin_of(end_entity).map_err(|error| rustls::Error::General(error.to_string()))?;
-        match Peers::load(self.trust.peers()) {
-            Ok(peers) if peers.allows(&presented) => Ok(ClientCertVerified::assertion()),
-            Ok(_) => {
-                let window = PairingWindow::read(self.trust.pairing())
-                    .filter(|window| window.is_open() && window.decision.is_none());
-                if window.is_some() {
-                    // The listener decides whether this connection is
-                    // provisional; the verifier only lets it through so the
-                    // typed code can be exchanged.
-                    info!(target: "rpc", pin = %presented, "quic: unknown client admitted by the pairing window");
-                    return Ok(ClientCertVerified::assertion());
-                }
+        match self.trust.judge(&presented) {
+            Verdict::Allowed => Ok(ClientCertVerified::assertion()),
+            Verdict::Pairing => {
+                // The listener decides whether this connection is provisional;
+                // the verifier only lets it through so the typed code can be
+                // exchanged.
+                info!(target: "rpc", pin = %presented, "quic: unknown client admitted by the pairing window");
+                Ok(ClientCertVerified::assertion())
+            }
+            Verdict::Refused => {
                 warn!(target: "rpc", pin = %presented, "quic: refused a client that is not in peers.json");
                 Err(rustls::Error::General(format!(
                     "siphon: {presented} is not a paired client"
-                )))
-            }
-            Err(error) => {
-                // A broken allowlist refuses everybody, which is the safe
-                // direction; the daemon logs the reason at startup too.
-                warn!(target: "rpc", %error, "quic: could not read peers.json");
-                Err(rustls::Error::General(format!(
-                    "siphon: the allowlist is unreadable: {error}"
                 )))
             }
         }
@@ -707,11 +928,14 @@ impl ClientCertVerifier for Allowlisted {
 }
 
 /// The QUIC server configuration: TLS 1.3, our certificate, a client
-/// certificate that must be in the allowlist, ALPN `riffle/1`, no 0-RTT.
-fn server_config(identity: &Identity, trust: &Trust) -> Result<compio_quic::ServerConfig, Error> {
+/// certificate the snapshot must allow, ALPN `riffle/1`, no 0-RTT.
+fn server_config(
+    identity: &Identity,
+    trust: SharedTrust,
+) -> Result<compio_quic::ServerConfig, Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(Allowlisted {
-        trust: trust.clone(),
+        trust,
         algorithms: provider.signature_verification_algorithms,
     });
     let mut tls = rustls::ServerConfig::builder_with_provider(provider)
@@ -856,12 +1080,13 @@ pub struct Listener {
 impl Listener {
     /// Binds one address and is ready to accept.
     ///
-    /// `trust` is read for every handshake, so a window opened after the
-    /// listener started still admits one pairing attempt.
+    /// `trust` is the live snapshot, not the files: a window opened after the
+    /// listener started admits one pairing attempt as soon as the daemon's next
+    /// refresh publishes it, and no handshake ever waits on a disk read.
     pub async fn bind(
         addr: impl ToSocketAddrsAsync,
         identity: &Identity,
-        trust: &Trust,
+        trust: SharedTrust,
     ) -> Result<Self, Error> {
         let config = server_config(identity, trust)?;
         let endpoint = Endpoint::server(addr, config).await?;
@@ -1173,12 +1398,22 @@ mod tests {
         dir
     }
 
-    /// An allowlist with one key in it, at the path a daemon would read.
-    fn allow(dir: &Path, pin: &str) -> Trust {
+    /// An allowlist with one key in it, at the path a daemon would read, and
+    /// the snapshot a listener would consult.
+    fn allow(dir: &Path, pin: &str) -> SharedTrust {
         let trust = Trust::new(dir);
         let mut peers = Peers::load(trust.peers()).expect("empty allowlist");
         peers.add("test client", pin).expect("add the client");
-        trust
+        SharedTrust::new(trust.snapshot().expect("snapshot"))
+    }
+
+    /// A verifier reading one snapshot, so a test can ask it directly instead
+    /// of going through a handshake.
+    fn verifier(trust: SharedTrust) -> Allowlisted {
+        Allowlisted {
+            trust,
+            algorithms: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
     }
 
     #[test]
@@ -1248,7 +1483,7 @@ mod tests {
             // otherwise the server's client-certificate check would fail first
             // and the client would see a plain handshake error.
             let trust = allow(&dir, client_identity.pin());
-            let listener = Listener::bind("127.0.0.1:0", &identity, &trust)
+            let listener = Listener::bind("127.0.0.1:0", &identity, trust)
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("local addr").to_string();
@@ -1311,7 +1546,7 @@ mod tests {
             let trust = allow(&dir, client_identity.pin());
             // The `sha256:` spelling is what a UI may persist beside the key.
             let pin = format!("sha256:{}", identity.pin());
-            let listener = Listener::bind("127.0.0.1:0", &identity, &trust)
+            let listener = Listener::bind("127.0.0.1:0", &identity, trust)
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("local addr").to_string();
@@ -1382,8 +1617,10 @@ mod tests {
         runtime.block_on(async {
             let identity = Identity::load_or_create(&dir).expect("identity");
             let client_identity = Identity::load_or_create_client(&dir.join("ui")).expect("client");
-            let trust = Trust::new(&dir);
-            let listener = Listener::bind("127.0.0.1:0", &identity, &trust)
+            // No allowlist entry and no window: an empty snapshot, which is
+            // exactly what a daemon that has never paired anybody has.
+            let trust = SharedTrust::default();
+            let listener = Listener::bind("127.0.0.1:0", &identity, trust)
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("local addr").to_string();
@@ -1512,6 +1749,75 @@ mod tests {
         PairingWindow::close(trust.pairing()).expect("close");
         let pairing = PairingWindow::read(trust.pairing()).expect("read");
         assert!(!pairing.is_open());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The verifier answers from the snapshot and the snapshot follows the
+    /// files: a refresh admits a key that was added and refuses one that was
+    /// revoked, without a restart in between.
+    #[test]
+    fn a_refresh_changes_what_the_verifier_admits() {
+        let dir = scratch("refresh");
+        let runtime = compio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let trust = Trust::new(&dir);
+            let client = Identity::load_or_create_client(&dir.join("ui")).expect("client");
+            let shared = SharedTrust::default();
+            let allowed = |shared: &SharedTrust| {
+                verifier(shared.clone())
+                    .verify_client_cert(&client.cert, &[], UnixTime::now())
+                    .is_ok()
+            };
+            assert!(!allowed(&shared), "an empty snapshot admits nobody");
+
+            Peers::load(trust.peers())
+                .expect("empty allowlist")
+                .add("laptop", client.pin())
+                .expect("add the client");
+            assert!(
+                trust.refresh(&shared).await.expect("refresh"),
+                "the files changed"
+            );
+            assert!(allowed(&shared), "the refresh admitted the new peer");
+
+            std::fs::write(trust.peers(), r#"{"peers":[]}"#).expect("revoke");
+            assert!(
+                trust.refresh(&shared).await.expect("refresh"),
+                "the files changed"
+            );
+            assert!(!allowed(&shared), "the refresh revoked the peer");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A malformed `peers.json` is a refresh error that keeps the last good
+    /// snapshot: an operator halfway through an edit must not revoke everybody.
+    #[test]
+    fn a_malformed_allowlist_keeps_the_last_good_snapshot() {
+        let dir = scratch("refresh-broken");
+        let runtime = compio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let trust = Trust::new(&dir);
+            let client = Identity::load_or_create_client(&dir.join("ui")).expect("client");
+            Peers::load(trust.peers())
+                .expect("empty allowlist")
+                .add("laptop", client.pin())
+                .expect("add the client");
+            let shared = SharedTrust::default();
+            assert!(trust.refresh(&shared).await.expect("refresh"));
+            assert_eq!(shared.judge(client.pin()), Verdict::Allowed);
+
+            std::fs::write(trust.peers(), "not json").expect("write a broken file");
+            assert!(
+                trust.refresh(&shared).await.is_err(),
+                "a malformed allowlist is an error, not an empty one"
+            );
+            assert_eq!(
+                shared.judge(client.pin()),
+                Verdict::Allowed,
+                "the previous snapshot survived the broken file"
+            );
+        });
         let _ = std::fs::remove_dir_all(dir);
     }
 }

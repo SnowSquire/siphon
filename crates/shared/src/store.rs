@@ -46,6 +46,20 @@ pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StoreError> {
     Ok(Some(sonic_rs::from_slice(&bytes)?))
 }
 
+/// Reads and parses one file with `compio::fs`, for callers on the daemon's
+/// reactor: the blocking [`read`] would stop the one thread everything runs on.
+// `!Send` is the whole architecture: compio's I/O futures are not `Send`, and
+// every caller is a task on the one reactor thread.
+#[allow(clippy::future_not_send)]
+pub async fn read_async<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StoreError> {
+    let bytes = match compio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::Io(error)),
+    };
+    Ok(Some(sonic_rs::from_slice(&bytes)?))
+}
+
 /// Serialises a value in the spelling every file here uses.
 pub fn to_json<T: Serialize>(value: &T) -> Result<String, StoreError> {
     Ok(sonic_rs::to_string_pretty(value)?)
@@ -64,6 +78,21 @@ pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json)?;
     std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+/// [`write`] with `compio::fs`, with the same temporary name: the reactor must
+/// not block, and a reader must never see half a document.
+// `!Send` for the same reason as [`read_async`].
+#[allow(clippy::future_not_send)]
+pub async fn write_async<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+    let json = to_json(value)?;
+    if let Some(parent) = path.parent() {
+        compio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    compio::fs::write(&temporary, json).await.0?;
+    compio::fs::rename(&temporary, path).await?;
     Ok(())
 }
 

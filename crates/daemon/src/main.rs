@@ -639,6 +639,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
 
     let (accept_tx, accept_rx) = kanal::unbounded();
     let mut trust = None;
+    let mut trust_shared = siphon_shared::riffle::quic::SharedTrust::default();
     if !args.no_admin {
         let endpoint = args
             .admin
@@ -654,14 +655,18 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
             let dir = siphon_shared::riffle::state_dir(config::APP_ID);
             let daemon_trust = siphon_shared::riffle::quic::Trust::new(&dir);
             // A malformed allowlist is a startup error: the alternative is a
-            // daemon that trusts nobody for a reason nobody can see.
-            siphon_shared::riffle::quic::Peers::load(daemon_trust.peers())?;
+            // daemon that trusts nobody for a reason nobody can see. The same
+            // read seeds the snapshot the verifier starts with; the loop's tick
+            // keeps it current from here, so the verifier never reads a file.
+            let snapshot = daemon_trust.snapshot()?;
+            trust_shared = siphon_shared::riffle::quic::SharedTrust::new(snapshot);
             match siphon_shared::riffle::quic::Identity::load_or_create(&dir) {
                 Ok(identity) => {
                     let identity = Rc::new(identity);
                     riffle::spawn_quic_listeners(
                         &identity,
                         &daemon_trust,
+                        &trust_shared,
                         &config.network.listen,
                         &accept_tx,
                     );
@@ -684,6 +689,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
         jobs_tx,
         client_id: cfg.client_id.clone(),
         trust,
+        trust_shared,
     });
     compio::runtime::spawn(app.run()).detach();
 

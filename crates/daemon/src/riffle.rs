@@ -24,6 +24,7 @@ use siphon_shared::riffle::codec;
 use siphon_shared::riffle::quic;
 use siphon_shared::riffle::quic::PairingWindow;
 use siphon_shared::riffle::quic::Peers;
+use siphon_shared::riffle::quic::SharedTrust;
 use siphon_shared::riffle::quic::Trust;
 use tracing::error;
 use tracing::info;
@@ -349,6 +350,7 @@ pub fn spawn_listener(endpoint: String, queue: kanal::Sender<AdminStream>) -> io
 pub fn spawn_quic_listeners(
     identity: &Rc<quic::Identity>,
     trust: &Trust,
+    shared: &SharedTrust,
     addrs: &[String],
     queue: &kanal::Sender<AdminStream>,
 ) {
@@ -356,6 +358,7 @@ pub fn spawn_quic_listeners(
         spawn_quic_listener(
             Rc::clone(identity),
             trust.clone(),
+            shared.clone(),
             addr.clone(),
             queue.clone(),
         );
@@ -365,11 +368,12 @@ pub fn spawn_quic_listeners(
 fn spawn_quic_listener(
     identity: Rc<quic::Identity>,
     trust: Trust,
+    shared: SharedTrust,
     addr: String,
     queue: kanal::Sender<AdminStream>,
 ) {
     compio::runtime::spawn(async move {
-        let listener = match quic::Listener::bind(addr.as_str(), &identity, &trust).await {
+        let listener = match quic::Listener::bind(addr.as_str(), &identity, shared).await {
             Ok(listener) => listener,
             Err(error) => {
                 error!(%error, %addr, "quic: bind failed");
@@ -395,7 +399,7 @@ fn spawn_quic_listener(
                         return;
                     }
                 };
-                let Some(admission) = admit(&handshake, &trust) else {
+                let Some(admission) = admit(&handshake, &trust).await else {
                     return;
                 };
                 let (session, provisional) = match admission {
@@ -456,10 +460,16 @@ enum Admission {
 /// provisional one, and its code is published in `pairing.json` for
 /// `siphon-daemon pair` to print. `None` drops it: an unknown key with no open
 /// window, or a window that cannot be read, is not a connection.
-fn admit(handshake: &quic::Handshake, trust: &Trust) -> Option<Admission> {
+///
+/// Both files are read and written with `compio::fs`: this runs on the reactor,
+/// where the blocking calls in [`Peers::load`] would stall every task. The
+/// verifier has already admitted the key from its snapshot; the files are read
+/// again here because this is where the attempt is recorded and the operator's
+/// answer is the authority.
+async fn admit(handshake: &quic::Handshake, trust: &Trust) -> Option<Admission> {
     let pin = handshake.pin().to_owned();
     let sas = handshake.sas().to_owned();
-    let mut peers = match Peers::load(trust.peers()) {
+    let mut peers = match Peers::load_async(trust.peers()).await {
         Ok(peers) => peers,
         Err(error) => {
             error!(%error, "quic: refusing every client, peers.json is unreadable");
@@ -467,16 +477,17 @@ fn admit(handshake: &quic::Handshake, trust: &Trust) -> Option<Admission> {
         }
     };
     if peers.allows(&pin) {
-        if let Err(error) = peers.touch(&pin) {
+        if let Err(error) = peers.touch_async(&pin).await {
             warn!(%error, "quic: could not record when a peer last connected");
         }
         info!(%pin, "quic: client connected");
         return Some(Admission::Trusted);
     }
 
-    let pairing = PairingWindow::read(trust.pairing())
+    let pairing = PairingWindow::read_async(trust.pairing())
+        .await
         .filter(|window| window.is_open() && window.decision.is_none())?;
-    match PairingWindow::record_attempt(trust.pairing(), &sas, &pin) {
+    match PairingWindow::record_attempt_async(trust.pairing(), &sas, &pin).await {
         Ok(_) => info!(
             target: "rpc",
             %sas,
@@ -635,6 +646,7 @@ mod tests {
                 jobs_tx,
                 client_id: None,
                 trust: None,
+                trust_shared: SharedTrust::default(),
             });
             compio::runtime::spawn(daemon.run()).detach();
 
@@ -706,12 +718,22 @@ mod tests {
     }
 
     /// A daemon with the admin pipe left silent and one QUIC listener, plus the
-    /// two keys and the trust paths the tests need.
+    /// two keys and the trust state the tests need.
     struct QuicDaemon {
         endpoint: String,
         pin: String,
         identity: quic::Identity,
         trust: Trust,
+        /// The snapshot the listener's verifier reads; the app loop refreshes it
+        /// every second, and tests call [`Self::refresh`] to skip the wait.
+        shared: SharedTrust,
+    }
+
+    impl QuicDaemon {
+        /// Publishes the files into the snapshot, as the daemon's tick does.
+        async fn refresh(&self) {
+            self.trust.refresh(&self.shared).await.expect("refresh");
+        }
     }
 
     /// Builds the daemon: a real [`App`], a registry with one seeded channel,
@@ -754,11 +776,12 @@ mod tests {
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let trust = Trust::new(&state);
+        let shared = SharedTrust::default();
         let (accept_tx, accept_rx) = kanal::unbounded();
         let identity = Rc::new(quic::Identity::load_or_create(&state).expect("identity"));
         let client_identity =
             quic::Identity::load_or_create_client(&dir.join("ui")).expect("client identity");
-        let listener = quic::Listener::bind("127.0.0.1:0", &identity, &trust)
+        let listener = quic::Listener::bind("127.0.0.1:0", &identity, shared.clone())
             .await
             .expect("bind");
         let endpoint = listener.local_addr().expect("local addr").to_string();
@@ -774,7 +797,7 @@ mod tests {
                     let Ok(handshake) = quic::accept(incoming, &identity).await else {
                         return;
                     };
-                    let Some(admission) = admit(&handshake, &trust) else {
+                    let Some(admission) = admit(&handshake, &trust).await else {
                         return;
                     };
                     let (session, provisional) = match admission {
@@ -820,6 +843,7 @@ mod tests {
             jobs_tx,
             client_id: None,
             trust: Some(trust.clone()),
+            trust_shared: shared.clone(),
         });
         compio::runtime::spawn(daemon.run()).detach();
 
@@ -828,6 +852,7 @@ mod tests {
             pin: identity.pin().to_owned(),
             identity: client_identity,
             trust,
+            shared,
         }
     }
 
@@ -858,11 +883,13 @@ mod tests {
         let runtime = compio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let daemon = quic_daemon(&dir).await;
-            // The daemon's allowlist is the only thing that admits a client.
+            // The daemon's allowlist is the only thing that admits a client, and
+            // the verifier sees it through the snapshot the tick publishes.
             Peers::load(daemon.trust.peers())
                 .unwrap()
                 .add("test", daemon.identity.pin())
                 .unwrap();
+            daemon.refresh().await;
 
             let (client, snapshot) =
                 Client::connect_quic(&daemon.endpoint, &daemon.pin, &daemon.identity, "test")
@@ -901,6 +928,9 @@ mod tests {
         runtime.block_on(async {
             let daemon = quic_daemon(&dir).await;
             PairingWindow::open(daemon.trust.pairing(), Duration::from_secs(120)).unwrap();
+            // The verifier reads the snapshot, so opening the window on disk is
+            // only half of it: this is what the daemon's tick would do.
+            daemon.refresh().await;
 
             let pairing = begin_pairing(&daemon).await;
             let attempt = published_attempt(&daemon.trust).await;
@@ -940,6 +970,7 @@ mod tests {
 
             let daemon = quic_daemon(&dir).await;
             PairingWindow::open(daemon.trust.pairing(), Duration::from_secs(120)).unwrap();
+            daemon.refresh().await;
 
             let session = quic::connect(&daemon.endpoint, &daemon.pin, &daemon.identity)
                 .await

@@ -406,9 +406,14 @@ impl App {
         }
     }
 
-    /// Fires once a second: enforces the welcome timeout and drops the
-    /// connection after missed keepalives.
+    /// Fires once a second: re-reads the client-trust files for the QUIC
+    /// verifier, enforces the welcome timeout and drops the connection after
+    /// missed keepalives.
     pub(crate) async fn on_tick(&mut self) {
+        // The verifier only reads a snapshot, so the tick is the one place the
+        // files become visible to it. This runs even when Hermes is down: a
+        // remote client must be able to connect (or be revoked) regardless.
+        self.refresh_trust().await;
         // Once a second, and before the socket check: a UI watching recordings
         // must keep getting fresh counters even while Hermes is reconnecting.
         self.publish_telemetry();

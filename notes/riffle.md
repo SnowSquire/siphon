@@ -230,8 +230,9 @@ Pairing, once per client:
    daemon's. Mismatch: everything is torn down and forgotten.
 
 The typed code is proof, not comparison — an MITM on the UI's leg cannot produce
-the daemon's string. Revocation is deleting an entry from `peers.json`: the
-operator of a remote daemon is someone who edits JSON.
+the daemon's string. Revocation is deleting an entry from `peers.json`, which the
+daemon's refresh applies within a second: the operator of a remote daemon is
+someone who edits JSON.
 
 No session resumption and no 0-RTT. Resumption skips certificate verification, so
 it would bypass the pin on exactly the reconnects it exists to speed up, and 0-RTT
@@ -715,8 +716,14 @@ after `open_bi`, which is what completes the server's `accept_bi`.
   in `peers.json` in the daemon's state directory:
   `{ "peers": [ { "id", "name", "spki", "added_ms", "last_seen_ms" } ] }`,
   written pretty so editing it by hand is the supported path. Deleting an entry
-  is revocation — the file is read per handshake, so it takes effect on the
-  next connection — and adding one by hand is the other supported path.
+  is revocation; the daemon re-reads the file once a second into the verifier's
+  snapshot, so it takes effect on the next connection without a restart — and
+  adding one by hand works the same way. The verifier never touches a file:
+  rustls calls it synchronously on the reactor thread, so it reads an in-memory
+  snapshot (`TrustSnapshot`) and the loop's tick (`Trust::refresh`, `compio::fs`)
+  publishes a new one when the parsed value changes. A refresh that cannot
+  parse `peers.json` logs and keeps the previous snapshot; only startup treats
+  it as fatal.
   `id` is the first 16 hex of `spki`; `last_seen_ms` is refreshed at most once a
   minute. A malformed file is a startup error, never a silent empty allowlist.
 - Pairing is a typed code, not a pasted string, and it exists because the

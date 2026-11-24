@@ -41,6 +41,7 @@ use siphon_shared::riffle::Update;
 use siphon_shared::riffle::UpdateView;
 use siphon_shared::riffle::quic::PairingWindow;
 use siphon_shared::riffle::quic::Peers;
+use siphon_shared::riffle::quic::SharedTrust;
 use siphon_shared::riffle::quic::Trust;
 use tracing::info;
 use tracing::warn;
@@ -130,6 +131,10 @@ pub struct AppInit {
     /// Where a pairing window and the client allowlist live. `None` when the
     /// daemon has no QUIC listener, so no pairing can be in progress.
     pub trust: Option<Trust>,
+    /// The snapshot the QUIC verifier consults. The tick re-reads the files
+    /// above into it; without a QUIC listener it is an empty snapshot nobody
+    /// reads.
+    pub trust_shared: SharedTrust,
 }
 
 /// One message for the loop's queue.
@@ -210,6 +215,10 @@ pub struct App {
     save_running: bool,
     /// The allowlist and pairing window a `PairConfirm` is checked against.
     trust: Option<Trust>,
+    /// The snapshot the QUIC verifier consults, refreshed from `trust`.
+    trust_shared: SharedTrust,
+    /// When the trust snapshot is next due to be re-read.
+    trust_at: Instant,
 }
 
 impl App {
@@ -226,6 +235,7 @@ impl App {
             jobs_tx,
             client_id,
             trust,
+            trust_shared,
         } = init;
         // Hermes is wanted whenever there is a channel to watch; the endpoint is
         // whatever the edge is (Twitch, or the mock under `--debug`).
@@ -283,6 +293,8 @@ impl App {
             save_dirty: false,
             save_running: false,
             trust,
+            trust_shared,
+            trust_at: Instant::now(),
         }
     }
 
@@ -390,6 +402,11 @@ impl App {
         }
         if conns.iter().flatten().any(|conn| conn.ready) {
             at = at.min(self.telemetry_at);
+        }
+        // The verifier reads a snapshot, so somebody has to keep it in step
+        // with the files: once a second while this daemon has a QUIC listener.
+        if self.trust.is_some() {
+            at = at.min(self.trust_at);
         }
         // A pairing attempt has a real deadline of its own, shorter than the
         // minute the loop would otherwise sleep for.
@@ -502,7 +519,7 @@ impl App {
             ) {
                 // Sent instead of `Hello`, and only on a provisional connection.
                 Ok(siphon_shared::riffle::ClientMessage::PairConfirm { sas, name }) => {
-                    if !self.confirm_pairing(conn, &sas, &name) {
+                    if !self.confirm_pairing(conn, &sas, &name).await {
                         close = true;
                         break;
                     }
@@ -580,10 +597,10 @@ impl App {
     /// looked at. Only then is the key written to `peers.json`, and the
     /// connection becomes an ordinary one.
     ///
-    /// Both files are written synchronously: pairing happens once, on a human's
-    /// keystroke, with no stream traffic waiting on it — it is not a path in
-    /// the loop.
-    fn confirm_pairing(&self, conn: &mut riffle::Conn, sas: &str, name: &str) -> bool {
+    /// Both files are touched with `compio::fs`, because this runs on the
+    /// reactor. Pairing happens once, on a human's keystroke, but a blocking
+    /// read there would stall every other task all the same.
+    async fn confirm_pairing(&self, conn: &mut riffle::Conn, sas: &str, name: &str) -> bool {
         let Some(provisional) = conn.provisional.as_ref() else {
             warn!(target: "rpc", "rpc: PairConfirm on a connection that was not pairing");
             return false;
@@ -596,21 +613,22 @@ impl App {
             warn!(target: "rpc", "quic: pairing is not configured on this daemon");
             return false;
         };
-        let approved = PairingWindow::read(trust.pairing())
+        let approved = PairingWindow::read_async(trust.pairing())
+            .await
             .is_some_and(|pairing| pairing.approved(&provisional.sas));
         if !approved {
             warn!(target: "rpc", "quic: the pairing code was not approved by an operator");
             return false;
         }
         let spki = provisional.spki.clone();
-        let mut peers = match Peers::load(trust.peers()) {
+        let mut peers = match Peers::load_async(trust.peers()).await {
             Ok(peers) => peers,
             Err(error) => {
                 warn!(target: "rpc", %error, "quic: could not read peers.json to pair a client");
                 return false;
             }
         };
-        if let Err(error) = peers.add(name, &spki) {
+        if let Err(error) = peers.add_async(name, &spki).await {
             warn!(target: "rpc", %error, "quic: could not write peers.json");
             return false;
         }
@@ -626,8 +644,14 @@ impl App {
             conn.ready = true;
             // The window has done its job: nothing else may be admitted with an
             // unknown key.
-            if let Err(error) = PairingWindow::close(trust.pairing()) {
+            if let Err(error) = PairingWindow::close_async(trust.pairing()).await {
                 warn!(target: "rpc", %error, "quic: could not close the pairing window");
+            }
+            // Publish both changes now rather than at the next tick: the new
+            // key is allowed from here on, and the closed window must stop
+            // admitting unknown ones immediately.
+            if let Err(error) = trust.refresh(&self.trust_shared).await {
+                warn!(target: "rpc", %error, "quic: could not refresh the trust snapshot");
             }
         }
         queued
@@ -1048,6 +1072,39 @@ impl App {
     pub fn clear_error(&mut self) {
         if self.error.take().is_some() {
             self.bus.publish(Update::Error(None));
+        }
+    }
+
+    /// Re-reads `peers.json` and `pairing.json` into the verifier's snapshot.
+    ///
+    /// The verifier cannot read a file — rustls calls it synchronously on this
+    /// thread — so this tick is what makes the files live: an operator's edit to
+    /// `peers.json` takes effect within a second, and revoking a device no
+    /// longer needs a restart. `compio::fs`, never `std::fs`: this is the
+    /// reactor.
+    ///
+    /// A file that does not parse keeps the previous snapshot. An edit in
+    /// progress must not revoke every client, and a malformed allowlist is
+    /// already an error at startup, where the operator is looking.
+    pub(crate) async fn refresh_trust(&mut self) {
+        // The tick can be much faster than a second (a live connection's
+        // keepalive and telemetry deadlines are shorter), so the snapshot has
+        // its own due time rather than being re-read on every deadline.
+        if self.trust.is_none() || Instant::now() < self.trust_at {
+            return;
+        }
+        self.trust_at = Instant::now() + crate::constants::TRUST_REFRESH;
+        let Some(trust) = self.trust.as_ref() else {
+            return;
+        };
+        match trust.refresh(&self.trust_shared).await {
+            Ok(true) => info!(target: "rpc", "quic: the trust snapshot changed"),
+            Ok(false) => {}
+            Err(error) => warn!(
+                target: "rpc",
+                %error,
+                "quic: keeping the last trust snapshot, the files did not parse"
+            ),
         }
     }
 
@@ -1494,6 +1551,7 @@ mod tests {
             jobs_tx,
             client_id: None,
             trust: None,
+            trust_shared: SharedTrust::default(),
         })
     }
 
