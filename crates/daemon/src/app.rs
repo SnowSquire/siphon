@@ -24,6 +24,7 @@ use siphon_shared::riffle::ConnHealth;
 use siphon_shared::riffle::ConnStats;
 use siphon_shared::riffle::DownloaderSummary;
 use siphon_shared::riffle::LogLevel;
+use siphon_shared::riffle::MAX_AVATAR;
 use siphon_shared::riffle::PipelineView;
 use siphon_shared::riffle::Request;
 use siphon_shared::riffle::Response;
@@ -127,7 +128,9 @@ pub enum JobDone {
     UpdateDownloadFinished(Result<PathBuf, update::UpdateError>),
     SubscribeCheckDue(Topic, NanoId, u64),
     ConnectFinished(Box<ConnectOutcome>),
-    AvatarReady(u64, Option<String>),
+    /// A picture finished caching: the channel id and the avatar's content id,
+    /// or `None` when the download failed.
+    AvatarCached(u64, Option<String>),
 }
 
 /// One in-flight job. `!Send` is fine: everything stays on the reactor thread.
@@ -306,7 +309,7 @@ impl App {
             };
 
             match event {
-                Event::Conn(event) => self.handle_conn(event, &mut conns, &ops),
+                Event::Conn(event) => self.handle_conn(event, &mut conns, &ops).await,
                 Event::Socket(Ok(Some(text))) => self.handle_message(&text).await,
                 Event::Socket(Ok(None)) => {
                     tracing::info!(target: "hermes", "connection closed by peer");
@@ -366,7 +369,7 @@ impl App {
             .max(Duration::from_millis(10))
     }
 
-    fn handle_conn(
+    async fn handle_conn(
         &mut self,
         event: riffle::ConnEvent,
         conns: &mut Vec<Option<riffle::Conn>>,
@@ -399,7 +402,7 @@ impl App {
                         }
                     }
                 }
-                self.handle_frames(id, conns);
+                self.handle_frames(id, conns).await;
                 if let Some(conn) = conns[id].as_ref() {
                     ops.push(read_op(id, Rc::clone(&conn.stream)));
                 }
@@ -427,7 +430,7 @@ impl App {
     }
 
     /// Decodes and answers every complete frame already buffered.
-    fn handle_frames(&mut self, id: usize, conns: &mut [Option<riffle::Conn>]) {
+    async fn handle_frames(&mut self, id: usize, conns: &mut [Option<riffle::Conn>]) {
         let mut close = false;
         loop {
             let Some(conn) = conns[id].as_mut() else {
@@ -475,7 +478,7 @@ impl App {
                     id: request_id,
                     request,
                 }) => {
-                    let result = self.handle_request(request);
+                    let result = self.handle_request(request).await;
                     if !conn.push(&ServerMessage::Response {
                         id: request_id,
                         result,
@@ -602,9 +605,9 @@ impl App {
             JobDone::ConnectFinished(outcome) => {
                 self.complete_connect(*outcome).await;
             }
-            JobDone::AvatarReady(id, path) => {
+            JobDone::AvatarCached(id, avatar) => {
                 self.avatars_pending.remove(&id);
-                let Some(path) = path else {
+                let Some(avatar) = avatar else {
                     return;
                 };
                 let flags = self
@@ -614,7 +617,7 @@ impl App {
                     .find(|channel| channel.id == id)
                     .cloned();
                 if let Some(user) = self.channels.get_mut(&id) {
-                    user.avatar_path = Some(path);
+                    user.avatar = Some(avatar);
                     let view = user.view(flags.as_ref());
                     self.bus.publish(Update::ChannelUpsert(Box::new(view)));
                 }
@@ -622,7 +625,7 @@ impl App {
         }
     }
 
-    fn handle_request(&mut self, request: Request) -> Result<Response, RpcError> {
+    async fn handle_request(&mut self, request: Request) -> Result<Response, RpcError> {
         match request {
             Request::AddLogin { login } => {
                 self.request_add_login(&login);
@@ -686,6 +689,7 @@ impl App {
                 .registry
                 .disk_view(&key)
                 .map_or(Err(RpcError::NotFound), |view| Ok(Response::Disk(view))),
+            Request::GetAvatar { id } => get_avatar(&id).await,
         }
     }
 
@@ -703,7 +707,7 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| channel.login.clone()),
                     chat_color: gql::fallback_color(channel.id),
-                    avatar_path: None,
+                    avatar: None,
                     live: false,
                     title: None,
                     game: None,
@@ -1138,4 +1142,31 @@ fn update_view(release: &update::Release) -> UpdateView {
         page_url: release.page_url.clone(),
         installer: release.installer_url.is_some(),
     }
+}
+
+/// Reads one cached avatar for a client.
+///
+/// The read is asynchronous, like every other file the daemon touches: the app
+/// loop is the reactor's own task, and a picture is a disk read rather than a
+/// `memcpy`. The id is checked against [`crate::avatar::path_for`] first, because
+/// it arrives from the client and becomes a path.
+///
+/// Nothing is re-encoded or resized: the daemon has no image encoder, so the
+/// bytes are the ones it downloaded and the client scales them where it draws.
+async fn get_avatar(id: &str) -> Result<Response, RpcError> {
+    let path = crate::avatar::path_for(id).ok_or(RpcError::NotFound)?;
+    let metadata = compio::fs::metadata(&path)
+        .await
+        .map_err(|_| RpcError::NotFound)?;
+    let cap = u64::try_from(MAX_AVATAR).unwrap_or(u64::MAX);
+    if metadata.len() > cap {
+        return Err(RpcError::Failed(format!(
+            "avatar is {} bytes, over the {MAX_AVATAR} byte cap",
+            metadata.len()
+        )));
+    }
+    compio::fs::read(&path)
+        .await
+        .map(Response::Avatar)
+        .map_err(|error| RpcError::Failed(format!("avatar read failed: {error}")))
 }

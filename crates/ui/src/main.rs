@@ -23,6 +23,7 @@
 //! Nothing above the renderer knows which chain is linked.
 
 mod app;
+mod avatar;
 mod chain;
 mod css;
 mod format;

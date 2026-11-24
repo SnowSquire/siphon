@@ -51,6 +51,7 @@ pub use protocol::LaneView;
 pub use protocol::LogEntry;
 pub use protocol::LogLevel;
 pub use protocol::MAGIC;
+pub use protocol::MAX_AVATAR;
 pub use protocol::MAX_FRAME;
 pub use protocol::Network;
 pub use protocol::PROTOCOL_VERSION;

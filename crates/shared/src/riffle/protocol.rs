@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.
@@ -20,6 +20,13 @@ pub const MAGIC: u32 = 0x5349_5048; // "SIPH"
 
 /// Largest accepted frame. Rejected before allocating the payload.
 pub const MAX_FRAME: usize = 1024 * 1024;
+
+/// Largest avatar [`Request::GetAvatar`] will return.
+///
+/// Well under [`MAX_FRAME`]: the payload is one `Vec<u8>`, and an oversized
+/// picture has to fail as *that picture* rather than as a frame that takes the
+/// whole connection down. Twitch's profile pictures are tens of kilobytes.
+pub const MAX_AVATAR: usize = 512 * 1024;
 
 /// Identity of one pipeline: a Twitch channel id and an optional
 /// `STABLE-VARIANT-ID`. `None` means the monitor's best variant.
@@ -344,8 +351,14 @@ pub struct ChannelView {
     /// Twitch's chat colour for the channel's switches, with a generated
     /// fallback when Twitch reports none.
     pub chat_color: ChatColor,
-    /// A local file the daemon cached for the avatar; `None` until it exists.
-    pub avatar_path: Option<String>,
+    /// The avatar's content id: the lowercase hex of the 128-bit xxh3 hash of
+    /// the image bytes, never a path. `None` until the daemon has the picture.
+    ///
+    /// A path would only work for a client on the daemon's own machine: the
+    /// client fetches the bytes with [`Request::GetAvatar`] and caches them in
+    /// its own directory, which is also what makes two channels with the same
+    /// picture share one file.
+    pub avatar: Option<String>,
     pub live: bool,
     pub title: Option<String>,
     pub game: Option<String>,
@@ -635,6 +648,14 @@ pub enum Request {
     GetArena,
     GetDownloader,
     GetDisk(StreamKey),
+    /// Fetch one avatar's bytes by content id (see
+    /// [`ChannelView::avatar`]).
+    ///
+    /// There is no size hint: the daemon has no image encoder, so it serves the
+    /// picture exactly as Twitch did and the client scales it where it draws.
+    GetAvatar {
+        id: String,
+    },
 }
 
 /// A successful query result. Intents answer `Ack`.
@@ -648,6 +669,8 @@ pub enum Response {
     Arena(ArenaSummary),
     Downloader(DownloaderSummary),
     Disk(DiskView),
+    /// The image bytes for a [`Request::GetAvatar`], at most [`MAX_AVATAR`].
+    Avatar(Vec<u8>),
 }
 
 /// Typed failure. The UI renders the message; the daemon never sends a raw

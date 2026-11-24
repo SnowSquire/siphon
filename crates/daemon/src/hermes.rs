@@ -271,7 +271,7 @@ impl App {
         let client = std::rc::Rc::clone(&self.client);
         let url = url.to_owned();
         self.spawn_job(async move {
-            JobDone::AvatarReady(id, crate::avatar::ensure(&client, &url).await)
+            JobDone::AvatarCached(id, crate::avatar::ensure(&client, &url).await)
         });
     }
 
@@ -280,11 +280,8 @@ impl App {
         let id = user.id;
         // A refresh replaces the whole detail; the cached picture is still the
         // same person, so do not make the row fall back to initials for it.
-        if user.avatar_path.is_none() {
-            user.avatar_path = self
-                .channels
-                .get(&id)
-                .and_then(|old| old.avatar_path.clone());
+        if user.avatar.is_none() {
+            user.avatar = self.channels.get(&id).and_then(|old| old.avatar.clone());
         }
         if should_log_stream(self.channels.get(&id), &user) {
             let started = user
@@ -311,7 +308,7 @@ impl App {
         }
         let config = self.channel_config(id);
         let avatar_url = user.profile_image_url.clone();
-        let needs_avatar = user.avatar_path.is_none();
+        let needs_avatar = user.avatar.is_none();
         self.bus
             .publish(Update::ChannelUpsert(Box::new(user.view(config.as_ref()))));
         self.channels.insert(id, user);

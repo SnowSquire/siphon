@@ -172,6 +172,7 @@ pub async fn write<T: Serialize, W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::riffle::protocol::ClientMessage;
+    use crate::riffle::protocol::MAX_AVATAR;
     use crate::riffle::protocol::Request;
 
     #[test]
@@ -244,6 +245,15 @@ mod tests {
             decode::<ClientMessage>(payload),
             Err(CodecError::Postcard(_))
         ));
+    }
+
+    /// A capped avatar has to fit one frame, or `GetAvatar` would take the
+    /// connection down instead of failing the picture.
+    #[test]
+    fn the_largest_avatar_fits_in_one_frame() {
+        let response = crate::riffle::protocol::Response::Avatar(vec![0; MAX_AVATAR]);
+        let mut frame = Vec::new();
+        encode(&response, &mut frame).expect("a capped avatar fits one frame");
     }
 
     #[test]

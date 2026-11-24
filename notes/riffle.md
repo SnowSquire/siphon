@@ -187,11 +187,13 @@ because a lane whose broadcast just ended must still be able to name its channel
 
 ## Blobs and avatars
 
-`ChannelView` carries `avatar { id, rev }` where `id` is a content hash, not a
-path. `GetAvatar { id, px }` on the control plane returns pre-scaled bytes; the UI
-caches them by hash in its own directory and hands ZGUI a local file, because
-ZGUI's image element reads files and not URLs. A blob is an object with
-`retransmit + independent`, and nothing else.
+`ChannelView` carries `avatar` where the id is a content hash, not a path.
+`GetAvatar { id }` on the control plane returns the bytes; the UI caches them by
+hash in its own directory and hands ZGUI a local file, because ZGUI's image
+element reads files and not URLs. There is no size hint yet: the daemon has no
+image encoder, so it serves the picture as Twitch did and the client scales it
+where it draws. A blob is an object with `retransmit + independent`, and nothing
+else.
 
 ## Zero copy ends at the pipe
 
@@ -418,9 +420,9 @@ enum Update {
 ```
 
 `ChannelView` carries what the UI renders: id, login, display name, the resolved
-switch colour (`chatColor`, or a generated `oklch(...)` fallback), the local
-`avatarPath` the daemon cached, live, title, game, the
-game id, viewers, stream start as milliseconds, when it was last live
+switch colour (`chatColor`, or a generated `oklch(...)` fallback), the avatar's
+content id, live, title, game, the game id, viewers, stream start as
+milliseconds, when it was last live
 (`last_live_ms`), Twitch's `BROADCAST-ID`, the last per-channel failure
 (`error`), and the per-channel `record` switch — the notification switches are
 the client's and never cross this boundary. `last_live_ms` is Twitch's
@@ -437,11 +439,13 @@ newest live first for the live tier, most recently live first for the offline
 tier — which is what puts a channel that has been dark for weeks at the bottom.
 `error` is the channel's own resolve failure, cleared by the next successful
 refresh; pipeline and disk failures stay on their own entities and the UI
-merges them by login. ZGUI's
-image element reads files, not URLs, so `avatar::ensure` downloads each picture
-once into the app data directory and the row is re-published when the path
-exists. The workspace version (`0.5.0`) is shared by `daemon`, `siphon-shared` and
-`siphon-ui` because the Hello/Welcome carries it; `libplacebo-sys` and the
+merges them by login. ZGUI's image element reads files, not URLs, so
+`avatar::ensure` downloads each picture once into the daemon's data directory
+under the hash of its bytes and the row carries that id; the client fetches the
+bytes with `GetAvatar` and caches them in its own directory, so a UI on another
+machine is served too. The workspace version (`0.5.0`) is shared by `daemon`,
+`siphon-shared` and `siphon-ui` because the Hello/Welcome carries it;
+`libplacebo-sys` and the
 `video` prototype keep their own `0.1.0`. `PipelineView` carries key, state (live/offline/stopped),
 pinned, recording, sessions, position, live edge, segment tail, window size,
 counters, last error and the attached recorder's `disk` counters. `SegmentRecord`
@@ -468,7 +472,7 @@ Requests:
   notification switches and the word filter are not here: they are client
   settings, written to the client's own `ui.json`;
 - queries: `GetSnapshot`, `GetStreamDetail { key }`, `ListSegments { key,
-  limit }`, `GetArena`, `GetDownloader`, `GetDisk { key }`.
+  limit }`, `GetArena`, `GetDownloader`, `GetDisk { key }`, `GetAvatar { id }`.
 
 An intent returns an ack or a typed `RpcError`; the resulting state change
 arrives as an `Update`. The UI may optimistically render a toggle, but the

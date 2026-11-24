@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,7 +99,7 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
     // The settings document comes first: the state and the renderer hold the
     // same handle to it, so a switch writes the value the file keeps.
     let display = Display::load();
-    let state = UiState::new(display.settings());
+    let state = UiState::new(display.settings(), intents.clone());
     // The preset dark scheme is close, but the window has its own ink. The
     // token block is what makes every zgui-ui control (switches, inputs,
     // tooltips, buttons) use the same palette as the hand-written classes.
@@ -282,6 +283,7 @@ fn App(
     let downloader_sig = state.downloader;
     let notices_sig = state.notices;
     let logs_sig = state.logs;
+    let avatars_sig = state.avatars;
     let settings_sig = state.settings;
 
     // The tray owns the window's lifetime on Windows: closing it puts it away,
@@ -586,6 +588,7 @@ fn App(
                     pipelines = pipelines_sig,
                     now = now,
                     pending = pending_sig,
+                    avatars = avatars_sig,
                     expanded = expanded,
                     closing = closing,
                     draft = draft,
@@ -691,6 +694,8 @@ fn ChannelsTab(
     pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
     now: RwSignal<i64, LocalStorage>,
     pending: RwSignal<Rc<Vec<String>>, LocalStorage>,
+    /// Avatar content id to the local file this client cached it as.
+    avatars: RwSignal<Rc<HashMap<String, String>>, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
     closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     draft: RwSignal<String, LocalStorage>,
@@ -757,6 +762,7 @@ fn ChannelsTab(
                             pins = pins,
                             pipelines = pipelines,
                             now = now,
+                            avatars = avatars,
                             expanded = expanded,
                             closing = closing,
                             intents = Rc::clone(&rows),
@@ -834,6 +840,8 @@ fn ChannelRow(
     pins: RwSignal<Rc<Vec<u64>>, LocalStorage>,
     pipelines: RwSignal<Rc<Vec<RwSignal<PipelineView, LocalStorage>>>, LocalStorage>,
     now: RwSignal<i64, LocalStorage>,
+    /// Avatar content id to the local file this client cached it as.
+    avatars: RwSignal<Rc<HashMap<String, String>>, LocalStorage>,
     expanded: RwSignal<BTreeSet<u64>, LocalStorage>,
     closing: RwSignal<BTreeSet<u64>, LocalStorage>,
     intents: Rc<IntentSender>,
@@ -856,7 +864,10 @@ fn ChannelRow(
     let display_name = Signal::derive_local(move || channel.with(|c| c.display_name.clone()));
     let initials =
         Signal::derive_local(move || initials(&channel.with(|c| c.display_name.clone())));
-    let avatar_path = Signal::derive_local(move || channel.with(|c| c.avatar_path.clone()));
+    let avatar_path = Signal::derive_local(move || {
+        let id = channel.with(|c| c.avatar.clone())?;
+        avatars.with(|paths| paths.get(&id).cloned())
+    });
     let color = Signal::derive_local(move || channel.with(|c| c.chat_color));
     let live = Signal::derive_local(move || channel.with(|c| c.live));
     let title = Signal::derive_local(move || {

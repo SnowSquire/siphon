@@ -2,7 +2,7 @@
 //!
 //! The window raises them now, not the daemon: the daemon publishes stream
 //! transitions and this decides whether one is worth a toast. The image is a
-//! local file the daemon already cached next to the avatar, so nothing is
+//! local file this client cached from the avatar's content id, so nothing is
 //! downloaded here.
 
 /// `AppUserModelId` the toasts are shown under; registered per user on startup

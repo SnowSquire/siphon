@@ -4,7 +4,6 @@
 //! `sonic_rs`, so the backend keeps one TLS/connection stack.
 
 use std::num::NonZeroU64;
-use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -15,7 +14,6 @@ use siphon_shared::riffle::ChatColor;
 use thiserror::Error;
 
 use crate::constants::DEFAULT_CLIENT_ID;
-use crate::constants::MAX_IMAGE;
 use crate::constants::MAX_JSON;
 use crate::http::Client;
 use crate::http::StatusCode;
@@ -50,8 +48,8 @@ pub struct ChannelDetail {
     /// stable generated one when the user has not picked a chat colour.
     pub chat_color: ChatColor,
     pub profile_image_url: String,
-    /// Local avatar file, once the app has cached the remote picture.
-    pub avatar_path: Option<String>,
+    /// The avatar's content id, once the picture is cached under its hash.
+    pub avatar: Option<String>,
     /// Twitch's `BROADCAST-ID` from the active stream; `None` when offline.
     pub stream_id: Option<NonZeroU64>,
     pub stream_title: Option<String>,
@@ -96,7 +94,7 @@ impl ChannelDetail {
             login: self.login.clone(),
             display_name: self.display_name.clone(),
             chat_color: self.chat_color,
-            avatar_path: self.avatar_path.clone(),
+            avatar: self.avatar.clone(),
             live: self.live,
             title: self.stream_title.clone(),
             game: self.game.as_ref().map(|game| game.display_name.clone()),
@@ -335,7 +333,7 @@ impl GqlUser {
             login: self.login.filter(|login| !login.is_empty())?,
             display_name: self.display_name.filter(|name| !name.is_empty())?,
             profile_image_url: self.profile_image_url.filter(|url| !url.is_empty())?,
-            avatar_path: None,
+            avatar: None,
             stream_id,
             stream_title: settings.title.filter(|title| !title.is_empty()),
             stream_start,
@@ -454,23 +452,22 @@ pub async fn fetch_channels(
     Ok(users)
 }
 
-/// Downloads one small asset (a notification avatar) to `path`. The body is
-/// read before the file is created, so a truncated transfer leaves no file.
-pub async fn fetch_file(client: &Client, url: &str, path: &Path) -> Result<(), GqlError> {
+/// Downloads one small asset (an avatar) into memory, up to `limit` bytes.
+///
+/// The caller hashes and writes the body, so nothing is created for a failed
+/// transfer and a truncated download leaves no file behind.
+pub async fn fetch_bytes(client: &Client, url: &str, limit: usize) -> Result<Vec<u8>, GqlError> {
     let mut response = crate::http::timeout(GQL_TIMEOUT, client.get(url))
         .await
         .map_err(|_| GqlError::Timeout)??;
     if !response.status.is_success() {
         return Err(GqlError::Status(response.status));
     }
-    let body = crate::http::timeout(GQL_TIMEOUT, response.body.read_to_end(MAX_IMAGE))
-        .await
-        .map_err(|_| GqlError::Timeout)??;
-    if let Some(parent) = path.parent() {
-        compio::fs::create_dir_all(parent).await?;
-    }
-    compio::fs::write(path, body).await.0?;
-    Ok(())
+    Ok(
+        crate::http::timeout(GQL_TIMEOUT, response.body.read_to_end(limit))
+            .await
+            .map_err(|_| GqlError::Timeout)??,
+    )
 }
 
 #[cfg(test)]

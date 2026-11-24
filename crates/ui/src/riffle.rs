@@ -7,6 +7,8 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::rc::Rc;
@@ -36,11 +38,17 @@ use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
 use zgui::reactive::prelude::*;
 
-/// One snapshot or entity update for the UI thread.
+/// One snapshot, entity update, or fetched picture for the UI thread.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Snapshot(Box<Snapshot>),
     Update(Box<Update>),
+    /// One avatar's bytes landed in this client's cache: the content id and the
+    /// local file the image element can read.
+    Avatar {
+        id: String,
+        path: Option<String>,
+    },
 }
 
 /// A single-waiter wake, shared between the UI thread (intent sender) and the
@@ -93,6 +101,15 @@ impl IntentSender {
         let queued = matches!(self.tx.try_send(request), Ok(true));
         self.wake.wake();
         queued
+    }
+
+    /// Asks the worker for one avatar's bytes.
+    ///
+    /// A query rather than an intent, but it travels the same queue: the worker
+    /// fetches it in the background and reports the local path as
+    /// [`UiEvent::Avatar`], so the frame loop never waits on a picture.
+    pub fn fetch_avatar(&self, id: &str) {
+        let _ = self.send(Request::GetAvatar { id: id.to_owned() });
     }
 }
 
@@ -218,13 +235,29 @@ async fn serve_connection(
         let disconnected = closed.get() && queue.borrow().is_empty();
 
         while let Ok(Some(request)) = intents.try_recv() {
-            // Fire and forget: a slow handler must not stall the update stream,
-            // and the ack would be discarded anyway. A rejected intent arrives
-            // as an `Update`.
-            if let Err(error) = client.send(request) {
-                let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(
-                    error.to_string(),
-                )))));
+            // A picture is the one request whose answer is the point, so it is
+            // fetched on its own task: the update stream keeps flowing while the
+            // bytes arrive.
+            match request {
+                Request::GetAvatar { id } => {
+                    let client = Rc::clone(&client);
+                    let events = events.clone();
+                    compio::runtime::spawn(async move {
+                        let path = crate::avatar::fetch(&client, &id).await;
+                        let _ = events.try_send(UiEvent::Avatar { id, path });
+                    })
+                    .detach();
+                }
+                // Fire and forget: a slow handler must not stall the update
+                // stream, and the ack would be discarded anyway. A rejected
+                // intent arrives as an `Update`.
+                request => {
+                    if let Err(error) = client.send(request) {
+                        let _ = events.try_send(UiEvent::Update(Box::new(Update::Error(Some(
+                            error.to_string(),
+                        )))));
+                    }
+                }
             }
         }
 
@@ -299,8 +332,18 @@ pub struct UiState {
     /// restart, and nothing in the daemon knows it exists.
     pub notices: RwSignal<Rc<Vec<Notice>>, LocalStorage>,
     pub logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
+    /// Where each avatar's bytes live in this client's cache, keyed by the
+    /// content id a row carries. A row draws its initials until its id is here.
+    pub avatars: RwSignal<Rc<HashMap<String, String>>, LocalStorage>,
+    /// Avatar ids this session has already asked for, so a viewer-count tick
+    /// does not ask again. A snapshot clears it: requests a dropped connection
+    /// never answered have to be made again.
+    avatar_requests: Rc<RefCell<HashSet<String>>>,
+    /// The queue to the RPC worker, so a row whose picture is not cached can ask
+    /// for it without the frame loop waiting.
+    intents: IntentSender,
     /// When each channel was last seen going offline, for the title/game mute.
-    muted: Rc<RefCell<std::collections::HashMap<u64, i64>>>,
+    muted: Rc<RefCell<HashMap<u64, i64>>>,
     /// The next notification-centre id.
     notice_seq: Rc<Cell<u64>>,
 }
@@ -441,7 +484,7 @@ fn pinned_ids(document: &ClientSettings) -> Vec<u64> {
 impl UiState {
     /// The state a window starts with, before the first snapshot arrives.
     #[must_use]
-    pub fn new(settings: RwSignal<ClientSettings, LocalStorage>) -> Self {
+    pub fn new(settings: RwSignal<ClientSettings, LocalStorage>, intents: IntentSender) -> Self {
         let state = empty_snapshot();
         let pins = pinned_ids(&settings.get_untracked());
         Self {
@@ -457,7 +500,10 @@ impl UiState {
             downloader: RwSignal::new_local(state.downloader),
             notices: RwSignal::new_local(Rc::new(Vec::new())),
             logs: RwSignal::new_local(Rc::new(state.logs)),
-            muted: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            avatars: RwSignal::new_local(Rc::new(HashMap::new())),
+            avatar_requests: Rc::new(RefCell::new(HashSet::new())),
+            intents,
+            muted: Rc::new(RefCell::new(HashMap::new())),
             notice_seq: Rc::new(Cell::new(1)),
         }
     }
@@ -467,6 +513,10 @@ impl UiState {
         self.conn.set(state.conn);
         self.error.set(state.error);
         self.update.set(state.update);
+        // A reconnect is the one moment to re-ask: whatever a dropped connection
+        // never answered is still unanswered.
+        self.avatar_requests.borrow_mut().clear();
+        self.ensure_avatars(&state.channels);
         sync_rows(self.channels, state.channels, |channel| channel.id);
         self.reorder();
         self.pending.set(Rc::new(state.pending));
@@ -522,6 +572,48 @@ impl UiState {
                 .filtered_words
                 .retain(|existing| existing != word);
         });
+    }
+
+    /// Makes sure every row's picture is either in this client's cache or on its
+    /// way, and does nothing for one that already is.
+    fn ensure_avatars(&self, views: &[ChannelView]) {
+        for view in views {
+            if let Some(id) = view.avatar.as_deref() {
+                self.ensure_avatar(id);
+            }
+        }
+    }
+
+    fn ensure_avatar(&self, id: &str) {
+        if self.avatars.get_untracked().contains_key(id) {
+            return;
+        }
+        if !self.avatar_requests.borrow_mut().insert(id.to_owned()) {
+            return;
+        }
+        // A picture an earlier run cached needs no round trip at all.
+        if let Some(path) = crate::avatar::cached(id) {
+            self.set_avatar(id, path);
+            return;
+        }
+        self.intents.fetch_avatar(id);
+    }
+
+    /// Records where one avatar's bytes are: what the row's image element was
+    /// waiting for, and the reason a row needs no republish to show a picture.
+    fn set_avatar(&self, id: &str, path: String) {
+        let mut avatars = (*self.avatars.get_untracked()).clone();
+        if avatars.get(id) == Some(&path) {
+            return;
+        }
+        avatars.insert(id.to_owned(), path);
+        self.avatars.set(Rc::new(avatars));
+    }
+
+    /// The local picture for a row, when this client has it.
+    fn avatar_file(&self, view: &ChannelView) -> Option<String> {
+        let id = view.avatar.as_deref()?;
+        self.avatars.get_untracked().get(id).cloned()
     }
 
     /// Turns one stream transition into a notification, or drops it.
@@ -601,11 +693,12 @@ impl UiState {
             notices.drain(..drop);
         }
         self.notices.set(Rc::new(notices));
+        let image = self.avatar_file(&event.view);
         crate::notify::show(
             &summary,
             &body,
             policy.sound,
-            event.view.avatar_path.as_deref(),
+            image.as_deref(),
             Some(&event.view.login),
         );
     }
@@ -652,6 +745,7 @@ impl UiState {
             // One row of the list, not the list: the row's own signal carries
             // the change, so the keyed list never re-runs.
             Update::ChannelUpsert(view) => {
+                self.ensure_avatars(std::slice::from_ref(&view));
                 upsert_row(self.channels, *view, |channel| channel.id);
                 // A live flip or a new `last live` is the only thing that can
                 // move a row; `reorder` is a no-op when the order holds.
@@ -733,6 +827,11 @@ impl UiState {
         match event {
             UiEvent::Snapshot(state) => self.reset(*state),
             UiEvent::Update(update) => self.apply(*update),
+            UiEvent::Avatar { id, path } => {
+                if let Some(path) = path {
+                    self.set_avatar(&id, path);
+                }
+            }
         }
     }
 }
@@ -747,7 +846,8 @@ mod tests {
 
     /// A window state over a fresh, unsaved settings document.
     fn state() -> UiState {
-        UiState::new(RwSignal::new_local(ClientSettings::default()))
+        let (intents, _intent_rx, _wake) = intent_channel();
+        UiState::new(RwSignal::new_local(ClientSettings::default()), intents)
     }
 
     fn view(id: u64, viewers: u32) -> ChannelView {
@@ -756,7 +856,7 @@ mod tests {
             login: format!("channel{id}"),
             display_name: format!("Channel {id}"),
             chat_color: ChatColor::Twitch(0x00ff_ffff),
-            avatar_path: None,
+            avatar: None,
             live: true,
             title: Some("a title".to_owned()),
             game: None,
@@ -866,6 +966,47 @@ mod tests {
             let ordered = order_channels(&rows, &[5]);
             let ids: Vec<u64> = ordered.iter().map(|row| row.get_untracked().id).collect();
             assert_eq!(ids, vec![5, 2, 4, 3, 1]);
+        });
+        scope.unmount();
+    }
+
+    /// One id is asked for once. A viewer count that ticks must not ask again,
+    /// and the answer is what a row draws, so it needs no republish.
+    #[test]
+    fn an_avatar_is_asked_for_once_and_then_drawn_from_the_event() {
+        install().ok();
+        let scope = Mounted::new();
+        scope.with(|| {
+            let (intents, intent_rx, _wake) = intent_channel();
+            let state = UiState::new(RwSignal::new_local(ClientSettings::default()), intents);
+            let id = "0".repeat(32);
+            let mut row = view(1, 10);
+            row.avatar = Some(id.clone());
+            state.reset(Snapshot {
+                channels: vec![row],
+                ..Snapshot::default()
+            });
+
+            let asked = intent_rx.try_recv().unwrap().expect("a request");
+            assert!(matches!(asked, Request::GetAvatar { id: asked } if asked == id));
+
+            state.apply(Update::ChannelUpsert(Box::new(ChannelView {
+                avatar: Some(id.clone()),
+                ..view(1, 99)
+            })));
+            assert!(
+                intent_rx.try_recv().unwrap().is_none(),
+                "a tick must not ask for a picture twice"
+            );
+
+            state.apply_event(UiEvent::Avatar {
+                id: id.clone(),
+                path: Some("/tmp/avatar.png".to_owned()),
+            });
+            assert_eq!(
+                state.avatars.get_untracked().get(&id).map(String::as_str),
+                Some("/tmp/avatar.png")
+            );
         });
         scope.unmount();
     }
