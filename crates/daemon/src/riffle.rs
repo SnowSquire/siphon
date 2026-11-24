@@ -896,6 +896,14 @@ mod tests {
                     .await
                     .expect("quic connect");
             assert_eq!(snapshot.channels.len(), 1);
+            // The connect path keeps the connection, so the media lane has a
+            // datagram channel on the same connection as the control stream.
+            assert!(
+                client
+                    .datagrams()
+                    .is_some_and(|channel| channel.max_size().is_some()),
+                "a QUIC client keeps its datagram channel"
+            );
 
             let response = client.request(Request::GetSnapshot).await.unwrap();
             assert!(matches!(response, Response::Snapshot(_)));

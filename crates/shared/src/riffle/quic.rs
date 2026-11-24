@@ -6,6 +6,14 @@
 //! carries, so the handshake, the snapshot and the intents do not know which
 //! carrier they are on.
 //!
+//! The same connection also carries QUIC DATAGRAM frames ([`Datagrams`]), the
+//! media lane's transport: the stream is the control plane and must not be
+//! behind a video access unit, and datagrams are unreliable and unordered by
+//! design. DATAGRAM is a transport parameter (`max_datagram_frame_size`), so
+//! both endpoints set it in their [`TransportConfig`]; a peer that never
+//! advertises it gets [`DatagramError::Unsupported`] rather than a silent
+//! drop.
+//!
 //! There is no CA and no `WebPKI`. Each side makes one self-signed certificate
 //! on first use and the pin is the SHA-256 of its `SubjectPublicKeyInfo` — the
 //! key, not the certificate wrapper, so re-issuing the certificate does not
@@ -43,6 +51,7 @@ use std::time::UNIX_EPOCH;
 use compio::buf::BufResult;
 use compio::buf::IoBuf;
 use compio::buf::IoBufMut;
+use compio::buf::bytes::Bytes;
 use compio::io::AsyncRead;
 use compio::io::AsyncWrite;
 use compio::net::ToSocketAddrsAsync;
@@ -50,7 +59,9 @@ use compio_quic::Connection;
 use compio_quic::Endpoint;
 use compio_quic::Incoming;
 use compio_quic::RecvStream;
+use compio_quic::SendDatagramError;
 use compio_quic::SendStream;
+use compio_quic::TransportConfig;
 use rustls::DistinguishedName;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::client::danger::ServerCertVerified;
@@ -110,6 +121,28 @@ const SAS_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// How long a handshake may take before the client gives up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What both endpoints advertise and buffer for DATAGRAM, in bytes.
+///
+/// quinn derives the transport parameter `max_datagram_frame_size` from this
+/// number, capped at `u16::MAX` (RFC 9221), so both sides advertise 65535 and
+/// the budget a datagram actually has is the path MTU, which
+/// [`Datagrams::max_size`] reports. This is a *buffer*, not one frame: quinn
+/// drops the oldest unread datagrams once this much is queued, which is the
+/// right failure for a lane that is already lossy.
+const DATAGRAM_RECEIVE_BUFFER: usize = 256 * 1024;
+
+/// The transport parameters both endpoints use.
+///
+/// DATAGRAM is negotiated here and not in the TLS config: it is a transport
+/// parameter, and quinn advertises `max_datagram_frame_size` only when a
+/// receive buffer is set. Setting it on both sides is what makes
+/// [`Datagrams::max_size`] `Some` after the handshake.
+fn transport_config() -> Arc<TransportConfig> {
+    let mut transport = TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
+    Arc::new(transport)
+}
 
 /// A daemon's pinned identity: the certificate it presents and the key.
 ///
@@ -955,7 +988,9 @@ fn server_config(
     tls.send_tls13_tickets = 0;
     let crypto = compio_quic::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|error| Error::Config(error.to_string()))?;
-    Ok(compio_quic::ServerConfig::with_crypto(Arc::new(crypto)))
+    let mut config = compio_quic::ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(transport_config());
+    Ok(config)
 }
 
 /// The verifier's record of why a handshake was refused.
@@ -1069,7 +1104,9 @@ fn client_config(
     tls.resumption = rustls::client::Resumption::disabled();
     let crypto = compio_quic::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|error| Error::Config(error.to_string()))?;
-    Ok((compio_quic::ClientConfig::new(Arc::new(crypto)), refusal))
+    let mut config = compio_quic::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(transport_config());
+    Ok((config, refusal))
 }
 
 /// A server endpoint bound to one of `network.listen`.
@@ -1104,6 +1141,86 @@ impl Listener {
     }
 }
 
+/// Why one datagram was not queued.
+///
+/// Datagrams are unreliable, so `Ok` from [`Datagrams::send`] means "queued",
+/// never "delivered"; these are the three ways the connection refuses one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DatagramError {
+    /// The payload is over the budget [`Datagrams::max_size`] reports right now.
+    #[error("the datagram is {len} bytes, this connection carries at most {max}")]
+    TooLarge { len: usize, max: usize },
+    /// DATAGRAM was not negotiated: the peer did not advertise
+    /// `max_datagram_frame_size`, or local support is off. Never a silent drop.
+    #[error("the connection does not carry datagrams")]
+    Unsupported,
+    /// The connection is gone, so nothing can be queued any more.
+    #[error("the connection is closed")]
+    Closed,
+}
+
+/// The datagram half of one connection: the media lane's carrier.
+///
+/// A cloneable handle over the connection the control stream rides on. quinn's
+/// `send_datagram` and `recv_datagram` both take `&self` and own the connection
+/// internally, so there is no `Rc<RefCell<..>>` here and no borrow to hold
+/// across an `.await`: a clone of [`Connection`] is all the ownership the
+/// channel needs. Sharing the connection is the point — media datagrams and
+/// control frames are multiplexed by QUIC, so a full video access unit cannot
+/// delay a `Request`.
+#[derive(Debug, Clone)]
+pub struct Datagrams {
+    connection: Connection,
+}
+
+impl Datagrams {
+    /// Queues one application datagram.
+    ///
+    /// `payload` is copied: quinn frees a datagram only once it has transmitted
+    /// it, so it cannot borrow the caller's buffer. Use [`Self::max_size`] to
+    /// size a fragment before this is called; the check here is the last word.
+    pub fn send(&self, payload: &[u8]) -> Result<(), DatagramError> {
+        let len = payload.len();
+        self.connection
+            .send_datagram(Bytes::copy_from_slice(payload))
+            .map_err(|error| match error {
+                SendDatagramError::TooLarge => DatagramError::TooLarge {
+                    len,
+                    max: self.connection.max_datagram_size().unwrap_or(0),
+                },
+                SendDatagramError::UnsupportedByPeer | SendDatagramError::Disabled => {
+                    DatagramError::Unsupported
+                }
+                SendDatagramError::ConnectionLost(_) => DatagramError::Closed,
+            })
+    }
+
+    /// The largest payload [`Self::send`] accepts right now, or `None` when the
+    /// peer did not advertise DATAGRAM.
+    ///
+    /// The number is already the application payload budget: quinn subtracts
+    /// the DATAGRAM frame header and this path's QUIC and IP overhead from the
+    /// smaller of the peer's `max_datagram_frame_size` and the current path
+    /// MTU. It moves with path-MTU discovery, so read it when a fragment is
+    /// sized rather than caching it for the life of the connection.
+    #[must_use]
+    pub fn max_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+
+    /// The next datagram, or `None` once the connection is closed.
+    ///
+    /// Nothing is invented on a timeout and nothing is reordered: a lost
+    /// datagram simply never appears here.
+    pub async fn recv(&self) -> Option<Vec<u8>> {
+        self.connection
+            .recv_datagram()
+            .await
+            .ok()
+            .map(|bytes| bytes.to_vec())
+    }
+}
+
 /// One established connection: the control stream plus what the handshake
 /// proves about the peer.
 ///
@@ -1111,6 +1228,7 @@ impl Listener {
 /// handshake. A normal connection only needs the pin (to look it up in the
 /// allowlist); a provisional one sends the code back.
 pub struct Session {
+    datagrams: Datagrams,
     stream: Stream,
     pin: String,
     sas: String,
@@ -1131,9 +1249,40 @@ impl Session {
     }
 
     /// The control stream, for a peer whose key is already trusted.
+    ///
+    /// This consumes the datagram handle; call [`Self::datagrams`] first if the
+    /// same connection is also going to carry media.
     #[must_use]
     pub fn into_stream(self) -> Stream {
         self.stream
+    }
+
+    /// The datagram channel alone, for a caller that hands the stream to
+    /// somebody else and keeps sending media.
+    #[must_use]
+    pub fn datagrams(&self) -> Datagrams {
+        self.datagrams.clone()
+    }
+
+    /// Queues one media datagram on this connection.
+    pub fn send_datagram(&self, payload: &[u8]) -> Result<(), DatagramError> {
+        self.datagrams.send(payload)
+    }
+
+    /// The largest datagram payload this connection accepts, or `None` when the
+    /// peer did not advertise DATAGRAM.
+    #[must_use]
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.datagrams.max_size()
+    }
+
+    /// The next datagram from the peer, or `None` once the connection closed.
+    ///
+    /// Takes `&self`: the receive side is a handle into the connection, not
+    /// state of this session's, so a read can be armed while the same session
+    /// is still writing frames.
+    pub async fn read_datagram(&self) -> Option<Vec<u8>> {
+        self.datagrams.recv().await
     }
 }
 
@@ -1175,6 +1324,9 @@ impl Handshake {
             .await
             .map_err(|error| Error::Stream(error.to_string()))?;
         Ok(Session {
+            datagrams: Datagrams {
+                connection: self.connection,
+            },
             stream: Stream {
                 endpoint: None,
                 send,
@@ -1188,8 +1340,9 @@ impl Handshake {
 
 /// Completes one incoming handshake: certificate, exporter, both pins.
 ///
-/// One bidirectional stream is the control plane. More streams and datagrams
-/// belong to the media lane that does not exist yet, so they are ignored.
+/// One bidirectional stream is the control plane and the connection's datagram
+/// channel is the media lane's; the [`Connection`] is kept in the [`Session`]
+/// so both are reachable from one handle.
 pub async fn accept(incoming: Incoming, identity: &Identity) -> Result<Handshake, Error> {
     let connection = incoming
         .await
@@ -1212,6 +1365,9 @@ pub async fn establish(incoming: Incoming, identity: &Identity) -> Result<Sessio
 }
 
 /// Opens the client side: resolve, handshake against the pin, one stream.
+///
+/// The returned [`Session`] carries both halves of the connection: the control
+/// stream and the datagram channel.
 ///
 /// `pin` is the daemon's SPKI SHA-256 as 64 hex characters (either case, with
 /// or without a `sha256:` prefix). It is a parameter here on purpose: where a
@@ -1254,6 +1410,7 @@ pub async fn connect(addr: &str, pin: &str, identity: &Identity) -> Result<Sessi
         .open_bi()
         .map_err(|error| Error::Stream(error.to_string()))?;
     Ok(Session {
+        datagrams: Datagrams { connection },
         stream: Stream {
             endpoint: Some(endpoint),
             send,
@@ -1817,6 +1974,148 @@ mod tests {
                 Verdict::Allowed,
                 "the previous snapshot survived the broken file"
             );
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The client half of one loopback connection, with a `Hello` written so the
+    /// server's `accept_bi` completes; the server has to be driven alongside.
+    async fn client_session(addr: &str, pin: &str, identity: &Identity) -> Session {
+        use crate::riffle::codec;
+        use crate::riffle::protocol::ClientMessage;
+        use crate::riffle::protocol::MAGIC;
+        use crate::riffle::protocol::PROTOCOL_VERSION;
+
+        let mut session = connect(addr, pin, identity).await.expect("client");
+        codec::write(
+            &mut session.stream,
+            &ClientMessage::Hello {
+                magic: MAGIC,
+                protocol: PROTOCOL_VERSION,
+                app_version: "test".to_owned(),
+            },
+        )
+        .await
+        .expect("write hello");
+        session
+    }
+
+    /// One loopback connection with both ends established.
+    async fn pair(dir: &Path) -> (Session, Session) {
+        let identity = Identity::load_or_create(dir).expect("identity");
+        let client_identity = Identity::load_or_create_client(&dir.join("ui")).expect("client");
+        let trust = allow(dir, client_identity.pin());
+        let listener = Listener::bind("127.0.0.1:0", &identity, trust)
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let client = client_session(&addr, identity.pin(), &client_identity);
+        let accept = async {
+            establish(listener.incoming().await.expect("incoming"), &identity)
+                .await
+                .expect("server")
+        };
+        join(client, accept).await
+    }
+
+    /// A datagram leaves one end and arrives at the other byte for byte, in both
+    /// directions, and the budget each side reports is a plausible one.
+    #[test]
+    fn datagrams_cross_the_loopback_in_both_directions() {
+        let dir = scratch("datagram");
+        let runtime = compio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let (client, server) = pair(&dir).await;
+            // Both sides advertised DATAGRAM, so the budget is the path's
+            // payload allowance: over a kilobyte on any usable MTU, under one
+            // QUIC frame (RFC 9221 caps the transport parameter at u16).
+            for budget in [client.max_datagram_size(), server.max_datagram_size()] {
+                let budget = budget.expect("the peer advertised DATAGRAM");
+                assert!(
+                    (1024..=usize::from(u16::MAX)).contains(&budget),
+                    "implausible datagram budget: {budget}"
+                );
+            }
+
+            client
+                .send_datagram(b"an access unit")
+                .expect("client send");
+            assert_eq!(
+                server.read_datagram().await.as_deref(),
+                Some(b"an access unit".as_slice())
+            );
+            server.send_datagram(b"and back").expect("server send");
+            assert_eq!(
+                client.read_datagram().await.as_deref(),
+                Some(b"and back".as_slice())
+            );
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One byte over the advertised budget is a typed error rather than a panic,
+    /// and the connection survives it.
+    #[test]
+    fn an_oversized_datagram_is_refused_and_the_connection_survives() {
+        let dir = scratch("datagram-large");
+        let runtime = compio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let (client, server) = pair(&dir).await;
+            let max = client.max_datagram_size().expect("budget");
+            let oversized = vec![0u8; max + 1];
+            match client.send_datagram(&oversized) {
+                Err(DatagramError::TooLarge { len, max: reported }) => {
+                    assert_eq!(len, max + 1);
+                    assert_eq!(reported, max);
+                }
+                other => panic!("expected TooLarge, got {other:?}"),
+            }
+            client
+                .send_datagram(b"still here")
+                .expect("a small datagram still goes");
+            assert_eq!(
+                server.read_datagram().await.as_deref(),
+                Some(b"still here".as_slice())
+            );
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A peer that does not advertise DATAGRAM is `Unsupported`, not a silent
+    /// drop: the transport parameter, not the TLS config, is what decides.
+    #[test]
+    fn a_peer_without_datagram_support_is_unsupported() {
+        let dir = scratch("datagram-unsupported");
+        let runtime = compio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let identity = Identity::load_or_create(&dir).expect("identity");
+            let client_identity = Identity::load_or_create_client(&dir.join("ui")).expect("client");
+            let trust = allow(&dir, client_identity.pin());
+            // The same server with DATAGRAM turned off: `None` advertises
+            // nothing, so the client is never told it may send a datagram.
+            let mut config = server_config(&identity, trust).expect("server config");
+            let mut transport = TransportConfig::default();
+            transport.datagram_receive_buffer_size(None);
+            config.transport_config(Arc::new(transport));
+            let endpoint = Endpoint::server("127.0.0.1:0", config).await.expect("bind");
+            let addr = endpoint.local_addr().expect("local addr").to_string();
+            let client = client_session(&addr, identity.pin(), &client_identity);
+            let accept = async {
+                establish(endpoint.wait_incoming().await.expect("incoming"), &identity)
+                    .await
+                    .expect("server")
+            };
+            let (client, _server) = join(client, accept).await;
+
+            assert_eq!(
+                client.max_datagram_size(),
+                None,
+                "the peer advertised nothing"
+            );
+            match client.send_datagram(b"anyone there") {
+                Err(DatagramError::Unsupported) => {}
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
         });
         let _ = std::fs::remove_dir_all(dir);
     }

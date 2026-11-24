@@ -112,6 +112,7 @@ pub struct Client {
     events: AsyncReceiver<ClientEvent>,
     pending: Pending,
     next_id: Cell<u64>,
+    datagrams: Option<quic::Datagrams>,
 }
 
 impl Client {
@@ -123,7 +124,7 @@ impl Client {
         app_version: &str,
     ) -> Result<(Self, Snapshot), ConnectError> {
         let stream = endpoint::connect(endpoint).await?;
-        Self::connect_over(stream, Self::hello(app_version)).await
+        Self::connect_over(stream, Self::hello(app_version), None).await
     }
 
     /// Connects over QUIC, checking the daemon's SPKI against `pin`.
@@ -133,14 +134,23 @@ impl Client {
     /// [`Pairing::pin`] on the first connection. `identity` is this client's
     /// key, which the daemon has in `peers.json` — or will, if this is the
     /// handshake that pairs it, in which case use [`Pairing`] instead.
+    ///
+    /// The connection's datagram channel survives this call: it is available
+    /// from [`Self::datagrams`] for the media lane.
     pub async fn connect_quic(
         endpoint: &str,
         pin: &str,
         identity: &quic::Identity,
         app_version: &str,
     ) -> Result<(Self, Snapshot), ConnectError> {
-        let stream = quic::connect(endpoint, pin, identity).await?.into_stream();
-        Self::connect_over(stream, Self::hello(app_version)).await
+        let session = quic::connect(endpoint, pin, identity).await?;
+        let datagrams = session.datagrams();
+        Self::connect_over(
+            session.into_stream(),
+            Self::hello(app_version),
+            Some(datagrams),
+        )
+        .await
     }
 
     fn hello(app_version: &str) -> ClientMessage {
@@ -157,6 +167,7 @@ impl Client {
     async fn connect_over<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         mut stream: S,
         first: ClientMessage,
+        datagrams: Option<quic::Datagrams>,
     ) -> Result<(Self, Snapshot), ConnectError> {
         write(&mut stream, &first).await?;
 
@@ -203,9 +214,20 @@ impl Client {
                 events: events_rx.to_async(),
                 pending,
                 next_id: Cell::new(0),
+                datagrams,
             },
             snapshot,
         ))
+    }
+
+    /// The datagram channel of a QUIC connection, or `None` on the pipe.
+    ///
+    /// The pipe is a byte stream: it has no datagram channel, and inventing one
+    /// would be a second framing to keep right. Media over the local carrier is
+    /// not designed yet.
+    #[must_use]
+    pub const fn datagrams(&self) -> Option<&quic::Datagrams> {
+        self.datagrams.as_ref()
     }
 
     /// The stream of `Snapshot`/`Update` events. Closes when the backend
@@ -308,6 +330,7 @@ impl Pairing {
     /// matches, and drops the connection when it does not.
     pub async fn confirm(self, name: &str) -> Result<(Client, Snapshot), ConnectError> {
         let sas = self.stream.sas().to_owned();
+        let datagrams = self.stream.datagrams();
         let stream = self.stream.into_stream();
         Client::connect_over(
             stream,
@@ -315,6 +338,7 @@ impl Pairing {
                 sas,
                 name: name.to_owned(),
             },
+            Some(datagrams),
         )
         .await
     }

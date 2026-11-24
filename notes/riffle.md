@@ -3,12 +3,13 @@
 Status: Part I is designed and the *lane control plane* is built — the
 per-connection state machine behind `StreamOpen`/`StreamUpdate`/`StreamClose`/
 `StreamSeek`, the playhead estimate and the `LaneView` rows. There is still no
-packet transport, no demuxer wiring and no GOP alignment. RTSP is gone — `play`,
-the RTSP listener and the RTP packetizers were removed — so there is no viewer
-path at all until that lands. Parts II and III are implemented, and so is the
-**QUIC carrier for the control plane**: self-signed certificates on both sides,
-a pin per key, mutual authentication against `peers.json` and the typed-code
-pairing that fills it. The ALPN is `riffle/1`.
+packet transport, no demuxer wiring and no GOP alignment: the carrier's datagram
+channel exists (below), but nothing fragments an access unit into it. RTSP is
+gone — `play`, the RTSP listener and the RTP packetizers were removed — so there
+is no viewer path at all until that lands. Parts II and III are implemented, and
+so is the **QUIC carrier for the control plane**: self-signed certificates on
+both sides, a pin per key, mutual authentication against `peers.json` and the
+typed-code pairing that fills it. The ALPN is `riffle/1`.
 It is one protocol: the RPC is the control plane (`Class::Control`) and media is
 the same framing with media classes, over a carrier that can lose datagrams.
 
@@ -39,6 +40,20 @@ together. That round trip exists only to satisfy RTSP.
 `compio-quic` 0.8.x (quinn-proto 0.11 + rustls 0.23) on the compio reactor,
 pinned. The pipe is not the second-class path — it is the fast one, and the only
 one that can hand over arena slots.
+
+The datagram channel is built on the QUIC carrier and unused by any packer yet:
+`quic::Datagrams` (`session.datagrams()`) sends, receives and reports the
+payload budget, and both endpoints advertise DATAGRAM in their
+`TransportConfig` (`max_datagram_frame_size` derived from a 256 KiB receive
+buffer, so 65535 on the wire). `max_size()` is quinn's per-path budget — the
+peer's parameter and the current MTU, minus the DATAGRAM frame header and the
+QUIC/IP overhead — 1162 bytes on loopback after a default handshake, so a
+fragmenter sizes from it rather than from a constant. `send` copies the payload
+because quinn frees it only after transmission; `TooLarge` carries the size and
+the budget, `Unsupported` means the peer never advertised DATAGRAM, `Closed`
+means the connection is gone. A QUIC `Client` keeps the same handle
+(`Client::datagrams()`), so the control stream and the media lane share one
+connection. The pipe has no datagram channel.
 
 Only elementary stream crosses either carrier. No MPEG-TS, no fMP4: containers
 exist on disk and inside the fetch path only. The demuxer is incremental and
@@ -679,7 +694,9 @@ loopback would let any local process impersonate a daemon.
 
 One QUIC connection per UI carries both planes: the control plane on a
 bidirectional stream, media as datagrams on the same connection. No second
-credential, no second listener.
+credential, no second listener. The datagram channel already works
+(`Session::send_datagram` / `read_datagram` / `max_datagram_size`); the lane
+that fills it does not.
 
 The carrier is built in `siphon_shared::riffle::quic`. The daemon's identity is
 one self-signed certificate and one key in the state directory
