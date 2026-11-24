@@ -12,6 +12,11 @@
 #[allow(dead_code)]
 pub mod aac;
 pub mod dvr;
+// The fMP4 demuxer has no consumer yet either, but its fixtures are the only
+// thing exercising it, so the allowance stops at the test build and a stale
+// accessor does not hide behind it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod fmp4;
 #[allow(dead_code)]
 pub mod h264;
 #[allow(dead_code)]

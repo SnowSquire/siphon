@@ -1,11 +1,10 @@
 # TS demux and access units
 
 Turning Twitch's containers into the elementary stream a sink consumes: access-unit
-boundaries, codec configuration, timestamps and seek points. Implemented for the TS
-source (H.264 + AAC) in `crates/daemon/src/rtsp/{ts,h264,aac}.rs`. This is not
-RTSP-specific — `media-transport.md` plans to reuse `ts.rs` and the H.264/AAC
-splitters for the UI media channel. fMP4 is design-only. RTP/RTCP, SDP
-and RTSP sessions are `notes/rtsp-output.md`.
+boundaries, codec configuration, timestamps and seek points. Two demuxers live in
+`crates/daemon/src/media/`: `ts.rs` for the MPEG-TS source (H.264 + AAC) and `fmp4.rs`
+for the fMP4 source (H.264 or H.265 + AAC), which is the only path H.265 can take.
+The elementary stream leaves through Riffle (`notes/riffle.md`).
 
 ## Access units
 
@@ -36,6 +35,13 @@ and RTSP sessions are `notes/rtsp-output.md`.
   demuxed bytes did not change.
 - AAC arrives as ADTS frames: strip the header, keep raw frames, capture the
   AudioSpecificConfig.
+- fMP4 needs no carry: a sample's bytes are contiguous in `mdat`, so a segment is fed
+  whole and nothing spans a call. `trun`/`tfhd`/`trex` defaults resolve each sample's
+  size, duration, flags and composition offset, video is rewritten from length prefixes
+  to the same Annex B start codes the TS path emits, and a segment that fails halfway
+  is rolled back out of the store. Keyframes are read from the bitstream — an IDR NAL
+  for H.264, any IRAP for H.265 — while `trun`/`sdtp` only supply the separate `sync`
+  bit.
 
 | source | demux | elementary stream |
 |---|---|---|
@@ -48,8 +54,8 @@ and RTSP sessions are `notes/rtsp-output.md`.
 ## Timestamps
 
 - TS: PES PTS/DTS are already 90 kHz.
-- fMP4: DTS from `tfdt` + `trun` durations, PTS = DTS + composition offsets,
-  scaled from the media timescale.
+- fMP4: DTS from `tfdt` + `trun` durations, PTS = DTS + composition offsets, in the
+  track's own media timescale (`Sample` carries counts, `Track::timescale` converts).
 - The per-track RTP base, SSRC and clock-to-NTP mapping live in the sink
   (`notes/rtsp-output.md`).
 

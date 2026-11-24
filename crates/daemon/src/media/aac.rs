@@ -112,6 +112,48 @@ pub fn parse_adts(frame: &[u8]) -> Option<AdtsFrame> {
     })
 }
 
+/// Parse an `AudioSpecificConfig`: the record `esds` carries in an fMP4 init
+/// segment, where ADTS would carry the same fields in every frame header.
+///
+/// Only the head of the record is read: object type, sampling frequency index
+/// and channel configuration. An explicit SBR/PS extension (object type 5 or
+/// 29) is reported at the extension's output rate, which is what a decoder
+/// produces; the underlying object type is not modelled, exactly as for the
+/// ADTS path. Returns `None` for a reserved frequency index, a layout that
+/// only a program config element describes, or a truncated record.
+#[must_use]
+pub fn parse_asc(asc: &[u8]) -> Option<AudioConfig> {
+    let first = u16::from(*asc.first()?);
+    let second = u16::from(*asc.get(1)?);
+
+    let object_type = first >> 3;
+    // An explicit SBR/PS extension leads with its own rate, which is what a
+    // decoder outputs; otherwise the base frequency index is the rate.
+    let frequency_index = if object_type == 5 || object_type == 29 {
+        (u16::from(*asc.get(2)?) >> 4) & 0x0F
+    } else {
+        ((first & 0x07) << 1) | (second >> 7)
+    };
+    if frequency_index > 12 {
+        return None;
+    }
+    let sample_rate = SAMPLE_RATES[usize::from(frequency_index)];
+
+    let channel_configuration = (second >> 3) & 0x0F;
+    let channels = match channel_configuration {
+        1..=6 => channel_configuration,
+        7 => 8,
+        // 0 means the layout comes from a PCE, which is not supported here.
+        _ => return None,
+    };
+
+    Some(AudioConfig {
+        sample_rate,
+        channels: u8::try_from(channels).ok()?,
+        asc: asc.to_vec(),
+    })
+}
+
 /// Packetize one raw AAC access unit with the AAC-hbr AU header.
 ///
 /// This is `writeAggregated` for a single access unit: a 16-bit
@@ -143,6 +185,28 @@ pub fn config_hex(asc: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_an_audio_specific_config() {
+        let config = parse_asc(&[0x11, 0x90]).expect("asc");
+        assert_eq!(config.sample_rate, 48_000);
+        assert_eq!(config.channels, 2);
+        assert_eq!(config.asc, [0x11, 0x90]);
+    }
+
+    /// Object type 5 is explicit SBR: the extension rate is the output rate.
+    #[test]
+    fn reads_the_extension_rate_of_an_sbr_record() {
+        let config = parse_asc(&[0x2B, 0x90, 0x30]).expect("asc");
+        assert_eq!(config.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn rejects_a_reserved_audio_specific_config() {
+        assert!(parse_asc(&[]).is_none());
+        // Frequency index 15 means the rate follows explicitly, which this does not read.
+        assert!(parse_asc(&[0x17, 0x90]).is_none());
+    }
 
     #[allow(clippy::cast_possible_truncation)] // the test header is 7 bits wide
     fn adts_header(
