@@ -69,6 +69,13 @@ monotonic for the life of the connection and **never reset**, so a seek needs no
 epoch field and "drop if `obj_id <= last_delivered`" survives one. `flags` is
 `supersede | keyframe | last_fragment`.
 
+The header carries no timestamp, so a media object's payload opens with one:
+`pts` then `dts`, two big-endian `i64`s in the track's own timescale (the one
+`StreamConfig` carries — 90 kHz for MPEG-TS, the `mdhd` timescale for fMP4).
+The 16 bytes count towards `total_len` and fragment like any other payload
+byte, so they arrive with the access unit they time and no extra field is paid
+for by control messages and blobs.
+
 ### Policy, not delivery classes
 
 Reliability and ordering are per object, not per connection.

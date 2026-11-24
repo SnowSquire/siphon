@@ -8,6 +8,12 @@
 //! `obj_id` is monotonic for the life of a connection and is never reset, so a
 //! seek needs no epoch field and "drop if `obj_id <= last_delivered`" survives
 //! one unchanged.
+//!
+//! A media object's payload opens with its own timing, because this header has
+//! no timestamp field: `pts` then `dts`, two big-endian `i64`s in the track's
+//! timescale (the one `StreamConfig` carries). Those 16 bytes are part of
+//! `total_len` and fragment like every other payload byte, so the receiver
+//! reads them from the reassembled object. `daemon::media::wire` writes them.
 
 use std::fmt;
 
@@ -97,6 +103,9 @@ impl Flags {
 }
 
 /// A decoded header plus a borrowed payload.
+///
+/// For [`Class::Video`] and [`Class::Audio`] the payload begins with the
+/// 16-byte timestamp prefix described in the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Object<'a> {
     pub class: Class,

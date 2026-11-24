@@ -1,0 +1,891 @@
+//! From a segment's bytes to the Riffle media objects.
+//!
+//! This is the seam the transport will sit on. A [`SegmentSource`] demuxes one
+//! HLS segment with whichever container it is — MPEG-TS through [`crate::media::ts`],
+//! fMP4 through [`crate::media::fmp4`] — and yields access units in file order;
+//! a [`Packer`] turns each one into the [`Object`]s the media lane ships. There
+//! is no socket, task or QUIC here: the carrier is a later task's job.
+//!
+//! # The payload prefix
+//!
+//! The object header (`riffle::object`) has no timestamp field. It is 18 bytes
+//! shared by control messages, blobs and media, and adding `pts`/`dts` to it
+//! would make every blob pay for two `i64`s only the media classes use. So a
+//! media object's payload opens with its timing instead: `pts` then `dts`,
+//! each a big-endian `i64`, in **the track's own timescale** — 90 kHz for
+//! MPEG-TS, the `mdhd` timescale for fMP4, which is the same number
+//! `StreamConfig` carries for that track. That is [`TIMESTAMP_PREFIX`] bytes.
+//!
+//! The prefix is part of `total_len`, so it fragments like any other payload
+//! byte and reassembly is the plain concatenation of the fragments in
+//! `frag_offset` order. The first fragment always holds the whole prefix
+//! because the budget ([`FRAGMENT_PAYLOAD`]) is far above 16; [`timestamps`]
+//! reads it back.
+//!
+//! # Inputs
+//!
+//! [`Container::detect`] says which demuxer a buffer needs: the MPEG-TS sync
+//! byte, or an ISO-BMFF box type at offset 4. fMP4 is not self-describing — its
+//! init segment carries the codec records and the sample-entry framing — so it
+//! has to be handed to [`SegmentSource::new`]/[`SegmentSource::open`]
+//! explicitly; a media segment without one is [`Error::MissingInit`], never
+//! guessed. The segment itself is validated before it is demuxed, so a
+//! truncated buffer is an [`Error`] rather than a silently partial yield.
+
+use siphon_shared::riffle::fragment_count;
+use siphon_shared::riffle::object::Class;
+use siphon_shared::riffle::object::DATAGRAM_HEADER;
+use siphon_shared::riffle::object::Flags;
+use siphon_shared::riffle::object::MAX_OBJECT;
+use siphon_shared::riffle::object::Object;
+
+use crate::media::fmp4;
+use crate::media::ts;
+
+/// Two big-endian `i64`s: `pts`, then `dts`, in the track's timescale. See the
+/// module docs.
+pub const TIMESTAMP_PREFIX: usize = 16;
+
+/// One candidate datagram, header and payload together.
+///
+/// QUIC's `max_datagram_frame_size` already accounts for the IP, UDP, QUIC and
+/// AEAD overhead, so this number is the *application* datagram and nothing
+/// above it is free. Sizing the payload at 1200 instead put 1218 bytes on the
+/// wire, which cannot fit a 1280-byte path once QUIC frames it.
+pub const DATAGRAM_BUDGET: usize = 1200;
+
+/// Payload bytes per datagram: the budget less the header.
+pub const FRAGMENT_PAYLOAD: usize = DATAGRAM_BUDGET - DATAGRAM_HEADER;
+
+/// The container a segment is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Container {
+    /// MPEG-TS: 188-byte packets starting with `0x47`.
+    Ts,
+    /// Fragmented ISO-BMFF: boxes, and a media segment that needs an init
+    /// segment first.
+    Fmp4,
+}
+
+/// The box types a media segment or init segment starts with.
+const BOX_TYPES: [&[u8]; 9] = [
+    b"ftyp", b"styp", b"moov", b"moof", b"mdat", b"sidx", b"free", b"emsg", b"skip",
+];
+
+impl Container {
+    /// Guess the container from the first bytes of a buffer.
+    ///
+    /// A box begins with a 32-bit size, so its first byte is `0x00` for every
+    /// box smaller than 16 MiB; `0x47` is the MPEG-TS sync byte and cannot be
+    /// the high byte of a real box. Otherwise the box type at offset 4 is
+    /// matched against the types a Twitch segment starts with.
+    #[must_use]
+    pub fn detect(bytes: &[u8]) -> Option<Self> {
+        if bytes.first() == Some(&ts::TS_SYNC) {
+            return Some(Self::Ts);
+        }
+        let kind = bytes.get(4..8)?;
+        BOX_TYPES.contains(&kind).then_some(Self::Fmp4)
+    }
+}
+
+/// Which media lane an access unit belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Track {
+    /// H.264/H.265 access units, Annex B.
+    Video,
+    /// Raw AAC frames, no ADTS.
+    Audio,
+}
+
+impl Track {
+    /// The object class this track's access units are shipped as.
+    #[must_use]
+    pub const fn class(self) -> Class {
+        match self {
+            Self::Video => Class::Video,
+            Self::Audio => Class::Audio,
+        }
+    }
+}
+
+/// One access unit, borrowed from the segment's sample store.
+#[derive(Clone, Copy, Debug)]
+pub struct AccessUnit<'a> {
+    /// Which lane it belongs to.
+    pub track: Track,
+    /// Presentation time, in the track's timescale.
+    pub pts: i64,
+    /// Decode time, in the track's timescale.
+    pub dts: i64,
+    /// A random access point, as the elementary stream says (an IDR for H.264,
+    /// any IRAP for H.265).
+    pub keyframe: bool,
+    /// The bytes to ship: Annex B for video, one raw AAC frame for audio.
+    pub data: &'a [u8],
+}
+
+/// Why a segment could not be turned into access units, or an access unit into
+/// objects.
+///
+/// Every variant comes from bytes off the network, so none of them panics.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// [`Container::detect`] matched neither container.
+    #[error("unknown segment container")]
+    UnknownContainer,
+    /// An fMP4 media segment was handed over without its init segment.
+    #[error("an fMP4 segment needs its init segment")]
+    MissingInit,
+    /// The buffer ends before the structure it declares.
+    #[error("truncated {0}")]
+    Truncated(&'static str),
+    /// The access unit is larger than one object may be ([`MAX_OBJECT`]).
+    #[error("access unit of {0} bytes is past the object ceiling")]
+    TooLarge(usize),
+    /// The fMP4 demuxer rejected the init or media segment.
+    #[error(transparent)]
+    Fmp4(#[from] fmp4::Error),
+}
+
+enum Inner {
+    Ts {
+        demuxer: ts::TsDemuxer,
+        store: ts::SampleStore,
+    },
+    Fmp4 {
+        demuxer: fmp4::Fmp4Demuxer,
+        store: fmp4::SampleStore,
+    },
+}
+
+/// One stream's demuxer, fed one segment at a time.
+///
+/// The demuxer carries state across segments (the MPEG-TS PMT and codec
+/// records, the fMP4 running decode time), so a source lives for the stream,
+/// not for a segment: [`SegmentSource::feed`] replaces the previous segment's
+/// access units.
+pub struct SegmentSource {
+    inner: Inner,
+}
+
+impl SegmentSource {
+    /// A source for `container`. `init` is the fMP4 init segment and is
+    /// required for [`Container::Fmp4`]; MPEG-TS needs nothing fed first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingInit`] when `container` is fMP4 and `init` is `None`,
+    /// and [`Error::Fmp4`] when the init segment does not parse.
+    pub fn new(container: Container, init: Option<&[u8]>) -> Result<Self, Error> {
+        let inner = match container {
+            Container::Ts => Inner::Ts {
+                demuxer: ts::TsDemuxer::new(),
+                store: ts::SampleStore::new(),
+            },
+            Container::Fmp4 => Inner::Fmp4 {
+                demuxer: fmp4::Fmp4Demuxer::new(fmp4::Init::parse(
+                    init.ok_or(Error::MissingInit)?,
+                )?),
+                store: fmp4::SampleStore::new(),
+            },
+        };
+        Ok(Self { inner })
+    }
+
+    /// Detect the container from `segment`, build the source and feed it.
+    ///
+    /// This is [`SegmentSource::new`] plus [`SegmentSource::feed`], for a
+    /// caller that has one complete segment in hand.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnknownContainer`], plus everything [`SegmentSource::new`] and
+    /// [`SegmentSource::feed`] return.
+    pub fn open(segment: &[u8], init: Option<&[u8]>) -> Result<Self, Error> {
+        let container = Container::detect(segment).ok_or(Error::UnknownContainer)?;
+        let mut source = Self::new(container, init)?;
+        source.feed(segment)?;
+        Ok(source)
+    }
+
+    /// The container this source was built for.
+    #[must_use]
+    pub const fn container(&self) -> Container {
+        match self.inner {
+            Inner::Ts { .. } => Container::Ts,
+            Inner::Fmp4 { .. } => Container::Fmp4,
+        }
+    }
+
+    /// Demux one whole segment, replacing the previous one's access units.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Truncated`] for an MPEG-TS segment that is empty or not a whole
+    /// number of 188-byte packets — the demuxer resyncs by design, so it would
+    /// otherwise drop the tail silently — and [`Error::Fmp4`] for a media
+    /// segment the fMP4 demuxer rejects. On any error the source holds no
+    /// access units: a segment is demuxed whole or not at all.
+    pub fn feed(&mut self, segment: &[u8]) -> Result<(), Error> {
+        match &mut self.inner {
+            Inner::Ts { demuxer, store } => {
+                // Start from an empty store: `finish_segment` closes everything
+                // this feed opened, and the next segment is independent.
+                demuxer.reset(store);
+                if segment.is_empty() || !segment.len().is_multiple_of(ts::TS_PACKET) {
+                    return Err(Error::Truncated("MPEG-TS segment"));
+                }
+                demuxer.feed(segment, store);
+                demuxer.finish_segment(store);
+            }
+            Inner::Fmp4 { demuxer, store } => {
+                store.clear();
+                demuxer.feed(segment, store)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The access units of the last fed segment, in demux order.
+    #[must_use]
+    pub const fn access_units(&self) -> AccessUnits<'_> {
+        let samples = match &self.inner {
+            Inner::Ts { store, .. } => Samples::Ts(store),
+            Inner::Fmp4 { store, .. } => Samples::Fmp4(store),
+        };
+        AccessUnits { samples, index: 0 }
+    }
+}
+
+enum Samples<'a> {
+    Ts(&'a ts::SampleStore),
+    Fmp4(&'a fmp4::SampleStore),
+}
+
+/// The access units of one fed segment.
+pub struct AccessUnits<'a> {
+    samples: Samples<'a>,
+    index: usize,
+}
+
+impl AccessUnits<'_> {
+    fn remaining(&self) -> usize {
+        let len = match &self.samples {
+            Samples::Ts(store) => store.samples().len(),
+            Samples::Fmp4(store) => store.samples().len(),
+        };
+        len.saturating_sub(self.index)
+    }
+}
+
+impl<'a> Iterator for AccessUnits<'a> {
+    type Item = AccessUnit<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &self.samples {
+            Samples::Ts(store) => {
+                let sample = *store.samples().get(self.index)?;
+                self.index += 1;
+                Some(AccessUnit {
+                    track: track(sample.is_video()),
+                    pts: sample.pts(),
+                    dts: sample.dts(),
+                    keyframe: sample.keyframe(),
+                    data: store.data(sample),
+                })
+            }
+            Samples::Fmp4(store) => {
+                let sample = *store.samples().get(self.index)?;
+                self.index += 1;
+                Some(AccessUnit {
+                    track: track(sample.is_video()),
+                    pts: sample.pts(),
+                    dts: sample.dts(),
+                    keyframe: sample.keyframe(),
+                    data: store.data(sample),
+                })
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for AccessUnits<'_> {}
+
+const fn track(video: bool) -> Track {
+    if video { Track::Video } else { Track::Audio }
+}
+
+/// The `pts` and `dts` at the front of a media object's payload.
+///
+/// `None` means fewer than [`TIMESTAMP_PREFIX`] bytes were passed, which only a
+/// fragment other than the first can be.
+#[must_use]
+pub fn timestamps(payload: &[u8]) -> Option<(i64, i64)> {
+    let pts = payload.get(..8)?;
+    let dts = payload.get(8..TIMESTAMP_PREFIX)?;
+    Some((
+        i64::from_be_bytes(pts.try_into().ok()?),
+        i64::from_be_bytes(dts.try_into().ok()?),
+    ))
+}
+
+/// One lane's object ids.
+///
+/// `obj_id` is monotonic for the life of a Riffle connection and never reset
+/// (`notes/riffle.md`, "One header"), so the packer that fills one lane owns
+/// the counter. A connection with several lanes either shares one packer or
+/// seeds the others with [`Packer::from_id`]/[`Packer::next_id`].
+#[derive(Debug, Default)]
+pub struct Packer {
+    next_id: u64,
+}
+
+impl Packer {
+    /// A packer whose first object is id 0.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { next_id: 0 }
+    }
+
+    /// A packer that continues at `next_id`.
+    #[must_use]
+    pub const fn from_id(next_id: u64) -> Self {
+        Self { next_id }
+    }
+
+    /// The id the next object will carry.
+    #[must_use]
+    pub const fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Turn one access unit into its fragments, written into `scratch`.
+    ///
+    /// The payload — the timestamp prefix followed by the access unit — is
+    /// copied once into the caller's reusable buffer, and the returned
+    /// [`Fragments`] borrows it, so nothing is allocated per access unit once
+    /// `scratch` has grown. Video sets [`Flags::KEYFRAME`] where the demuxer
+    /// said so; the last fragment is marked [`Flags::LAST_FRAGMENT`] as well as
+    /// being derivable from `total_len`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] when the prefixed access unit does not fit
+    /// [`MAX_OBJECT`]; no id is consumed in that case.
+    pub fn pack<'a>(
+        &mut self,
+        unit: AccessUnit<'_>,
+        scratch: &'a mut Vec<u8>,
+    ) -> Result<Fragments<'a>, Error> {
+        let total = TIMESTAMP_PREFIX
+            .checked_add(unit.data.len())
+            .ok_or(Error::TooLarge(unit.data.len()))?;
+        let total_len = u32::try_from(total).map_err(|_| Error::TooLarge(total))?;
+        if total_len > MAX_OBJECT {
+            return Err(Error::TooLarge(total));
+        }
+
+        scratch.clear();
+        scratch.reserve(total);
+        scratch.extend_from_slice(&unit.pts.to_be_bytes());
+        scratch.extend_from_slice(&unit.dts.to_be_bytes());
+        scratch.extend_from_slice(unit.data);
+
+        let obj_id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+
+        Ok(Fragments {
+            class: unit.track.class(),
+            flags: if unit.track == Track::Video && unit.keyframe {
+                Flags::KEYFRAME
+            } else {
+                Flags::NONE
+            },
+            obj_id,
+            total_len,
+            remaining: fragment_count(total_len, FRAGMENT_PAYLOAD),
+            frag_offset: 0,
+            payload: scratch,
+        })
+    }
+}
+
+/// The fragments of one access unit, in wire order.
+pub struct Fragments<'a> {
+    class: Class,
+    flags: Flags,
+    obj_id: u64,
+    total_len: u32,
+    remaining: u32,
+    frag_offset: u32,
+    payload: &'a [u8],
+}
+
+impl<'a> Iterator for Fragments<'a> {
+    type Item = Object<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        // `total_len` is past the prefix and inside `MAX_OBJECT`, so the
+        // offset and the fragment length both fit their header fields.
+        let start = usize::try_from(self.frag_offset).ok()?;
+        let end = start.checked_add(FRAGMENT_PAYLOAD)?.min(self.payload.len());
+        let payload = self.payload.get(start..end)?;
+        let len = u32::try_from(payload.len()).ok()?;
+
+        let mut flags = self.flags;
+        if end == self.payload.len() {
+            flags = flags.union(Flags::LAST_FRAGMENT);
+        }
+
+        let object = Object {
+            class: self.class,
+            flags,
+            obj_id: self.obj_id,
+            total_len: self.total_len,
+            frag_offset: self.frag_offset,
+            payload,
+        };
+        self.frag_offset = self.frag_offset.saturating_add(len);
+        self.remaining -= 1;
+        Some(object)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Fragments<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    use siphon_shared::riffle::object::DATAGRAM_HEADER;
+
+    use super::*;
+
+    /// The fixtures are gitignored, so a checkout without `captures/` skips.
+    fn fixture(relative: &str) -> Option<PathBuf> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../captures")
+            .join(relative);
+        path.exists().then_some(path)
+    }
+
+    fn read(path: &Path) -> Vec<u8> {
+        std::fs::read(path).expect("fixture reads")
+    }
+
+    #[derive(Default)]
+    struct Report {
+        access_units: usize,
+        audio: usize,
+        audio_fragments: usize,
+        fragments: usize,
+        keyframes: usize,
+        /// Largest access unit in bytes, without the prefix.
+        largest: usize,
+        largest_fragments: u32,
+    }
+
+    /// Pack every access unit of a fed segment and verify each object end to
+    /// end: class, flags, ordering, budget, datagram round trip and reassembly.
+    fn pack_all(source: &SegmentSource, packer: &mut Packer, scratch: &mut Vec<u8>) -> Report {
+        let mut report = Report::default();
+        let mut expected = Vec::new();
+        let mut reassembled = Vec::new();
+        let mut datagram = [0u8; DATAGRAM_BUDGET];
+        let mut last_au_id: Option<u64> = None;
+
+        for unit in source.access_units() {
+            report.access_units += 1;
+            let keyframe = unit.track == Track::Video && unit.keyframe;
+            report.keyframes += usize::from(keyframe);
+            if unit.track == Track::Audio {
+                report.audio += 1;
+            }
+
+            expected.clear();
+            expected.extend_from_slice(&unit.pts.to_be_bytes());
+            expected.extend_from_slice(&unit.dts.to_be_bytes());
+            expected.extend_from_slice(unit.data);
+            let total_len = u32::try_from(expected.len()).expect("an access unit fits an object");
+
+            reassembled.clear();
+            let mut emitted = 0u32;
+            let mut au_id = None;
+            for object in packer.pack(unit, scratch).expect("the access unit packs") {
+                emitted += 1;
+                // Every fragment of one access unit shares its object id, and
+                // the next access unit's id is above it.
+                if let Some(id) = au_id {
+                    assert_eq!(object.obj_id, id, "one id per access unit");
+                } else {
+                    if let Some(previous) = last_au_id {
+                        assert!(
+                            object.obj_id > previous,
+                            "obj_id must strictly increase across the segment"
+                        );
+                    }
+                    au_id = Some(object.obj_id);
+                }
+                assert_eq!(object.class, unit.track.class());
+                assert_eq!(
+                    object.flags.contains(Flags::KEYFRAME),
+                    keyframe,
+                    "the keyframe bit is exactly what the demuxer said"
+                );
+                assert_eq!(object.total_len, total_len);
+                assert_eq!(
+                    usize::try_from(object.frag_offset).unwrap(),
+                    reassembled.len(),
+                    "fragments arrive in order and cover the object"
+                );
+                assert_ne!(object.payload.len(), 0, "a fragment carries bytes");
+                assert!(
+                    object.payload.len() <= FRAGMENT_PAYLOAD,
+                    "a fragment is {} bytes, past the budget",
+                    object.payload.len()
+                );
+                assert_eq!(
+                    object.flags.contains(Flags::LAST_FRAGMENT),
+                    object.is_last(),
+                    "the last fragment is the one that ends the object"
+                );
+                if object.frag_offset == 0 {
+                    assert_eq!(
+                        timestamps(object.payload),
+                        Some((unit.pts, unit.dts)),
+                        "fragment 0 carries the whole prefix"
+                    );
+                }
+
+                let written = object
+                    .encode_datagram(&mut datagram)
+                    .expect("a fragment fits a datagram buffer");
+                assert_eq!(written, DATAGRAM_HEADER + object.payload.len());
+                assert!(
+                    written <= DATAGRAM_BUDGET,
+                    "a datagram is {written} bytes, past the {DATAGRAM_BUDGET} byte budget"
+                );
+                let decoded =
+                    Object::decode_datagram(&datagram[..written]).expect("the datagram decodes");
+                assert_eq!(decoded, object, "the datagram round trip is lossless");
+
+                reassembled.extend_from_slice(object.payload);
+                report.fragments += 1;
+                if unit.track == Track::Audio {
+                    report.audio_fragments += 1;
+                }
+            }
+            last_au_id = au_id;
+            assert!(
+                last_au_id.is_some(),
+                "an access unit is at least one fragment"
+            );
+
+            assert_eq!(
+                emitted,
+                fragment_count(total_len, FRAGMENT_PAYLOAD),
+                "the packer agrees with fragment_count exactly"
+            );
+            assert_eq!(
+                reassembled, expected,
+                "the fragments reassemble to the prefixed access unit"
+            );
+            assert_eq!(usize::try_from(total_len).unwrap(), reassembled.len());
+
+            if unit.data.len() > report.largest {
+                report.largest = unit.data.len();
+                report.largest_fragments = emitted;
+            }
+        }
+
+        report
+    }
+
+    fn print_report(label: &str, report: &Report) {
+        println!(
+            "{label}: {} access units ({} audio), {} fragments, {} keyframes, \
+             largest AU {} B in {} fragments",
+            report.access_units,
+            report.audio,
+            report.fragments,
+            report.keyframes,
+            report.largest,
+            report.largest_fragments
+        );
+    }
+
+    #[test]
+    fn detects_the_container_from_the_bytes() {
+        assert_eq!(Container::detect(&[0x47; 376]), Some(Container::Ts));
+        assert_eq!(
+            Container::detect(&[0, 0, 0, 16, b'm', b'o', b'o', b'f']),
+            Some(Container::Fmp4)
+        );
+        assert_eq!(
+            Container::detect(&[0, 0, 1, 0x88, b'e', b'm', b's', b'g']),
+            Some(Container::Fmp4)
+        );
+        assert_eq!(Container::detect(&[]), None);
+        assert_eq!(Container::detect(b"not a segment"), None);
+    }
+
+    #[test]
+    fn an_access_unit_packs_with_its_timestamps() {
+        let unit = AccessUnit {
+            track: Track::Video,
+            pts: 90_001,
+            dts: 89_999,
+            keyframe: true,
+            data: &[0, 0, 0, 1, 0x65, 1, 2, 3],
+        };
+        let mut packer = Packer::new();
+        let mut scratch = Vec::new();
+
+        let objects: Vec<_> = packer.pack(unit, &mut scratch).unwrap().collect();
+        assert_eq!(objects.len(), 1);
+        let object = objects[0];
+        assert_eq!(object.class, Class::Video);
+        assert!(object.flags.contains(Flags::KEYFRAME));
+        assert!(object.flags.contains(Flags::LAST_FRAGMENT));
+        assert_eq!(
+            object.total_len,
+            u32::try_from(TIMESTAMP_PREFIX).unwrap() + 8
+        );
+        assert_eq!(object.frag_offset, 0);
+        assert_eq!(timestamps(object.payload), Some((90_001, 89_999)));
+        assert_eq!(&object.payload[TIMESTAMP_PREFIX..], unit.data);
+        assert_eq!(packer.next_id(), 1);
+
+        // Audio never carries the video keyframe bit, even if a source sets it.
+        let audio = AccessUnit {
+            track: Track::Audio,
+            pts: 1,
+            dts: 1,
+            keyframe: true,
+            data: &[0xAA; 400],
+        };
+        let objects: Vec<_> = packer.pack(audio, &mut scratch).unwrap().collect();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].class, Class::Audio);
+        assert!(!objects[0].flags.contains(Flags::KEYFRAME));
+        assert_eq!(objects[0].obj_id, 1, "the lane's ids continue");
+    }
+
+    #[test]
+    fn a_large_access_unit_fragments_to_the_budget() {
+        let data = vec![0xAB; 3000];
+        let unit = AccessUnit {
+            track: Track::Video,
+            pts: 1,
+            dts: 2,
+            keyframe: true,
+            data: &data,
+        };
+        let mut packer = Packer::new();
+        let mut scratch = Vec::new();
+        let objects: Vec<_> = packer.pack(unit, &mut scratch).unwrap().collect();
+
+        let total_len = u32::try_from(TIMESTAMP_PREFIX + data.len()).unwrap();
+        assert_eq!(fragment_count(total_len, FRAGMENT_PAYLOAD), 3);
+        assert_eq!(objects.len(), 3);
+        assert_eq!(objects[0].frag_offset, 0);
+        assert_eq!(objects[0].payload.len(), FRAGMENT_PAYLOAD);
+        assert_eq!(
+            objects[1].frag_offset,
+            u32::try_from(FRAGMENT_PAYLOAD).unwrap()
+        );
+        assert_eq!(objects[1].payload.len(), FRAGMENT_PAYLOAD);
+        assert_eq!(
+            objects[2].frag_offset,
+            u32::try_from(2 * FRAGMENT_PAYLOAD).unwrap()
+        );
+        assert_eq!(
+            objects[2].payload.len(),
+            usize::try_from(total_len).unwrap() - 2 * FRAGMENT_PAYLOAD
+        );
+        assert!(!objects[0].is_last());
+        assert!(!objects[1].is_last());
+        assert!(objects[2].is_last());
+
+        let mut joined = Vec::new();
+        for object in &objects {
+            assert_eq!(object.obj_id, 0);
+            assert_eq!(object.total_len, total_len);
+            joined.extend_from_slice(object.payload);
+        }
+        assert_eq!(joined.len(), usize::try_from(total_len).unwrap());
+        assert_eq!(&joined[TIMESTAMP_PREFIX..], &data[..]);
+    }
+
+    #[test]
+    fn an_access_unit_past_the_object_ceiling_is_refused() {
+        let data = vec![0u8; usize::try_from(MAX_OBJECT).unwrap()];
+        let unit = AccessUnit {
+            track: Track::Video,
+            pts: 0,
+            dts: 0,
+            keyframe: true,
+            data: &data,
+        };
+        let mut packer = Packer::from_id(7);
+        let mut scratch = Vec::new();
+        assert!(matches!(
+            packer.pack(unit, &mut scratch),
+            Err(Error::TooLarge(_))
+        ));
+        assert_eq!(packer.next_id(), 7, "a refused unit consumes no id");
+    }
+
+    #[test]
+    fn a_truncated_ts_segment_is_an_error() {
+        let mut source = SegmentSource::new(Container::Ts, None).unwrap();
+        // A whole number of packets minus a byte.
+        assert!(matches!(
+            source.feed(&[0x47; ts::TS_PACKET - 1]),
+            Err(Error::Truncated("MPEG-TS segment"))
+        ));
+        assert!(matches!(
+            source.feed(&[]),
+            Err(Error::Truncated("MPEG-TS segment"))
+        ));
+        assert_eq!(source.access_units().len(), 0);
+    }
+
+    #[test]
+    fn packs_the_ts_fixture() {
+        let Some(path) = fixture("servermock/live/000000.ts") else {
+            println!("captures/ is absent; skipping the TS packing test");
+            return;
+        };
+        let bytes = read(&path);
+        assert_eq!(Container::detect(&bytes), Some(Container::Ts));
+
+        let source = SegmentSource::open(&bytes, None).expect("the TS segment demuxes");
+        assert_eq!(source.container(), Container::Ts);
+        let mut packer = Packer::new();
+        let mut scratch = Vec::new();
+        let report = pack_all(&source, &mut packer, &mut scratch);
+        print_report("servermock/live/000000.ts", &report);
+
+        assert!(report.access_units > 0);
+        assert!(report.audio > 0);
+        assert!(report.keyframes > 0, "the segment starts with an IDR");
+        assert_eq!(
+            report.audio_fragments, report.audio,
+            "one AAC frame is one fragment"
+        );
+        assert!(
+            report.largest > FRAGMENT_PAYLOAD,
+            "a video keyframe has to fragment"
+        );
+        assert!(report.largest_fragments > 1);
+        assert_eq!(
+            packer.next_id(),
+            u64::try_from(report.access_units).unwrap(),
+            "one id per access unit"
+        );
+    }
+
+    #[test]
+    fn packs_the_h264_fmp4_fixture() {
+        let Some(dir) = fixture("servermock-fmp4/landscape") else {
+            println!("captures/ is absent; skipping the H.264 fMP4 packing test");
+            return;
+        };
+        let init = read(&dir.join("init.mp4"));
+        let segment = read(&dir.join("live/000000.m4s"));
+        assert_eq!(Container::detect(&segment), Some(Container::Fmp4));
+
+        // The init segment is not optional state the source guesses at.
+        assert!(matches!(
+            SegmentSource::open(&segment, None),
+            Err(Error::MissingInit)
+        ));
+
+        let source = SegmentSource::open(&segment, Some(&init)).expect("the fMP4 segment demuxes");
+        assert_eq!(source.container(), Container::Fmp4);
+        let mut packer = Packer::new();
+        let mut scratch = Vec::new();
+        let report = pack_all(&source, &mut packer, &mut scratch);
+        print_report("servermock-fmp4/landscape/live/000000.m4s", &report);
+
+        assert!(report.access_units > 0);
+        assert!(report.audio > 0);
+        assert!(report.keyframes > 0);
+        assert_eq!(
+            report.audio_fragments, report.audio,
+            "one AAC frame is one fragment"
+        );
+        assert!(
+            report.largest > FRAGMENT_PAYLOAD,
+            "a video keyframe has to fragment"
+        );
+        assert!(report.largest_fragments > 1);
+    }
+
+    #[test]
+    fn packs_the_h265_fixture() {
+        let Some(dir) =
+            fixture("ozeniken-30s/ozeniken-portrait-dvr/tmp/ozeniken-portrait-dvr/0____")
+        else {
+            println!("captures/ is absent; skipping the H.265 fMP4 packing test");
+            return;
+        };
+        let init = read(&dir.join("_init.mp4"));
+        let segment = read(&dir.join("1795300590544.m4s"));
+        assert_eq!(Container::detect(&segment), Some(Container::Fmp4));
+
+        let source = SegmentSource::open(&segment, Some(&init)).expect("the fMP4 segment demuxes");
+        let mut packer = Packer::new();
+        let mut scratch = Vec::new();
+        let report = pack_all(&source, &mut packer, &mut scratch);
+        print_report("ozeniken/1795300590544.m4s", &report);
+
+        assert!(report.access_units > 0);
+        assert!(report.keyframes > 0, "an IRAP has to open the segment");
+        // This source is low-bitrate portrait video (a ~10 s, 600-frame
+        // segment at under 100 KB), so even its IRAPs are below the 1200-byte
+        // budget: every access unit is one fragment. Fragmentation itself is
+        // covered by the other two fixtures and by the synthetic unit test.
+        assert_eq!(
+            report.fragments, report.access_units,
+            "every access unit here fits one fragment"
+        );
+    }
+
+    #[test]
+    fn a_truncated_fmp4_segment_is_an_error() {
+        let Some(dir) = fixture("servermock-fmp4/landscape") else {
+            println!("captures/ is absent; skipping the truncated-segment test");
+            return;
+        };
+        let init = read(&dir.join("init.mp4"));
+        let segment = read(&dir.join("live/000000.m4s"));
+        let truncated = segment
+            .get(..1024)
+            .expect("the fixture is longer than 1 KiB");
+
+        let mut source = SegmentSource::new(Container::Fmp4, Some(&init)).unwrap();
+        assert!(source.feed(truncated).is_err());
+        assert_eq!(
+            source.access_units().len(),
+            0,
+            "a failed segment yields nothing"
+        );
+    }
+}

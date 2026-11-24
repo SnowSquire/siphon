@@ -10,8 +10,8 @@ use crate::media::aac::AudioConfig;
 use crate::media::h264;
 use crate::media::h264::H264Config;
 
-const TS_PACKET: usize = 188;
-const TS_SYNC: u8 = 0x47;
+pub const TS_PACKET: usize = 188;
+pub const TS_SYNC: u8 = 0x47;
 const PID_PAT: u16 = 0x0000;
 const STREAM_TYPE_H264: u8 = 0x1B;
 const STREAM_TYPE_AAC: u8 = 0x0F;
