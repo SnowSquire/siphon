@@ -200,7 +200,7 @@ target.
 
 The dependency layers are packages of their own — `.#windows-deps`,
 `.#linux-deps` — so CI can cache exactly them and nothing that changes per
-commit. `release.yml` is two jobs:
+commit. `build.yml` is two jobs:
 
 1. `deps` builds `.#windows-deps` under `nix-deps-<CACHE_VERSION>-<the hash in
    that derivation's store path>`. Keying on the derivation rather than on
@@ -214,12 +214,12 @@ commit. `release.yml` is two jobs:
    commit, so they are never cached; a run pays two crate compiles and a link.
 
 `clippy.yml`'s Windows job builds the same `.#windows-deps` and *saves* it under
-that key, so a lint run warms the release cache: the release's `deps` job then
-restores instead of compiling. `release.yml` builds `main` on any push that
+that key, so a lint run warms the build cache: the build's `deps` job then
+restores instead of compiling. `build.yml` builds `main` on any push that
 touches `crates/`, the manifests, `nix/` or `installer/`, and uploads the three
 artifacts; a `vX.Y.Z` tag publishes a draft release instead, through
-`release-tag.yml` (a tag has no changed files, so it could not satisfy a `paths`
-filter; the tag trigger lives in its own file that calls `release.yml`). There
+`release.yml` (a tag has no changed files, so it could not satisfy a `paths`
+filter; the tag trigger lives in its own file that calls `build.yml`). There
 is no nightly — a successful `main` push is it.
 
 Both entries are capped at `gc-max-store-size-linux: 8G`: GitHub's cache budget

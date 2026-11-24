@@ -141,8 +141,8 @@ crate, so the daemon's file is `siphon_daemon.pdb`, not `siphon-daemon.pdb`.
 
 ## Release
 
-`.github/workflows/release.yml` runs on a `vX.Y.Z` tag and refuses a tag that
-does not equal the workspace version. Two jobs, both just Nix:
+`.github/workflows/release.yml` runs on a `vX.Y.Z` tag, calls `build.yml`, and
+refuses a tag that does not equal the workspace version. Two jobs, both just Nix:
 
 1. `cachix/install-nix-action` puts Nix on the runner; nothing else is
    installed — no compiler, no xwin, no meson.

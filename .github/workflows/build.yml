@@ -1,0 +1,230 @@
+name: build
+
+# Builds main on every push that can change the payload, and uploads the setup,
+# the portable zip and the symbols zip as workflow artifacts. A vX.Y.Z tag
+# (which must match the workspace version, so a release cannot ship binaries
+# that do not match its source) publishes a draft release instead; that trigger
+# lives in `release.yml`, because a path filter on the branch push would
+# also have to match a tag, and a tag has no changed files to match against.
+# Manual dispatch builds any branch, tag or commit and uploads artifacts only.
+# There is no nightly: a successful main push is the nightly.
+# Nothing runs on pull requests. GitHub adds the source archives itself; the
+# assets below are the setup, the portable zip and the symbols zip.
+#
+# Everything is built by the flake: `nix/sources.nix` pins the MSVC CRT/SDK,
+# shaderc and libplacebo, `nix/msvc.nix` owns the cross toolchain, and
+# `nix/windows-installer.nix` packages the payload. The runner installs no
+# compiler of its own, so the release and `nix build .#windows-installer` on a
+# dev box produce the same bytes.
+#
+# The build is split across two jobs so the store cache holds something stable.
+# `deps` builds `.#windows-deps` — every dependency crate — and caches it under
+# a key made of the lockfile and the flake pins; the layer only changes on a
+# dependency or toolchain bump. `windows` restores that entry, reads only
+# (`save: false`), and compiles the two binaries plus the installer, which
+# change on every commit and are therefore never cached.
+on:
+  push:
+    branches: ["main"]
+    # Only what can change the payload. A note, a README or an unrelated
+    # workflow no longer starts a nine-minute build.
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "nix/**"
+      - "flake.nix"
+      - "flake.lock"
+      - "installer/**"
+      - ".github/workflows/build.yml"
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA, branch or tag to build (blank = the selected ref)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.commit || github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Bump to invalidate both cache entries without touching the tree.
+  CACHE_VERSION: v1
+
+jobs:
+  deps:
+    name: Windows dependency layer
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # The entry holds the dependency layer plus everything it needed to be
+      # built: the MSVC CRT/SDK, the rust toolchain, the vendored crates and
+      # every compiled dependency. The key is `.#windows-deps`'s own derivation
+      # hash, so it is reused until the dependency set, a flake pin or the msvc
+      # environment changes -- and a release bump does not touch it.
+      - name: dependency layer key
+        id: deps
+        # The layer's own derivation names exactly the inputs that matter: the
+        # dependency set, the toolchain and the cross environment. Hashing the
+        # lockfile instead would also hash the workspace version, which
+        # `depsSrc` deliberately keeps out of the layer.
+        run: echo "drv=$(nix eval --raw .#windows-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ steps.deps.outputs.drv }}
+          restore-prefixes-first-match: |
+            nix-deps-${{ env.CACHE_VERSION }}-
+          gc-max-store-size-linux: 8G
+          purge: true
+          purge-prefixes: nix-deps-
+          purge-last-accessed: P30D
+
+      - name: build the dependency layer
+        run: nix build .#windows-deps
+
+  windows:
+    name: Windows x64 installer, portable zip and symbols
+    needs: deps
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          # Full history so a manual run can name a short SHA as well as a
+          # branch or tag. `self.rev` also comes from the checkout, so the
+          # binaries embed the commit they were built from.
+          fetch-depth: 0
+
+      - name: resolve the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          # A tag still has to be vX.Y.Z and agree with the tree. A push to a
+          # branch and a manual build are allowed to name any commit, so only
+          # their Cargo.toml counts.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::release tags must be vX.Y.Z, got $tag"
+              exit 1
+            fi
+            if [[ "$tag" != "v$version" ]]; then
+              echo "::error::$tag does not match Cargo.toml's version $version"
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Same key as the `deps` job: this restores the dependency layer and
+      # saves nothing, so the entry stays small and stable.
+      - name: dependency layer key
+        id: deps
+        # The layer's own derivation names exactly the inputs that matter: the
+        # dependency set, the toolchain and the cross environment. Hashing the
+        # lockfile instead would also hash the workspace version, which
+        # `depsSrc` deliberately keeps out of the layer.
+        run: echo "drv=$(nix eval --raw .#windows-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-deps-${{ env.CACHE_VERSION }}-${{ steps.deps.outputs.drv }}
+          restore-prefixes-first-match: |
+            nix-deps-${{ env.CACHE_VERSION }}-
+          save: false
+
+      - name: build the artifacts
+        run: |
+          set -euo pipefail
+          # A tag ships the release names the updater expects; anything else
+          # carries the commit, so two builds of one version can be told apart.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            nix build .#windows-installer --print-out-paths
+          else
+            nix build .#windows-installer-sha --print-out-paths
+          fi
+
+      - name: publish
+        # `act` sets ACT=true for local runs; there is no token there and no
+        # release to write. Only a tag publishes: a branch push uploads
+        # artifacts below instead, and `github.ref_name` on main would
+        # otherwise name a release "main".
+        if: ${{ !env.ACT && startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: true
+          fail_on_unmatched_files: true
+          body: |
+            **Installer (recommended):** `siphon-${{ steps.version.outputs.version }}-x64-setup.exe`
+            installs for the current user only, with an uninstaller and a Start
+            menu entry, and is what the in-app updater downloads.
+
+            **Portable:** `siphon-${{ steps.version.outputs.version }}-x64-portable.zip`
+            extracts to a `siphon-${{ steps.version.outputs.version }}/` folder;
+            run `siphon.exe` from it. No install, no updater.
+
+            **Symbols:** `siphon-${{ steps.version.outputs.version }}-x64-symbols.zip`
+            holds the release PDBs for both executables. Point a debugger's
+            symbol path at the extracted folder to resolve a minidump.
+
+            The installer and the portable build need the Microsoft Visual C++
+            2015-2022 Redistributable (x64); the installer adds it when it is
+            missing, the portable zip does not.
+          files: |
+            result/*-setup.exe
+            result/*-portable.zip
+            result/*-symbols.zip
+
+      # v7 can upload one file unzipped: each download is the setup, the
+      # portable zip or the symbols zip itself, not a wrapper artifact.
+      - name: upload the installer
+        if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: result/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
+
+      - name: upload the portable zip
+        if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: result/*-portable.zip
+          if-no-files-found: error
+          retention-days: 14
+          archive: false
+
+      - name: upload the symbols
+        if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: result/*-symbols.zip
+          if-no-files-found: error
+          retention-days: 14
+          archive: false

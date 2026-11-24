@@ -29,7 +29,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep in sync with release.yml: the Windows lint restores that job's entry.
+  # Keep in sync with build.yml: the Windows lint restores that job's entry.
   CACHE_VERSION: v1
 
 jobs:
@@ -77,7 +77,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # Restores the release's `deps` entry and saves nothing: the Windows
+      # Restores the build's `deps` entry and saves nothing: the Windows
       # dependency layer is the same derivation, so a second copy under a
       # `nix-clippy-windows-` key would only spend the repository cache budget
       # twice. The lint artifacts on top are a workspace compile, which is
@@ -91,9 +91,9 @@ jobs:
         run: echo "drv=$(nix eval --raw .#windows-deps.drvPath | sed 's|/nix/store/||; s|-.*||')" >> "$GITHUB_OUTPUT"
 
       # Saving this entry is the point of the shared key: the Windows job builds
-      # `.#windows-deps` anyway, so the release workflow's `deps` job restores
+      # `.#windows-deps` anyway, so the build workflow's `deps` job restores
       # what this already compiled instead of building it a second time. The
-      # Windows job of the release restores it read-only; the content is the
+      # Windows job of the build restores it read-only; the content is the
       # same derivation, so whichever run writes first is the one that counts.
       - uses: nix-community/cache-nix-action@v7
         with:
