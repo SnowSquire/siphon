@@ -21,7 +21,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering;
 
-use eros::Context as _;
 use windows_sys::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HWND;
@@ -57,7 +56,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
 use windows_sys::Win32::UI::WindowsAndMessaging::ICON_BIG;
 use windows_sys::Win32::UI::WindowsAndMessaging::ICON_SMALL;
 use windows_sys::Win32::UI::WindowsAndMessaging::LR_DEFAULTCOLOR;
-use windows_sys::Win32::UI::WindowsAndMessaging::LookupIconIdFromDirectoryEx;
 use windows_sys::Win32::UI::WindowsAndMessaging::MF_STRING;
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows_sys::Win32::UI::WindowsAndMessaging::RegisterClassW;
@@ -94,9 +92,17 @@ pub enum TrayAction {
 #[allow(dead_code)]
 pub static ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
 
-/// Bundled `.ico`; the shell picks its preferred image through the lookup
-/// call in `load_icon`.
+/// Bundled `.ico`; the directory inside it names every image and its size.
 static ICON_ICO: &[u8] = include_bytes!("../icons/icon.ico");
+
+/// Header of an `.ico`: reserved, type, image count.
+const ICONDIR_SIZE: usize = 6;
+/// One `.ico` directory entry. It is two bytes longer than the entry of a
+/// *resource group* directory, which names images by resource id instead.
+const ICONDIRENTRY_SIZE: usize = 16;
+/// The size the notification area asks for on a normal display; the shell
+/// scales it down for the tray.
+const TRAY_ICON: i32 = 32;
 
 const TRAY_ID: u32 = 1;
 /// Callback message the shell posts to the message window on tray input.
@@ -234,74 +240,73 @@ fn write_tip(tip: &mut [u16; 128], text: &str) {
     tip[..len].copy_from_slice(&encoded[..len]);
 }
 
-/// Validates the `.ico` directory so offsets read below stay in bounds.
-fn valid_ico(data: &[u8]) -> bool {
-    const ICONDIR_SIZE: usize = 6;
-    const ICONDIRENTRY_SIZE: usize = 16;
-    if data.len() < ICONDIR_SIZE || data[0..2] != [0, 0] || data[2..4] != [1, 0] {
-        return false;
+/// The bundled `.ico` image closest to `cx` by `cy`, as `(offset, size)`.
+///
+/// The file's own directory answers this: each entry carries the image's width
+/// and height as one byte (zero meaning 256), its length, and its offset into
+/// the file. `LookupIconIdFromDirectoryEx` is not the answer even though it is
+/// the call the shell offers: it parses a resource *group* directory, whose
+/// entries are two bytes shorter and hold a resource id where a file entry
+/// holds an offset, so what it returns is an id and not a position in these
+/// bytes.
+fn best_image(data: &[u8], cx: u32, cy: u32) -> Option<(usize, usize)> {
+    if data.get(0..2)? != [0, 0] || data.get(2..4)? != [1, 0] {
+        return None;
     }
-    let count = u16::from_le_bytes([data[4], data[5]]) as usize;
-    let directory = ICONDIR_SIZE + count.saturating_mul(ICONDIRENTRY_SIZE);
+    let count = usize::from(u16::from_le_bytes([*data.get(4)?, *data.get(5)?]));
+    let directory = ICONDIR_SIZE.checked_add(count.checked_mul(ICONDIRENTRY_SIZE)?)?;
     if count == 0 || directory > data.len() {
-        return false;
+        return None;
     }
-    (0..count).all(|index| {
+    let mut best: Option<(u64, bool, usize, usize)> = None;
+    for index in 0..count {
         let start = ICONDIR_SIZE + index * ICONDIRENTRY_SIZE;
-        let entry = &data[start..start + ICONDIRENTRY_SIZE];
-        let size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
-        let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
-        size != 0
-            && offset >= directory
-            && offset
-                .checked_add(size)
-                .is_some_and(|end| end <= data.len())
-    })
+        let entry = data.get(start..start + ICONDIRENTRY_SIZE)?;
+        // A zero dimension is how the format writes 256.
+        let extent = |value: u8| if value == 0 { 256 } else { u32::from(value) };
+        let width = extent(entry[0]);
+        let height = extent(entry[1]);
+        let size = u32::from_le_bytes(entry[8..12].try_into().ok()?) as usize;
+        let offset = u32::from_le_bytes(entry[12..16].try_into().ok()?) as usize;
+        if size == 0
+            || offset < directory
+            || offset.checked_add(size).is_none_or(|end| end > data.len())
+        {
+            return None;
+        }
+        let upscale = width < cx || height < cy;
+        let distance = u64::from(width.abs_diff(cx)) + u64::from(height.abs_diff(cy));
+        let better = best.is_none_or(|(nearest, upscaled, ..)| {
+            // Closest first; at the same distance the larger image, so the slot
+            // is filled by scaling a picture down, never up.
+            distance < nearest || (distance == nearest && upscaled && !upscale)
+        });
+        if better {
+            best = Some((distance, upscale, offset, size));
+        }
+    }
+    best.map(|(_, _, offset, size)| (offset, size))
 }
 
-/// Picks the shell-preferred image out of the bundled `.ico`.
+/// Loads the bundled `.ico` at the size the notification area shows.
 pub fn load_icon() -> eros::Result<HICON> {
-    if !valid_ico(ICON_ICO) {
-        eros::bail!("bundled icon.ico failed validation");
-    }
-    // SAFETY: `ICON_ICO` passed validation as a well-formed `.ico`
-    // directory, so the lookup only reads its header.
-    let offset =
-        unsafe { LookupIconIdFromDirectoryEx(ICON_ICO.as_ptr(), 1, 0, 0, LR_DEFAULTCOLOR) };
-    if offset <= 0 {
-        eros::bail!("bundled icon.ico lookup failed");
-    }
-    let rest = ICON_ICO
-        .get(offset as usize..)
-        .context("bundled icon.ico entry out of bounds")?;
-    // SAFETY: `rest` starts at the validated image offset and spans to the
-    // end of the bundle, which is exactly the resource slice the call reads.
-    let icon = unsafe {
-        CreateIconFromResourceEx(
-            rest.as_ptr(),
-            rest.len() as u32,
-            1,
-            0x0003_0000,
-            0,
-            0,
-            LR_DEFAULTCOLOR,
-        )
-    };
-    if icon.is_null() {
-        eros::bail!("CreateIconFromResourceEx failed");
-    }
+    let icon = icon_at(TRAY_ICON, TRAY_ICON);
+    eros::ensure!(!icon.is_null(), "bundled icon.ico could not be loaded");
     Ok(icon)
 }
 
-/// Sets the window's title-bar and taskbar icon from the bundled `.ico`.
+/// Sets the window's title-bar and task-bar icon from the bundled `.ico`.
 ///
-/// The `.ico` rather than the `.png`: the window manager takes an `HICON`, and
-/// the icon file already carries the images Windows asks for at each size,
-/// while the `.png` would need a decoder to become the straight rows
-/// `Surface::set_icon` takes. Renderer setup calls this again on every
-/// swapchain rebuild, so the check for an icon already set is what keeps a
-/// resize from leaking another pair of handles. An icon given to a window this
-/// way lives as long as the window, which is why neither is destroyed here.
+/// The `.ico` rather than the `.png`: a window takes an `HICON`, and the icon
+/// file already carries the images Windows asks for at each size, while the PNG
+/// would need a decoder to become the straight rows `Surface::set_icon` takes.
+/// This covers the running window; the executable carries the same icon as a
+/// resource (`build.rs`), which is what Explorer and a pinned button read.
+///
+/// Renderer setup calls this again on every swapchain rebuild, so the check for
+/// an icon already set is what keeps a resize from leaking another pair of
+/// handles. An icon given to a window this way lives as long as the window,
+/// which is why neither is destroyed here.
 pub fn set_window_icon(hwnd: HWND) {
     // SAFETY: `hwnd` is this process's window, and the message reads no pointers.
     if unsafe { SendMessageW(hwnd, WM_GETICON, ICON_BIG as WPARAM, 0) } != 0 {
@@ -326,31 +331,35 @@ pub fn set_window_icon(hwnd: HWND) {
     }
 }
 
-/// Creates the bundled `.ico` image closest to `cx` by `cy`.
+/// Creates an `HICON` from the bundled `.ico`, at the size closest to `cx` by
+/// `cy`.
+///
+/// The image is created at its own size (`0, 0`): the directory already picked
+/// the one that matches, and the call's own scaling then has nothing to do.
 fn icon_at(cx: i32, cy: i32) -> HICON {
-    if !valid_ico(ICON_ICO) {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: `ICON_ICO` passed validation as a well-formed `.ico` directory,
-    // so the lookup only reads its header.
-    let offset =
-        unsafe { LookupIconIdFromDirectoryEx(ICON_ICO.as_ptr(), 1, cx, cy, LR_DEFAULTCOLOR) };
-    if offset <= 0 {
-        return std::ptr::null_mut();
-    }
-    let Some(rest) = ICON_ICO.get(offset as usize..) else {
+    let request = |value: i32| u32::try_from(value).unwrap_or(0);
+    let Some((offset, size)) = best_image(ICON_ICO, request(cx), request(cy)) else {
         return std::ptr::null_mut();
     };
-    // SAFETY: `rest` starts at the validated image offset and spans to the end
-    // of the bundle, which is exactly the resource slice the call reads.
+    let Some(bytes) = ICON_ICO.get(offset..offset + size) else {
+        return std::ptr::null_mut();
+    };
+    // The call wants the bits DWORD-aligned, and an `.ico` image begins wherever
+    // its directory says: a heap buffer is aligned where the embedded bytes are
+    // not. The copy happens once per icon, which is setup.
+    let mut bits = Vec::with_capacity(size);
+    bits.extend_from_slice(bytes);
+    // SAFETY: `bits` is exactly one image the validated directory names, which
+    // is the resource slice the call reads, and the call copies whatever it
+    // needs before it returns.
     unsafe {
         CreateIconFromResourceEx(
-            rest.as_ptr(),
-            rest.len() as u32,
+            bits.as_ptr(),
+            u32::try_from(bits.len()).unwrap_or(0),
             1,
             0x0003_0000,
-            cx,
-            cy,
+            0,
+            0,
             LR_DEFAULTCOLOR,
         )
     }
@@ -530,10 +539,36 @@ unsafe extern "system" fn wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::ICON_ICO;
-    use super::valid_ico;
+    use super::best_image;
 
     #[test]
     fn rejects_truncated_directory() {
-        assert!(!valid_ico(&ICON_ICO[..10]));
+        assert!(best_image(&ICON_ICO[..10], 32, 32).is_none());
+    }
+
+    /// The chosen bounds are one whole image, and it is the image that calls
+    /// itself that size. The bundle stores PNG images; an icon that is
+    /// regenerated with uncompressed entries stacks the colour rows over the AND
+    /// mask, so the DIB's height is twice the icon's.
+    #[test]
+    fn picks_the_image_nearest_the_requested_size() {
+        for request in [16, 24, 32, 48, 64, 256] {
+            let (offset, size) = best_image(ICON_ICO, request, request).expect("an image");
+            assert_eq!(
+                dimensions(&ICON_ICO[offset..offset + size]),
+                (request, request)
+            );
+        }
+    }
+
+    fn dimensions(image: &[u8]) -> (u32, u32) {
+        if image.starts_with(b"\x89PNG\r\n\x1a\n") {
+            let width = u32::from_be_bytes(image[16..20].try_into().expect("width"));
+            let height = u32::from_be_bytes(image[20..24].try_into().expect("height"));
+            return (width, height);
+        }
+        let width = u32::from_le_bytes(image[4..8].try_into().expect("width"));
+        let height = u32::from_le_bytes(image[8..12].try_into().expect("height"));
+        (width, height / 2)
     }
 }

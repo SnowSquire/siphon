@@ -16,15 +16,22 @@
 //! `OUT_DIR` for `include_bytes!`. Because that lives under `target/`, a
 //! `cargo clean` drops it and the next build fetches it again.
 //! `SIPHON_CHILLAX_TTF` points the build at a local copy instead.
+//!
+//! On the Windows target it also links the brand icon into the executable as a
+//! resource. The shell reads a program's icon from there and nowhere else:
+//! Explorer's file icon, the shortcut the installer writes, a pinned task-bar
+//! button and the Apps & features entry are all the image, not the window.
 
 use std::env;
 use std::fs;
 use std::io::Read as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     font();
+    icon();
     println!("cargo:rerun-if-env-changed=DEP_PLACEBO_LIBDIR");
     println!("cargo:rerun-if-env-changed=DEP_PLACEBO_RPATH");
     if env::var("CARGO_CFG_TARGET_FAMILY").as_deref() != Ok("unix") {
@@ -46,6 +53,73 @@ fn main() {
             Path::new(&dir).display()
         );
     }
+}
+
+/// Embeds the brand icon in the executable as a Windows resource.
+///
+/// `crates/ui/icons/icon.ico` is already what the running window sets its
+/// title-bar and task-bar icon from, but the shell does not ask a running
+/// program for the icon of its *file*: Explorer, a shortcut, a pinned button
+/// and Apps & features read `RT_GROUP_ICON` out of the image. Without this the
+/// executable has the generic application icon and a pinned button has no logo.
+///
+/// The script is one group icon, because the `.ico` already carries every size
+/// Windows asks for. `llvm-rc` is the resource compiler the cross build carries
+/// (`nix/msvc.nix`); `rc.exe` is the fallback for a native MSVC build, and `RC`
+/// names another. The `.res` goes on the link line as one more input, which
+/// both linkers accept.
+///
+/// MSVC only: a GNU link wants the resource assembled into a COFF object
+/// first, and this workspace builds no GNU Windows target.
+fn icon() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
+    {
+        return;
+    }
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let icon = manifest.join("icons").join("icon.ico");
+    println!("cargo:rerun-if-changed={}", icon.display());
+    println!("cargo:rerun-if-env-changed=RC");
+
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    let script = out.join("siphon.rc");
+    let resource = out.join("siphon.res");
+    // Quotes keep a source path with a space from ending the file name early;
+    // forward slashes are accepted by both compilers.
+    let text = format!("1 ICON \"{}\"\n", icon.display());
+    fs::write(&script, text).unwrap_or_else(|error| panic!("{}: {error}", script.display()));
+
+    let mut compilers = Vec::with_capacity(3);
+    if let Some(named) = env::var_os("RC") {
+        compilers.push(named);
+    }
+    compilers.push("llvm-rc".into());
+    // A native Windows build with the MSVC toolset has `rc.exe`, and `llvm-rc`
+    // only when LLVM is installed; the cross build has `llvm-rc` alone.
+    if cfg!(windows) {
+        compilers.push("rc".into());
+    }
+    let mut failure = String::from("no resource compiler ran");
+    for compiler in &compilers {
+        let outcome = Command::new(compiler)
+            .arg("/fo")
+            .arg(&resource)
+            .arg(&script)
+            .status();
+        match outcome {
+            Ok(status) if status.success() => {
+                println!("cargo:rustc-link-arg-bins={}", resource.display());
+                return;
+            }
+            Ok(status) => failure = format!("{}: {status}", compiler.to_string_lossy()),
+            Err(error) => failure = format!("{}: {error}", compiler.to_string_lossy()),
+        }
+    }
+    panic!(
+        "could not compile {} into an icon resource ({failure}); set RC to an rc compiler",
+        script.display()
+    );
 }
 
 /// Fontshare's archive for the whole family.

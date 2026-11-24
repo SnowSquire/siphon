@@ -86,6 +86,12 @@ autostart value), and leaves that data alone.
 
 ## Payload pieces
 
+- **The UI's icon.** `siphon.exe` embeds `crates/ui/icons/icon.ico` as an
+  `RT_GROUP_ICON` resource at build time (`crates/ui/build.rs`; see
+  `notes/riffle.md`). That resource, not anything the running window does, is
+  what Explorer, the Start-menu shortcut, `DisplayIcon` and a pinned task-bar
+  button show. The installer's own icon is the separate `MUI_ICON` in
+  `installer/siphon.nsi`, which covers setup and uninstall.
 - **libplacebo.** `libplacebo-sys` copies `libplacebo-<api>.dll` next to the UI
   for a dynamic build; the packager harvests it from the payload's `bin/`. The
   DLL must be built with a shader compiler: `nix/msvc.nix` cross-builds shaderc

@@ -1161,6 +1161,20 @@ the desktop asks for). The `.ico` rather than `icon.png` because the window want
 an `HICON` and the file already holds the images Windows asks for; the PNG would
 need a decoder to become the RGBA rows `Surface::set_icon` takes.
 
+The executable carries that icon as an `RT_GROUP_ICON` resource, linked in by
+`crates/ui/build.rs` (`llvm-rc` writes a `.res`, `rustc-link-arg-bins` puts it on
+the link line). Explorer's file icon, the shortcuts the installer writes, a
+pinned task-bar button, the Apps & features entry and Task Manager read the
+image's resources rather than the running window's, so without it the file is the
+generic application and a pinned button has no logo. Which image to make is the
+file's own directory — 16-byte entries naming width, height, length and offset —
+not `LookupIconIdFromDirectoryEx`, which parses a resource *group* directory
+(14-byte entries, resource ids where file entries hold offsets) and answers an id
+that indexes nothing in the file. The bits are copied to a heap buffer first:
+`CreateIconFromResourceEx` wants them DWORD-aligned and an entry begins wherever
+the directory says. The bundle's images are PNG-compressed, which Vista and later
+accept.
+
 What the window costs, measured rather than guessed (debug build, private
 working set as Task Manager's Memory column reports it):
 
