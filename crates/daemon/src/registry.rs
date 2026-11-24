@@ -21,7 +21,6 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::task::Waker;
 
-use futures_util::future::LocalBoxFuture;
 use kanal::AsyncSender;
 use siphon_shared::riffle::ArenaSummary;
 use siphon_shared::riffle::DiskView;
@@ -47,16 +46,25 @@ use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::metrics::StreamMetrics;
 use crate::notify::Notifier;
-use crate::media::ResolveError;
-use crate::media::Stream;
-use crate::media::StreamResolver;
 use crate::media::dvr::Dvr;
-use crate::media::parse_stream_key;
 use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::Segment;
 use crate::scheduler::StreamScheduler;
 use crate::spool::ConsumerWake;
 use crate::spool::WakeSet;
+/// Why a channel could not be resolved into a pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolveError(u16);
+
+impl ResolveError {
+    const NOT_FOUND: Self = Self(404);
+    const UNAVAILABLE: Self = Self(503);
+
+    const fn status(self) -> u16 {
+        self.0
+    }
+}
+
 use crate::variant::Variant;
 use crate::variant::VariantKind;
 use crate::variant::VariantPlaylistError;
@@ -161,7 +169,9 @@ struct StreamRuntime {
     /// identity; `key.channel` is.
     login: String,
     title: String,
-    stream: Rc<Stream>,
+    /// Set when the pipeline was stopped on purpose. Nothing can be watching
+    /// yet, so this is the only reason a runtime outlives its recording.
+    stopped: Cell<bool>,
     dvr: Rc<Dvr>,
     client: Rc<Client>,
     wakes: Rc<WakeSet>,
@@ -170,7 +180,6 @@ struct StreamRuntime {
     reader_wake: Rc<ConsumerWake>,
     /// The disk recorder while this pipeline is recording.
     recording: RefCell<Option<Recorder>>,
-    media_spawned: Cell<bool>,
     dvr_spawned: Cell<bool>,
     broadcast_id: u64,
     /// `STABLE-VARIANT-ID` of the variant this runtime serves; names its
@@ -193,35 +202,13 @@ impl StreamRuntime {
     }
 
     fn stop(&self) {
-        self.stream.stop();
+        self.stopped.set(true);
         self.dvr.stop();
         self.reader_wake.wake();
         self.registration.borrow_mut().take();
         if let Some(recording) = self.recording.borrow_mut().take() {
             recording.disk.stop();
         }
-    }
-
-    /// Spawns the media engine if this runtime was monitor-only until now.
-    /// Returns whether anything changed.
-    fn upgrade(&self) -> bool {
-        if self.media_spawned.replace(true) {
-            return false;
-        }
-        self.ensure_dvr();
-        let Some(registration) = self.registration.borrow().clone() else {
-            return false;
-        };
-        crate::media::spawn_media(
-            Rc::clone(&self.stream),
-            Rc::clone(&self.client),
-            Rc::clone(&self.dvr),
-            &self.wakes,
-            &registration,
-            Rc::clone(&self.live_window),
-            &self.reader_wake,
-        );
-        true
     }
 
     fn ensure_dvr(&self) {
@@ -383,49 +370,6 @@ impl Registry {
         }
     }
 
-    async fn resolve_uri(&self, uri: &str) -> Result<Rc<Stream>, ResolveError> {
-        let parsed = parse_stream_key(uri).ok_or(ResolveError::BAD_REQUEST)?;
-        let data = self.channel_data(&parsed.login).await?;
-        let key = StreamKey::new(data.id, parsed.quality.clone());
-        let id = Self::stream_id(&key);
-
-        if let Some(runtime) = self.streams.borrow().get(&id).cloned() {
-            if runtime.upgrade() {
-                self.publish_pipeline(&runtime);
-            }
-            return Ok(Rc::clone(&runtime.stream));
-        }
-
-        let _guard = self
-            .gate
-            .acquire(gate_key(&parsed.login, key.quality.as_deref()))
-            .await;
-
-        // Another DESCRIBE may have created it while this one waited.
-        if let Some(runtime) = self.streams.borrow().get(&id).cloned() {
-            if runtime.upgrade() {
-                self.publish_pipeline(&runtime);
-            }
-            return Ok(Rc::clone(&runtime.stream));
-        }
-
-        let Some(variant) = choose_variant(&data.variants, key.quality.as_deref()) else {
-            debug!(
-                login = %parsed.login,
-                quality = key.quality.as_deref().unwrap_or("<first>"),
-                "daemon: no such variant"
-            );
-            return Err(ResolveError::NOT_FOUND);
-        };
-        let runtime = self.spawn_runtime(&key, &data, variant, false);
-        // A DESCRIBE is what a viewer is: attach the media engine now, before
-        // the control connection waits for the first segment's codec config.
-        runtime.upgrade();
-        self.streams.borrow_mut().insert(id, Rc::clone(&runtime));
-        self.publish_pipeline(&runtime);
-        Ok(Rc::clone(&runtime.stream))
-    }
-
     /// Get or build the channel row. Followed channels already exist.
     fn ensure_row(&self, login: &str) -> bool {
         let mut rows = self.channels.borrow_mut();
@@ -543,7 +487,7 @@ impl Registry {
                     VariantPlaylistError::NoVariants(_) => ResolveError::NOT_FOUND,
                     _ => ResolveError::UNAVAILABLE,
                 };
-                warn!(%error, login, status = status.status, "daemon: channel resolution failed");
+                warn!(%error, login, status = status.status(), "daemon: channel resolution failed");
                 return Err(status);
             }
         };
@@ -562,7 +506,6 @@ impl Registry {
         variant: &Variant,
         record: bool,
     ) -> Rc<StreamRuntime> {
-        let stream = Rc::new(Stream::new(key.clone(), data.title.clone()));
         let metrics = StreamMetrics::new(
             key.clone(),
             Some(variant.id.to_string()),
@@ -594,7 +537,7 @@ impl Registry {
             key: key.clone(),
             login: data.login.clone(),
             title: data.title.clone(),
-            stream,
+            stopped: Cell::new(false),
             dvr,
             client: Rc::clone(&self.client),
             wakes,
@@ -602,7 +545,6 @@ impl Registry {
             registration: RefCell::new(Some(registration)),
             reader_wake,
             recording: RefCell::new(None),
-            media_spawned: Cell::new(false),
             dvr_spawned: Cell::new(false),
             broadcast_id: data.broadcast_id,
             variant: variant.id.clone(),
@@ -769,9 +711,7 @@ impl Registry {
             self.stop_recording(&sibling);
             // Nobody owns it but the primary recording; a viewer of that quality
             // keeps its pipeline alive.
-            if !sibling.stream.has_sessions() {
-                self.remove_runtime(&key);
-            }
+            self.remove_runtime(&key);
         }
     }
 
@@ -912,11 +852,7 @@ impl Registry {
             .collect();
         for (id, runtime) in entries {
             self.stop_recording(&runtime);
-            if runtime.stream.has_sessions() {
-                self.publish_pipeline(&runtime);
-            } else {
-                self.remove_runtime_id(&id, &runtime.key);
-            }
+            self.remove_runtime_id(&id, &runtime.key);
         }
     }
 
@@ -937,7 +873,7 @@ impl Registry {
             .map(|(id, runtime)| (id.clone(), Rc::clone(runtime)))
             .collect();
         for (id, runtime) in entries {
-            if runtime.is_recording() || runtime.stream.has_sessions() {
+            if runtime.is_recording() {
                 continue;
             }
             self.remove_runtime_id(&id, &runtime.key);
@@ -955,13 +891,8 @@ impl Registry {
         let Some(runtime) = runtime else {
             return;
         };
-        if force {
-            runtime.stream.disconnect_viewers();
-        } else if runtime.stream.has_sessions() {
-            self.stop_recording(&runtime);
-            self.publish_pipeline(&runtime);
-            return;
-        }
+        let _ = force;
+        self.stop_recording(&runtime);
         self.remove_runtime(key);
     }
 
@@ -981,10 +912,11 @@ impl Registry {
         }
     }
 
-    pub fn disconnect_viewers(&self, key: &StreamKey) {
-        if let Some(runtime) = self.runtime(key) {
-            runtime.stream.disconnect_viewers();
-        }
+    pub const fn disconnect_viewers(&self, key: &StreamKey) {
+        // Nothing can be watching until the Riffle media path exists, so there
+        // is no viewer to disconnect. The intent stays accepted rather than
+        // erroring on a surface the UI still offers.
+        let _ = (self, key);
     }
 
     /// The disk recorder for `key` finished. Release the stream when nobody is
@@ -994,30 +926,10 @@ impl Registry {
             return;
         };
         runtime.recording.borrow_mut().take();
-        if runtime.stream.has_sessions() {
-            self.publish_pipeline(&runtime);
-            return;
-        }
         info!(
             login = %runtime.login,
             quality = key.quality.as_deref().unwrap_or("<first>"),
             "daemon: recording finished, stream stopped"
-        );
-        self.remove_runtime(key);
-    }
-
-    /// The last viewer left. Keep a recording or wanted runtime.
-    fn release_stream(&self, key: &StreamKey) {
-        let Some(runtime) = self.runtime(key) else {
-            return;
-        };
-        if runtime.stream.has_sessions() || runtime.is_recording() || self.wanted(&runtime.login) {
-            return;
-        }
-        info!(
-            login = %runtime.login,
-            quality = key.quality.as_deref().unwrap_or("<first>"),
-            "daemon: stream stopped, last viewer left"
         );
         self.remove_runtime(key);
     }
@@ -1072,7 +984,12 @@ impl Registry {
     fn pipeline_view(&self, runtime: &Rc<StreamRuntime>) -> PipelineView {
         let metrics = &runtime.metrics;
         let last_error = metrics.last_error.borrow().clone();
-        let state = if runtime.stream.stopped() {
+        let live_edge_ms = runtime
+            .live_window
+            .borrow()
+            .last()
+            .map_or(0, |segment| segment.timestamp_ms + segment.duration_ms);
+        let state = if runtime.stopped.get() {
             PipelineState::Stopped
         } else if metrics.segment_tail.get() > 0 {
             PipelineState::Live
@@ -1097,9 +1014,9 @@ impl Registry {
             state,
             pinned: recording.is_some() || self.wanted(&runtime.login),
             recording: recording.is_some(),
-            sessions: runtime.stream.session_count(),
-            position_ms: runtime.stream.position_ms(),
-            live_edge_ms: runtime.stream.live_edge_ms(),
+            sessions: 0,
+            position_ms: live_edge_ms,
+            live_edge_ms,
             segment_tail: metrics.segment_tail.get(),
             prefetch_tail: metrics.prefetch_tail.get(),
             window: metrics.window.get(),
@@ -1207,16 +1124,6 @@ fn mock_dvr_url(variant: &Variant) -> Option<String> {
 #[cfg(not(debug_assertions))]
 const fn mock_dvr_url(_: &Variant) -> Option<String> {
     None
-}
-
-impl StreamResolver for Registry {
-    fn resolve<'a>(&'a self, uri: &'a str) -> LocalBoxFuture<'a, Result<Rc<Stream>, ResolveError>> {
-        Box::pin(self.resolve_uri(uri))
-    }
-
-    fn release(&self, stream: &Rc<Stream>) {
-        self.release_stream(stream.key());
-    }
 }
 
 /// `(login, quality)` collapsed to one gate key, so no string is allocated.

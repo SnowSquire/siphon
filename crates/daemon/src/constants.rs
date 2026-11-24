@@ -20,9 +20,6 @@ pub const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6b
 
 pub const DEFAULT_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
-/// RTSP control port; RTP/RTCP use ephemeral ports or interleaved TCP.
-pub const DEFAULT_RTSP_PORT: u16 = 7417;
-
 // `--debug <base>` replays the mock edge instead of Twitch. Dev builds only: a
 // release binary has no such mode, and the addresses are the flag's, not these.
 // Only the names the mock pretends to serve live here.
@@ -36,10 +33,6 @@ pub const DEBUG_CHANNEL_TITLE: &str = "sunnys";
 pub const DEBUG_VARIANT_ID: &str = "1080p";
 #[cfg(any(test, debug_assertions))]
 pub const DEBUG_PORTRAIT_VARIANT_ID: &str = "1080p-portrait";
-
-/// RTP payload budget, matching gortsplib's default:
-/// 1500 (UDP MTU) - 20 (IP) - 8 (UDP) - 12 (RTP) - 10 (SRTP headroom).
-pub const RTP_MAX_PAYLOAD: usize = 1450;
 
 /// Downloader tasks pulling from the fetch queue: one per segment in flight.
 pub const DOWNLOAD_TASKS: usize = 8;

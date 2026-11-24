@@ -106,6 +106,7 @@ pub struct Segment {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // consumed by the Riffle media lane
 pub enum SegmentMessage {
     Segment(Segment),
     Prefetch {

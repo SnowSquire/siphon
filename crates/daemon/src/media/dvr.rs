@@ -18,6 +18,9 @@
 //! Discovery and refresh run in a background task, in parallel with the live
 //! scheduler, so a seek never has to fetch a playlist first.
 
+// The seek helpers below serve the Riffle media lane; nothing seeks yet.
+#![allow(dead_code)]
+
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;

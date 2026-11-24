@@ -21,7 +21,3 @@ pub fn write(app_id: &str) -> std::io::Result<()> {
     }
     std::fs::write(path, std::process::id().to_string())
 }
-
-pub fn remove(app_id: &str) {
-    let _ = std::fs::remove_file(path(app_id));
-}

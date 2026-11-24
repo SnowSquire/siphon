@@ -1,9 +1,10 @@
 # AGENTS.md
 
 Twitch HLS live-stream client (Rust, single-threaded `compio` reactor) plus
-`servermock/`, a Node mock of Twitch's edge used to test it offline. RTSP is the
-only sink; disk output is disabled and being rebuilt from
-`notes/disk-complete-recording.md`.
+`servermock/`, a Node mock of Twitch's edge used to test it offline. RTSP has
+been removed; Riffle (`notes/riffle.md`) is the transport that replaces it and
+has no implementation yet, so nothing can watch a stream. Disk output is
+disabled and being rebuilt from `notes/disk-complete-recording.md`.
 
 ## Who writes what
 
@@ -17,7 +18,6 @@ only sink; disk output is disabled and being rebuilt from
 
 - `architecture.md` — pipeline, scheduler, downloader, daemon, listeners.
 - `ts-demux.md` — access units, codec config, timestamps, seek points.
-- `rtsp-output.md` — RTP packetization, RTCP, SDP, sessions, DVR seeking.
 - `daemon-mode.md` — daemon registry, capacity, stream lifecycle, session gotchas.
 - `tls-client-api.md` — the HTTP/1.1 + rustls client (and why it is unbuffered).
 - `hls-transport-probe.md` — measurements of how Twitch actually delivers.
@@ -93,7 +93,7 @@ only sink; disk output is disabled and being rebuilt from
 - **slot** — fixed 192 512 B zeroed buffer in the arena. Never "chunk": *chunk* means an HTTP transfer-encoding chunk.
 - **segment** — one HLS media playlist entry (~2 s), one HTTP fetch.
 - **spool** — the byte stream of one segment: one `Writer`, any number of `Reader`s, backed by a chain of slots.
-- **consumer** — the task/sink reading a spool (RTSP, disk). A consumer owns one `ConsumerWake`.
+- **consumer** — the task/sink reading a spool (Riffle lane, disk). A consumer owns one `ConsumerWake`.
 - **reader** — a consumer's cursor into a spool.
 
 ## Local dev loop (servermock)
@@ -104,10 +104,8 @@ playlists. The mock's Hermes socket is on its own port, so point the daemon at i
 with `SIPHON_HERMES_URL=ws://127.0.0.1:8001/v1`.
 
 1. In `servermock/`: `pnpm install`, then `pnpm dev` (`node --watch main.ts`). It needs the built fixtures in `captures/servermock/` (`pnpm run build:fixtures`; ~2.8 GB, gitignored — `SEGMENTS_DIR` points it elsewhere). `SPEED=8` by default (`SPEED=1` for a real-time RTSP test); it ends with `#EXT-X-ENDLIST`, and `touch servermock/main.ts` restarts it from the top.
-2. `cargo run -p daemon -- play -c anything -d http://127.0.0.2:8000` — `-c` is required even in debug mode; broadcast id `0`.
-3. `play` serves `rtsp://127.0.0.1:7417/` and `rtsp://[::1]:7417/`; `daemon` binds `--bind` (default `127.0.0.1:7417`) and serves `rtsp://host/<channel>/<quality>/`; DESCRIBE creates the stream.
-4. `ffplay -nodisp rtsp://127.0.0.1:7417/` and `ffprobe -rtsp_transport tcp -i rtsp://127.0.0.1:7417/` are the end-to-end checks (`.../sunnys/1080p/` under `daemon -d http://127.0.0.2:8000`).
-5. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
+2. `cargo run -p daemon -- daemon -d http://127.0.0.2:8000`; the pipeline starts on the mock's `stream-up`. There is no viewer until Riffle's media lane exists, so the end-to-end checks are the pipeline rows, the logs and whatever recording is enabled.
+3. `cargo run -p siphon-ui` opens the Siphon window against the running daemon; it starts one when the admin port is idle.
 
 ## Worktrees
 
@@ -141,7 +139,7 @@ detail: `notes/architecture.md`.
 - `app.rs`, `bus.rs`, `riffle.rs`, `metrics.rs` — the backend app loop, entity update bus, Riffle control-plane server and telemetry.
 - `registry.rs` — the stream registry and monitors behind `daemon` mode (`notes/daemon-mode.md`).
 - `downloader.rs` — bounded fetch workers streaming into spools.
-- `rtsp/` — RTSP server and ES over RTP (`notes/rtsp-output.md`; demux is `notes/ts-demux.md`). Sink only, and slated to become a compile-time optional feature: keep it correct, but do not invest in its hot path.
+- `media/` — the TS demuxer, the codec configs and the DVR timeline (`notes/ts-demux.md`). RTSP and its RTP packetizers are gone; the demuxer is the input side of the Riffle media lane and is not wired to a consumer yet.
 - `disk.rs` — complete-broadcast recording: live runs, DVR holes, v4 index (`notes/disk-complete-recording.md`).
 - `crates/shared` (`siphon-shared`) — what both sides agree on: `riffle/` (the
   typed protocol, postcard framing, the object header, the UI-side client), `settings/` (the

@@ -57,8 +57,6 @@ mod utils;
 #[allow(clippy::future_not_send)]
 mod variant;
 
-use std::net::Ipv4Addr;
-use std::net::SocketAddr;
 use std::rc::Rc;
 
 use clap::Args;
@@ -66,9 +64,6 @@ use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::Parser;
 use clap::Subcommand;
-use futures_util::future::Either;
-use futures_util::future::select;
-use futures_util::pin_mut;
 #[cfg(not(miri))]
 use mimalloc::MiMalloc;
 use sonic_rs::JsonValueTrait as _;
@@ -80,7 +75,6 @@ use crate::arena::ArenaSet;
 use crate::bus::Bus;
 #[cfg(debug_assertions)]
 use crate::constants::DEBUG_CHANNEL_TITLE;
-use crate::constants::DEFAULT_RTSP_PORT;
 use crate::constants::HERMES_WELCOME_TIMEOUT;
 use crate::http::Client;
 use crate::http::timeout;
@@ -95,7 +89,6 @@ use crate::spool::WakeSet;
 use crate::variant::Variant;
 use crate::variant::VariantKind;
 use crate::variant::VariantPlaylistError;
-use crate::variant::choose_variant;
 use crate::variant::get_variants;
 
 // Miri cannot execute a foreign allocator, so it runs on the system allocator.
@@ -126,40 +119,10 @@ struct Config {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Serve one channel on the loopback RTSP addresses
-    Play(Play),
     /// Record one channel to disk, exit when its broadcast ends
     Record(Record),
     /// Serve any channel through `rtsp://host/<channel>/<quality>/`
     Daemon(Daemon),
-}
-
-#[derive(Args, Debug)]
-struct Play {
-    /// Twitch channel name to fetch
-    #[arg(short, long)]
-    channel: String,
-
-    /// STABLE-VARIANT-ID (`720p60`, `chunked`, ...); defaults to the first
-    #[arg(short, long)]
-    quality: Option<String>,
-
-    /// Record the complete broadcast into this directory
-    #[arg(long)]
-    output: Option<std::path::PathBuf>,
-
-    /// Webhook to notify about skipped DVR chunks and alignment problems
-    #[arg(long)]
-    notify: Option<String>,
-
-    /// Keep `live.NNN` run pairs after their holes are filled
-    #[arg(long)]
-    keep_runs: bool,
-
-    /// Twitch token used for GQL and usher; `play` also stores it in
-    /// `auth.json` so a later daemon start does not need it again
-    #[arg(long)]
-    auth_token: Option<String>,
 }
 
 /// One channel, no UI: wait for it to go live, record it, exit when it ends.
@@ -212,10 +175,6 @@ struct Record {
 
 #[derive(Args, Debug)]
 struct Daemon {
-    /// Address the RTSP listener binds
-    #[arg(long, default_value_t = default_bind())]
-    bind: SocketAddr,
-
     /// Admin RPC endpoint: a named pipe on Windows, a socket path on Unix.
     /// Defaults to the per-app endpoint derived from the app id.
     #[arg(long)]
@@ -238,10 +197,6 @@ struct Daemon {
     keep_runs: bool,
 }
 
-fn default_bind() -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_RTSP_PORT))
-}
-
 #[compio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logging::init(config::APP_ID);
@@ -260,7 +215,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match &cfg.command {
-        Command::Play(args) => Box::pin(play(&cfg, args)).await?,
         Command::Record(args) => record(&cfg, args).await?,
         Command::Daemon(args) => daemon(&cfg, args).await?,
     }
@@ -320,164 +274,6 @@ const fn debug_dvr_url(_: &Config, _: &Variant) -> Option<String> {
 }
 
 /// One channel, served at the root of every loopback RTSP address.
-#[allow(clippy::future_not_send)]
-async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error>> {
-    let mock = debug_channel(cfg);
-    let debug = debug_mode(cfg);
-    let title = mock
-        .as_ref()
-        .map_or_else(|| args.channel.clone(), |(title, _)| title.clone());
-
-    let client = Rc::new(Client::new());
-    let arena = Rc::new(ArenaSet::new());
-    let wakes = WakeSet::new();
-    // `play` is an ad-hoc mode, so its token comes from the flag; giving one
-    // also seeds `auth.json`, which is the only way a daemon start learns it
-    // (its own command line must never carry a secret).
-    let auth_token = auth::resolve(args.auth_token.clone());
-
-    let (variants, broadcast_id) = if let Some((_, variants)) = mock {
-        (variants, 0)
-    } else {
-        // A manifest failure is reported and turned into a non-zero exit; it is
-        // not a reason to kill the process from deep inside the request path.
-        match get_variants(
-            &client,
-            cfg.client_id.as_deref(),
-            auth_token.as_deref(),
-            &args.channel,
-            cfg.low_latency,
-        )
-        .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                error!(%error, channel = %args.channel, "failed to resolve variants");
-                return Err(error.into());
-            }
-        }
-    };
-
-    let variant = choose_variant(&variants, args.quality.as_deref()).ok_or_else(|| {
-        VariantPlaylistError::UnknownQuality {
-            channel: args.channel.clone(),
-            quality: args.quality.clone().unwrap_or_default(),
-        }
-    })?;
-    // A debug build replays the mock's DVR playlist, which is per variant group.
-    // Otherwise discovery (GQL plus domain probing) and the periodic playlist
-    // refresh run in the background, concurrently with the live variant and
-    // manifest fetches.
-    let dvr = media::dvr::Dvr::new(debug_dvr_url(cfg, variant));
-    media::dvr::spawn(
-        Rc::clone(&client),
-        (!debug).then(|| args.channel.clone()),
-        Rc::clone(&dvr),
-    );
-    dvr.set_live_variant(variant);
-
-    // `play`/`record` are single-stream modes: no registry, so no channel id.
-    let key = media::StreamKey::new(0, args.quality.clone());
-    let stream = Rc::new(media::Stream::new(key, title));
-
-    let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
-    let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
-    let (registration_tx, registration_rx) = kanal::unbounded();
-    // The scheduler publishes its current live playlist window here. When VOD
-    // playback reaches the end of the DVR timeline, the RTSP engine replays the
-    // live segments in this window up to the live edge, bridging the DVR lag.
-    let live_window = Rc::new(std::cell::RefCell::new(Vec::new()));
-    let reader_wake = ConsumerWake::new();
-
-    let notifier = args
-        .notify
-        .as_ref()
-        .map(|url| notify::Notifier::new(Rc::clone(&client), url.clone()));
-    let disk = args.output.as_ref().map(|output| {
-        disk::spawn_disk_output(
-            disk::DiskOptions {
-                output: output.clone(),
-                stream_id: if debug { 0 } else { broadcast_id },
-                variant: variant.id.clone(),
-                keep_runs: args.keep_runs,
-                notifier,
-                dvr: Rc::clone(&dvr),
-                client: Rc::clone(&client),
-                metrics: Rc::new(DiskMetrics::new()),
-                live: true,
-            },
-            &wakes,
-            &downloaders_tx.clone().to_async(),
-            Some(&registration_tx),
-        )
-    });
-
-    downloader::spawn_downloaders::<{ constants::DOWNLOAD_TASKS }>(
-        &client,
-        &downloaders_rx,
-        &downloader_metrics,
-    );
-    media::spawn_media(
-        Rc::clone(&stream),
-        Rc::clone(&client),
-        Rc::clone(&dvr),
-        &wakes,
-        &registration_tx,
-        Rc::clone(&live_window),
-        &reader_wake,
-    );
-    // `play` keeps serving after the last player leaves: a reconnect starts at
-    // the live edge of the same stream.
-    media::spawn_single(Rc::clone(&stream));
-
-    let scheduler = scheduler::StreamScheduler::new(
-        client,
-        arena,
-        wakes,
-        variant.url.clone(),
-        downloaders_tx.to_async(),
-        registration_rx,
-        reader_wake,
-    )
-    .with_live_window(live_window);
-
-    let scheduler_future = scheduler.main();
-    pin_mut!(scheduler_future);
-    if let Some(disk) = disk {
-        let disk_future = disk.wait();
-        pin_mut!(disk_future);
-        match select(scheduler_future.as_mut(), disk_future.as_mut()).await {
-            Either::Left(((), _)) => {
-                // The scheduler ended (offline): let the DVR finish its tail.
-                if let Some(error) = disk_future.await {
-                    return Err(error.into());
-                }
-            }
-            Either::Right((fatal, _)) => {
-                if let Some(error) = fatal {
-                    return Err(error.into());
-                }
-                scheduler_future.await;
-            }
-        }
-    } else {
-        scheduler_future.await;
-    }
-
-    // Dropping the runtime cancels the remaining tasks.
-    drop(registration_tx);
-    drop(downloaders_rx);
-    Ok(())
-}
-
-/// A long-lived RTSP server plus the Siphon backend: config, Hermes, monitors,
-/// Record one channel of one variant, with no UI, RPC, RTSP listener or config.
-///
-/// It is deliberately not the daemon: the variant is chosen here (by id, or the
-/// highest-scoring one), the live and DVR sides can be selected independently,
-/// and the command exits when the recording does. `--list` dumps the live
-/// master. Everything after that is the same scheduler, DVR and disk code the
-/// daemon runs.
 #[allow(clippy::future_not_send)]
 async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::Error>> {
     let login = args.channel.to_ascii_lowercase();
@@ -852,19 +648,16 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
     });
     compio::runtime::spawn(app.run()).detach();
 
-    // Only returns on a bind error: the RTSP accept loop runs for the process's
-    // life.
-    media::serve(registry, args.bind).await?;
-    pid::remove(config::APP_ID);
-
-    drop(downloaders_rx);
-    Ok(())
+    // Nothing else owns the process now: the app loop and the downloaders run
+    // detached, so park here rather than returning and tearing them down.
+    std::future::pending::<Result<(), Box<dyn std::error::Error>>>().await
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::variant::Variant;
+    use crate::variant::choose_variant;
     use crate::variant::debug_variant;
 
     #[test]
@@ -888,21 +681,11 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_both_modes() {
-        let play =
-            Config::try_parse_from(["app", "play", "-c", "sunnys", "-q", "720p60"]).expect("play");
-        let Command::Play(args) = play.command else {
-            panic!("expected play");
-        };
-        assert_eq!(args.channel, "sunnys");
-        assert_eq!(args.quality.as_deref(), Some("720p60"));
-
-        let daemon =
-            Config::try_parse_from(["app", "daemon", "--bind", "0.0.0.0:8554"]).expect("daemon");
+    fn cli_parses_the_modes() {
+        let daemon = Config::try_parse_from(["app", "daemon"]).expect("daemon");
         let Command::Daemon(args) = daemon.command else {
             panic!("expected daemon");
         };
-        assert_eq!(args.bind.port(), 8554);
         assert!(args.admin.is_none());
         assert!(!args.no_admin);
 
@@ -911,14 +694,9 @@ mod tests {
         // Nor is the token: it reaches the daemon through `auth.json` only, so
         // no startup entry ever carries a secret.
         assert!(Config::try_parse_from(["app", "daemon", "--auth-token", "t"]).is_err());
-
-        // The ad-hoc modes take it directly.
-        let play = Config::try_parse_from(["app", "play", "-c", "sunnys", "--auth-token", "t"])
-            .expect("play token");
-        let Command::Play(args) = play.command else {
-            panic!("expected play");
-        };
-        assert_eq!(args.auth_token.as_deref(), Some("t"));
+        // Nor is a bind address: RTSP is gone, so there is nothing to bind but
+        // the admin endpoint.
+        assert!(Config::try_parse_from(["app", "daemon", "--bind", "0.0.0.0:8554"]).is_err());
 
         let record = Config::try_parse_from(["app", "record", "sunnys", "--auth-token", "t"])
             .expect("record token");

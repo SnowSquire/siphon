@@ -135,6 +135,7 @@ pub fn log_unavailable_media(master: &str, source: &str) {
 }
 
 #[derive(Debug, Error)]
+#[allow(dead_code)] // one variant is only reachable from the resolve path
 pub enum VariantPlaylistError {
     #[error("http: {0}")]
     Request(#[from] crate::http::Error),

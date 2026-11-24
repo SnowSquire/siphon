@@ -1,7 +1,8 @@
 # Riffle: the daemon↔UI protocol
 
-Status: Part I is designed and nothing is built; `play` still serves RTSP and the
-UI has no video path. Parts II and III are implemented. The ALPN is `riffle/1`.
+Status: Part I is designed and nothing is built. RTSP is gone — `play`, the
+RTSP listener and the RTP packetizers were removed — so there is no viewer path
+at all until this lands. Parts II and III are implemented. The ALPN is `riffle/1`.
 It is one protocol: the RPC is the control plane (`Class::Control`) and media is
 the same framing with media classes, over a carrier that can lose datagrams.
 
@@ -341,7 +342,7 @@ Siphon UI (ZGUI)  ── typed RPC ──  Siphon backend (compio)
                                       └─ RTSP listener
 ```
 
-`play` stays a separate CLI mode and does not serve RPC.
+`play` is gone: it existed only to serve RTSP. `record` and `daemon` remain.
 
 ## Transport
 
@@ -599,7 +600,7 @@ There is no monitor set. The key is `(channel id, quality)`, the same pair `Stre
   the DXGI/libplacebo renderer, the native tray and the Riffle worker. It owns the daemon lifecycle (`service.rs`): auto-start on launch and
   a process-level restart (`daemon.pid` in the app data dir, image-name check,
   `taskkill` fallback).
-- `play` keeps its current pipeline and needs no protocol types.
+- `record` keeps its current pipeline and needs no protocol types.
 
 ## Tests
 
