@@ -1,11 +1,13 @@
 name: build
 
 # Builds main on every push that can change the payload, and uploads the setup,
-# the portable zip and the symbols zip as workflow artifacts. A vX.Y.Z tag
+# the portable zip and the symbols zip as workflow artifacts. A `vX.Y.Z` tag
 # (which must match the workspace version, so a release cannot ship binaries
 # that do not match its source) publishes a draft release instead; that trigger
 # lives in `release.yml`, because a path filter on the branch push would
 # also have to match a tag, and a tag has no changed files to match against.
+# A branch push of a commit that already carries a release tag is skipped --
+# that tag's run is the build -- so pushing both refs at once builds once.
 # Manual dispatch builds any branch, tag or commit and uploads artifacts only.
 # There is no nightly: a successful main push is the nightly.
 # Nothing runs on pull requests. GitHub adds the source archives itself; the
@@ -55,8 +57,45 @@ env:
   CACHE_VERSION: v1
 
 jobs:
+  # `git push origin main v1.2.3` produces two push events for one commit: the
+  # tag, which calls this workflow from `release.yml` and publishes, and the
+  # branch, which would build the same tree again under the `-sha` names. The
+  # branch run asks whether the commit already carries a `vX.Y.Z` tag and, if it
+  # does, does nothing: the release run is the build. A tag pushed later cannot
+  # retroactively skip a build that already ran, so promoting an old commit to a
+  # release still rebuilds it, under the release names.
+  gate:
+    name: is this commit a release?
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.tag.outputs.build }}
+    steps:
+      - name: look for a `vX.Y.Z` tag on this commit
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The tags endpoint resolves an annotated tag to its commit, which is
+        # why it is used instead of `git tag --points-at` over a checkout.
+        run: |
+          set -euo pipefail
+          build=true
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == branch ]]; then
+            # A failure here means "cannot tell", and building is the safe
+            # answer: the run then does what it did before this check existed.
+            tagged="$(gh api "repos/$GITHUB_REPOSITORY/tags?per_page=100" --paginate \
+                        --jq ".[] | select(.commit.sha == \"$GITHUB_SHA\") | .name" || true)"
+            if grep -qxE 'v[0-9]+\.[0-9]+\.[0-9]+' <<<"$tagged"; then
+              echo "::notice::$GITHUB_SHA carries a release tag; the release run builds it"
+              build=false
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
   deps:
     name: Windows dependency layer
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
     # One build per commit at a time. A `vX.Y.Z` tag calls this workflow for a
     # commit a main push already built, so the group is the commit and not the
     # ref: the two runs take turns over the same tree instead of compiling it
@@ -108,7 +147,8 @@ jobs:
 
   windows:
     name: Windows x64 installer, portable zip and symbols
-    needs: deps
+    needs: [gate, deps]
+    if: needs.gate.outputs.build == 'true'
     # Same group as `deps`, for the same reason: this is the job that compiles
     # the payload, and it must not run beside the other run's copy of it.
     concurrency:

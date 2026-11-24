@@ -224,6 +224,16 @@ race that can cancel a release. Cancellation stays off, so neither run kills the
 other. The group sits on the jobs rather than the workflow so the called run and
 the pushed run land in exactly the same group.
 
+Serially is not the same as once, so `gate` decides whether the branch run has
+anything to do: `git push origin main v1.2.3` is two push events for one commit,
+and the tag's run — the release — builds that tree under the release names. The
+gate asks the tags API whether the commit carries a `vX.Y.Z` tag and the two
+build jobs are skipped when it does, so pushing both refs at once costs one
+build. The tags endpoint resolves an annotated tag to its commit, so there is no
+peeling to do; an API failure builds, which is the old behaviour. A tag pushed
+later cannot skip a build that already ran, so promoting an old commit to a
+release still rebuilds it.
+
 `clippy.yml`'s Windows job builds the same `.#windows-deps` and *saves* it under
 that key, so a lint run warms the build cache: the build's `deps` job then
 restores instead of compiling. `build.yml` builds `main` on any push that
