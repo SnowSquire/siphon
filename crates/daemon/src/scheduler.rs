@@ -208,6 +208,10 @@ pub struct StreamScheduler {
     segments: Vec<Segment>,
     prefetches: Vec<PrefetchSegment>,
 
+    /// The current `EXT-X-MAP` reader, shared with the runtime so a seek can
+    /// build an fMP4 demuxer without waiting for a consumer message.
+    init_window: Rc<RefCell<Option<Reader>>>,
+
     /// Snapshot of `segments` for the RTSP engine. When VOD playback reaches
     /// the end of the DVR playlist, the segments between there and the live
     /// edge are still in the live window; replaying them bridges the DVR lag
@@ -249,6 +253,8 @@ impl StreamScheduler {
             segments: Vec::new(),
             prefetches: Vec::new(),
 
+            init_window: Rc::new(RefCell::new(None)),
+
             live_window: Rc::new(RefCell::new(Vec::new())),
 
             readers: Vec::new(),
@@ -266,6 +272,14 @@ impl StreamScheduler {
     #[must_use]
     pub fn with_live_window(mut self, live_window: Rc<RefCell<Vec<Segment>>>) -> Self {
         self.live_window = live_window;
+        self
+    }
+
+    /// Share the current `EXT-X-MAP` reader with the runtime, so a seek that
+    /// lands in an fMP4 segment can demux it without being a consumer.
+    #[must_use]
+    pub fn with_init_window(mut self, init_window: Rc<RefCell<Option<Reader>>>) -> Self {
+        self.init_window = init_window;
         self
     }
 
@@ -332,6 +346,7 @@ impl StreamScheduler {
         self.prefetch_tail = 0;
         self.last_segment_dur = Duration::from_secs(5);
         self.init = None;
+        self.init_window.borrow_mut().take();
         self.segments.clear();
         self.prefetches.clear();
         self.live_window.borrow_mut().clear();
@@ -396,6 +411,7 @@ impl StreamScheduler {
         self.segments.clear();
         self.prefetches.clear();
         self.init = None;
+        self.init_window.borrow_mut().take();
         self.live_window.borrow_mut().clear();
         self.resume_at_edge = true;
         loop {
@@ -654,6 +670,7 @@ impl StreamScheduler {
             .await
             .union()?;
         self.init = Some((uri.into(), reader.clone()));
+        *self.init_window.borrow_mut() = Some(reader.clone());
         // Media must not overtake the new map: existing consumers get it now,
         // while a consumer adopted later gets it from `adopt`.
         self.readers.retain_unordered(|consumer| {

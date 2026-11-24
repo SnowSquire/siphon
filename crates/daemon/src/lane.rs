@@ -100,6 +100,24 @@ impl Playback {
     }
 }
 
+/// Where a `(re)started` producer must begin: the segment that holds the
+/// keyframe a seek resolved to, and that keyframe's presentation time on the
+/// broadcast timeline.
+///
+/// A seek is answered before the producer that serves it exists, so the answer
+/// travels through the lane handle: the app writes it, and the producer the
+/// connection starts takes it once when it begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Start {
+    /// Playlist sequence of the segment to begin at. Whole segments before it
+    /// are skipped, because the replay window reaches back further.
+    pub sequence: u64,
+    /// The keyframe's presentation time, in broadcast milliseconds. Access
+    /// units before it belong to the part of the segment the client would
+    /// discard.
+    pub pts_ms: u64,
+}
+
 /// One lane's live state: the app writes the playback numbers, the lane's
 /// producer task writes the counters, and both read the other side as plain
 /// values.
@@ -111,6 +129,9 @@ impl Playback {
 #[derive(Debug, Default)]
 struct Shared {
     playback: Cell<Option<Playback>>,
+    /// Where a producer that has not started yet must begin, written by a seek
+    /// or an absolute open and taken once by the producer.
+    start: Cell<Option<Start>>,
     /// End of the newest live segment, in broadcast milliseconds; `0` when the
     /// pipeline has published nothing yet.
     live_edge_ms: Cell<u64>,
@@ -289,6 +310,49 @@ impl LaneHandle {
         self.0.playback.set(Some(playback));
         self.0.live_edge_ms.set(live_edge_ms);
     }
+
+    /// Where a producer that has not started yet must begin, taken once.
+    ///
+    /// A seek that resumes forward or backward moves the start; only the
+    /// producer that is about to read the window cares, and it takes it when it
+    /// registers.
+    #[must_use]
+    pub fn take_start(&self) -> Option<Start> {
+        self.0.start.take()
+    }
+
+    /// Places the lane at a GOP-aligned start.
+    ///
+    /// The estimate restarts at `start.pts_ms` — the keyframe the daemon will
+    /// actually serve, not the requested target — and nothing counts as already
+    /// sent, because a backward seek lands before what this lane has already
+    /// delivered. The producer the caller starts next takes the start from
+    /// [`Self::take_start`].
+    pub fn begin_at(&self, start: Start, live_edge_ms: u64, now: Instant) {
+        let (rate, buffer_ms) = self
+            .0
+            .playback
+            .get()
+            .map_or((1.0, MIN_BUFFER_MS), |playback| {
+                (playback.rate(), playback.buffer_ms())
+            });
+        self.0.start.set(Some(start));
+        self.write(
+            Playback {
+                reported_ms: start.pts_ms,
+                rate,
+                buffer_ms,
+                at: now,
+            },
+            live_edge_ms,
+        );
+        for sent in &self.0.sent_ms {
+            sent.set(0);
+        }
+        for any in &self.0.sent_any {
+            any.set(false);
+        }
+    }
 }
 
 /// How far behind the playhead an access unit is still worth sending.
@@ -414,6 +478,18 @@ impl Lanes {
         self.lanes.get(key).map(|lane| lane.handle.clone())
     }
 
+    /// Moves an attached lane to a GOP-aligned start: the estimate and the
+    /// producer that the caller starts next both begin at `start`.
+    ///
+    /// `false` means the lane is not attached, so there is nothing to place.
+    pub fn begin_at(&self, key: &StreamKey, start: Start, live_edge_ms: u64, now: Instant) -> bool {
+        let Some(lane) = self.lanes.get(key) else {
+            return false;
+        };
+        lane.handle.begin_at(start, live_edge_ms, now);
+        true
+    }
+
     #[must_use]
     pub fn contains(&self, key: &StreamKey) -> bool {
         self.lanes.contains_key(key)
@@ -423,13 +499,6 @@ impl Lanes {
     /// to be released.
     pub fn remove(&mut self, key: &StreamKey) -> bool {
         self.lanes.remove(key).is_some()
-    }
-
-    /// The reported position of one lane, for a seek that cannot place the
-    /// pipeline.
-    #[must_use]
-    pub fn position_ms(&self, key: &StreamKey) -> Option<u64> {
-        self.lanes.get(key).map(Lane::position_ms)
     }
 
     /// One lane's row.
@@ -736,6 +805,43 @@ mod tests {
         assert!(view.recovering, "a video drop now is a smear now");
         let after = start + Duration::from_secs(RECOVERY_MS / 1_000 + 1);
         assert!(!lanes.view(&key(7), after, 0).unwrap().recovering);
+    }
+
+    /// A GOP-aligned start moves the estimate back and forgets what was sent:
+    /// a backward seek lands before what the lane has already delivered, so
+    /// nothing may be suppressed as a replay.
+    #[test]
+    fn a_seek_places_the_lane_at_the_keyframe_and_forgets_what_was_sent() {
+        let start = Instant::now();
+        let mut lanes = Lanes::default();
+        lanes.open(
+            key(7),
+            playback(PlaybackPosition::Absolute { pts_ms: 60_000 }, 1.0, 30_000),
+            60_000,
+            60_000,
+            start,
+            1_000,
+        );
+        let handle = lanes.handle(&key(7)).unwrap();
+        handle.note_sent(Track::Video, 59_000);
+        handle.note_sent(Track::Audio, 59_020);
+        assert!(handle.already_sent(Track::Video, 58_000));
+
+        let seek = Start {
+            sequence: 42,
+            pts_ms: 12_000,
+        };
+        assert!(lanes.begin_at(&key(7), seek, 60_000, start));
+        assert_eq!(handle.take_start(), Some(seek));
+        assert_eq!(handle.take_start(), None, "the producer takes it once");
+        assert_eq!(handle.playback().unwrap().position_ms(), 12_000);
+        assert_eq!(handle.playhead_ms(start), 12_000);
+        assert!(!handle.has_sent());
+        assert!(!handle.already_sent(Track::Video, 11_999));
+        // The rate and the buffer belong to the client and survive the seek.
+        assert_eq!(handle.buffer_ms(), 30_000);
+
+        assert!(!lanes.begin_at(&key(8), seek, 0, start), "not attached");
     }
 
     /// The connection's stats are the lanes' counters summed, and a lane that

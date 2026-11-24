@@ -53,6 +53,7 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::lane::LaneHandle;
+use crate::lane::Start;
 use crate::media::wire::AccessUnit;
 use crate::media::wire::AccessUnits;
 use crate::media::wire::Container;
@@ -499,6 +500,8 @@ pub struct LaneProducer<S: Sink> {
     source: Option<SegmentSource>,
     /// The fMP4 init segment, kept because a rebuild needs it.
     init: Option<Vec<u8>>,
+    /// A seek's start, until the segment that holds its keyframe arrives.
+    start: Option<Start>,
 
     packer: Packer,
     /// One segment's bytes, reused.
@@ -534,8 +537,10 @@ impl<S: Sink + 'static> LaneProducer<S> {
         // A lane at the live edge wants what is published from now on: anything
         // older is either already at the client or superseded. A lane that is
         // behind wants the retained window, which is the only place the segment
-        // it needs next can be.
-        let backlog = !handle.at_edge(Instant::now());
+        // it needs next can be — and that includes a lane a seek placed, whose
+        // starting segment may be older still.
+        let start = handle.take_start();
+        let backlog = start.is_some() || !handle.at_edge(Instant::now());
         let stream = SegmentStream::register(consumer.slot, backlog)?;
         let control = stream.control();
         let (stop_tx, stop_rx) = kanal::bounded(1);
@@ -551,6 +556,7 @@ impl<S: Sink + 'static> LaneProducer<S> {
             stop: stop_rx.to_async(),
             source: None,
             init: None,
+            start,
             packer: Packer::for_lane(lane_id, lane.wrapping_mul(LANE_ID_SPAN), budget),
             segment: Vec::new(),
             scratch: Vec::new(),
@@ -576,7 +582,21 @@ impl<S: Sink + 'static> LaneProducer<S> {
             match message {
                 SegmentMessage::Init { reader } => self.read_init(reader).await,
                 SegmentMessage::Segment(segment) => {
-                    if !self.feed(segment).await {
+                    // A seek's window replay reaches back before the segment it
+                    // picked, so whole segments are skipped until the one that
+                    // holds the keyframe. A segment past it means the picked one
+                    // rotated out of the window: starting at that segment's own
+                    // first unit is the closest the daemon can still get.
+                    let align = if let Some(start) = self.start.take() {
+                        if segment.sequence_num < start.sequence {
+                            self.start = Some(start);
+                            continue;
+                        }
+                        (segment.sequence_num == start.sequence).then_some(start.pts_ms)
+                    } else {
+                        None
+                    };
+                    if !self.feed(segment, align).await {
                         break;
                     }
                 }
@@ -627,7 +647,10 @@ impl<S: Sink + 'static> LaneProducer<S> {
     }
 
     /// Demuxes one segment and feeds its access units. `false` ends the lane.
-    async fn feed(&mut self, segment: Segment) -> bool {
+    ///
+    /// `align` is the keyframe a seek starts at, when this is the segment that
+    /// holds it.
+    async fn feed(&mut self, segment: Segment, align: Option<u64>) -> bool {
         let Segment {
             timestamp_ms,
             mut reader,
@@ -671,7 +694,9 @@ impl<S: Sink + 'static> LaneProducer<S> {
         }
         // The iterator borrows the source, which is out of `self` for exactly
         // this reason: packing needs `self` mutably.
-        let outcome = self.feed_units(source.access_units(), timestamp_ms).await;
+        let outcome = self
+            .feed_units(source.access_units(), timestamp_ms, align)
+            .await;
         self.source = Some(source);
         match outcome {
             Outcome::Done => true,
@@ -684,12 +709,28 @@ impl<S: Sink + 'static> LaneProducer<S> {
     }
 
     /// Packs and offers every access unit of one segment.
-    async fn feed_units(&mut self, units: AccessUnits<'_>, segment_ms: u64) -> Outcome {
+    async fn feed_units(
+        &mut self,
+        units: AccessUnits<'_>,
+        segment_ms: u64,
+        align: Option<u64>,
+    ) -> Outcome {
         for unit in units {
             if self.stream.is_closed() {
                 return Outcome::Closed;
             }
+            // The anchor is taken before the seek filter: it is the mapping for
+            // the whole track, and the units before the keyframe are still part
+            // of the segment's clock.
             let media_ms = self.anchor(unit, segment_ms);
+            // A seek starts at the located keyframe. What precedes it is the
+            // part of the broadcast the client discards, so it is never sent —
+            // and it is not loss, so it is not counted as a drop.
+            if let Some(start) = align
+                && media_ms < start
+            {
+                continue;
+            }
             let now = Instant::now();
 
             // The push rule first: a paused lane does not read at all, so
@@ -808,18 +849,36 @@ impl<S: Sink + 'static> LaneProducer<S> {
 /// forwards what the test publishes, so the media lane is exercised end to end
 /// over the real carrier without a playlist server. `consumers` counts the live
 /// registrations, which is how a test sees a lane unregister.
+///
+/// It also keeps the pipeline's retained window, which the real scheduler
+/// fills: `place` and a seek read it, and a lane that registers with `backlog`
+/// is replayed from it. There is no map here, so this covers MPEG-TS fixtures.
 #[cfg(all(test, not(miri)))]
 pub fn spawn_fixture_feed(
     receive: kanal::Receiver<ConsumerRegistration>,
     source: kanal::AsyncReceiver<SegmentMessage>,
     consumers: Rc<Cell<usize>>,
+    live_window: Rc<RefCell<Vec<Segment>>>,
 ) {
     compio::runtime::spawn(async move {
         let mut sinks: Vec<kanal::Sender<SegmentMessage>> = Vec::new();
         while let Ok(message) = source.recv().await {
             while let Ok(Some(registration)) = receive.try_recv() {
+                // A lane that is starting behind the edge — a paused producer
+                // or one a seek placed — replays the window, exactly as the
+                // scheduler's own adoption does.
+                if registration.backlog {
+                    for segment in live_window.borrow().iter() {
+                        let _ = registration
+                            .tx
+                            .try_send(SegmentMessage::Segment(segment.clone()));
+                    }
+                }
                 sinks.push(registration.tx);
                 consumers.set(consumers.get() + 1);
+            }
+            if let SegmentMessage::Segment(segment) = &message {
+                live_window.borrow_mut().push(segment.clone());
             }
             sinks.retain(|sink| {
                 let forwarded = match &message {
@@ -903,19 +962,25 @@ mod tests {
         path.exists().then_some(path)
     }
 
-    /// Writes a whole segment into a spool and hands over its reader.
-    fn spooled(arena: &Rc<ArenaSet>, bytes: &[u8]) -> Segment {
+    /// Writes a whole segment into a spool and hands over its reader, with the
+    /// sequence and playlist time the scheduler would give it. Closing the
+    /// writer is what makes the reader see the end of the segment, exactly as a
+    /// completed fetch does.
+    fn spooled_at(
+        arena: &Rc<ArenaSet>,
+        bytes: &[u8],
+        sequence_num: u64,
+        timestamp_ms: u64,
+    ) -> Segment {
         let wakes = WakeSet::new();
         let (mut writer, reader) = Spool::open(arena, &wakes).expect("spool");
         write(&mut writer, bytes);
-        // Closing the writer is what makes the reader see the end of the
-        // segment, exactly as a completed fetch does.
         drop(writer);
         Segment {
-            timestamp_ms: 0,
+            timestamp_ms,
             pdt_ms: 0,
             duration_ms: 2_000,
-            sequence_num: 1,
+            sequence_num,
             reader,
         }
     }
@@ -939,6 +1004,10 @@ mod tests {
         producer: Option<ProducerHandle>,
         /// The producer's consumer channel, as the scheduler would hold it.
         feed: kanal::Sender<SegmentMessage>,
+        /// The pipeline's registration channel: a restarted producer registers
+        /// again, exactly as one that the push rule stopped does.
+        slot: kanal::Sender<ConsumerRegistration>,
+        registrations: kanal::Receiver<ConsumerRegistration>,
         arena: Rc<ArenaSet>,
     }
 
@@ -963,7 +1032,7 @@ mod tests {
             let handle = lanes.handle(&key).expect("the lane opened");
             let (slot, registrations) = kanal::unbounded();
             let consumer = LaneConsumer {
-                slot,
+                slot: slot.clone(),
                 wake: ConsumerWake::new(),
             };
             let collector = Collector::with_budget(budget);
@@ -978,6 +1047,8 @@ mod tests {
                 lanes,
                 producer: Some(producer),
                 feed: registration.tx,
+                slot,
+                registrations,
                 arena: Rc::new(ArenaSet::new()),
             }
         }
@@ -987,7 +1058,11 @@ mod tests {
         }
 
         fn segment(&self, bytes: &[u8]) {
-            let segment = spooled(&self.arena, bytes);
+            self.segment_at(bytes, 1, 0);
+        }
+
+        fn segment_at(&self, bytes: &[u8], sequence_num: u64, timestamp_ms: u64) {
+            let segment = spooled_at(&self.arena, bytes, sequence_num, timestamp_ms);
             let _ = self.feed.try_send(SegmentMessage::Segment(segment));
         }
 
@@ -999,6 +1074,29 @@ mod tests {
             write(&mut writer, bytes);
             drop(writer);
             let _ = self.feed.try_send(SegmentMessage::Init { reader });
+        }
+
+        /// Stops the producer and starts another, the way a seek does: the lane
+        /// is placed at `start` and a fresh producer takes it from the handle.
+        fn restart(&mut self, start: Start) {
+            self.producer.take();
+            let key = StreamKey::new(1, None);
+            let handle = self.handle();
+            handle.begin_at(start, 0, Instant::now());
+            let consumer = LaneConsumer {
+                slot: self.slot.clone(),
+                wake: ConsumerWake::new(),
+            };
+            let producer =
+                LaneProducer::spawn(key, handle, consumer, Rc::clone(&self.collector), 0)
+                    .expect("the producer registers again");
+            let registration = self
+                .registrations
+                .try_recv()
+                .expect("the registration is queued")
+                .expect("one registration");
+            self.feed = registration.tx;
+            self.producer = Some(producer);
         }
 
         fn stop(&mut self) {
@@ -1153,6 +1251,83 @@ mod tests {
                 "the fMP4 segment opens with an IRAP"
             );
             assert!(objects.iter().any(|object| object.class == Class::Audio));
+            harness.stop();
+        });
+    }
+
+    /// A seek backwards restarts the producer at the segment that holds the
+    /// target, not at the point it had already reached: the first video access
+    /// unit it offers afterwards is that segment's keyframe.
+    #[test]
+    fn a_seek_backwards_restarts_the_producer_at_the_containing_segment() {
+        let Some(dir) = fixture("servermock-fmp4/landscape") else {
+            println!("captures/ is absent; skipping the seek restart test");
+            return;
+        };
+        let init = std::fs::read(dir.join("init.mp4")).expect("init fixture");
+        let first = std::fs::read(dir.join("live/000000.m4s")).expect("segment fixture");
+        let second = std::fs::read(dir.join("live/000001.m4s")).expect("segment fixture");
+        // The first video access unit of the first segment, in the container's
+        // own clock: what the restarted producer must reproduce exactly.
+        let expected = SegmentSource::open(&first, Some(&init))
+            .expect("the fixture demuxes")
+            .access_units()
+            .find(|unit| unit.track == Track::Video)
+            .expect("the segment has video")
+            .pts;
+        let runtime = compio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            // Play both segments to the end, so the lane's sent position is
+            // past the seek target.
+            let mut harness = Harness::new(0, 1.0, 30_000, 1_182);
+            harness.init(&init);
+            harness.segment_at(&first, 1, 0);
+            let handle = harness.handle();
+            until(|| handle.sent_ms() >= 1_900).await;
+            harness.segment_at(&second, 2, 2_000);
+            until(|| handle.sent_ms() >= 3_900).await;
+            // Let the old producer see the stop: nothing it still holds may
+            // arrive after the baseline and be mistaken for the new one's.
+            harness.stop();
+            until(|| harness.feed.is_closed()).await;
+            let before = harness.collector.count();
+
+            // Seek to the first segment's keyframe. The scheduler re-sends the
+            // map and replays the window, as it does for a paused lane.
+            let keyframe = SegmentSource::open(&first, Some(&init))
+                .expect("the fixture demuxes")
+                .seek_keyframe(0, 0)
+                .expect("a keyframe");
+            harness.restart(Start {
+                sequence: 1,
+                pts_ms: keyframe,
+            });
+            harness.init(&init);
+            harness.segment_at(&first, 1, 0);
+            harness.segment_at(&second, 2, 2_000);
+            until(|| harness.collector.count() > before).await;
+
+            // The first video object after the restart is the one the seek
+            // named, not the one the lane had reached.
+            let offered = harness.collector.offered();
+            let (pts, _dts) = offered[before..]
+                .iter()
+                .find_map(|(_, datagram)| {
+                    let object = Object::decode_datagram(datagram).expect("a valid object header");
+                    (object.class == Class::Video && object.frag_offset == 0)
+                        .then(|| crate::media::wire::timestamps(object.payload))
+                        .flatten()
+                })
+                .expect("the restarted producer offers video");
+            assert_eq!(pts, expected, "the seek segment's keyframe opens it");
+            assert_eq!(
+                handle
+                    .playback()
+                    .expect("the lane has playback")
+                    .position_ms(),
+                keyframe,
+                "the estimate moved to the keyframe with the producer"
+            );
             harness.stop();
         });
     }

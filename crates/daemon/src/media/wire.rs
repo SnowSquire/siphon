@@ -286,6 +286,45 @@ impl SegmentSource {
         Ok(())
     }
 
+    /// The last video keyframe at or before `target_ms`, on the broadcast
+    /// timeline where this segment starts at `segment_ms`; the segment's first
+    /// keyframe when the target precedes them all, and `None` when the segment
+    /// carries no video keyframe at all.
+    ///
+    /// This is the same mapping the lane producer uses — a track's container
+    /// clock offset by the difference between the playlist's segment start and
+    /// the segment's first access unit on that track — so a seek answer and the
+    /// first access unit the producer sends for it agree exactly.
+    ///
+    /// A segment boundary is not a GOP boundary: Twitch's fMP4 segments carry
+    /// several IRAPs, so the answer has to come from the access units and never
+    /// from the playlist.
+    #[must_use]
+    pub fn seek_keyframe(&self, segment_ms: u64, target_ms: u64) -> Option<u64> {
+        let mut anchor: Option<i64> = None;
+        let mut first = None;
+        let mut last_before = None;
+        for unit in self.access_units() {
+            if unit.track != Track::Video {
+                continue;
+            }
+            let container_ms = i64::try_from(unit.pts_ms()).unwrap_or(0);
+            let offset = *anchor
+                .get_or_insert_with(|| i64::try_from(segment_ms).unwrap_or(0) - container_ms);
+            if !unit.keyframe {
+                continue;
+            }
+            let media = u64::try_from(container_ms.saturating_add(offset)).unwrap_or(0);
+            if first.is_none() {
+                first = Some(media);
+            }
+            if media <= target_ms {
+                last_before = Some(media);
+            }
+        }
+        last_before.or(first)
+    }
+
     /// The access units of the last fed segment, in demux order.
     #[must_use]
     pub const fn access_units(&self) -> AccessUnits<'_> {
@@ -1040,6 +1079,78 @@ mod tests {
             report.fragments, report.access_units,
             "every access unit here fits one fragment"
         );
+    }
+
+    /// Every video keyframe's presentation time on the broadcast timeline, in
+    /// demux order, mapped the way the lane producer maps them: a segment
+    /// starts at `segment_ms` and its first video access unit anchors the
+    /// track's clock.
+    fn media_keyframes(source: &SegmentSource, segment_ms: u64) -> Vec<u64> {
+        let mut anchor: Option<i64> = None;
+        let mut keyframes = Vec::new();
+        for unit in source.access_units() {
+            if unit.track != Track::Video {
+                continue;
+            }
+            let container_ms = i64::try_from(unit.pts_ms()).unwrap();
+            let offset =
+                *anchor.get_or_insert_with(|| i64::try_from(segment_ms).unwrap() - container_ms);
+            if unit.keyframe {
+                keyframes.push(u64::try_from(container_ms + offset).unwrap());
+            }
+        }
+        keyframes
+    }
+
+    /// A segment boundary is not a GOP boundary: this fixture's chunk carries
+    /// five IRAPs, so a seek answer has to come from the access units and must
+    /// land strictly before its target rather than on the next GOP.
+    #[test]
+    fn a_seek_lands_on_the_keyframe_before_its_target() {
+        let Some(dir) = fixture("servermock-fmp4/landscape") else {
+            println!("captures/ is absent; skipping the fMP4 seek test");
+            return;
+        };
+        let init = read(&dir.join("init.mp4"));
+        let segment = read(&dir.join("chunks/000.m4s"));
+        let source = SegmentSource::open(&segment, Some(&init)).expect("the fMP4 chunk demuxes");
+
+        let keyframes = media_keyframes(&source, 0);
+        assert!(
+            keyframes.len() >= 3,
+            "the fixture's chunk has five IRAPs, which is why seek cannot use a segment boundary"
+        );
+        // Halfway between the second and third IRAP: unambiguously inside the
+        // second GOP, not on a keyframe.
+        let target = keyframes[1] + (keyframes[2] - keyframes[1]) / 2;
+        assert!(keyframes[1] < target);
+        assert_eq!(source.seek_keyframe(0, target), Some(keyframes[1]));
+        assert!(
+            source.seek_keyframe(0, target).unwrap() < target,
+            "the answer never rounds up to the next GOP"
+        );
+
+        // A target before every keyframe still starts at one: the first.
+        assert_eq!(source.seek_keyframe(0, 0), Some(keyframes[0]));
+        // And with the segment starting later in the broadcast, the answer is
+        // on that timeline, not the container's.
+        assert_eq!(
+            source.seek_keyframe(10_000, 10_000 + target),
+            Some(10_000 + keyframes[1])
+        );
+    }
+
+    /// A segment with no video access unit has no keyframe to align to, so a
+    /// seek cannot invent one.
+    #[test]
+    fn a_seek_point_needs_a_video_keyframe() {
+        // Two whole MPEG-TS packets with no PAT, PMT or PES: valid framing,
+        // no samples.
+        let Ok(source) = SegmentSource::open(&[0x47; 376], None) else {
+            return;
+        };
+        assert_eq!(source.access_units().len(), 0);
+        assert_eq!(source.seek_keyframe(0, 5_000), None);
     }
 
     #[test]

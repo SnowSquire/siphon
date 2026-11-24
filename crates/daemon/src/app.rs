@@ -59,6 +59,7 @@ use crate::hermes::Topic;
 use crate::http::Client;
 use crate::http::ws::WsStream;
 use crate::lane::Lanes;
+use crate::lane::Start;
 use crate::registry::Job;
 use crate::registry::LanePlace;
 use crate::registry::Registry;
@@ -869,7 +870,7 @@ impl App {
             Request::StreamOpen { key, playback } => self.stream_open(conn, key, playback).await,
             Request::StreamUpdate { key, playback } => self.stream_update(conn, &key, playback),
             Request::StreamClose { key } => self.stream_close(conn, key),
-            Request::StreamSeek { key, target } => self.stream_seek(conn, &key, target),
+            Request::StreamSeek { key, target } => self.stream_seek(conn, &key, target).await,
             Request::GetSnapshot => Ok(Response::Snapshot(Box::new(
                 self.snapshot(&conn.lanes, conn.stats(Instant::now())),
             ))),
@@ -903,6 +904,12 @@ impl App {
     /// lanes, so a second `attach` would be a second claim that no close would
     /// ever release.
     ///
+    /// `PlaybackPosition::Live` starts at the next published segment: there is
+    /// nothing to align, because that segment has not arrived yet. An absolute
+    /// position is a seek with no reply, so it is GOP-aligned exactly like one —
+    /// the lane starts at the keyframe at or before the target, in the segment
+    /// that holds it, and its producer is (re)started there.
+    ///
     /// A connection with no datagram channel has nowhere to push media. That is
     /// a typed refusal *before* the pipeline is attached: the local pipe carries
     /// control only, and a lane that attached and then fed nothing would look
@@ -928,8 +935,15 @@ impl App {
         } else {
             (self.registry.place(&key), None)
         };
-        let position_ms = position_of(playback.position, place);
+        let target_ms = position_of(playback.position, place);
+        let point = match playback.position {
+            PlaybackPosition::Live => None,
+            PlaybackPosition::Absolute { .. } => self.registry.seek_point(&key, target_ms).await,
+        };
         let live_edge_ms = place.map_or(0, |place| place.position_ms);
+        // The estimate starts where the daemon will actually serve, so a starved
+        // check and the push rule agree with the first access unit.
+        let position_ms = point.map_or(target_ms, |point| point.pts_ms);
         conn.lanes.open(
             key.clone(),
             playback,
@@ -938,7 +952,27 @@ impl App {
             now,
             wall_ms(),
         );
-        if let Some(runtime) = runtime {
+        if let Some(point) = point {
+            conn.lanes.begin_at(
+                &key,
+                Start {
+                    sequence: point.sequence,
+                    pts_ms: point.pts_ms,
+                },
+                live_edge_ms,
+                now,
+            );
+        }
+        // A fresh lane needs a producer; so does one re-opened at an absolute
+        // position, because where it starts moved.
+        if opened || point.is_some() {
+            let Some(runtime) = runtime.or_else(|| self.registry.stream(&key)) else {
+                conn.lanes.remove(&key);
+                self.registry.detach(&key);
+                return Err(RpcError::Failed(
+                    "the pipeline stopped before the lane could start".to_owned(),
+                ));
+            };
             let Some(handle) = conn.lanes.handle(&key) else {
                 return Err(RpcError::NotFound);
             };
@@ -1005,37 +1039,83 @@ impl App {
         Ok(Response::Ack)
     }
 
-    /// Answers where the daemon would start serving, not the target itself.
+    /// Answers where the daemon will start serving, and moves the lane there.
     ///
-    /// GOP alignment needs the demuxer's access-unit index, which is not wired
-    /// yet, so the answer is the position the runtime holds (the live edge) and
-    /// the newest segment's sequence. `trimmed` stays false because nothing is
-    /// clamped here: [`LaneState::Starved`] already says the retained window no
-    /// longer holds a position, and the clamp lands with the media lane.
+    /// The answer is a keyframe, not the target: the last video keyframe at or
+    /// before the target in the retained window, plus the playlist sequence of
+    /// the segment that holds it. The lane's estimate moves to that keyframe and
+    /// its producer is restarted from that segment, so the first access unit the
+    /// client receives is the one the answer named.
+    ///
+    /// A target older than the window is clamped forward to the window's oldest
+    /// segment and reported as `trimmed`, because the daemon cannot serve what it
+    /// no longer retains. A gap between the served start and the target is the
+    /// client's to discard, exactly as on a forward seek.
     ///
     /// [`LaneState::Starved`]: siphon_shared::riffle::LaneState::Starved
-    fn stream_seek(
+    async fn stream_seek(
         &self,
-        conn: &riffle::Conn,
+        conn: &mut riffle::Conn,
         key: &StreamKey,
         target: PlaybackPosition,
     ) -> Result<Response, RpcError> {
         if !conn.lanes.contains(key) {
             return Err(RpcError::NotFound);
         }
-        // The target is what the client discards towards; the daemon cannot
-        // place it without the AU index, so it is deliberately unused here.
-        let _ = target;
-        let place = self.registry.place(key);
-        let held = conn.lanes.position_ms(key);
-        let started = StreamStarted {
-            start_pts_ms: place.map_or_else(|| held.unwrap_or(0), |place| place.position_ms),
-            start_sequence: place.map_or(0, |place| place.sequence),
-            trimmed: false,
+        let Some(media) = conn.media() else {
+            return Err(if conn.is_quic() {
+                quic_without_datagrams()
+            } else {
+                pipe_has_no_media()
+            });
         };
-        // The lane's own position moves on the client's next `StreamUpdate`;
-        // this answer only says what the daemon would serve.
-        Ok(Response::StreamStarted(started))
+        let now = Instant::now();
+        let place = self.registry.place(key);
+        let target_ms = position_of(target, place);
+        // A pipeline that retains nothing yet has no keyframe to name. The
+        // answer is where it will start, and it is a clamp: the target was not
+        // honoured as asked.
+        let Some(point) = self.registry.seek_point(key, target_ms).await else {
+            return Ok(Response::StreamStarted(StreamStarted {
+                start_pts_ms: target_ms,
+                start_sequence: place.map_or(0, |place| place.sequence),
+                trimmed: true,
+            }));
+        };
+        let start = Start {
+            sequence: point.sequence,
+            pts_ms: point.pts_ms,
+        };
+        let live_edge_ms = place.map_or(0, |place| place.position_ms);
+        if !conn.lanes.begin_at(key, start, live_edge_ms, now) {
+            return Err(RpcError::NotFound);
+        }
+        let Some(runtime) = self.registry.stream(key) else {
+            return Err(RpcError::Failed(
+                "the pipeline stopped before the seek could be served".to_owned(),
+            ));
+        };
+        let Some(handle) = conn.lanes.handle(key) else {
+            return Err(RpcError::NotFound);
+        };
+        let Some(consumer) = runtime.lane_consumer() else {
+            return Err(RpcError::Failed(
+                "the pipeline has no scheduler left".to_owned(),
+            ));
+        };
+        if !conn.start_lane(key.clone(), handle, consumer, Rc::new(media)) {
+            return Err(RpcError::Failed(
+                "the pipeline stopped before the lane could register".to_owned(),
+            ));
+        }
+        if !Self::push_lane(conn, key, now, place) {
+            return Err(RpcError::Disconnected);
+        }
+        Ok(Response::StreamStarted(StreamStarted {
+            start_pts_ms: point.pts_ms,
+            start_sequence: point.sequence,
+            trimmed: point.trimmed,
+        }))
     }
 
     /// Writes one lane row straight to the owning connection's queue.

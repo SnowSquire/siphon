@@ -190,10 +190,12 @@ pub struct Conn {
     /// The one task that sends this connection's media, created with the first
     /// lane. Dropping it (with the connection) ends the sender.
     media: Option<MediaSender>,
-    /// One producer per attached lane. Dropping a handle stops its producer.
-    producers: HashMap<StreamKey, ProducerHandle>,
+    /// One producer per attached lane, with the object-id lane it stamps on its
+    /// objects. Dropping a handle stops its producer.
+    producers: HashMap<StreamKey, (u64, ProducerHandle)>,
     /// How many lanes this connection has opened, for the disjoint object-id
-    /// range each one gets.
+    /// range each one gets. A producer that is restarted for a seek keeps the
+    /// lane it already had, so its ids stay in one monotonic range.
     lanes_opened: u64,
     /// Set while the connection is a pairing attempt: it may send exactly one
     /// `PairConfirm` and nothing else.
@@ -238,6 +240,11 @@ impl Conn {
     }
 
     /// Registers one lane's producer, stopping any producer already there.
+    ///
+    /// A restart — a seek, or a re-open at an absolute position — reuses the
+    /// lane's object-id range: `obj_id` is monotonic per lane for the life of a
+    /// connection, and a new range for every seek would drift by `2^40` each
+    /// time and eventually wrap the 16-bit lane tag.
     pub fn start_lane<S: Sink + 'static>(
         &mut self,
         key: StreamKey,
@@ -245,12 +252,20 @@ impl Conn {
         consumer: crate::media::lane::LaneConsumer,
         sink: Rc<S>,
     ) -> bool {
-        let lane = self.lanes_opened;
+        // Remove first: the old producer is stopped before the new one
+        // registers, so the scheduler never has two live consumers for one lane
+        // and nothing the replaced producer holds arrives after the restart.
+        let lane = if let Some((lane, _)) = self.producers.remove(&key) {
+            lane
+        } else {
+            let lane = self.lanes_opened;
+            self.lanes_opened = self.lanes_opened.wrapping_add(1);
+            lane
+        };
         let Some(producer) = LaneProducer::spawn(key.clone(), handle, consumer, sink, lane) else {
             return false;
         };
-        self.lanes_opened = self.lanes_opened.wrapping_add(1);
-        self.producers.insert(key, producer);
+        self.producers.insert(key, (lane, producer));
         true
     }
 
@@ -1090,15 +1105,16 @@ mod tests {
             daemon
                 .fixture
                 .send(crate::scheduler::SegmentMessage::Segment(spooled(
-                    &arena, &segment, 0,
+                    &arena, &segment, 1, 0,
                 )))
                 .expect("fixture segment");
-            let send = |arena: &Rc<ArenaSet>, timestamp_ms: u64| {
+            let send = |arena: &Rc<ArenaSet>, bytes: &[u8], sequence, timestamp_ms| {
                 daemon
                     .fixture
                     .send(crate::scheduler::SegmentMessage::Segment(spooled(
                         arena,
-                        &segment,
+                        bytes,
+                        sequence,
                         timestamp_ms,
                     )))
                     .expect("fixture segment");
@@ -1183,6 +1199,87 @@ mod tests {
             );
             assert!(!snapshot.conn_stats.recovering());
 
+            // A second segment, then a seek into its first millisecond: the
+            // answer is that segment's keyframe, and the producer restarts
+            // there rather than carrying on from the edge.
+            let second = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../captures/servermock/live/000001.ts"),
+            )
+            .expect("the second fixture");
+            send(&arena, &second, 2, 2_000);
+            let mut latest = Vec::new();
+            while let Ok(Some(datagram)) =
+                compio::time::timeout(Duration::from_millis(300), datagrams.recv()).await
+            {
+                latest.push(datagram);
+            }
+            assert!(!latest.is_empty(), "the second segment was served");
+            let first_lane = objects[0].lane;
+
+            let response = client
+                .request(Request::StreamSeek {
+                    key: key.clone(),
+                    target: PlaybackPosition::Absolute { pts_ms: 2_000 },
+                })
+                .await
+                .expect("stream seek");
+            let Response::StreamStarted(started) = response else {
+                panic!("a started position, got {response:?}");
+            };
+            assert_eq!(started.start_sequence, 2, "the segment that holds it");
+            assert_eq!(started.start_pts_ms, 2_000, "its keyframe, not the target");
+            assert!(!started.trimmed, "the window still held the target");
+
+            // Flush whatever the replaced producer had already queued, so the
+            // media below can only be the restarted one's.
+            while compio::time::timeout(Duration::from_millis(300), datagrams.recv())
+                .await
+                .is_ok()
+            {}
+
+            // One more published segment is what makes the fixture feed adopt
+            // the new registration; it replays the window, of which the
+            // restarted producer must skip the part before the seek segment.
+            send(&arena, &segment, 3, 4_000);
+            let mut resumed = Vec::new();
+            while let Ok(Some(datagram)) =
+                compio::time::timeout(Duration::from_millis(300), datagrams.recv()).await
+            {
+                resumed.push(datagram);
+            }
+            let second_keyframe = crate::media::wire::SegmentSource::open(&second, None)
+                .expect("the second fixture demuxes")
+                .access_units()
+                .find(|unit| unit.track == crate::media::wire::Track::Video)
+                .expect("the fixture has video")
+                .pts;
+            let (pts, _) = resumed
+                .iter()
+                .find_map(|datagram| {
+                    let object =
+                        siphon_shared::riffle::Object::decode_datagram(datagram).expect("a header");
+                    (object.class == siphon_shared::riffle::Class::Video && object.frag_offset == 0)
+                        .then(|| crate::media::wire::timestamps(object.payload))
+                        .flatten()
+                })
+                .expect("the restarted producer serves video");
+            assert_eq!(
+                pts, second_keyframe,
+                "the replay started at the seek segment's keyframe"
+            );
+            assert_eq!(
+                resumed
+                    .iter()
+                    .find_map(|datagram| {
+                        siphon_shared::riffle::Object::decode_datagram(datagram).ok()
+                    })
+                    .expect("an object")
+                    .lane,
+                first_lane,
+                "a restarted producer keeps its lane's object-id range"
+            );
+
             // Closing the lane releases the pipeline and unregisters the
             // consumer; a later segment reaches nobody.
             let response = client.request(Request::StreamClose { key }).await.unwrap();
@@ -1196,7 +1293,7 @@ mod tests {
 
             // A closed lane's consumer is gone, so a later segment is
             // dispatched to nobody: the producer ended, it was not left parked.
-            send(&arena, 2_000);
+            send(&arena, &segment, 4, 6_000);
             for _ in 0..50 {
                 if daemon.fixture_consumers.get() == 0 {
                     break;
@@ -1213,7 +1310,12 @@ mod tests {
     }
 
     /// Writes one segment into a spool, as a completed fetch leaves it.
-    fn spooled(arena: &Rc<ArenaSet>, bytes: &[u8], timestamp_ms: u64) -> crate::scheduler::Segment {
+    fn spooled(
+        arena: &Rc<ArenaSet>,
+        bytes: &[u8],
+        sequence_num: u64,
+        timestamp_ms: u64,
+    ) -> crate::scheduler::Segment {
         let wakes = crate::spool::WakeSet::new();
         let (mut writer, reader) = crate::spool::Spool::open(arena, &wakes).expect("spool");
         let mut offset = 0;
@@ -1229,7 +1331,7 @@ mod tests {
             timestamp_ms,
             pdt_ms: 0,
             duration_ms: 2_000,
-            sequence_num: 1,
+            sequence_num,
             reader,
         }
     }

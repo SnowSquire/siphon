@@ -6,10 +6,11 @@ playhead estimate, the `LaneView` rows, and the path that actually pushes media:
 one producer task per lane demuxes the pipeline's segments, packs access units
 into objects and hands them to one datagram sender per connection, which drains
 audio and edge-lane traffic first. The UI's receive half reassembles those
-datagrams into whole access units and counts what it loses. What is *not* built
-yet: GOP alignment on join and seek (a lane that opens while the pipeline has no
-edge waits for the next segment), the UI's decoder and player, and the zero-copy
-pipe path. RTSP
+datagrams into whole access units and counts what it loses. Seek and an absolute
+join are GOP-aligned from the retained window (a live open starts at the next
+published segment). What is *not* built yet: the best-effort live join that
+starts a GOP back and runs above 1× (the daemon does not pace above 1×), the UI's
+decoder and player, and the zero-copy pipe path. RTSP
 is gone — `play`, the RTSP listener and the RTP packetizers were removed — so the
 only viewer path is this one. Parts II and III are implemented, and so is the
 **QUIC carrier for the control plane**: self-signed certificates on both sides, a
@@ -265,6 +266,35 @@ high queue, and the sender drains high before low.
   retained segment and reported through `StreamStarted`, so the client knows it
   jumped. This is a rare path: a DVR 403, or a DVR URL that cannot be resolved.
 
+As built:
+
+- The window a seek reads is the pipeline's live window (the scheduler's
+  `Segments` snapshot). The DVR archive's front is **not** in it — the media lane
+  has no DVR reader — so a target in the archived past is clamped to the live
+  window's oldest segment and reported `trimmed`, not served.
+- `registry::seek_point` copies the window out (a `RefCell` borrow never crosses
+  an await), reads one segment's spool and demuxes it with `SegmentSource`, then
+  asks `SegmentSource::seek_keyframe` for the last video keyframe at or before
+  the target — or the segment's first when the target precedes them all. Twitch's
+  fMP4 segments carry several IRAPs, so a segment boundary is not a GOP boundary
+  and the answer must come from the access units.
+- Only a **closed** spool is demuxed. The newest window segment is usually still
+  arriving, and reading it would wait inside a request handler; the last keyframe
+  before it is a GOP-aligned start the client's discard covers.
+- The reply's `start_pts_ms` is the keyframe on the broadcast timeline (the same
+  anchor rule the producer uses, so the first unit it sends agrees exactly) and
+  `start_sequence` is that segment's playlist sequence. The lane's estimate moves
+  to the keyframe and its producer is stopped and restarted through
+  `Conn::start_lane`, which reuses the lane's object-id range. The new producer
+  registers with `backlog`, skips whole segments before the one it was given, and
+  drops access units before the keyframe: the first unit the client receives is
+  the one the reply named. A start whose segment rotated out of the window
+  degrades to the first replayed segment after it.
+- Opening a lane at `PlaybackPosition::Live` does **not** align: it starts at the
+  next published segment (the 1× catch-up the bullet above describes is not
+  built). Opening at an absolute position is treated as a seek with no reply and
+  is GOP-aligned the same way.
+
 ## Codecs
 
 - v1: H.264 over MPEG-TS.
@@ -405,7 +435,8 @@ on the critical path.
   later.
 - **Cross-lane alignment** — the client's modulator owns it and is audio-driven; a
   manual offset knob first. The protocol carries no anchor for it.
-- **Frame-accurate seek** — needs an AU index in the demuxer.
+- **Frame-accurate seek** — the daemon is GOP-accurate; going finer needs an AU
+  index in the demuxer.
 - **DVR 403** — the one path that turns a clamp into a restart.
 
 ## Rejected

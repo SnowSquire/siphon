@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::task::Waker;
 
+use compio::buf::IoBuf as _;
 use kanal::AsyncSender;
 use siphon_shared::riffle::ArenaSummary;
 use siphon_shared::riffle::DiskView;
@@ -48,6 +49,8 @@ use crate::downloader::ToDownloader;
 use crate::http::Client;
 use crate::media::dvr::Dvr;
 use crate::media::lane::LaneConsumer;
+use crate::media::wire::Container;
+use crate::media::wire::SegmentSource;
 use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::metrics::StreamMetrics;
@@ -56,6 +59,7 @@ use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::Segment;
 use crate::scheduler::StreamScheduler;
 use crate::spool::ConsumerWake;
+use crate::spool::Reader;
 use crate::spool::WakeSet;
 /// Why a channel could not be resolved into a pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +200,22 @@ pub struct LanePlace {
     pub sequence: u64,
 }
 
+/// Where a seek will actually begin.
+///
+/// The daemon is GOP-accurate and the client is precise: a start is the last
+/// keyframe at or before the target, never the target itself, because trimming
+/// back to the target would remove the keyframe the target needs to decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekPoint {
+    /// The keyframe's presentation time, in broadcast milliseconds.
+    pub pts_ms: u64,
+    /// The playlist sequence of the segment that holds it.
+    pub sequence: u64,
+    /// The request fell before the retained window, so the start is a clamp
+    /// forward and the client has to expect a jump.
+    pub trimmed: bool,
+}
+
 impl StreamId {
     fn new(channel: u64, quality: Option<&str>) -> Self {
         Self {
@@ -219,6 +239,9 @@ pub struct StreamRuntime {
     client: Rc<Client>,
     wakes: Rc<WakeSet>,
     live_window: Rc<RefCell<Vec<Segment>>>,
+    /// The playlist's current `EXT-X-MAP` reader, shared with the scheduler: a
+    /// seek into an fMP4 segment needs it to build a demuxer.
+    init: Rc<RefCell<Option<Reader>>>,
     registration: RefCell<Option<kanal::Sender<ConsumerRegistration>>>,
     reader_wake: Rc<ConsumerWake>,
     /// The disk recorder while this pipeline is recording.
@@ -315,6 +338,101 @@ impl StreamRuntime {
             window_start_ms,
             sequence,
         }
+    }
+
+    /// Where a seek to `target_ms` begins, GOP-aligned.
+    ///
+    /// `None` when this pipeline retains nothing to aim at yet, so the caller
+    /// answers with the place and no start.
+    pub(crate) async fn seek_point(&self, target_ms: u64) -> Option<SeekPoint> {
+        // A `RefCell` borrow must not survive an await, so the window is copied
+        // out first. A `Segment` is a `Reader`, which pins its slot for the
+        // length of the request and nothing longer.
+        let window: Vec<Segment> = self.live_window.borrow().clone();
+        let init = self.init.borrow().clone();
+        seek_point(&window, init.as_ref(), target_ms, &self.wakes).await
+    }
+}
+
+/// Where a seek begins, from the segments a pipeline retains.
+///
+/// The newest segment in the window is usually still being written, so only a
+/// closed spool is demuxed: reading an open one would wait for the rest of the
+/// download inside a request handler. The last keyframe before a segment that
+/// is still arriving is a GOP-aligned start too, and the client's discard
+/// covers the difference.
+///
+/// Segments are tried newest first, so the answer is the last keyframe at or
+/// before the target in the newest segment that can be read. `trimmed` is the
+/// clamp: the target predates the window, so the start is its oldest segment's
+/// keyframe and the client is told it jumped.
+///
+/// `None` only when the window is empty, which is a pipeline that has published
+/// nothing (or is parked with no readers).
+pub async fn seek_point(
+    window: &[Segment],
+    init: Option<&Reader>,
+    target_ms: u64,
+    wakes: &Rc<WakeSet>,
+) -> Option<SeekPoint> {
+    let oldest = window.first()?;
+    let window_start = oldest.timestamp_ms;
+    let trimmed = target_ms < window_start;
+    let target_ms = target_ms.max(window_start);
+
+    // The wake has to be one the pipeline publishes to, because the init spool
+    // may still be filling; a closed media spool never parks, so this costs
+    // nothing for the case that matters.
+    let wake = ConsumerWake::new();
+    wakes.register(&wake);
+    let mut bytes = Vec::new();
+    let mut init_bytes = Vec::new();
+    for segment in window.iter().rev() {
+        if segment.timestamp_ms > target_ms || !segment.reader.is_closed() {
+            continue;
+        }
+        bytes.clear();
+        read_to_end(&segment.reader, &wake, &mut bytes).await;
+        let Some(container) = Container::detect(&bytes) else {
+            continue;
+        };
+        init_bytes.clear();
+        let map = if container == Container::Fmp4 {
+            let Some(init) = init else {
+                continue;
+            };
+            read_to_end(init, &wake, &mut init_bytes).await;
+            Some(init_bytes.as_slice())
+        } else {
+            None
+        };
+        let Ok(source) = SegmentSource::open(&bytes, map) else {
+            continue;
+        };
+        if let Some(pts_ms) = source.seek_keyframe(segment.timestamp_ms, target_ms) {
+            return Some(SeekPoint {
+                pts_ms,
+                sequence: segment.sequence_num,
+                trimmed,
+            });
+        }
+    }
+
+    // Nothing retained could be demuxed: the window is a single segment that is
+    // still arriving, or its bytes are unusable. Its start is the best answer,
+    // and it is a clamp, so the client expects to jump.
+    Some(SeekPoint {
+        pts_ms: target_ms,
+        sequence: oldest.sequence_num,
+        trimmed: true,
+    })
+}
+
+/// Reads one spool to its end into `out`, reusing the buffer across segments.
+async fn read_to_end(reader: &Reader, wake: &ConsumerWake, out: &mut Vec<u8>) {
+    let mut reader = reader.clone();
+    while let Some(view) = reader.next_view(wake).await {
+        out.extend_from_slice(view.as_init());
     }
 }
 
@@ -528,6 +646,19 @@ impl Registry {
         self.streams.borrow().get(&Self::stream_id(key)).cloned()
     }
 
+    /// The running pipeline for a wire key, for a lane that has to start a
+    /// producer against it.
+    pub(crate) fn stream(&self, key: &StreamKey) -> Option<Rc<StreamRuntime>> {
+        self.runtime(key)
+    }
+
+    /// Where a seek to `target_ms` begins behind `key`, GOP-aligned.
+    ///
+    /// `None` when the pipeline is gone or has retained nothing to aim at.
+    pub(crate) async fn seek_point(&self, key: &StreamKey, target_ms: u64) -> Option<SeekPoint> {
+        self.runtime(key)?.seek_point(target_ms).await
+    }
+
     /// The login of the channel with this id, from the channel table.
     fn login_of(&self, channel: u64) -> Option<String> {
         self.channels
@@ -629,6 +760,7 @@ impl Registry {
 
         let wakes = WakeSet::new();
         let live_window = Rc::new(RefCell::new(Vec::new()));
+        let init = Rc::new(RefCell::new(None));
         let (registration, receive) = kanal::unbounded();
         let reader_wake = ConsumerWake::new();
 
@@ -644,6 +776,7 @@ impl Registry {
             Rc::clone(&reader_wake),
         )
         .with_live_window(Rc::clone(&live_window))
+        .with_init_window(Rc::clone(&init))
         .with_metrics(Rc::clone(&metrics));
         // A test can serve this pipeline's consumers from fixture segments
         // instead of the playlist, so the media lane is exercised end to end
@@ -655,7 +788,12 @@ impl Registry {
         #[cfg(all(test, not(miri)))]
         match fixture {
             Some(source) => {
-                crate::media::lane::spawn_fixture_feed(feed_receive, source, fixture_consumers);
+                crate::media::lane::spawn_fixture_feed(
+                    feed_receive,
+                    source,
+                    fixture_consumers,
+                    Rc::clone(&live_window),
+                );
             }
             None => compio::runtime::spawn(scheduler.main()).detach(),
         }
@@ -671,6 +809,7 @@ impl Registry {
             client: Rc::clone(&self.client),
             wakes,
             live_window,
+            init,
             registration: RefCell::new(Some(registration)),
             reader_wake,
             recording: RefCell::new(None),
@@ -1433,6 +1572,137 @@ mod tests {
         compio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(future)
+    }
+
+    /// The fixtures are gitignored, so a checkout without `captures/` skips.
+    fn fixture(relative: &str) -> Option<PathBuf> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../captures")
+            .join(relative);
+        path.exists().then_some(path)
+    }
+
+    /// Writes one segment into a closed spool and hands back the reader the
+    /// scheduler gives a consumer. A closed spool is a complete segment.
+    fn spooled(arena: &Rc<ArenaSet>, wakes: &Rc<WakeSet>, bytes: &[u8]) -> Reader {
+        let (mut writer, reader) = crate::spool::Spool::open(arena, wakes).expect("spool");
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let tail = writer.tail().expect("spool capacity");
+            let len = tail.len().min(bytes.len() - offset);
+            tail[..len].copy_from_slice(&bytes[offset..offset + len]);
+            writer.commit(len);
+            offset += len;
+        }
+        drop(writer);
+        reader
+    }
+
+    const fn retained(
+        reader: Reader,
+        sequence: u64,
+        timestamp_ms: u64,
+        duration_ms: u64,
+    ) -> Segment {
+        Segment {
+            timestamp_ms,
+            pdt_ms: 0,
+            duration_ms,
+            sequence_num: sequence,
+            reader,
+        }
+    }
+
+    /// A seek to a segment's first millisecond lands on that segment's own
+    /// keyframe: the segment the target names is the one served.
+    #[test]
+    fn a_seek_to_a_ts_segment_boundary_returns_its_keyframe() {
+        let (Some(first), Some(second)) = (
+            fixture("servermock/live/000000.ts"),
+            fixture("servermock/live/000001.ts"),
+        ) else {
+            println!("captures/ is absent; skipping the TS boundary seek test");
+            return;
+        };
+        let first = std::fs::read(first).expect("fixture");
+        let second = std::fs::read(second).expect("fixture");
+        let arena = Rc::new(ArenaSet::new());
+        let wakes = WakeSet::new();
+        let window = [
+            retained(spooled(&arena, &wakes, &first), 1, 0, 2_000),
+            retained(spooled(&arena, &wakes, &second), 2, 2_000, 2_000),
+        ];
+
+        let point = run(seek_point(&window, None, 2_000, &wakes)).expect("the window answers");
+        assert_eq!(point.sequence, 2);
+        assert!(!point.trimmed);
+        // Both fixtures open with an IDR, and the segment's first video access
+        // unit is where the playlist says the segment starts.
+        assert_eq!(point.pts_ms, 2_000, "the second segment's first keyframe");
+    }
+
+    /// A target older than the retained window is clamped forward to its oldest
+    /// segment and reported as trimmed, so the client knows it jumped.
+    #[test]
+    fn a_seek_before_the_window_clamps_to_its_oldest_keyframe() {
+        let Some(first) = fixture("servermock/live/000000.ts") else {
+            println!("captures/ is absent; skipping the seek clamp test");
+            return;
+        };
+        let first = std::fs::read(first).expect("fixture");
+        let arena = Rc::new(ArenaSet::new());
+        let wakes = WakeSet::new();
+        let window = [
+            retained(spooled(&arena, &wakes, &first), 7, 10_000, 2_000),
+            retained(spooled(&arena, &wakes, &first), 8, 12_000, 2_000),
+        ];
+
+        let point = run(seek_point(&window, None, 500, &wakes)).expect("the window answers");
+        assert!(point.trimmed, "the request was not honoured as asked");
+        assert_eq!(point.sequence, 7, "the oldest retained segment");
+        assert_eq!(point.pts_ms, 10_000, "its first keyframe");
+
+        // The window's front itself is inside the window: no clamp.
+        let point = run(seek_point(&window, None, 10_000, &wakes)).expect("the window answers");
+        assert!(!point.trimmed);
+        assert_eq!(point.sequence, 7);
+        assert_eq!(point.pts_ms, 10_000);
+    }
+
+    /// An fMP4 seek reads the map and the segment through the demuxer, so the
+    /// answer is on the broadcast timeline even though the container's clock is
+    /// elsewhere.
+    #[test]
+    fn an_fmp4_seek_reads_the_init_and_the_segment() {
+        let Some(dir) = fixture("servermock-fmp4/landscape") else {
+            println!("captures/ is absent; skipping the fMP4 seek test");
+            return;
+        };
+        let init = std::fs::read(dir.join("init.mp4")).expect("init fixture");
+        let bytes = std::fs::read(dir.join("chunks/000.m4s")).expect("chunk fixture");
+        let expected = SegmentSource::open(&bytes, Some(&init))
+            .expect("the fMP4 chunk demuxes")
+            .seek_keyframe(0, 3_000)
+            .expect("the chunk has IRAPs");
+        assert!(expected < 3_000, "no rounding up to the next GOP");
+
+        let arena = Rc::new(ArenaSet::new());
+        let wakes = WakeSet::new();
+        let map = spooled(&arena, &wakes, &init);
+        let window = [retained(spooled(&arena, &wakes, &bytes), 1, 0, 10_000)];
+        let point =
+            run(seek_point(&window, Some(&map), 3_000, &wakes)).expect("the window answers");
+        assert_eq!(point.sequence, 1);
+        assert_eq!(point.pts_ms, expected);
+        assert!(!point.trimmed);
+    }
+
+    /// A seek that has nothing retained to aim at says so rather than naming a
+    /// position it cannot start from.
+    #[test]
+    fn a_seek_with_an_empty_window_has_no_answer() {
+        let wakes = WakeSet::new();
+        assert!(run(seek_point(&[], None, 0, &wakes)).is_none());
     }
 
     #[test]

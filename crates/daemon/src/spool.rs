@@ -204,6 +204,16 @@ pub struct Reader {
 }
 
 impl Reader {
+    /// Whether the writer is gone, i.e. no more bytes are coming.
+    ///
+    /// A closed reader may still have published bytes to hand out; this only
+    /// says the segment will grow no further, which is what a reader that must
+    /// not wait checks before it starts.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.spool.closed.get()
+    }
+
     /// Next published run as an owned, pinned view. `None` once the writer is gone
     /// and everything has been consumed.
     ///
