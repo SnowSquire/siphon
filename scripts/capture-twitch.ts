@@ -986,7 +986,7 @@ async function main(): Promise<void> {
         segments: parsed.segments.length,
       });
       // The segment itself, so the capture does not depend on fetching it by
-      // hand afterwards. `live-first-media.m3u8` above is the evidence that it
+      // hand afterward. `live-first-media.m3u8` above is the evidence that it
       // is segment 0.
       const firstDir = path.join(options.out, "first");
       mkdirSync(firstDir, { recursive: true });

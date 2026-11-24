@@ -7,7 +7,7 @@ video path.
 
 RTSP/RTP is built for a client on the network. It costs SDP negotiation, a
 session state machine, RTP 90 kHz timestamps mapped to NTP, RTCP sender reports
-once a second, RTP range signalling for the live position, TCP interleaving, and
+once a second, RTP range signaling for the live position, TCP interleaving, and
 a jitter/reorder buffer on the far side. The UI is on loopback, in order, and
 wants one thing: the next access unit, or a keyframe if it fell behind.
 

@@ -85,12 +85,12 @@ and a second UI must be able to differ.
   the desc flag makes `CreateSwapChainForHwnd` fail outright without it, and the
   flags are kept for `ResizeBuffers` to be given back unchanged.
 
-Wayland ignores both. A `VkSwapchainKHR` takes its colour space from the
+Wayland ignores both. A `VkSwapchainKHR` takes its color space from the
 compositor's image description and has no tearing mode; mailbox, chosen at
 creation, is already the unpaced path. Both settings are still read and saved so
 one client file moves between platforms intact. The Windows half is **type-checked
-only** — it has not run on hardware, so the HDR target colour, the SDR white point
-inside an HDR container and the tear behaviour still want a real display.
+only** — it has not run on hardware, so the HDR target color, the SDR white point
+inside an HDR container and the tear behavior still want a real display.
 
 ## The seam
 

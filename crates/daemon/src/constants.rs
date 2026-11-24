@@ -167,7 +167,7 @@ pub fn public_endpoint() -> &'static str {
 }
 
 /// The base `--debug` named, for the paths that are not one endpoint: the mock's
-/// playlists and the archive route the registry recognises. `None` when this
+/// playlists and the archive route the registry recognizes. `None` when this
 /// build has no `--debug` or the flag was not given.
 #[cfg(debug_assertions)]
 #[must_use]

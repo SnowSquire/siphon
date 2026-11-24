@@ -233,7 +233,7 @@ pub struct DxgiSwapchain {
     /// The D3D12 resources themselves, kept alive while the Vulkan images exist.
     backbuffers: Vec<ID3D12Resource>,
     swapchain: IDXGISwapChain3,
-    /// Signalled when there is room for another frame in the flip queue.
+    /// Signaled when there is room for another frame in the flip queue.
     latency: HANDLE,
     /// The `vk::Device` the images and memories were created on.
     device_handle: ash::Device,
@@ -327,7 +327,7 @@ impl DxgiSwapchain {
         // Whatever `DXGI_SCALING_NONE` leaves outside the back buffer — a band of
         // the client area a compositor has not taken from the chain yet, say — is
         // filled with the chain's background, and that defaults to opaque black.
-        // The page colour is the only thing that may be behind the interface.
+        // The page color is the only thing that may be behind the interface.
         let page = DXGI_RGBA {
             r: 18.0 / 255.0,
             g: 20.0 / 255.0,
@@ -411,7 +411,7 @@ impl DxgiSwapchain {
         self.attach_backbuffers(d3d12, gpu, width, height)?;
         self.width = width;
         self.height = height;
-        // The colour space, the metadata and the white point are re-read by
+        // The color space, the metadata and the white point are re-read by
         // `refresh` on the present path, not here: this runs for every step of
         // a resize drag, where a `QueryDisplayConfig` per step is milliseconds
         // of stall each time.
@@ -421,7 +421,7 @@ impl DxgiSwapchain {
     /// Re-reads the output under the running window: the SDR white point the
     /// user set in Windows, and whether the display is in HDR or SDR now.
     ///
-    /// The colour space is only re-applied when the answer changed, so a steady
+    /// The color space is only re-applied when the answer changed, so a steady
     /// display costs one `QueryDisplayConfig` and no present-path work.
     pub fn refresh(&self) -> eros::Result<()> {
         eros::ensure!(!self.removed.get(), "the device was removed");
@@ -537,7 +537,7 @@ impl DxgiSwapchain {
 
     /// The mode the chain was created with.
     ///
-    /// The colour space and the HDR metadata are chosen at creation, so this is
+    /// The color space and the HDR metadata are chosen at creation, so this is
     /// also what a caller compares against to know a new chain is needed.
     #[must_use]
     pub const fn hdr_mode(&self) -> HdrMode {
@@ -888,13 +888,13 @@ pub fn hwnd_from_raw(handle: raw_window_handle::RawWindowHandle) -> eros::Result
     Ok(HWND(win32.hwnd.get() as *mut c_void))
 }
 
-/// Colours everything behind the interface.
+/// Colors everything behind the interface.
 ///
 /// The window class the platform registers has no background brush, so any pixel
 /// the compositor has to fill rather than take from the chain is black: the area
 /// `DXGI_SCALING_NONE` leaves outside the back buffer, whatever DWM exposes while
 /// a window is being resized, and `WM_ERASEBKGND` if it is ever sent. The page's
-/// own colour is the only thing that may be behind the interface, and with it a
+/// own color is the only thing that may be behind the interface, and with it a
 /// frame that exposes that area shows the page instead of a black bar.
 pub fn set_window_background(hwnd: HWND) {
     use windows::Win32::Foundation::COLORREF;
@@ -902,7 +902,7 @@ pub fn set_window_background(hwnd: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::GCLP_HBRBACKGROUND;
     use windows::Win32::UI::WindowsAndMessaging::SetClassLongPtrW;
 
-    // The page background, `#080a10`, as a `0x00BBGGRR` colour reference.
+    // The page background, `#080a10`, as a `0x00BBGGRR` color reference.
     const PAGE: COLORREF = COLORREF(0x0010_0a08);
     // SAFETY: a solid brush takes no pointers and fails by returning null, which
     // `SetClassLongPtrW` accepts as "no brush" — the state it is in already.

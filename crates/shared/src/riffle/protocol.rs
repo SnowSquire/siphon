@@ -1,7 +1,7 @@
 //! Serializable state shared by the Siphon backend and its UI.
 //!
 //! Every type in this module crosses the RPC, so the two sides cannot drift:
-//! the daemon builds these values and the UI renders them. Behaviour (config
+//! the daemon builds these values and the UI renders them. Behavior (config
 //! files, GQL, Hermes, pipelines) stays in the daemon; this crate only owns
 //! the shape and the frame codec.
 
@@ -308,12 +308,12 @@ impl ConnStats {
     }
 }
 
-/// The colour a channel's switches and chevron take.
+/// The color a channel's switches and chevron take.
 ///
 /// Two producers, one value: Twitch's `chatColor` is `#RRGGBB`, and a channel
-/// that never picked one gets a generated colour. The generated one is authored
+/// that never picked one gets a generated color. The generated one is authored
 /// in OKLCH because the palette is — its chromas reach outside sRGB, so packing
-/// it down to RGB would change the colour the design asks for. Either way the
+/// it down to RGB would change the color the design asks for. Either way the
 /// UI only needs the CSS text, which `Display` is; a string on the wire would
 /// put an unvalidated value straight into a style property, and cost more than
 /// this does.
@@ -353,7 +353,7 @@ pub struct ChannelView {
     pub id: u64,
     pub login: String,
     pub display_name: String,
-    /// Twitch's chat colour for the channel's switches, with a generated
+    /// Twitch's chat color for the channel's switches, with a generated
     /// fallback when Twitch reports none.
     pub chat_color: ChatColor,
     /// The avatar's content id: the lowercase hex of the 128-bit xxh3 hash of

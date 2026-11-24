@@ -19,7 +19,7 @@ This note records what that choice costs and what would make us change it.
   // src/conn/unbuffered.rs:328-336
   pub struct ReadTraffic<'c, 'i, Data> {
       conn: &'c mut UnbufferedConnectionCommon<Data>,
-      // for forwards compatibility; to support in-place decryption in the future
+      // for forward compatibility; to support in-place decryption in the future
       _incoming_tls: &'i mut [u8],
   ```
 

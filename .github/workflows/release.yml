@@ -156,7 +156,7 @@ jobs:
             nix-deps-${{ env.CACHE_VERSION }}-
           save: false
 
-      - name: build the artefacts
+      - name: build the artifacts
         run: |
           set -euo pipefail
           # A tag ships the release names the updater expects; anything else

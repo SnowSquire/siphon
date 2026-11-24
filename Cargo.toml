@@ -62,8 +62,8 @@ strip = true
 [profile.dev]
 panic = "abort"
 # The dependencies do the UI's per-frame work — layout, painting, text shaping,
-# wgpu and the Win32 bindings — and an optimised build of them is several times
-# faster than an unoptimised one. The daemon and the RPC crate stay at the dev
+# wgpu and the Win32 bindings — and an optimized build of them is several times
+# faster than an unoptimized one. The daemon and the RPC crate stay at the dev
 # default, so this costs a one-off dependency build and nothing on incremental
 # rebuilds of the workspace.
 [profile.dev.package."*"]

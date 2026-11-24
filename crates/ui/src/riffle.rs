@@ -369,13 +369,13 @@ async fn begin_pairing(endpoint: String, pin: String) -> Result<Provisional, Str
 /// derive the same six characters, and a terminal is not where one learns to
 /// type them exactly as a parser wants.
 fn codes_match(typed: &str, derived: &str) -> bool {
-    let normalise = |code: &str| -> String {
+    let normalize = |code: &str| -> String {
         code.chars()
             .filter(|character| !character.is_whitespace() && *character != '-')
             .flat_map(char::to_uppercase)
             .collect()
     };
-    normalise(typed) == normalise(derived)
+    normalize(typed) == normalize(derived)
 }
 
 /// Serves one connection until the backend or the UI goes away.
@@ -641,7 +641,7 @@ pub struct UiState {
     pub media: RwSignal<Option<MediaView>, LocalStorage>,
     pub arena: RwSignal<ArenaSummary, LocalStorage>,
     pub downloader: RwSignal<DownloaderSummary, LocalStorage>,
-    /// The notification centre. Client state: it does not survive a window
+    /// The notification center. Client state: it does not survive a window
     /// restart, and nothing in the daemon knows it exists.
     pub notices: RwSignal<Rc<Vec<Notice>>, LocalStorage>,
     pub logs: RwSignal<Rc<Vec<LogEntry>>, LocalStorage>,
@@ -664,11 +664,11 @@ pub struct UiState {
     intents: IntentSender,
     /// When each channel was last seen going offline, for the title/game mute.
     muted: Rc<RefCell<HashMap<u64, i64>>>,
-    /// The next notification-centre id.
+    /// The next notification-center id.
     notice_seq: Rc<Cell<u64>>,
 }
 
-/// One entry of the notification centre.
+/// One entry of the notification center.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub id: u64,

@@ -77,7 +77,7 @@ The source is filtered to `Cargo.toml`, `Cargo.lock` and `crates/` (`lib.fileset
 in `flake.nix`), so editing a note, a workflow or this file does not invalidate
 the payload; `crates/` carries the non-Rust files the crates embed — fonts,
 icons, `index.hexpat`, and the C shim `libplacebo-sys` compiles. The installer
-still takes the whole tree, because it needs the licence texts and the NSIS
+still takes the whole tree, because it needs the license texts and the NSIS
 script.
 
 Four pieces are Nix-only plumbing worth knowing about:
@@ -117,7 +117,7 @@ fetched and hashed, and the selection inside it is pinned to
 the headers or libraries under the build. Bumping either means bumping the
 versions in `nix/sources.nix` and re-hashing the download derivation.
 
-The CRT/SDK stay under Microsoft's licence (`meta.license` is unfree), which is
+The CRT/SDK stay under Microsoft's license (`meta.license` is unfree), which is
 why `flake.nix` narrows `allowUnfreePredicate` to that one package. Building the
 Windows payload is agreeing to those terms.
 
@@ -160,7 +160,7 @@ For editing code, use the dev shell: it has the same toolchain, CRT/SDK and
 libplacebo, and `cargo build` is an ordinary incremental build against
 `./target`. The shipped profile knobs (`CARGO_PROFILE_RELEASE_LTO=fat`,
 `..._CODEGEN_UNITS=1`) live in `nix/windows.nix`, not in `msvc.env`, so the shell
-uses the quick profile and cross artefacts land under
+uses the quick profile and cross artifacts land under
 `target/x86_64-pc-windows-msvc/`:
 
 ```sh
@@ -170,7 +170,7 @@ nix develop            -c cargo run -p siphon-ui     # native UI
 
 A persistent `CARGO_TARGET_DIR` shared by builds would be the obvious
 alternative to the layer split and it is a trap: cargo's freshness check
-compares mtimes, Nix stamps every source file with 1970, and artefacts from an
+compares mtimes, Nix stamps every source file with 1970, and artifacts from an
 earlier build are newer than that, so cargo concludes nothing changed and the
 derivation installs a binary from the previous tree. (The content-hash fix,
 `-Zchecksum-freshness`, is nightly-only.) Splitting at the dependency boundary
@@ -235,7 +235,7 @@ layer from scratch — the layers only help the runner. The tree is also clean u
 ## The installer
 
 `packages.windows-installer` is packaging *inside* the derivation: it stages the
-payload's `bin/` with the licence texts from the tree plus libplacebo's from its
+payload's `bin/` with the license texts from the tree plus libplacebo's from its
 source, runs `makensis`, and zips the payload and the PDBs out of `symbols/`.
 `nsis` and `zip` are the only tools it needs — no `cargo`, no `jq`, because the
 version comes from `Cargo.toml` through the flake rather than from
@@ -248,7 +248,7 @@ copies are pinned to `SOURCE_DATE_EPOCH` before packing, and both zips are
 written with `-X`. Without that the setup differed in three bytes and the zip
 differed in the entry headers.
 
-Signing stays outside Nix: it needs the PKCS#12 secret, and the artefacts come
+Signing stays outside Nix: it needs the PKCS#12 secret, and the artifacts come
 out unsigned. `osslsigncode` on `result/*-setup.exe` is the post-build step; the
 workflow does not do it today, and it is the reason the payload's own exes are
 unsigned too — sign them before `makensis` would mean a second packaging pass.
@@ -268,10 +268,10 @@ rustc's link step:
 
 So the random directory name reached the executable through the PDB hash. The
 first fix tried was `-C link-arg=/DEBUG:NONE` (no PDB, no GUID), which is
-reproducible but throws away the only thing that can symbolise a minidump from a
+reproducible but throws away the only thing that can symbolize a minidump from a
 release build.
 
-Instead the PDB is kept. `nix/normalise-pe-debug.py` runs after the link, per
+Instead the PDB is kept. `nix/normalize-pe-debug.py` runs after the link, per
 binary:
 
 - takes the PDB path from the executable's own `RSDS` record rather than

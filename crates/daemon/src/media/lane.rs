@@ -196,7 +196,7 @@ impl MediaStats {
 /// Bytes one pipe media frame may carry.
 ///
 /// A pipe has no path MTU, so a fragment is not sized by one: 64 KiB keeps the
-/// frame count and the 5-byte framing amortised over a whole access unit without
+/// frame count and the 5-byte framing amortized over a whole access unit without
 /// making the loop's write buffer lumpy. QUIC's budget comes from the path and
 /// is read per segment instead.
 pub const PIPE_BUDGET: usize = 64 * 1024;
@@ -1417,7 +1417,7 @@ mod tests {
 
     /// A seek backwards restarts the producer at the segment that holds the
     /// target, not at the point it had already reached: the first video access
-    /// unit it offers afterwards is that segment's keyframe.
+    /// unit it offers afterward is that segment's keyframe.
     #[test]
     fn a_seek_backwards_restarts_the_producer_at_the_containing_segment() {
         let Some(dir) = fixture("servermock-fmp4/landscape") else {

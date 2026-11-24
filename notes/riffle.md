@@ -26,7 +26,7 @@ daemon and UI already speak. Part III is the UI's presentation path.
 
 RTSP/RTP is built for a client across a network. It costs SDP negotiation, a
 session state machine, RTP 90 kHz timestamps mapped to NTP, RTCP sender reports
-once a second, `Range` signalling for the live position, TCP interleaving, and a
+once a second, `Range` signaling for the live position, TCP interleaving, and a
 jitter/reorder buffer on the far side. The UI wants one thing: the next access
 unit, or an older one when it is behind.
 
@@ -148,7 +148,7 @@ epoch field and "drop if `obj_id <= last_delivered`" survives one. `flags` is
 The header carries no timestamp, so a media object's payload opens with one:
 `pts` then `dts`, two big-endian `i64`s in the track's own timescale (the one
 `StreamConfig` carries — 90 kHz for MPEG-TS, the `mdhd` timescale for fMP4).
-The 16 bytes count towards `total_len` and fragment like any other payload
+The 16 bytes count toward `total_len` and fragment like any other payload
 byte, so they arrive with the access unit they time and no extra field is paid
 for by control messages and blobs.
 
@@ -185,7 +185,7 @@ sent_position < predicted_playhead + buffer_ms
 ```
 
 and never faster than data exists. That single rule produces all three
-behaviours:
+behaviors:
 
 - **at the edge** — "data exists" is the binding constraint, so AUs leave as the
   demuxer emits them. Chunk by chunk, no lookahead, no added latency.
@@ -212,7 +212,7 @@ lane's consumer registration is **torn down**, so the scheduler stops dispatchin
 and no spool slot is pinned by a lane that is not reading. It waits on a
 computed deadline (capped at 500 ms, so a `StreamUpdate` is noticed) and then
 registers again — with the retained window, because a lane that was paused is
-behind by construction. Access units it already sent are recognised and skipped,
+behind by construction. Access units it already sent are recognized and skipped,
 so the replay neither duplicates nor counts as loss.
 
 That is why `LaneState::Paused` is real now: it is a lane whose producer has
@@ -330,7 +330,7 @@ As built:
   transport. The same path later carries AV1.
 - Codec config is one opaque blob — the raw `avcC` / `hvcC` / `av1C` record —
   which is bit-for-bit what `avcodec_open2` takes as `extradata`. No per-codec
-  parameter-set modelling.
+  parameter-set modeling.
 
 `StreamConfig { video: { codec, extradata, timescale, width, height }, audio: {
 extradata, timescale, sample_rate, channels } }`, sent once, reliably, before any
@@ -508,13 +508,13 @@ from the tray.
 ## Goal
 
 The whole app is Siphon. The long-lived process is the **Siphon backend** (today
-`daemon`); the tray/window is the **Siphon UI**. The backend owns all behaviour
+`daemon`); the tray/window is the **Siphon UI**. The backend owns all behavior
 and the UI is a dumb renderer:
 
 - backend: config load/save/migrate, GQL resolution, Hermes, live/title
   transitions, monitor list, pipelines, disk, telemetry;
 - UI: render the latest state, send user intents, decide and show notifications,
-  own the notification centre and the tray. No GQL, no Hermes, no daemon-config
+  own the notification center and the tray. No GQL, no Hermes, no daemon-config
   writes.
 
 The two talk over one typed RPC. The protocol types live in one crate so the
@@ -611,7 +611,7 @@ enum Update {
 ```
 
 `ChannelView` carries what the UI renders: id, login, display name, the resolved
-switch colour (`chatColor`, or a generated `oklch(...)` fallback), the avatar's
+switch color (`chatColor`, or a generated `oklch(...)` fallback), the avatar's
 content id, live, title, game, the game id, viewers, stream start as
 milliseconds, when it was last live
 (`last_live_ms`), Twitch's `BROADCAST-ID`, the last per-channel failure
@@ -737,7 +737,7 @@ listeners are tasks around it.
   `stream-up`, `stream-down` and a title/game move each publish one
   `StreamEvent` (kind, `previous`, and the row as it stood), uncoalesced. The
   client owns the switches, the word filter and the mute window and raises the
-  OS toast itself, so the notification centre is client state and does not
+  OS toast itself, so the notification center is client state and does not
   survive a window restart. This is safe because the UI autostarts at login and
   owns the daemon. The webhook in `notify.rs` stays: it reports
   the disk output's own conditions, not the user's notifications.
@@ -933,7 +933,7 @@ after `open_bi`, which is what completes the server's `accept_bi`.
   dropped, and so is any message on it other than `PairConfirm`. A successful
   pairing closes the window and the connection becomes an ordinary one
   (`Welcome` plus the snapshot).
-- A `y` with a matching code is the whole enrollment: afterwards the client
+- A `y` with a matching code is the whole enrollment: afterward the client
   stores the daemon's pin in `ui.json`'s `Connection::Remote::fingerprint`
   (`ClientSettings::remember_remote`), and a mismatch there is a refusal, never
   a "connect anyway". The client half is `riffle::Pairing` — `begin` completes
@@ -1071,22 +1071,22 @@ window one (~3 ms) after it stops. A pause in the middle of a drag looks like th
 end of one and pays the same two.
 
 `DXGI_SCALING_NONE` fills whatever part of the client area the chain does not
-cover with the chain's *background colour*, which defaults to opaque black —
-not with the window's background brush, and not with the page colour. An
+cover with the chain's *background color*, which defaults to opaque black —
+not with the window's background brush, and not with the page color. An
 occasional one-frame black bar across the client area during a live resize was
 tracked down to that fill and nothing else in the path can produce pure black:
 a flip-model `Present` is atomic, the canvas is drawn whole before it, and the
 UI texture is rebuilt and fully damaged on the resize frame. `SetBackgroundColor`
-puts the page colour (`#12141a`) in that slot, so whatever the compositor fills
+puts the page color (`#12141a`) in that slot, so whatever the compositor fills
 is the page rather than a black bar. A window-class background brush is set to
-the page colour as well, for `WM_ERASEBKGND` paths. (The chain-size and
+the page color as well, for `WM_ERASEBKGND` paths. (The chain-size and
 background knobs that made those two fills visible on demand were removed once
 the causes were known.)
 
 The D3D12 device, command queue and DXGI factory are created once per window by
 `dxgi::D3d12` and shared by every swapchain. Recreating them per resize cost
 ~280 ms, almost all of it `D3D12CreateDevice`, which is what made a drag crawl.
-The dev profile optimises the dependencies (ZGUI's layout and paint, wgpu, the
+The dev profile optimizes the dependencies (ZGUI's layout and paint, wgpu, the
 Win32 bindings) and `siphon-ui`, because a drag is a CPU-bound frame loop.
 
 A rebuild replaces nothing until its replacement exists. It used to free the
@@ -1188,7 +1188,7 @@ block size this UI actually wants.
 The inner renderer's atlas textures are moved onto the replacement: the atlas*policy* (which tile holds which glyph) lives in the window's content cache,
 above the renderer, and it believes every tile it placed is resident. A fresh
 empty atlas would therefore draw the rectangles and nothing else — the scene
-still names glyph tiles no texture backs. The colour space, HDR metadata and SDR
+still names glyph tiles no texture backs. The color space, HDR metadata and SDR
 white point are decisions about the display and survive a resize; only a window
 that moved to another output changes them, which is the next feature's problem.
 There are no external textures to lose: RPC events are drained by a 100 ms

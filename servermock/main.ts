@@ -701,7 +701,7 @@ function gqlResponse(operation: string | undefined, variables: any, origin: stri
           },
         },
       };
-    // The archive routes are not modelled; the recorder promotes live.
+    // The archive routes are not modeled; the recorder promotes live.
     default:
       return { data: null };
   }

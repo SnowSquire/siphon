@@ -172,7 +172,7 @@ impl WsStream {
 
     /// Makes one more transport read available in `buffered`.
     ///
-    /// The read lives in `self.read`, so cancelling this future (the event loop
+    /// The read lives in `self.read`, so canceling this future (the event loop
     /// drops `next_text()` whenever another branch wins) only stops waiting;
     /// the next call polls the same read and keeps every byte.
     #[allow(clippy::await_holding_refcell_ref)] // see `send`
@@ -214,7 +214,7 @@ impl WsStream {
 
     /// Parses one whole frame out of `buffered`, or returns `None` when more
     /// bytes are needed. Nothing is consumed until the complete frame is
-    /// present, so a cancelled read leaves the parser exactly where it was.
+    /// present, so a canceled read leaves the parser exactly where it was.
     fn parse_frame(&mut self) -> Result<Option<Frame>, Error> {
         loop {
             if self.buffered.len() < 2 {
@@ -606,7 +606,7 @@ mod tests {
     /// must not cancel the transport read or forget a header already consumed:
     /// the old parser lost the frame boundary and desynced.
     #[test]
-    fn a_cancelled_read_keeps_the_partial_frame() {
+    fn a_canceled_read_keeps_the_partial_frame() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -615,7 +615,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 serve_handshake(&mut stream).await.unwrap();
                 // Header now, payload later: the client is suspended between
-                // them when its read is cancelled.
+                // them when its read is canceled.
                 let frame = server_frame(true, OP_TEXT, b"hello");
                 stream.write_all(frame[..2].to_vec()).await.0.unwrap();
                 compio::time::sleep(std::time::Duration::from_millis(100)).await;

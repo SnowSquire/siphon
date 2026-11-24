@@ -470,7 +470,7 @@ async fn resolve_record_variants(
 }
 
 /// Wait for `stream-up` on the channel's `video-playback-by-id` topic. Only the
-/// notification matters: the master is fetched again afterwards.
+/// notification matters: the master is fetched again afterward.
 #[allow(clippy::future_not_send)]
 async fn wait_for_stream_up(login: &str, id: u64) -> Result<(), Box<dyn std::error::Error>> {
     let mut socket = WsStream::connect(&hermes::url()).await?;

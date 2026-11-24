@@ -451,7 +451,7 @@ impl Lanes {
     ) -> bool {
         let state = Playback {
             reported_ms: position_ms,
-            rate: sanitise_rate(playback.rate),
+            rate: sanitize_rate(playback.rate),
             buffer_ms: playback.buffer_ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS),
             at: now,
         };
@@ -557,7 +557,7 @@ impl Lanes {
 }
 
 /// A rate from the wire, clamped to what the estimate can use.
-const fn sanitise_rate(rate: f32) -> f32 {
+const fn sanitize_rate(rate: f32) -> f32 {
     if rate.is_finite() {
         rate.clamp(MIN_RATE, MAX_RATE)
     } else {

@@ -9,7 +9,7 @@ A record of one session: fourteen hours of wall clock, and — by the measure th
 matters to whoever reads this next, which is how much context it consumed and how
 many dead ends it opened before closing — about a week's worth of work. Both
 numbers earn their place. The second says what re-entering this will cost; the
-first says it did not take a fortnight of calendar, and most of it went on
+first says it did not take two weeks of calendar, and most of it went on
 theories held without measurement rather than on the work itself.
 
 The working version of the conclusion lives on the jj bookmark **`blit-path`**
@@ -54,8 +54,8 @@ real queue work, so the ordering holds.
 ## What the measurements said
 
 - **The finished buffer was always clean.** A compute pass scanned each target
-  for the fill colour and wrote its tally into a persistent host-visible buffer
-  (read by the CPU with no fence, no copy). With every synchronisation edge
+  for the fill color and wrote its tally into a persistent host-visible buffer
+  (read by the CPU with no fence, no copy). With every synchronization edge
   disabled it reported zero bands. The content was right; the display was reading
   it early.
 - **The interface texture is opaque.** 0 of 760 000 texels translucent, read back
@@ -79,14 +79,14 @@ summary is here so a future session does not re-derive it by hand.
 |---|---|---|---|
 | `SIPHON_PLAIN` | ZGUI's texture blitted straight into the DXGI image, no overlay pass at all | bands survived, and it TDR'd | libplacebo's overlay pass is not the cause |
 | `SIPHON_DEBUG_FILL` | magenta underlay instead of the pass clear | black bands became magenta bands | the hole is real, and the fill is the detector |
-| `SIPHON_UI_CONST` / `TWICE` / `NONE` / `OPAQUE` / `SIPHON_BLIT` | overlay-pass variants: flat colour, doubled, underlay only, alpha ignored, plain blit | flat-colour frames were uniform in every capture | the defect does not live in the overlay parts |
+| `SIPHON_UI_CONST` / `TWICE` / `NONE` / `OPAQUE` / `SIPHON_BLIT` | overlay-pass variants: flat color, doubled, underlay only, alpha ignored, plain blit | flat-color frames were uniform in every capture | the defect does not live in the overlay parts |
 | `SIPHON_CATCH_BANDS` | download the target after the render, before the present, scan for the fill | never fired | reading back stalls the frame and hides the race it is meant to catch |
 | GDI `CopyFromScreen`, idle, under mouse motion, 40 programmatic resizes, 30 real mouse-driven resize frames | none | never showed magenta, not once | a 3 ms tear cannot be captured at 10–30 Hz; stop treating capture as the oracle |
 | full-frame, then per-column, interface alpha readback | none | 0 of 760 000 texels translucent | the fill does not bleed through the interface |
 | `D3D12` `COMMON → PRESENT` after `ResizeBuffers` | transition every backbuffer before its first present | `E_INVALIDARG` at `Close` | backbuffers are already `PRESENT`; there is no state to fix |
 | frame-latency waitable bypassed (`wait_for_frame` → `true`) | presentation paced only by `Present` | the counter rose to ~380/s | **withdrawn**: the counter counts *attempts*, not presents, so it proved nothing. The 10 fps was concurrent with `ResizeBuffers` failing (see the leak below); the gate is fine |
 | waitable re-taken after `ResizeBuffers` | close the old handle, `GetFrameLatencyWaitableObject` again, re-apply the latency | no change | nothing to fix; the handle was never the problem |
-| `SIPHON_NO_SIGNAL` | queue `Wait` on a value that is never signalled | 10 fps, presents stopped retiring | the D3D12 queue wait is genuinely honoured |
+| `SIPHON_NO_SIGNAL` | queue `Wait` on a value that is never signaled | 10 fps, presents stopped retiring | the D3D12 queue wait is genuinely honored |
 | `SIPHON_SYNC=none / compose / handover / present / all` | CPU waits on each of the three edges, in every combination | no combination removed the bands on the share path | the share path has no ordering hook to strengthen |
 | empty `ExecuteCommandLists` per frame | a real submission that touches nothing | no change | DXGI needs work that *writes* the buffer, not merely a submission |
 | one canvas / two canvases / one per backbuffer | rotate the render target | one canvas: ~5 s then a wedge (write-after-read); two: workable; three: the wait is three frames old and costs nothing | one canvas per backbuffer |
@@ -182,6 +182,6 @@ amount of CPU waiting fixes a backbuffer being recycled underneath the renderer.
 - One canvas per backbuffer, so the wait on a canvas is three frames old and
   costs nothing; waiting on last frame's copy is a tenth of a second of
   cross-API latency.
-- Synchronise at the smallest boundary, and delete the boundary if you can.
-- Measure before theorising. A GPU-side counter that costs no sync is worth ten
+- Synchronize at the smallest boundary, and delete the boundary if you can.
+- Measure before theorizing. A GPU-side counter that costs no sync is worth ten
   screen captures that cannot see a 3 ms tear.

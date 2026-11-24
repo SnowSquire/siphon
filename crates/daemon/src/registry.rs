@@ -1658,7 +1658,7 @@ mod tests {
         ];
 
         let point = run(seek_point(&window, None, 500, &wakes)).expect("the window answers");
-        assert!(point.trimmed, "the request was not honoured as asked");
+        assert!(point.trimmed, "the request was not honored as asked");
         assert_eq!(point.sequence, 7, "the oldest retained segment");
         assert_eq!(point.pts_ms, 10_000, "its first keyframe");
 
@@ -1706,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_serialises_the_same_key_only() {
+    fn the_gate_serializes_the_same_key_only() {
         let gate = Gate::default();
         run(async {
             let first = gate.acquire(1).await;

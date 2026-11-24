@@ -14,7 +14,7 @@ The Windows build uses the dynamic MSVC runtime: the UCRT is part of Windows
 (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) provides the VCRuntime
 and C++ runtime. The installer downloads and installs it when it is missing
 (one UAC prompt); the portable zip expects it to be present. Nothing is bundled
-with either artefact.
+with either artifact.
 
 ## License
 
@@ -40,7 +40,7 @@ aler9 and Copyright (c) 2020 aler9 respectively.
 
 The window links [libplacebo](https://github.com/haasn/libplacebo)
 (LGPL-2.1-or-later) as a shared library; a binary that ships it must keep it
-replaceable and carry its licence. Archivo and Noto Color Emoji are bundled under
+replaceable and carry its license. Archivo and Noto Color Emoji are bundled under
 the SIL Open Font License ([`crates/ui/fonts/*-OFL.txt`](crates/ui/fonts)); the
 installer copies those texts beside the binaries. Chillax is fetched at build
 time under the ITF Free Font License and is not redistributed here.

@@ -370,7 +370,7 @@ mod tests {
             label: "media box".to_owned(),
         });
         written.active_connection = "c41f0b2e".to_owned();
-        let json = sonic_rs::to_string(&written).expect("serialise");
+        let json = sonic_rs::to_string(&written).expect("serialize");
         let read_back: ClientSettings = sonic_rs::from_slice(json.as_bytes()).expect("parse");
         assert_eq!(read_back, written);
         assert!(!read_back.active().is_local());

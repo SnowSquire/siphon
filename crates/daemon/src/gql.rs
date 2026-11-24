@@ -44,8 +44,8 @@ pub struct ChannelDetail {
     pub id: u64,
     pub login: String,
     pub display_name: String,
-    /// CSS colour for this channel's switches: Twitch's chat colour, or a
-    /// stable generated one when the user has not picked a chat colour.
+    /// CSS color for this channel's switches: Twitch's chat color, or a
+    /// stable generated one when the user has not picked a chat color.
     pub chat_color: ChatColor,
     pub profile_image_url: String,
     /// The avatar's content id, once the picture is cached under its hash.
@@ -70,7 +70,7 @@ pub struct ChannelDetail {
     pub error: Option<String>,
 }
 
-/// The game a broadcast is categorised under.
+/// The game a broadcast is categorized under.
 #[derive(Debug, Clone)]
 pub struct StreamGame {
     /// Kept for game-change matching; the UI renders the display name.
@@ -140,7 +140,7 @@ struct GqlUser {
     #[serde(default, deserialize_with = "de_opt_u64")]
     id: Option<u64>,
     login: Option<String>,
-    /// Null until the user picks a chat colour in Twitch's settings.
+    /// Null until the user picks a chat color in Twitch's settings.
     #[serde(rename = "chatColor")]
     chat_color: Option<String>,
     #[serde(rename = "displayName")]
@@ -239,12 +239,12 @@ where
 
 /// A stable stand-in for users with no `chatColor` (Twitch leaves it null until
 /// they pick one). The channel id walked by the golden angle spreads hues
-/// across the wheel while keeping each channel's colour the same across
+/// across the wheel while keeping each channel's color the same across
 /// refreshes and restarts, rather than flickering on every snapshot.
 pub fn fallback_color(id: u64) -> ChatColor {
     const GOLDEN_ANGLE: f64 = 137.507_764_050_918;
     // Ids are only a hue seed here: the high bits survive, and a collision in
-    // the low 12 would pick the same colour anyway after `% 360`.
+    // the low 12 would pick the same color anyway after `% 360`.
     #[allow(
         clippy::cast_precision_loss,
         reason = "a channel id is a hue seed, not a quantity"
@@ -264,7 +264,7 @@ pub fn fallback_color(id: u64) -> ChatColor {
         hue: hue.round() as u16,
     }
 }
-/// Twitch's `chatColor` is `#RRGGBB`; anything else is not a colour and gets
+/// Twitch's `chatColor` is `#RRGGBB`; anything else is not a color and gets
 /// the generated fallback rather than a style property with junk in it.
 fn parse_twitch_color(raw: &str) -> Option<ChatColor> {
     let hex = raw.strip_prefix('#').unwrap_or(raw);

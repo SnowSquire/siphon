@@ -193,7 +193,7 @@ fn dev_text(path_var: &str, fallback: &str) -> String {
 
 /// Registers the shipped fonts, then any dev overrides. Archivo, Chillax and a
 /// CBDT Noto Color Emoji are embedded so every platform renders the same text
-/// and real colour emoji: the system emoji font can be COLRv1, which zgui's
+/// and real color emoji: the system emoji font can be COLRv1, which zgui's
 /// rasterizer decodes as a monochrome outline.
 fn fonts() -> eros::Result<Fonts> {
     let fonts = Fonts::system();

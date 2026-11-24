@@ -95,7 +95,7 @@ armed at 1 Hz only then.
 
 The Hermes socket read is **cancel-safe**. The loop drops `next_text()` whenever
 another branch wins, so the in-flight transport read lives in the `WsStream` and
-the parser never consumes a partial frame: cancelling only stops waiting, and
+the parser never consumes a partial frame: canceling only stops waiting, and
 the next call resumes both. Without this, a dropped TLS read discards its
 in-flight chunk (and a consumed header), the next frame is garbage, and the
 socket reconnects; a lost `subscribeResponse` also trips the 10 s confirmation
@@ -113,7 +113,7 @@ their modules.
 ### Debug
 
 `--debug` means "the endpoints point at `servermock`", nothing else. The
-behavioural branches go: fake variants, seeded channels, skipped GQL, faked
+behavioral branches go: fake variants, seeded channels, skipped GQL, faked
 connection health, forced DVR URLs. The mock grows a GQL route for the queries
 `gql.rs` actually makes. `--debug` is compiled out of release builds
 (`cfg(debug_assertions)`). The edge is named on the command line
@@ -123,7 +123,7 @@ is on its own port and comes from `SIPHON_HERMES_URL`.
 ### Disk and demux
 
 - Disk: the live registration already ends at handoff (`drain_live`). The missing
-  half was that the live scheduler kept polling and fetching afterwards; the
+  half was that the live scheduler kept polling and fetching afterward; the
   scheduler parking above fixes it.
 - Demux: a flat sample store — one byte buffer plus records of ranges, reused
   across segments — instead of one `Vec` per access unit, one `Vec` per NAL list

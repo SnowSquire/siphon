@@ -14,9 +14,9 @@ back into both files, so the pair stays matched for a debugger.
 
 The PDB is named after the crate (`siphon-daemon.exe` -> `siphon_daemon.pdb`),
 so it is taken from the path the linker recorded rather than guessed. The path
-of the normalised PDB is printed on stdout.
+of the normalized PDB is printed on stdout.
 
-Usage: normalise-pe-debug.py <executable>
+Usage: normalize-pe-debug.py <executable>
 """
 import re
 import struct
@@ -64,7 +64,7 @@ def freeze_temp_dir(raw: bytes, pdb_path: Path) -> bytearray:
     return bytearray(TEMP_DIR.sub(FIXED_DIR, raw))
 
 
-def normalise(exe_path: str) -> Path:
+def normalize(exe_path: str) -> Path:
     exe = bytearray(Path(exe_path).read_bytes())
     record, pdb_path = recorded_pdb(exe, exe_path)
     pdb = freeze_temp_dir(pdb_path.read_bytes(), pdb_path)
@@ -96,4 +96,4 @@ def normalise(exe_path: str) -> Path:
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         raise SystemExit(f"usage: {sys.argv[0]} <executable>")
-    print(normalise(sys.argv[1]))
+    print(normalize(sys.argv[1]))

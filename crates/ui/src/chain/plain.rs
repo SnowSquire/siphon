@@ -3,10 +3,10 @@
 //! ZGUI composes into a wgpu texture, and the DXGI backbuffer is a D3D12
 //! resource shared into the same Vulkan device. Both sides are Vulkan here, so
 //! the interface is blitted from one VkImage to the other on wgpu's own queue
-//! and presented: no overlay pass, no `pl_tex` handover, no colour management.
+//! and presented: no overlay pass, no `pl_tex` handover, no color management.
 //!
 //! This exists to give the present path a surface with nothing else in it. The
-//! colour is a plain format conversion, so PQ/HDR grading is not part of it.
+//! color is a plain format conversion, so PQ/HDR grading is not part of it.
 
 use ash::vk;
 use eros::Context as _;

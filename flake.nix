@@ -130,7 +130,7 @@
             mv $out/Cargo.lock.versionless $out/Cargo.lock
           '';
 
-          # The packaging derivation reads the licences, the fonts' OFL files,
+          # The packaging derivation reads the licenses, the fonts' OFL files,
           # the NSIS script and the VC++ bootstrapper; nothing else in the tree
           # belongs in its inputs.
           installerSrc = lib.fileset.toSource {
@@ -175,7 +175,7 @@
             windows = windows.package;
           };
 
-          # The same three artefacts with the commit in the name. A push to
+          # The same three artifacts with the commit in the name. A push to
           # main builds one of these: two builds of 0.5.1 are otherwise
           # indistinguishable, and only a tag ships the plain release name.
           windows-installer-sha = callPackage ./nix/windows-installer.nix {

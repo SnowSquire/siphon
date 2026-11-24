@@ -30,7 +30,7 @@ crate.
 
 ## The box decodes; Fedora's driver build does not
 
-The earlier "this box cannot decode" was a packaging artefact, not hardware:
+The earlier "this box cannot decode" was a packaging artifact, not hardware:
 
 - Fedora's `libva-intel-media-driver` is the **free** build. `vainfo` lists only
   MPEG2, VP8, VP9 and JPEG, and FFmpeg's VA-API path dies with
@@ -85,9 +85,9 @@ Two separate decisions were in play, and only one of them changes:
   but a hand-written parser would be just as exposed, so nothing about the patent
   position moves either way.
 - **LGPL — now accepted, because it is cheap to discharge.** The earlier plan
-  avoided FFmpeg only to keep the licence obligation off the Windows
+  avoided FFmpeg only to keep the license obligation off the Windows
   distribution. Keeping it is a one-time packaging cost: dynamic linking only
-  (ship the FFmpeg DLLs unmodified beside the exe), the licence text, and a
+  (ship the FFmpeg DLLs unmodified beside the exe), the license text, and a
   pointer to the corresponding source. Static linking is the case that would
   force shipping object files for relinking — not doing that. Use an **LGPL
   shared** build (BtbN's `lgpl-shared`), never a "full" one: those link
@@ -103,7 +103,7 @@ the binaries that do not play video.
 
 D3D11VA was the first draft of this section and it was the wrong instinct: it
 would make the Windows path *four* APIs (D3D11 decode, D3D12 swapchain, Vulkan
-render, DXGI present) with two different interop flavours.
+render, DXGI present) with two different interop flavors.
 
 Measured on the Windows N97: the driver exposes D3D12 Video decode
 (`ffmpeg -hwaccel d3d12va -hwaccel_output_format d3d12` decodes cleanly), so the
@@ -123,7 +123,7 @@ needs:
   which is the one thing an exported texture must have.
 - Frames arrive as `AVD3D12VAFrame { texture, subresource_index, sync_ctx }`,
   and `AVD3D12VASyncContext` is an `ID3D12Fence` + event + value — a real
-  synchronisation primitive, importable into Vulkan as a semaphore
+  synchronization primitive, importable into Vulkan as a semaphore
   (`VK_KHR_external_semaphore_win32`, `D3D12_FENCE`), rather than the keyed mutex
   a shared D3D11 texture forces.
 - Import per plane is the same call as the dmabuf path: NV12/P010 is two planes,
@@ -161,7 +161,7 @@ Not in a separate crate: the spike is gone (`notes/linux-port.md`). It lands in
 | `release()` | `pl_unmap_avframe` | signal/wait the D3D12 fence, unmap AVFrame |
 
 Above the seam: demuxer, decoder, the stream clock from `player.rs`, and the
-container-colour fix-up (`player.rs` — HEVC overwrites `avctx->color_*` from a VUI
+container-color fix-up (`player.rs` — HEVC overwrites `avctx->color_*` from a VUI
 that says nothing while the container says BT.2020/PQ). Audio stays out of scope.
 
 ## Milestones
@@ -186,4 +186,4 @@ that says nothing while the container says BT.2020/PQ). Audio stays out of scope
 - 10-bit: HEVC Main10/P010 for HDR, and whether the container metadata path
   carries over unchanged.
 - Whether the player wants `AV_HWFRAME_MAP_DIRECT` only, or also a read mapping
-  for the CPU-side colour probing that `player.rs` does today.
+  for the CPU-side color probing that `player.rs` does today.

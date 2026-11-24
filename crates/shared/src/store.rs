@@ -60,7 +60,7 @@ pub async fn read_async<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, S
     Ok(Some(sonic_rs::from_slice(&bytes)?))
 }
 
-/// Serialises a value in the spelling every file here uses.
+/// Serializes a value in the spelling every file here uses.
 pub fn to_json<T: Serialize>(value: &T) -> Result<String, StoreError> {
     Ok(sonic_rs::to_string_pretty(value)?)
 }

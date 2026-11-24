@@ -1,4 +1,4 @@
-//! HDR maths for the presentation.
+//! HDR math for the presentation.
 //!
 //! The interface is SDR, but on an HDR output the chain presents PQ, so a
 //! diagnostics part has to be able to say "this many nits" in the encoding the

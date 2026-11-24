@@ -1,6 +1,6 @@
 //! How bright plain SDR white is on the display.
 //!
-//! DXGI says what a display can do (peak luminance, colour space); it does not
+//! DXGI says what a display can do (peak luminance, color space); it does not
 //! say where the user put the SDR white point. Windows does, through the
 //! DisplayConfig API: each active path carries a `DISPLAYCONFIG_SDR_WHITE_LEVEL`
 //! for its target, found by matching the path's GDI device name against the

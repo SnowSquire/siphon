@@ -1,6 +1,6 @@
 # Windows installer
 
-The shipped artefact is one per-user NSIS installer, built on Linux by the
+The shipped artifact is one per-user NSIS installer, built on Linux by the
 flake:
 
 ```
@@ -17,7 +17,7 @@ carries it too. Only a `vX.Y.Z` tag builds the plain name, which is the one
 `update::parse_release` expects.
 
 `nix/windows-installer.nix` is the whole packaging step: it stages the payload
-`nix/windows.nix` built, adds the licence texts, runs `makensis`, and zips the
+`nix/windows.nix` built, adds the license texts, runs `makensis`, and zips the
 portable copy and the PDBs. `notes/nix-build.md` covers the toolchain and pins.
 There is no packaging script, and nothing is downloaded at build time.
 
@@ -94,7 +94,7 @@ autostart value), and leaves that data alone.
   at the first frame.
 - **FFmpeg.** Nothing links it until the UI enables libplacebo's `libav`
   feature, and the Nix payload ships none of it yet. When it does, the packaging
-  derivation has to copy the `av*` DLLs from a Nix-built FFmpeg and the licence
+  derivation has to copy the `av*` DLLs from a Nix-built FFmpeg and the license
   text with them.
   Use BtbN's `lgpl-shared` build or configure with `--disable-gpl
   --disable-nonfree --disable-version3 --enable-shared --disable-static`.
@@ -112,7 +112,7 @@ autostart value), and leaves that data alone.
   verifies its Authenticode signature and runs it elevated — one UAC prompt,
   while the install itself stays per-user. The portable zip has no installer,
   so the runtime is a plain prerequisite there. Nothing is bundled either way.
-- **Signing.** The artefacts come out unsigned: a Nix build cannot hold the
+- **Signing.** The artifacts come out unsigned: a Nix build cannot hold the
   PKCS#12 secret, and the workflow has no signing step. `osslsigncode sign
   -pkcs12 ... -in result/*-setup.exe -out ...` is the post-build step, but it
   only covers the setup — signing the installed exes too means signing the
@@ -122,7 +122,7 @@ autostart value), and leaves that data alone.
 
 ## Portable copy
 
-There is no single exe to hand out any more, so the portable artefact is the
+There is no single exe to hand out any more, so the portable artifact is the
 same staged payload zipped as `siphon-<version>-x64-portable.zip`: extract it
 anywhere and run `siphon.exe`. It carries no install marker, so `install_mode`
 reports `Portable` and the updater only opens the release page. The name does
@@ -136,7 +136,7 @@ They stay out of the installer payload — a user never needs them — and are
 published beside it: a minidump is useless without the matching PDBs, and the
 GUID in each PDB is what the debugger matches against the dump. The packaging
 derivation takes them from the payload's `symbols/`, which is where
-`nix/windows.nix` puts the normalised copies. rustc names a PDB after its
+`nix/windows.nix` puts the normalized copies. rustc names a PDB after its
 crate, so the daemon's file is `siphon_daemon.pdb`, not `siphon-daemon.pdb`.
 
 ## Release

@@ -95,7 +95,7 @@ pub struct Chain {
     owned: Cell<[bool; BUFFERS as usize]>,
     /// The backbuffer the current frame acquired.
     acquired: Cell<usize>,
-    /// Signalled when a backbuffer is handed back for presentation.
+    /// Signaled when a backbuffer is handed back for presentation.
     target_sem: pl::VkSemaphore,
     target_value: Cell<u64>,
     /// The display settings this window is presented with.
@@ -245,7 +245,7 @@ impl Chain {
         Ok(this)
     }
 
-    /// The backbuffer's colour space.
+    /// The backbuffer's color space.
     ///
     /// SDR is sRGB, not BT.1886: `DxgiSwapchain` hands the buffer to DXGI as
     /// `DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709`, the space every SDR desktop
@@ -305,7 +305,7 @@ impl Chain {
         // make the window association and the flip queue start over. A chain
         // that cannot be resized is dropped, and the next attempt creates one.
         //
-        // An HDR mode is not resizable: the colour space and the metadata are
+        // An HDR mode is not resizable: the color space and the metadata are
         // chosen when the chain is created, so a new mode is a new chain.
         let hdr = hdr_mode(&self.display);
         if self
@@ -564,7 +564,7 @@ impl Chain {
 
     /// Follows a display setting that needs a new chain.
     ///
-    /// `hdr` picks the colour space and the metadata at creation, so it cannot
+    /// `hdr` picks the color space and the metadata at creation, so it cannot
     /// change in place; the window's extent stays what it was.
     pub fn apply_display(&mut self) {
         let wanted = hdr_mode(&self.display);

@@ -369,7 +369,7 @@ impl Peers {
                 peers: Vec::new(),
             });
         };
-        // Normalise every pin so a hand-written `sha256:` prefix — the spelling
+        // Normalize every pin so a hand-written `sha256:` prefix — the spelling
         // `ui.json` stores — matches a presented one, and reject an entry that
         // could never match rather than carrying it around.
         let mut peers = Vec::with_capacity(file.peers.len());
@@ -722,7 +722,7 @@ impl Trust {
 /// same value is a no-op rather than a wake-up for nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustSnapshot {
-    /// Every allowed client key, normalised to 64 lowercase hex characters.
+    /// Every allowed client key, normalized to 64 lowercase hex characters.
     peers: Vec<String>,
     /// When the pairing window closes, in Unix milliseconds, if one was open
     /// and unanswered at the last refresh.

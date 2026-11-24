@@ -5,7 +5,7 @@ excluded from this pass.
 
 The current layout is broadly right; the problem is the *surface*: it reads as
 a generic dark SaaS template. The target is a dense desktop tool with 90s DNA:
-square where it can be, textured where it helps, colourful where colour carries
+square where it can be, textured where it helps, colorful where color carries
 meaning, and functional first. Not pure brutalism, and not a web dashboard.
 
 ## System approach
@@ -23,23 +23,23 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   34×18 for the dense per-channel rows), because the 24×14 pill was both the
   wrong shape and too small. Use the `--zui-color-control-switch-*` tokens for
   the track/thumb so the palette stays in one place.
-- The checked colour is per channel: `--channel-color` is set from the row's
+- The checked color is per channel: `--channel-color` is set from the row's
   Twitch `chatColor`. Twitch leaves that null until the user picks one, so the
   daemon walks the channel id by the golden angle into a stable `oklch(L C H)`
-  colour: any hue, L 0.70–0.73, C 0.13–0.15. Global settings fall back to the
-  app primary. The expand chevron uses the same channel colour.
+  color: any hue, L 0.70–0.73, C 0.13–0.15. Global settings fall back to the
+  app primary. The expand chevron uses the same channel color.
 - The app accent is a cool blue (`oklch(0.75 0.13 230)`), not the earlier amber —
   amber read too close to Pornhub. Live red and error red stay semantic.
-- Every neutral surface and text colour is written in OKLCH at the same hue
+- Every neutral surface and text color is written in OKLCH at the same hue
   (240): the empty table, odd/even rows, hover, the details panel and borders
   differ only in lightness and chroma, so they cannot drift into different
-  hues. Semantic reds and per-channel colours are the only other hues. Each
+  hues. Semantic reds and per-channel colors are the only other hues. Each
   value repeated in `SHEET` is declared once in its `:root` palette and used
   through `var()`; the widget palette lives in `THEME_CSS`.
 - The channels scrollbar lives in a permanent right strip (`--zui-scrollbar-width`
   is 8px; the engine reserves about 16px of gutter for its bar, and
   `scrollbar-gutter` is unsupported in ZGUI). The rows and the panel paint
-  *under* it with a `box-shadow` strip in their own colour (16px, no blur),
+  *under* it with a `box-shadow` strip in their own color (16px, no blur),
   which is ink and leaves the layout alone; a negative margin would widen the
   box into the gutter instead and fight the viewport's horizontal clip. The
   cells keep 16px of right padding so they sit clear of the bar, and the header
@@ -63,8 +63,8 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   while the outgoing tab eases back; the outgoing tab is tracked explicitly so
   the other tabs stay at 200 instead of blinking through the ramp. Each label
   keeps a fixed-width box, measured once for Chillax at the selected weight, so
-  the tween cannot resize the tab or shift the row; the text is centred inside
-  that box, which keeps it centred when the font falls back to the system's and
+  the tween cannot resize the tab or shift the row; the text is centered inside
+  that box, which keeps it centered when the font falls back to the system's and
   the glyphs spill symmetrically rather than hanging off one side. The string
   must be an explicit child of that box: a `text` element styled as a flex
   container turns its own string into an anonymous flex item, and this zgui
@@ -84,8 +84,8 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   tooltips wait 400ms so dragging the pointer across a row does not flash a
   label.
 - Avoid the default "sloth look": no purple `#9146ff` primary, no soft cards on
-  empty space, no oversized radii, no random low-contrast grey text.
-- Use **semantic colour**, not one accent. Live/record/healthy/error/selection
+  empty space, no oversized radii, no random low-contrast gray text.
+- Use **semantic color**, not one accent. Live/record/healthy/error/selection
   should be distinct and meaningful (red live dot, amber record, etc.). OKLCH
   is supported by ZGUI, so palette work should be done in L/C/H values, not
   guessed hex.
@@ -117,14 +117,14 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   writes it into the profile's `OUT_DIR`, so both profiles embed it and a
   `cargo clean` makes the next build fetch it again; `SIPHON_CHILLAX_TTF`
   points the build at a local copy instead, and `SIPHON_FONT_BRAND` still
-  overrides the family at runtime. The licence allows embedding in the app but
+  overrides the family at runtime. The license allows embedding in the app but
   explicitly forbids distributing the font file through a repository, so it is
   **not** in git.
 - **Noto Color Emoji** (CBDT build, OFL 1.1) ships in `crates/ui/fonts/` and is
   registered as `SiphonEmoji`. It is both the last entry in the root
   `font-family` stack and bound to fontique's `Emoji` generic. The CBDT build
   matters: the system COLRv1 font decodes as a monochrome outline in zgui's
-  swash 0.2.10. Verified with kwin-mcp that 😀/🎉/✅ render in colour. `★` and
+  swash 0.2.10. Verified with kwin-mcp that 😀/🎉/✅ render in color. `★` and
   `✧` are not Unicode-emoji, so they stay monochrome by design.
 
 ## Header / activity ticker
@@ -142,7 +142,7 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   space entirely makes the tabs look clipped against the title bar; filling
   it with live activity is what makes the gap read as deliberate. The ticker
   viewport is a flex row with `align-items: center` and full header height, so
-  the run stays centred both windowed and maximized.
+  the run stays centered both windowed and maximized.
 - Do not use `scale()` on the ticker text (see the transform note above).
 
 ## Channels view
@@ -151,16 +151,16 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   currently reads as a small list floating on an empty background.
 - Remove the visual gap between the tab bar and the channels content. Add a
   full-width divider/line spanning the whole window between them.
-- Alternate row colours (zebra striping) so the dense list remains scannable.
+- Alternate row colors (zebra striping) so the dense list remains scannable.
   The neutral ramp is a three-step one in OKLCH at hue 240: empty table
   `0.11`, odd rows `0.145`, even rows `0.165`, hover `0.19`, open `0.215`.
   The chrome/root background is `0.16`. The dark rows need their own explicit
-  colour — if they are left transparent they inherit the table background and
+  color — if they are left transparent they inherit the table background and
   the banding disappears below the last row. Offline rows step their name and
   title back (`0.78` / `0.56`) so the live ones carry the eye.
 - The header is one row of identical type (10px, 600, 0.6 letter-spacing) and
-  each label sits over its column: the notify switches are labelled once, with
-  `Notify` centred over `live` and `title`, instead of repeating the two words
+  each label sits over its column: the notify switches are labeled once, with
+  `Notify` centered over `live` and `title`, instead of repeating the two words
   on every row. The header and the rows both keep 32px of right padding (the
   engine's 16px scroll gutter plus the cells' own 10px, plus the old 6px list
   gap folded in) so the last columns sit over their values while the row
@@ -168,7 +168,7 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 - Rows are 36px tall: the 24px avatar plus 6px top and bottom padding. The
   two switches no longer set the row height, so the padding is explicit. Each
   row carries a transparent 2px left edge that an open row paints in its
-  channel colour; the cells line up with the header because the edge is
+  channel color; the cells line up with the header because the edge is
   reserved on both.
 - Order is meaning: pinned rows first, then live, then the channel that was
   most recently live, with ties keeping config order. Live rows are never
@@ -244,7 +244,7 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 - Keep Channel ID, Stream ID, Game ID/Game, Viewers and Collab in the detail
   grid. The grid itself should be denser and flatter than today.
 - The panel is part of the row, not a card under it: no top border, no margin,
-  and the open row's channel-coloured 2px edge runs straight down through it.
+  and the open row's channel-colored 2px edge runs straight down through it.
   Its background is a step darker than the open row (`0.12` against `0.215`).
 - It rolls out from the row inside an `overflow: hidden` wrapper: the wrapper
   animates `max-height` 0 → 240px over 200ms and `detail-out` runs it back, so
@@ -266,7 +266,7 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
 
 - Desktop-first, tool-like references: DaVinci Resolve for "quiet surface,
   content wins"; Blender/KDE/JetBrains for density and panel thinking.
-- 90s desktop GUIs for square controls, deliberate colour, and texture, but
+- 90s desktop GUIs for square controls, deliberate color, and texture, but
   not as a literal pixel-art recreation.
 - Reject mobile/web-first design systems (Material, Carbon, Spectrum) as the
   basis; they are not the target feel.
@@ -282,7 +282,7 @@ a compile.
 
 ## Open
 
-- Exact palette values (semantic colours and the neutral ramp).
+- Exact palette values (semantic colors and the neutral ramp).
 - Which texture/pattern, if any, and where.
 - Whether `Chillax` needs a local asset path or Fontshare API resolution at
-  build time, given the licence's redistribution terms.
+  build time, given the license's redistribution terms.

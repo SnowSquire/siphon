@@ -1,7 +1,7 @@
 //! The window styling: the zgui-ui theme tokens and the application sheet.
 //!
 //! `THEME_CSS` is the token block every zgui-ui control reads; `SHEET` is the
-//! hand-written CSS for the classes in `app.rs`. Colours the sheet reuses are
+//! hand-written CSS for the classes in `app.rs`. Colors the sheet reuses are
 //! declared once in its `:root` palette and referenced through `var()`.
 
 use zgui::prelude::*;
@@ -46,7 +46,7 @@ pub const THEME_CSS: &str = r"
 pub const SHEET: &str = css!(
     r####"
 :root {
-    /* One palette for the sheet. Every colour used more than once is declared
+    /* One palette for the sheet. Every color used more than once is declared
        here and referenced through var(); the zgui-ui tokens come from
        THEME_CSS, which owns the widget palette. */
     --fg: oklch(0.95 0.008 240);
@@ -112,7 +112,7 @@ pub const SHEET: &str = css!(
     .tab {
         padding: 5px 10px;
         /* The count is placed against the tab's corner rather than in its
-           flow, so it cannot push the label off-centre or widen the tab. */
+           flow, so it cannot push the label off-center or widen the tab. */
         position: relative;
         border-radius: 10px 10px 0 0;
         font-family: BrandFont, Chillax, sans-serif;
@@ -264,11 +264,11 @@ pub const SHEET: &str = css!(
         gap: 10px;
         /* 16px on the right is the scroll gutter the viewport reserves: the
            cells keep clear of it, and `box-shadow` paints that strip in the
-           row's own colour without changing the layout box. */
+           row's own color without changing the layout box. */
         padding: 6px 16px 6px 10px;
         border-radius: 0;
         /* A transparent 2px edge on every row keeps the cells aligned with the
-           header; an open row paints it in the channel's colour. */
+           header; an open row paints it in the channel's color. */
         border-left: 2px solid transparent;
         min-height: 30px;
         background-color: oklch(0.145 0.011 240);
@@ -408,7 +408,7 @@ pub const SHEET: &str = css!(
     .viewers-cell { justify-content: flex-end; }
 
     /* The panel is part of the row, not a card under it: no gap, no top
-       border, and the open row's channel-coloured edge runs straight through
+       border, and the open row's channel-colored edge runs straight through
        it. The wrapper clips the reveal and animates its own height, so the
        panel rolls out from under the row and pushes the rows below it down
        instead of those rows jumping a whole panel height at once. */
@@ -761,7 +761,7 @@ pub const SHEET: &str = css!(
 
 /* Each label keeps a fixed box, measured once for Chillax at the selected
    weight so the `wght` tween cannot resize the tab or shift the row. The text
-   child is centred by the box, so a fallback font that measures wider spills
+   child is centered by the box, so a fallback font that measures wider spills
    equally on both sides instead of hanging off the right. The string is an
    explicit child rather than the box's own text: a flex container's anonymous
    text item is mis-shaped by this zgui revision once the font variation
@@ -775,7 +775,7 @@ pub const SHEET: &str = css!(
 
 .tab__text { white-space: nowrap; }
 /* A count in the tab's corner. It is out of flow so it can neither widen the
-   tab nor push its label off-centre; only its opacity changes with the count. */
+   tab nor push its label off-center; only its opacity changes with the count. */
 .tab__count {
     display: inline-flex;
     align-items: center;
@@ -820,7 +820,7 @@ pub const SHEET: &str = css!(
 .list { gap: 0; padding: 0; }
 
 /* The visible thumb `ListThumb` draws: the engine's position, the engine's
-   look (a slim light capsule centred in the gutter), after the rows. */
+   look (a slim light capsule centered in the gutter), after the rows. */
 .list-thumb {
     position: absolute;
     top: 0;
@@ -834,7 +834,7 @@ pub const SHEET: &str = css!(
 .list-thumb.hidden { display: none; }
 
 /* Zebra rows; hover/open must follow the even-row rule to win. Each one also
-   carries the 16px strip that paints under the scrollbar in its own colour. */
+   carries the 16px strip that paints under the scrollbar in its own color. */
 .channel:nth-child(even) .channel-row {
     background-color: oklch(0.165 0.012 240);
     box-shadow: 16px 0 0 0 oklch(0.165 0.012 240);
@@ -881,7 +881,7 @@ pub const SHEET: &str = css!(
 /* A bordered box instead of a text glyph: zgui does not paint text inside a
    transformed element, but it does transform boxes. The tip is a bottom-right
    corner, so -45deg points right and +45deg points down when the row is open.
-   The outer box stretches to the row and centres the tip vertically. */
+   The outer box stretches to the row and centers the tip vertically. */
 .chevron {
     display: inline-flex;
     align-self: stretch;
@@ -906,8 +906,8 @@ pub const SHEET: &str = css!(
 
 /* The stock switch is a rounded pill, which is the wrong shape and too small
    for a dense desktop tool. Rebuild it as a hard-edged track with a square
-   thumb on the same 4px grid. The checked colour comes from --channel-color
-   (the channel's Twitch chat colour, with a generated fallback); the global
+   thumb on the same 4px grid. The checked color comes from --channel-color
+   (the channel's Twitch chat color, with a generated fallback); the global
    settings have no channel, so they fall through to the app's primary. The
    extra class in each selector outranks the component's own scoped sheet. */
 .app .zui-switch,

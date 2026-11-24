@@ -173,7 +173,7 @@ prefetch  chunks=193 chunk_min=6   chunk_max=26061  chunk_avg=9751   total_ms=20
 main      chunks=46  chunk_min=138 chunk_max=262112 chunk_avg=35891  total_ms=48
 ```
 
-The recurring 6-byte chunks are real payload chunks, not framing artefacts.
+The recurring 6-byte chunks are real payload chunks, not framing artifacts.
 Prefetch pacing tracks production: ~2 s of wall time per segment regardless of
 scheme.
 

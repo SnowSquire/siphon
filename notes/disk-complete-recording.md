@@ -105,7 +105,7 @@ anything past it.
 
 ## Index v4
 
-`index.hexpat` mirrors this.  Backwards compatibility is deliberately dropped: a
+`index.hexpat` mirrors this.  Backward compatibility is deliberately dropped: a
 v3 index (or any header mismatch) on the target stream is a **fatal** error and
 the program exits.
 

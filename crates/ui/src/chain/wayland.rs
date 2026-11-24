@@ -158,7 +158,7 @@ impl Chain {
     }
 
     pub const fn sdr_white(&self) -> f32 {
-        // The desktop is SDR; the value only colours the interface overlay.
+        // The desktop is SDR; the value only colors the interface overlay.
         200.0
     }
 
@@ -178,7 +178,7 @@ impl Chain {
 
     /// Nothing here changes with the display settings.
     ///
-    /// A Wayland chain takes its colour space from the compositor's image
+    /// A Wayland chain takes its color space from the compositor's image
     /// description, and a `VkSwapchainKHR` has no tearing mode: the present mode
     /// chosen at creation is how the application asks, and mailbox is already it.
     /// The settings are still persisted for a client whose chain does read them.
@@ -209,7 +209,7 @@ impl Chain {
     /// KWin decides where a maximized frame goes from the geometry declared at
     /// the start of the animation. Calling this on configure, with the extent
     /// the compositor just granted, keeps that geometry in step with the new
-    /// surface; declaring the old swapchain extent centres the old window in
+    /// surface; declaring the old swapchain extent centers the old window in
     /// the new one and leaves the frame offset by half the difference.
     pub fn declare(&self, width: u32, height: u32, scale: f32) {
         self.surface.pre_present_frame(
@@ -261,7 +261,7 @@ impl Chain {
         }
         let mut frame = pl::pl_frame::default();
         // SAFETY: `sc_frame` describes a live image from this swapchain, and
-        // the frame borrows only its colour metadata and texture handle.
+        // the frame borrows only its color metadata and texture handle.
         unsafe { pl::pl_frame_from_swapchain(&mut frame, &sc_frame) };
         Some(Acquired {
             frame,
@@ -275,7 +275,7 @@ impl Chain {
     /// The extent passed in is the one the swapchain actually presented, which
     /// can lead the surface's own configure during a maximize. Declaring that
     /// extent here keeps `set_window_geometry` in step with the buffer; using
-    /// the surface's stale size makes KWin centre an old-size window inside
+    /// the surface's stale size makes KWin center an old-size window inside
     /// the new one and place the frame off-screen.
     pub fn end(&self, width: u32, height: u32, scale: f64) -> bool {
         if !self.presentable() {

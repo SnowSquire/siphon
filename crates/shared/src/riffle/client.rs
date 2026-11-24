@@ -70,23 +70,23 @@ pub enum ClientEvent {
 
 type Pending = Rc<RefCell<HashMap<u64, Sender<Result<Response, RpcError>>>>>;
 
-/// A single-waiter, signalled wake so a request queued between the drain and
+/// A single-waiter, signaled wake so a request queued between the drain and
 /// the park is not missed.
 struct Wake {
     waker: Cell<Option<Waker>>,
-    signalled: Cell<bool>,
+    signaled: Cell<bool>,
 }
 
 impl Wake {
     const fn new() -> Self {
         Self {
             waker: Cell::new(None),
-            signalled: Cell::new(false),
+            signaled: Cell::new(false),
         }
     }
 
     fn wake(&self) {
-        self.signalled.set(true);
+        self.signaled.set(true);
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
@@ -97,7 +97,7 @@ impl Wake {
     }
 
     const fn take_signal(&self) -> bool {
-        self.signalled.replace(false)
+        self.signaled.replace(false)
     }
 }
 

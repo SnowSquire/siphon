@@ -2,7 +2,7 @@
 //! tree.
 //!
 //! A source-built libplacebo lives under `OUT_DIR` (or `LIBPLACEBO_BUILD_DIR`),
-//! which is not a default search path. `libplacebo-sys` forwards the libdir as
+//! which is not a default search path. `libplacebo-sys` passes the libdir as
 //! `links` metadata; the search path keeps another dependency's system `-L`
 //! directory from shadowing it at link time, and a shared build also gets an
 //! rpath so a binary started directly works without `LD_LIBRARY_PATH`. A system

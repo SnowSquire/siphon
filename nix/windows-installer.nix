@@ -1,4 +1,4 @@
-# The three Windows artefacts, packaged from the payload `nix/windows.nix`
+# The three Windows artifacts, packaged from the payload `nix/windows.nix`
 # builds:
 #
 #   siphon-<version><label>-x64-setup.exe      the per-user NSIS installer
@@ -31,7 +31,7 @@
 }:
 
 let
-  # The name every artefact, and the portable zip's inner directory, is built
+  # The name every artifact, and the portable zip's inner directory, is built
   # from: `siphon-0.5.1`, or `siphon-0.5.1-18b8dd2` off a branch.
   base = "siphon-${version}${label}";
 in
@@ -39,7 +39,7 @@ stdenvNoCC.mkDerivation {
   pname = "siphon-windows-installer";
   inherit version;
 
-  # The licence texts, the fonts' OFL files, the NSIS script and the VC++
+  # The license texts, the fonts' OFL files, the NSIS script and the VC++
   # redistributable bootstrapper: the whole of what packaging reads, and
   # nothing else, so editing a note or the flake does not rebuild the setup.
   src = installerSrc;
@@ -61,10 +61,10 @@ stdenvNoCC.mkDerivation {
     cp ${windows}/bin/libplacebo-*.dll "$stage/"
 
     cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
-    # Both shipped faces are OFL and the licence text has to travel with them.
+    # Both shipped faces are OFL and the license text has to travel with them.
     cp crates/ui/fonts/Archivo-OFL.txt "$stage/LICENSE-Archivo-OFL.txt"
     cp crates/ui/fonts/NotoColorEmoji-OFL.txt "$stage/LICENSE-NotoColorEmoji-OFL.txt"
-    # The meson install does not carry libplacebo's licence; take it from the
+    # The meson install does not carry libplacebo's license; take it from the
     # checkout the DLL was built from.
     cp ${sources.libplacebo}/LICENSE "$stage/LICENSE-libplacebo.txt"
 

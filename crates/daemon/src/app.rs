@@ -1094,7 +1094,7 @@ impl App {
         let target_ms = position_of(target, place);
         // A pipeline that retains nothing yet has no keyframe to name. The
         // answer is where it will start, and it is a clamp: the target was not
-        // honoured as asked.
+        // honored as asked.
         let Some(point) = self.registry.seek_point(key, target_ms).await else {
             return Ok(Response::StreamStarted(StreamStarted {
                 start_pts_ms: target_ms,

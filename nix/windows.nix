@@ -25,7 +25,7 @@
   depsSrc,
 }:
 let
-  # The debug normaliser needs xxhash: lld derives the CodeView GUID with it.
+  # The debug normalizer needs xxhash: lld derives the CodeView GUID with it.
   python = python3.withPackages (ps: [ ps.xxhash ]);
 
   # Baked in by `siphon-shared`, so `--version` names the commit the binary came
@@ -62,7 +62,7 @@ let
 
     nativeBuildInputs = msvc.nativeBuildInputs ++ [
       # `stylo`'s build script regenerates its property tables with Python;
-      # the same interpreter (with xxhash) normalises the PDB after the link.
+      # the same interpreter (with xxhash) normalizes the PDB after the link.
       python3
       python
     ];
@@ -114,7 +114,7 @@ let
         };
 
         # The install is spelled out instead of crane's log-driven default: the
-        # PDB has to be normalised beside the executable and then moved out of
+        # PDB has to be normalized beside the executable and then moved out of
         # `bin/`.
         doNotPostBuildInstallCargoBinaries = true;
         installPhaseCommand = ''
@@ -122,11 +122,11 @@ let
           mkdir -p $out/bin $out/symbols
           # rustc links a temporary `symbols.o` from a per-invocation directory,
           # and lld records that path in the PDB it hashes into the CodeView
-          # GUID. The normaliser pins the path, recomputes the GUID in both
+          # GUID. The normalizer pins the path, recomputes the GUID in both
           # files and prints the PDB it touched, so the pair is reproducible and
           # still matches for a debugger. The PDB is already beside the
-          # executable, which is where the normaliser looks for it.
-          pdb=$(${python}/bin/python3 ${./normalise-pe-debug.py} "$target/${exe}")
+          # executable, which is where the normalizer looks for it.
+          pdb=$(${python}/bin/python3 ${./normalize-pe-debug.py} "$target/${exe}")
           cp "$target/${exe}" $out/bin/
           cp "$pdb" $out/symbols/
         ''

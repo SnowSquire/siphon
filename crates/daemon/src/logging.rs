@@ -36,7 +36,7 @@ pub fn init(app_id: &str) {
         console,
     };
     // The default is `error` only, which would make the file useless: it exists
-    // to be read back after something went wrong. Colour is for a terminal; the
+    // to be read back after something went wrong. Color is for a terminal; the
     // file gets plain text so it can be grepped.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()

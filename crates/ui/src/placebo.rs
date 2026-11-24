@@ -183,7 +183,7 @@ impl Placebo {
     /// Hands a wrapped image back to libplacebo, saying what layout it is in.
     ///
     /// Wrapped images start held by their owner; every `pl_tex` call before a
-    /// release is undefined behaviour.
+    /// release is undefined behavior.
     pub fn release(&self, texture: pl::pl_tex, layout: pl::VkImageLayout) {
         let params = pl::pl_vulkan_release_params {
             tex: texture,
@@ -306,7 +306,7 @@ impl Placebo {
         Ok(texture)
     }
 
-    /// Copies `src` onto `dst` with no overlay or colour-management pass.
+    /// Copies `src` onto `dst` with no overlay or color-management pass.
     ///
     /// A diagnostic path: it answers whether what reaches the screen is coming
     /// from the overlay renderer at all.

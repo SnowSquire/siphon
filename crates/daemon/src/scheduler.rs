@@ -841,7 +841,7 @@ mod tests {
     fn a_reader_registered_during_the_wait_wakes_it() {
         let (queue, receive) = kanal::unbounded();
         let wake = ConsumerWake::new();
-        let signalled = run(async {
+        let signaled = run(async {
             let signal = Rc::clone(&wake);
             compio::runtime::spawn(async move {
                 compio::time::sleep(Duration::from_millis(10)).await;
@@ -862,7 +862,7 @@ mod tests {
             pin_mut!(wait, guard);
             matches!(select(wait, guard).await, Either::Left(_))
         });
-        assert!(signalled);
+        assert!(signaled);
     }
 
     #[test]

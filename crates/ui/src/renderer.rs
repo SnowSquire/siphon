@@ -96,7 +96,7 @@ impl UiRenderer {
         })
     }
 
-    /// The SDR colour space, for parts that are plain interface colours.
+    /// The SDR color space, for parts that are plain interface colors.
     fn srgb_space(chain: &Chain) -> pl::pl_color_space {
         let white = chain.sdr_white();
         pl::pl_color_space {
@@ -218,7 +218,7 @@ impl UiRenderer {
     /// Looks for the diagnostics fill in the frame and, if it is there,
     /// writes the frame and the geometry that produced it.
     ///
-    /// Magenta is a colour the interface never contains, so a pixel of it can
+    /// Magenta is a color the interface never contains, so a pixel of it can
     /// only be the underlay showing through. That means the frame is on disk
     /// the moment it happens, instead of being caught by inference.
     fn catch_band(&self, target: &pl::pl_frame) {
@@ -503,7 +503,7 @@ impl UiRenderer {
             };
             count += 1;
         }
-        // SIPHON_UI_CONST: draw the interface as one flat colour instead of the
+        // SIPHON_UI_CONST: draw the interface as one flat color instead of the
         // texture. A band that survives this is not the texture's content.
         let mut flat = [pl::pl_overlay_part {
             src: pl::pl_rect2df {
@@ -520,7 +520,7 @@ impl UiRenderer {
             },
             color: [0.5, 0.5, 0.5, 1.0],
         }];
-        // The flat colour steps every frame, so a band of *stale* content shows
+        // The flat color steps every frame, so a band of *stale* content shows
         // as a different shade while a band of *missing* content stays magenta.
         if std::env::var_os("SIPHON_UI_CONST").is_some() {
             static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -589,7 +589,7 @@ impl UiRenderer {
                 overlay_count = 1;
             }
         }
-        // SIPHON_UI_NONE: the underlay alone, a frame of one colour.
+        // SIPHON_UI_NONE: the underlay alone, a frame of one color.
         if std::env::var_os("SIPHON_UI_NONE").is_none() {
             overlays[overlay_count] = overlay;
             overlay_count += 1;
@@ -634,7 +634,7 @@ impl UiRenderer {
                     x1: right.max(side),
                     y1: top + side,
                 };
-                // Premultiplied alpha: the part's colour is its own mask value.
+                // Premultiplied alpha: the part's color is its own mask value.
                 nits_part[0].color = [signal, signal, signal, 1.0];
                 overlays[overlay_count] = pl::pl_overlay {
                     tex: mask,
@@ -768,7 +768,7 @@ impl Renderer for UiRenderer {
         // KWin computes the final frame position from the geometry declared at
         // the start of a maximize. Declare the new extent now, before the
         // swapchain is rebuilt, so the window lands at the origin instead of
-        // centred on its old size.
+        // centered on its old size.
         if let Some(chain) = self.chain.as_ref() {
             chain.declare(width, height, target.scale.get());
         }
@@ -783,7 +783,7 @@ impl Renderer for UiRenderer {
         if let Some(chain) = self.chain.as_mut() {
             chain.settle((self.width, self.height));
             // A display setting that needs a new chain is followed before this
-            // frame acquires one: a chain's colour space is fixed at its creation.
+            // frame acquires one: a chain's color space is fixed at its creation.
             chain.apply_display();
         }
         if !self.inner.present_into(0) {

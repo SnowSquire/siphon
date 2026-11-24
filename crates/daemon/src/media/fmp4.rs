@@ -300,7 +300,7 @@ impl Sample {
     /// Whether the elementary stream says this access unit is a random access
     /// point: an IDR NAL unit for H.264, any IRAP (16–23: IDR, CRA, BLA) for
     /// H.265. This is the single keyframe fact the rest of the code uses and
-    /// `AV_PKT_FLAG_KEY` means, so IDR versus CRA is deliberately not modelled.
+    /// `AV_PKT_FLAG_KEY` means, so IDR versus CRA is deliberately not modeled.
     /// Always false for audio.
     #[must_use]
     pub const fn keyframe(self) -> bool {

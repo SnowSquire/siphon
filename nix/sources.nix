@@ -1,4 +1,4 @@
-# Everything the build downloads (or materialises once and then treats as
+# Everything the build downloads (or materializes once and then treats as
 # source) that is not in the repository. Each is pinned by a hash, so the network
 # is only ever used to fetch bytes this file names, and a hash bump is the only
 # way any of them can change.
@@ -138,7 +138,7 @@ let
     dontFixup = true;
   };
 
-  # The UI's brand face, Chillax. Its licence allows embedding the font in the
+  # The UI's brand face, Chillax. Its license allows embedding the font in the
   # application but not redistributing the file from a repository, so
   # `crates/ui/build.rs` fetches it from Fontshare. The endpoint hands out a zip
   # generated per request (its entry timestamps move), so this is a `fetchzip`:

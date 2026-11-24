@@ -118,7 +118,7 @@ pub fn parse_adts(frame: &[u8]) -> Option<AdtsFrame> {
 /// Only the head of the record is read: object type, sampling frequency index
 /// and channel configuration. An explicit SBR/PS extension (object type 5 or
 /// 29) is reported at the extension's output rate, which is what a decoder
-/// produces; the underlying object type is not modelled, exactly as for the
+/// produces; the underlying object type is not modeled, exactly as for the
 /// ADTS path. Returns `None` for a reserved frequency index, a layout that
 /// only a program config element describes, or a truncated record.
 #[must_use]

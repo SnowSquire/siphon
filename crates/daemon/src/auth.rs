@@ -366,7 +366,7 @@ mod tests {
             protection: Protection::None,
             token: "abc123".to_owned(),
         };
-        let json = siphon_shared::store::to_json(&stored).expect("serialise");
+        let json = siphon_shared::store::to_json(&stored).expect("serialize");
         let read_back: Stored = sonic_rs::from_slice(json.as_bytes()).expect("parse");
         assert_eq!(read_back.token, "abc123");
         assert_eq!(read_back.protection, Protection::None);

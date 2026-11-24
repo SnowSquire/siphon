@@ -70,7 +70,7 @@ pub mod libav {
             params: *const pl_avframe_params,
         ) -> bool;
         pub fn pl_unmap_avframe(gpu: pl_gpu, frame: *mut pl_frame);
-        /// Fills colour/repr/planes metadata (not textures) from an `AVFrame`.
+        /// Fills color/repr/planes metadata (not textures) from an `AVFrame`.
         pub fn pl_frame_from_avframe(out_frame: *mut pl_frame, frame: *const c_void);
         /// The `AVFrame *` a frame was mapped from.
         pub fn pl_get_mapped_avframe(frame: *const pl_frame) -> *mut c_void;

@@ -78,7 +78,7 @@ is empty.
 
 The rebase gives the worktree commits new commit IDs but keeps their **change
 IDs**, so `jj show <change>` and `jj squash --from <change>` still work
-afterwards. Verify: `jj chain` shows your commits, then the worktree's, with `@`
+afterward. Verify: `jj chain` shows your commits, then the worktree's, with `@`
 on top. `@` is the only undescribed commit and holds whatever the worktree's
 working copy had. `jj status` should show exactly those changes and nothing
 else; a conflict (from the squash or the rebase) is the one thing to resolve
@@ -189,7 +189,7 @@ ls <worktree-parent>    # the directory is gone
 - **Never rebase onto `main` or onto `@`.** The base is `@-`
   (`~/code/siphon`'s newest described commit). `main` can lag the local line,
   and `@` would become an ancestor of the chain, so the working copy could not
-  be moved to the new tip afterwards.
+  be moved to the new tip afterward.
 - **Move the previous `@`, do not rebuild it.** `jj rebase -s '@' -d
   <last-worktree-commit>` puts the working copy — with the worktree's changes
   now in it — back at the tip. Replacing it with `jj edit`/`jj new` can leave the
