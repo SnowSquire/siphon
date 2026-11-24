@@ -31,10 +31,10 @@ raw-window-handle = "0.6"
 siphon-shared = { path = "../shared" }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-zgui = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
-zgui-ui = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
-zgui-ui-tokens = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
-zgui-render-wgpu = { git = "https://github.com/zortax/zgui", rev = "aacaa469ee36eccf73a19bdb83356a7b8cd803c1" }
+zgui = { git = "https://github.com/sheoiken/zgui", rev = "82fb89f28911d2711bd44b65f3fb0af646a11b75" }
+zgui-ui = { git = "https://github.com/sheoiken/zgui", rev = "82fb89f28911d2711bd44b65f3fb0af646a11b75" }
+zgui-ui-tokens = { git = "https://github.com/sheoiken/zgui", rev = "82fb89f28911d2711bd44b65f3fb0af646a11b75" }
+zgui-render-wgpu = { git = "https://github.com/sheoiken/zgui", rev = "82fb89f28911d2711bd44b65f3fb0af646a11b75" }
 
 # The Win32 shell: the tray, the single-instance handover and the DXGI chain.
 [target.'cfg(windows)'.dependencies]

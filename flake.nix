@@ -75,8 +75,8 @@
           # whole source string rather than by crate name, and the value is the
           # tree hash of the pinned commit.
           cargoHashes = {
-            "git+https://github.com/zortax/zgui?rev=aacaa469ee36eccf73a19bdb83356a7b8cd803c1#aacaa469ee36eccf73a19bdb83356a7b8cd803c1" =
-              "sha256-wF8aYcJvME4/YVA6UXB2vrfQXmyWtFCRwLz1h6/NWP0=";
+            "git+https://github.com/sheoiken/zgui?rev=82fb89f28911d2711bd44b65f3fb0af646a11b75#82fb89f28911d2711bd44b65f3fb0af646a11b75" =
+              "sha256-r90ZuQ1bjbWscvi7RBM/kbbnc5TpStqZ/BSeYHYZWjQ=";
           };
           # crane splits a cargo invocation into a dependency layer and the
           # crates on top; cargo stays the resolver. The toolchain override is

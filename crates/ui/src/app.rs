@@ -111,6 +111,21 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
     let theme_css = dev_text("SIPHON_THEME_CSS", THEME_CSS);
     let dark = Signal::stored_local(Theme::dark().with_css(&theme_css));
     let sheet = dev_text("SIPHON_SHEET", SHEET);
+    // Shipped fonts are registered by path in dev so typography can be tried
+    // without a rebuild: SIPHON_FONT_UI, SIPHON_FONT_BRAND. Release builds
+    // keep ZGUI's system fonts until the licensing/asset path is settled.
+    let fonts = fonts()?;
+    // The platform's emoji family, named ahead of `sans-serif` in the sheet.
+    // A `sans-serif` fallback reaches the system's emoji list after several
+    // text faces, and on a machine with both Noto Emoji builds that lands on
+    // the monochrome one; the emoji generic leads with the colour face.
+    let sheet = match emoji_family(&fonts) {
+        Some(family) => sheet.replace(
+            "UIFont, Archivo,",
+            &format!("UIFont, Archivo, \"{family}\","),
+        ),
+        None => sheet,
+    };
 
     let window = app()
         .with_application_id("com.iken.siphon")
@@ -133,10 +148,6 @@ pub fn run(events: kanal::Receiver<UiEvent>, intents: IntentSender) -> eros::Res
         window
     };
 
-    // Shipped fonts are registered by path in dev so typography can be tried
-    // without a rebuild: SIPHON_FONT_UI, SIPHON_FONT_BRAND. Release builds
-    // keep ZGUI's system fonts until the licensing/asset path is settled.
-    let fonts = fonts()?;
     let window = window.with_fonts(fonts);
 
     // Both platforms compose the interface into a texture and present it
@@ -191,10 +202,19 @@ fn dev_text(path_var: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
-/// Registers the shipped fonts, then any dev overrides. Archivo, Chillax and a
-/// CBDT Noto Color Emoji are embedded so every platform renders the same text
-/// and real color emoji: the system emoji font can be COLRv1, which zgui's
-/// rasterizer decodes as a monochrome outline.
+/// The first family the platform lists for emoji, or nothing when it has none.
+fn emoji_family(fonts: &Fonts) -> Option<String> {
+    let mut context = fonts.shaper().fonts().font_context();
+    let family = context
+        .collection
+        .generic_families(fontique::GenericFamily::Emoji)
+        .next()?;
+    context.collection.family_name(family).map(str::to_owned)
+}
+
+/// Registers the shipped fonts, then any dev overrides. Archivo and Chillax are
+/// embedded so every platform renders the same text; colour emoji come from the
+/// platform's emoji face, which zgui paints from its COLR v1 graph.
 fn fonts() -> eros::Result<Fonts> {
     let fonts = Fonts::system();
     fonts
@@ -209,22 +229,6 @@ fn fonts() -> eros::Result<Fonts> {
             Some("BrandFont"),
         )
         .map_err(|error| eros::error!("shipped BrandFont: {error}"))?;
-    fonts
-        .register(
-            Arc::new(include_bytes!("../fonts/NotoColorEmoji-CBDT.ttf").to_vec()),
-            Some("SiphonEmoji"),
-        )
-        .map_err(|error| eros::error!("shipped emoji font: {error}"))?;
-
-    // parley appends the Emoji generic to every emoji cluster's font query.
-    // Binding it to the shipped family puts that face ahead of the platform
-    // font; the collection is shared with the shaper and rasterizer.
-    let mut context = fonts.shaper().fonts().font_context();
-    if let Some(id) = context.collection.family_id("SiphonEmoji") {
-        context
-            .collection
-            .set_generic_families(fontique::GenericFamily::Emoji, std::iter::once(id));
-    }
 
     for (var, family) in [
         ("SIPHON_FONT_UI", "UIFont"),

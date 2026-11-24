@@ -664,10 +664,10 @@ function mockUser(origin: string) {
     id: MOCK_CHANNEL_ID,
     login: MOCK_LOGIN,
     chatColor: "#009146",
-    displayName: "Sunnys",
+    displayName: "Sunnys 🌈",
     profileImageURL: `${origin}/avatar.png`,
     broadcastSettings: {
-      title: "mock broadcast",
+      title: "🎉 mock broadcast 🔥 ✨",
       game: { id: "1", name: "Mock", displayName: "Mock" },
     },
     stream: {

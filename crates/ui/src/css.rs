@@ -755,7 +755,7 @@ pub const SHEET: &str = css!(
     }
 
 :root {
-    font-family: UIFont, Archivo, SiphonEmoji, sans-serif;
+    font-family: UIFont, Archivo, sans-serif;
     font-variation-settings: "wght" 400, "wdth" 92;
 }
 
@@ -786,7 +786,7 @@ pub const SHEET: &str = css!(
     min-width: 12px;
     height: 12px;
     padding: 0 2px;
-    font-family: UIFont, Archivo, SiphonEmoji, sans-serif;
+    font-family: UIFont, Archivo, sans-serif;
     font-size: 9px;
     font-weight: 700;
     line-height: 1;
