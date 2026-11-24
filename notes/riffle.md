@@ -5,9 +5,11 @@ state machine behind `StreamOpen`/`StreamUpdate`/`StreamClose`/`StreamSeek`, the
 playhead estimate, the `LaneView` rows, and the path that actually pushes media:
 one producer task per lane demuxes the pipeline's segments, packs access units
 into objects and hands them to one datagram sender per connection, which drains
-audio and edge-lane traffic first. What is *not* built yet: GOP alignment on
-join and seek (a lane that opens while the pipeline has no edge waits for the
-next segment), the UI's receiver and decoder, and the zero-copy pipe path. RTSP
+audio and edge-lane traffic first. The UI's receive half reassembles those
+datagrams into whole access units and counts what it loses. What is *not* built
+yet: GOP alignment on join and seek (a lane that opens while the pipeline has no
+edge waits for the next segment), the UI's decoder and player, and the zero-copy
+pipe path. RTSP
 is gone — `play`, the RTSP listener and the RTP packetizers were removed — so the
 only viewer path is this one. Parts II and III are implemented, and so is the
 **QUIC carrier for the control plane**: self-signed certificates on both sides, a
@@ -105,15 +107,17 @@ segment. The AU is the atomic unit; within one, the transport fragments at
 
 ### One header
 
-Datagram: 18 B, ~1.5% of a 1200-byte payload.
+Datagram: 20 B, ~1.7% of a 1200-byte payload.
 
 ```
-u8 class | u8 flags | u64 obj_id | u32 total_len | u32 frag_offset | payload
+u8 class | u16 lane | u8 flags | u64 obj_id | u32 total_len | u32 frag_offset | payload
 ```
 
-Stream and pipe frames prepend `u32 len`. `class` doubles as the datagram lane
-tag, because a QUIC DATAGRAM frame carries no stream association. `obj_id` is
-monotonic for the life of the connection and **never reset**, so a seek needs no
+Stream and pipe frames prepend `u32 len`, so they are 24 B of header. `lane` is
+what a QUIC DATAGRAM frame has none of: the frame carries no stream association,
+so the header names the lane. Control objects use lane 0, and a media lane's
+number is the same one its `obj_id` range is seeded from. `obj_id` is monotonic
+per lane for the life of the connection and **never reset**, so a seek needs no
 epoch field and "drop if `obj_id <= last_delivered`" survives one. `flags` is
 `supersede | keyframe | last_fragment`.
 
@@ -222,6 +226,18 @@ an object is shipped or not shipped. Datagram send failures are counted too, on
 `ConnStats::lost`, because a carrier that refuses a datagram is the local half of
 "lost" and has to be visible beside the network's half.
 
+### The receive half, as built
+
+The UI's `MediaReceiver` demultiplexes by `(lane, class)` and reassembles each
+object by `obj_id` and `frag_offset`, so fragments may arrive out of order and
+two objects or two lanes may interleave. An object is never delivered partial:
+if a fragment is missing when a newer `obj_id` on the lane completes, or the
+500 ms deadline passes, the whole object is dropped and counted by class. An
+`obj_id` at or below the lane's high-water mark is discarded, which is also what
+makes the duplicated audio object arrive once. Delivered and dropped counts and
+the last unit's lane/`pts` live in the UI; they are not the daemon's numbers,
+and `ConnStats` stays the send side.
+
 ## Audio
 
 Separate class, same lane, never sharing video's fate. ~400 B per AAC frame, so it
@@ -285,10 +301,10 @@ lane never inherits a new broadcast. The channel rides along for attribution,
 because a lane whose broadcast just ended must still be able to name its channel.
 
 Object ids are unique per connection: each lane's packer starts at a disjoint
-range (`lane << 40`), so two lanes can never emit the same `obj_id`. The datagram
-header still carries no lane tag, so a client that watches two lanes on one
-connection has to demultiplex by something else — the next header change is a lane
-id or a per-lane obj_id base the client is told in `StreamConfig`.
+range (`lane << 40`), so two lanes can never emit the same `obj_id`. The header
+also carries the lane itself, so a client watching two lanes on one connection
+demultiplexes by `(lane, class)` and never has to infer the lane from the id
+range — a received object names its lane directly.
 
 ## Blobs and avatars
 

@@ -9,7 +9,7 @@
 //!
 //! # The payload prefix
 //!
-//! The object header (`riffle::object`) has no timestamp field. It is 18 bytes
+//! The object header (`riffle::object`) has no timestamp field. It is 20 bytes
 //! shared by control messages, blobs and media, and adding `pts`/`dts` to it
 //! would make every blob pay for two `i64`s only the media classes use. So a
 //! media object's payload opens with its timing instead: `pts` then `dts`,
@@ -48,13 +48,12 @@ use siphon_shared::riffle::object::DATAGRAM_HEADER;
 use siphon_shared::riffle::object::Flags;
 use siphon_shared::riffle::object::MAX_OBJECT;
 use siphon_shared::riffle::object::Object;
+/// Two big-endian `i64`s: `pts`, then `dts`, in the track's timescale. Defined
+/// with the header because both sides of the wire agree on it.
+pub use siphon_shared::riffle::object::TIMESTAMP_PREFIX;
 
 use crate::media::fmp4;
 use crate::media::ts;
-
-/// Two big-endian `i64`s: `pts`, then `dts`, in the track's timescale. See the
-/// module docs.
-pub const TIMESTAMP_PREFIX: usize = 16;
 
 /// One candidate datagram, header and payload together.
 ///
@@ -416,6 +415,8 @@ pub fn timestamps(payload: &[u8]) -> Option<(i64, i64)> {
 #[derive(Debug)]
 pub struct Packer {
     next_id: u64,
+    /// The lane every object this packer produces names in the header.
+    lane: u16,
     /// Payload bytes one fragment may carry.
     payload: usize,
 }
@@ -427,20 +428,38 @@ impl Default for Packer {
 }
 
 impl Packer {
-    /// A packer whose first object is id 0 and whose datagrams may be
-    /// `datagram_budget` bytes on the wire.
+    /// A packer for lane 0 whose first object is id 0 and whose datagrams may
+    /// be `datagram_budget` bytes on the wire.
     #[must_use]
     pub const fn new(datagram_budget: usize) -> Self {
         Self::from_id(0, datagram_budget)
     }
 
-    /// A packer that continues at `next_id`.
+    /// A packer that continues at `next_id`, still on lane 0. This is the
+    /// control plane's packer and what a test that does not care about lanes
+    /// builds.
     #[must_use]
     pub const fn from_id(next_id: u64, datagram_budget: usize) -> Self {
+        Self::for_lane(0, next_id, datagram_budget)
+    }
+
+    /// A packer for one lane: every object it produces carries `lane`, and its
+    /// ids start at `next_id` — normally `lane << 40`, so the ranges are
+    /// disjoint.
+    #[must_use]
+    pub const fn for_lane(lane: u16, next_id: u64, datagram_budget: usize) -> Self {
         Self {
             next_id,
+            lane,
             payload: payload_of(datagram_budget),
         }
+    }
+
+    /// The lane this packer stamps on its objects.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub const fn lane(&self) -> u16 {
+        self.lane
     }
 
     /// The id the next object will carry.
@@ -500,6 +519,7 @@ impl Packer {
 
         Ok(Fragments {
             class: unit.track.class(),
+            lane: self.lane,
             flags: if unit.track == Track::Video && unit.keyframe {
                 Flags::KEYFRAME
             } else {
@@ -530,6 +550,7 @@ const fn payload_of(datagram_budget: usize) -> usize {
 /// The fragments of one access unit, in wire order.
 pub struct Fragments<'a> {
     class: Class,
+    lane: u16,
     flags: Flags,
     obj_id: u64,
     total_len: u32,
@@ -563,6 +584,7 @@ impl<'a> Iterator for Fragments<'a> {
 
         let object = Object {
             class: self.class,
+            lane: self.lane,
             flags,
             obj_id: self.obj_id,
             total_len: self.total_len,
@@ -657,6 +679,11 @@ mod tests {
                     au_id = Some(object.obj_id);
                 }
                 assert_eq!(object.class, unit.track.class());
+                assert_eq!(
+                    object.lane,
+                    packer.lane(),
+                    "every fragment names the packer's lane"
+                );
                 assert_eq!(
                     object.flags.contains(Flags::KEYFRAME),
                     keyframe,
@@ -801,6 +828,34 @@ mod tests {
         assert_eq!(objects[0].class, Class::Audio);
         assert!(!objects[0].flags.contains(Flags::KEYFRAME));
         assert_eq!(objects[0].obj_id, 1, "the lane's ids continue");
+    }
+
+    /// The lane is in the header, not inferred from the id range: every
+    /// fragment of every object names it, and the ids stay inside the lane's
+    /// own range.
+    #[test]
+    fn a_packer_stamps_its_lane_on_every_fragment() {
+        let data = vec![0xAB; 3000];
+        let unit = AccessUnit {
+            track: Track::Video,
+            pts: 1,
+            dts: 2,
+            timescale: ts::TIMESCALE,
+            keyframe: true,
+            data: &data,
+        };
+        let base = 7u64 << 40;
+        let mut packer = Packer::for_lane(7, base, DATAGRAM_BUDGET);
+        let mut scratch = Vec::new();
+        let objects: Vec<_> = packer.pack(unit, &mut scratch).unwrap().collect();
+
+        assert_eq!(packer.lane(), 7);
+        assert!(objects.len() > 1, "the unit fragments");
+        for object in &objects {
+            assert_eq!(object.lane, 7);
+            assert_eq!(object.obj_id, base);
+        }
+        assert_eq!(packer.next_id(), base + 1, "one id per access unit");
     }
 
     #[test]

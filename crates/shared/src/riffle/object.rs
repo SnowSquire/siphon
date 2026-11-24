@@ -1,13 +1,17 @@
 //! The object header every carrier shares.
 //!
 //! A Riffle object is one access unit, one audio frame or one blob. On a QUIC
-//! datagram the header is 18 bytes; on a stream or the local pipe it is the same
+//! datagram the header is 20 bytes; on a stream or the local pipe it is the same
 //! header behind a `u32` length, so the object layer never learns which carrier
 //! it is on.
 //!
-//! `obj_id` is monotonic for the life of a connection and is never reset, so a
-//! seek needs no epoch field and "drop if `obj_id <= last_delivered`" survives
-//! one unchanged.
+//! `lane` is what a QUIC DATAGRAM frame has none of: the frame carries no stream
+//! association, so the header has to name the lane. Control objects use lane 0;
+//! a producer's lane number is the same one its `obj_id` range is seeded from.
+//!
+//! `obj_id` is monotonic per lane for the life of a connection and is never
+//! reset, so a seek needs no epoch field and "drop if `obj_id <= last_delivered`"
+//! survives one unchanged.
 //!
 //! A media object's payload opens with its own timing, because this header has
 //! no timestamp field: `pts` then `dts`, two big-endian `i64`s in the track's
@@ -17,15 +21,18 @@
 
 use std::fmt;
 
-/// Bytes in the datagram form: class, flags, id, total length, fragment offset.
-pub const DATAGRAM_HEADER: usize = 18;
+/// Bytes in the datagram form: class, lane, flags, id, total length, fragment
+/// offset.
+pub const DATAGRAM_HEADER: usize = 20;
 /// Bytes in the stream and pipe form, including the `u32` length prefix.
 pub const STREAM_HEADER: usize = DATAGRAM_HEADER + 4;
 /// Sanity ceiling for one object. A 1080p keyframe is around 1 MiB.
 pub const MAX_OBJECT: u32 = 4 * 1024 * 1024;
+/// The payload prefix a media object opens with: `pts`, then `dts`, each a
+/// big-endian `i64`. See the module docs.
+pub const TIMESTAMP_PREFIX: usize = 16;
 
-/// Which policy an object is subject to. Doubles as the datagram lane tag,
-/// because a QUIC DATAGRAM frame carries no stream association.
+/// Which policy an object is subject to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Class {
@@ -109,6 +116,8 @@ impl Flags {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Object<'a> {
     pub class: Class,
+    /// Which lane on the connection this object belongs to. Control is lane 0.
+    pub lane: u16,
     pub flags: Flags,
     pub obj_id: u64,
     pub total_len: u32,
@@ -166,15 +175,17 @@ impl<'a> Object<'a> {
             return Err(ObjectError::Short);
         }
         let class = Class::from_u8(buf[0]).ok_or(ObjectError::Class(buf[0]))?;
-        let flags = Flags::from_bits(buf[1]);
+        let lane = u16::from_be_bytes([buf[1], buf[2]]);
+        let flags = Flags::from_bits(buf[3]);
         let mut id = [0u8; 8];
-        id.copy_from_slice(&buf[2..10]);
+        id.copy_from_slice(&buf[4..12]);
         let mut total = [0u8; 4];
-        total.copy_from_slice(&buf[10..14]);
+        total.copy_from_slice(&buf[12..16]);
         let mut offset = [0u8; 4];
-        offset.copy_from_slice(&buf[14..18]);
+        offset.copy_from_slice(&buf[16..20]);
         let object = Self {
             class,
+            lane,
             flags,
             obj_id: u64::from_be_bytes(id),
             total_len: u32::from_be_bytes(total),
@@ -193,10 +204,11 @@ impl<'a> Object<'a> {
             return Err(ObjectError::NoSpace);
         }
         out[0] = self.class.as_u8();
-        out[1] = self.flags.bits();
-        out[2..10].copy_from_slice(&self.obj_id.to_be_bytes());
-        out[10..14].copy_from_slice(&self.total_len.to_be_bytes());
-        out[14..18].copy_from_slice(&self.frag_offset.to_be_bytes());
+        out[1..3].copy_from_slice(&self.lane.to_be_bytes());
+        out[3] = self.flags.bits();
+        out[4..12].copy_from_slice(&self.obj_id.to_be_bytes());
+        out[12..16].copy_from_slice(&self.total_len.to_be_bytes());
+        out[16..20].copy_from_slice(&self.frag_offset.to_be_bytes());
         out[DATAGRAM_HEADER..written].copy_from_slice(self.payload);
         Ok(written)
     }
@@ -264,6 +276,7 @@ mod tests {
     fn sample() -> Object<'static> {
         Object {
             class: Class::Video,
+            lane: 3,
             flags: Flags::SUPERSEDE.union(Flags::KEYFRAME),
             obj_id: 0x0102_0304_0506_0708,
             total_len: 1500,
@@ -280,9 +293,32 @@ mod tests {
         assert_eq!(written, DATAGRAM_HEADER + 300);
         let decoded = Object::decode_datagram(&buf[..written]).unwrap();
         assert_eq!(decoded, object);
+        assert_eq!(decoded.lane, 3);
         assert!(decoded.is_last());
         assert!(decoded.flags.contains(Flags::KEYFRAME));
         assert!(!decoded.flags.contains(Flags::LAST_FRAGMENT));
+    }
+
+    /// The datagram form is 20 bytes, so a full 1200-byte datagram carries 1180
+    /// payload bytes and not one more.
+    #[test]
+    fn the_datagram_budget_holds_with_the_lane_field() {
+        assert_eq!(DATAGRAM_HEADER, 20);
+        assert_eq!(STREAM_HEADER, 24);
+        let payload = [9u8; 1200 - DATAGRAM_HEADER];
+        let object = Object {
+            total_len: u32::try_from(payload.len()).unwrap(),
+            frag_offset: 0,
+            payload: &payload,
+            ..sample()
+        };
+        let mut buf = [0u8; 1200];
+        let written = object.encode_datagram(&mut buf).unwrap();
+        assert_eq!(written, 1200, "the header and payload are the whole budget");
+        assert_eq!(
+            Object::decode_datagram(&buf[..written]).unwrap().lane,
+            object.lane
+        );
     }
 
     #[test]
@@ -291,13 +327,16 @@ mod tests {
         let mut buf = [0u8; 512];
         let written = object.encode_frame(&mut buf).unwrap();
         assert_eq!(written, STREAM_HEADER + 300);
-        assert_eq!(&buf[..4], &318u32.to_be_bytes());
+        assert_eq!(&buf[..4], &320u32.to_be_bytes());
         assert_eq!(Object::decode_frame(&buf[..written]).unwrap(), object);
     }
 
     #[test]
     fn short_buffers_are_rejected() {
-        assert_eq!(Object::decode_datagram(&[0u8; 17]), Err(ObjectError::Short));
+        assert_eq!(
+            Object::decode_datagram(&[0u8; DATAGRAM_HEADER - 1]),
+            Err(ObjectError::Short)
+        );
         assert_eq!(
             Object::decode_frame(&[0u8; STREAM_HEADER - 1]),
             Err(ObjectError::Short)
@@ -314,9 +353,9 @@ mod tests {
         buf[0] = 9;
         assert_eq!(Object::decode_datagram(&buf), Err(ObjectError::Class(9)));
         buf[0] = 0;
-        buf[10..14].copy_from_slice(&0u32.to_be_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_be_bytes());
         assert_eq!(Object::decode_datagram(&buf), Err(ObjectError::TotalLen(0)));
-        buf[10..14].copy_from_slice(&(MAX_OBJECT + 1).to_be_bytes());
+        buf[12..16].copy_from_slice(&(MAX_OBJECT + 1).to_be_bytes());
         assert_eq!(
             Object::decode_datagram(&buf),
             Err(ObjectError::TotalLen(MAX_OBJECT + 1))

@@ -540,6 +540,9 @@ impl<S: Sink + 'static> LaneProducer<S> {
         let control = stream.control();
         let (stop_tx, stop_rx) = kanal::bounded(1);
         let budget = sink.budget();
+        // The header's lane field is 16 bits; ids stay disjoint on the full
+        // `u64`, so a lane past 65535 would share a tag but never an id.
+        let lane_id = u16::try_from(lane).unwrap_or(u16::MAX);
         let producer = Self {
             key,
             handle,
@@ -548,7 +551,7 @@ impl<S: Sink + 'static> LaneProducer<S> {
             stop: stop_rx.to_async(),
             source: None,
             init: None,
-            packer: Packer::from_id(lane.wrapping_mul(LANE_ID_SPAN), budget),
+            packer: Packer::for_lane(lane_id, lane.wrapping_mul(LANE_ID_SPAN), budget),
             segment: Vec::new(),
             scratch: Vec::new(),
             datagram: vec![0; budget],

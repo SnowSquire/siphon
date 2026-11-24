@@ -44,6 +44,8 @@ use zgui::reactive::LocalStorage;
 use zgui::reactive::RwSignal;
 use zgui::reactive::prelude::*;
 
+use crate::media::MediaView;
+
 /// One snapshot, entity update, or fetched picture for the UI thread.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -77,6 +79,9 @@ pub enum UiEvent {
     /// A pairing step failed, or the typed code was not the one the handshake
     /// derived. The provisional connection is already gone.
     PairFailed(String),
+    /// The receive side's counters and the last access unit it reassembled.
+    /// Client-side numbers: the daemon's `ConnStats` is the send side.
+    Media(MediaView),
 }
 
 /// A single-waiter wake, shared between the UI thread (intent sender) and the
@@ -381,6 +386,14 @@ async fn serve_connection(
     events: &kanal::Sender<UiEvent>,
 ) -> End {
     let client = Rc::new(client);
+    // QUIC carries media on the same connection; the local pipe has no
+    // datagram channel. The receiver is its own task, so a media burst never
+    // holds up the control-plane events, and it ends when `recv` sees the
+    // connection close.
+    if let Some(datagrams) = client.datagrams().cloned() {
+        let events = events.clone();
+        compio::runtime::spawn(crate::media::run(datagrams, events)).detach();
+    }
     let stream = client.events().clone();
     let queue: Rc<RefCell<VecDeque<ClientEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
     let closed = Rc::new(Cell::new(false));
@@ -619,6 +632,9 @@ pub struct UiState {
     /// The last `StreamStarted` the daemon answered a seek with. A lane's real
     /// start is the daemon's to decide, not the target the client asked for.
     pub started: RwSignal<Option<(StreamKey, StreamStarted)>, LocalStorage>,
+    /// What the receive half has assembled so far: its counters and the last
+    /// unit's lane and `pts`. Client-side numbers, not the daemon's `ConnStats`.
+    pub media: RwSignal<Option<MediaView>, LocalStorage>,
     pub arena: RwSignal<ArenaSummary, LocalStorage>,
     pub downloader: RwSignal<DownloaderSummary, LocalStorage>,
     /// The notification centre. Client state: it does not survive a window
@@ -829,6 +845,7 @@ impl UiState {
             pipelines: RwSignal::new_local(Rc::new(Vec::new())),
             lanes: RwSignal::new_local(Rc::new(Vec::new())),
             started: RwSignal::new_local(None),
+            media: RwSignal::new_local(None),
             arena: RwSignal::new_local(state.arena),
             downloader: RwSignal::new_local(state.downloader),
             notices: RwSignal::new_local(Rc::new(Vec::new())),
@@ -848,6 +865,9 @@ impl UiState {
         self.conn.set(state.conn);
         self.error.set(state.error);
         self.update.set(state.update);
+        // A snapshot is a new connection, and its receiver starts its counters
+        // from zero. The old numbers described a connection that is gone.
+        self.media.set(None);
         // A reconnect is the one moment to re-ask: whatever a dropped connection
         // never answered is still unanswered.
         self.avatar_requests.borrow_mut().clear();
@@ -1177,6 +1197,11 @@ impl UiState {
                 }
             }
             UiEvent::Started { key, started } => self.started.set(Some((key, started))),
+            UiEvent::Media(view) => {
+                if self.media.get_untracked() != Some(view) {
+                    self.media.set(Some(view));
+                }
+            }
             UiEvent::PairCode { sas } => self.pair.set(PairPhase::Code(sas)),
             UiEvent::Paired {
                 endpoint,

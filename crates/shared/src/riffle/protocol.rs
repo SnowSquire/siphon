@@ -12,7 +12,7 @@ use serde::Serialize;
 
 /// Monotonic protocol revision. Both sides refuse a mismatch before decoding
 /// anything else, so a stale UI gets a typed error instead of a panic.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 6; // Arbitrary until release.
 
 /// First field of `Hello`; a cheap guard against a client that connected to
 /// the RTSP port or some unrelated loopback service.

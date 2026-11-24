@@ -30,6 +30,7 @@ mod format;
 mod gpu;
 mod hdr;
 mod matcher;
+mod media;
 mod notify;
 mod placebo;
 mod renderer;
