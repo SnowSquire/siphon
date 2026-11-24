@@ -47,7 +47,7 @@ mod http;
 #[allow(clippy::future_not_send)]
 mod playlist;
 #[allow(clippy::future_not_send)]
-mod rtsp;
+mod media;
 #[allow(clippy::future_not_send)]
 mod scheduler;
 #[allow(clippy::future_not_send)]
@@ -368,8 +368,8 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     // Otherwise discovery (GQL plus domain probing) and the periodic playlist
     // refresh run in the background, concurrently with the live variant and
     // manifest fetches.
-    let dvr = rtsp::dvr::Dvr::new(debug_dvr_url(cfg, variant));
-    rtsp::dvr::spawn(
+    let dvr = media::dvr::Dvr::new(debug_dvr_url(cfg, variant));
+    media::dvr::spawn(
         Rc::clone(&client),
         (!debug).then(|| args.channel.clone()),
         Rc::clone(&dvr),
@@ -377,8 +377,8 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     dvr.set_live_variant(variant);
 
     // `play`/`record` are single-stream modes: no registry, so no channel id.
-    let key = rtsp::StreamKey::new(0, args.quality.clone());
-    let stream = Rc::new(rtsp::Stream::new(key, title));
+    let key = media::StreamKey::new(0, args.quality.clone());
+    let stream = Rc::new(media::Stream::new(key, title));
 
     let (downloaders_tx, downloaders_rx) = kanal::bounded(32);
     let downloader_metrics = Rc::new(DownloaderMetrics::new(32));
@@ -417,7 +417,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
         &downloaders_rx,
         &downloader_metrics,
     );
-    rtsp::spawn_media(
+    media::spawn_media(
         Rc::clone(&stream),
         Rc::clone(&client),
         Rc::clone(&dvr),
@@ -428,7 +428,7 @@ async fn play(cfg: &Config, args: &Play) -> Result<(), Box<dyn std::error::Error
     );
     // `play` keeps serving after the last player leaves: a reconnect starts at
     // the live edge of the same stream.
-    rtsp::spawn_single(Rc::clone(&stream));
+    media::spawn_single(Rc::clone(&stream));
 
     let scheduler = scheduler::StreamScheduler::new(
         client,
@@ -514,15 +514,15 @@ async fn record(cfg: &Config, args: &Record) -> Result<(), Box<dyn std::error::E
     // The DVR side: discovery when recording one, otherwise no URL at all (the
     // disk then promotes the live recording straight into the canonical file).
     let dvr = if want_dvr {
-        let dvr = rtsp::dvr::Dvr::new(debug_dvr_url(cfg, variant));
-        rtsp::dvr::spawn(
+        let dvr = media::dvr::Dvr::new(debug_dvr_url(cfg, variant));
+        media::dvr::spawn(
             Rc::clone(&client),
             (!debug).then(|| login.clone()),
             Rc::clone(&dvr),
         );
         dvr
     } else {
-        rtsp::dvr::Dvr::new(None)
+        media::dvr::Dvr::new(None)
     };
     dvr.set_live_variant(variant);
 
@@ -854,7 +854,7 @@ async fn daemon(cfg: &Config, args: &Daemon) -> Result<(), Box<dyn std::error::E
 
     // Only returns on a bind error: the RTSP accept loop runs for the process's
     // life.
-    rtsp::serve(registry, args.bind).await?;
+    media::serve(registry, args.bind).await?;
     pid::remove(config::APP_ID);
 
     drop(downloaders_rx);

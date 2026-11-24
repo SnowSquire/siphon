@@ -2,8 +2,8 @@
 
 use super::index::SegmentRecord;
 use super::index::add_signed;
-use crate::rtsp::dvr::DvrSegment;
-use crate::rtsp::dvr::DvrTimeline;
+use crate::media::dvr::DvrSegment;
+use crate::media::dvr::DvrTimeline;
 
 // Clock and hole arithmetic
 

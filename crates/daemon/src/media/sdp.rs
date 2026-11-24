@@ -2,9 +2,9 @@
 
 use std::net::IpAddr;
 
-use crate::rtsp::aac;
-use crate::rtsp::aac::AudioConfig;
-use crate::rtsp::h264::H264Config;
+use crate::media::aac;
+use crate::media::aac::AudioConfig;
+use crate::media::h264::H264Config;
 
 pub const VIDEO_PAYLOAD_TYPE: u8 = 96;
 pub const AUDIO_PAYLOAD_TYPE: u8 = 97;

@@ -5,10 +5,10 @@
 //! AAC as ADTS. The demuxer is fed the raw bytes of each HLS segment and emits
 //! one [`Sample`] per PES access unit.
 
-use crate::rtsp::aac;
-use crate::rtsp::aac::AudioConfig;
-use crate::rtsp::h264;
-use crate::rtsp::h264::H264Config;
+use crate::media::aac;
+use crate::media::aac::AudioConfig;
+use crate::media::h264;
+use crate::media::h264::H264Config;
 
 const TS_PACKET: usize = 188;
 const TS_SYNC: u8 = 0x47;

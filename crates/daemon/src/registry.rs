@@ -47,11 +47,11 @@ use crate::metrics::DiskMetrics;
 use crate::metrics::DownloaderMetrics;
 use crate::metrics::StreamMetrics;
 use crate::notify::Notifier;
-use crate::rtsp::ResolveError;
-use crate::rtsp::Stream;
-use crate::rtsp::StreamResolver;
-use crate::rtsp::dvr::Dvr;
-use crate::rtsp::parse_stream_key;
+use crate::media::ResolveError;
+use crate::media::Stream;
+use crate::media::StreamResolver;
+use crate::media::dvr::Dvr;
+use crate::media::parse_stream_key;
 use crate::scheduler::ConsumerRegistration;
 use crate::scheduler::Segment;
 use crate::scheduler::StreamScheduler;
@@ -212,7 +212,7 @@ impl StreamRuntime {
         let Some(registration) = self.registration.borrow().clone() else {
             return false;
         };
-        crate::rtsp::spawn_media(
+        crate::media::spawn_media(
             Rc::clone(&self.stream),
             Rc::clone(&self.client),
             Rc::clone(&self.dvr),
@@ -228,7 +228,7 @@ impl StreamRuntime {
         if self.dvr_spawned.replace(true) {
             return;
         }
-        crate::rtsp::dvr::spawn(
+        crate::media::dvr::spawn(
             Rc::clone(&self.client),
             Some(self.login.clone()),
             Rc::clone(&self.dvr),
