@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use compio::BufResult;
+use compio::buf::IntoInner;
 use compio::buf::IoBuf;
 use compio::fs::File;
 use compio::fs::OpenOptions;
@@ -16,6 +18,7 @@ use tracing::warn;
 use xxhash_rust::xxh3::Xxh3;
 use xxhash_rust::xxh3::xxh3_128;
 
+use super::COPY_BLOCK;
 use super::Canonical;
 use super::DiskOutputError;
 use super::Event;
@@ -329,35 +332,11 @@ pub(super) async fn read_exact_at(
     result.0.map(|()| result.1)
 }
 
-/// A file region read in fixed blocks. The block size and the cursor live here
-/// so every copy implementation shares them.
-pub(super) struct Blocks<'a> {
-    pub(super) file: &'a File,
-    pub(super) offset: u64,
-    pub(super) remaining: u64,
-}
-
-impl<'a> Blocks<'a> {
-    const fn new(file: &'a File, offset: u64, len: u64) -> Self {
-        Self {
-            file,
-            offset,
-            remaining: len,
-        }
-    }
-
-    async fn next(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        if self.remaining == 0 {
-            return Ok(None);
-        }
-        let take = block_take(self.remaining);
-        let buffer = read_exact_at(self.file, self.offset, take).await?;
-        self.offset += take as u64;
-        self.remaining -= take as u64;
-        Ok(Some(buffer))
-    }
-}
-
+/// Copy `len` bytes from one open file into a hole in another. On Linux this
+/// runs through a kernel pipe, so the bytes never enter userspace and nothing
+/// is allocated per block; a filesystem that refuses splice, and every other
+/// platform, copies fixed-size blocks instead.
+#[cfg(target_os = "linux")]
 pub(super) async fn copy_between(
     source: &File,
     source_offset: u64,
@@ -365,23 +344,149 @@ pub(super) async fn copy_between(
     destination_offset: u64,
     len: u64,
 ) -> Result<(), DiskOutputError> {
-    let mut blocks = Blocks::new(source, source_offset, len);
-    let mut position = 0u64;
-    while let Some(buffer) = blocks.next().await? {
-        let take = buffer.len() as u64;
-        destination
-            .write_all_at(buffer, destination_offset + position)
+    let mut done = 0u64;
+    match splice_between(
+        source,
+        source_offset,
+        destination,
+        destination_offset,
+        len,
+        &mut done,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) if splice_unavailable(&error) => {
+            debug!(%error, done, "disk: splice unavailable, copying in blocks");
+            read_write_between(
+                source,
+                source_offset + done,
+                destination,
+                destination_offset + done,
+                len - done,
+            )
             .await
-            .0?;
-        position += take;
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) async fn copy_between(
+    source: &File,
+    source_offset: u64,
+    destination: &mut File,
+    destination_offset: u64,
+    len: u64,
+) -> Result<(), DiskOutputError> {
+    read_write_between(source, source_offset, destination, destination_offset, len).await
+}
+
+/// Copy in fixed-size blocks through one buffer that is allocated once and
+/// reused, and never zeroed: the read fills a slice of it and hands the length
+/// back. Windows copies every hole this way; on Linux it is the fallback for a
+/// filesystem without splice.
+pub(super) async fn read_write_between(
+    source: &File,
+    source_offset: u64,
+    destination: &mut File,
+    destination_offset: u64,
+    len: u64,
+) -> Result<(), DiskOutputError> {
+    let mut buffer = Vec::with_capacity(COPY_BLOCK);
+    let mut position = 0u64;
+    while position < len {
+        let take = block_take(len - position);
+        // The slice, not the buffer's capacity, is what the read fills, so the
+        // last block can be a partial one.
+        let BufResult(result, slice) = source
+            .read_exact_at(buffer.slice(..take), source_offset + position)
+            .await;
+        result?;
+        let BufResult(result, written) = destination
+            .write_all_at(slice.into_inner(), destination_offset + position)
+            .await;
+        result?;
+        buffer = written;
+        buffer.clear();
+        position += take as u64;
     }
     Ok(())
 }
 
+/// Bytes moved per pipe fill, and the pipe's size. One mebibyte is the largest
+/// an unprivileged process may request (`/proc/sys/fs/pipe-max-size` defaults
+/// to it, and asking for more fails with `EPERM`); a bigger copy would need a
+/// ring of pipes with several chunks in flight, which a sequential file copy
+/// does not need — 256 KiB already reached the knee of the loop.
+#[cfg(target_os = "linux")]
+const SPLICE_PIPE_BYTES: usize = 1024 * 1024;
+
+/// Splice through a pipe: the same mechanism `copy_file_range` falls back to
+/// when it cannot clone the range, owned here so it stays async. `done` is the
+/// bytes fully copied, so the caller can resume with the block loop if the
+/// filesystem turns out not to support splice.
+#[cfg(target_os = "linux")]
+async fn splice_between(
+    source: &File,
+    source_offset: u64,
+    destination: &File,
+    destination_offset: u64,
+    len: u64,
+    done: &mut u64,
+) -> std::io::Result<()> {
+    let (rx, tx) = compio::fs::pipe::anonymous().await?;
+    if let Err(error) = rustix::pipe::fcntl_setpipe_size(&tx, SPLICE_PIPE_BYTES) {
+        debug!(%error, "disk: pipe resize rejected, using the default size");
+    }
+    while *done < len {
+        let want = usize::try_from((len - *done).min(SPLICE_PIPE_BYTES as u64))
+            .unwrap_or(SPLICE_PIPE_BYTES);
+        let position = *done;
+        let filled = compio::fs::pipe::splice(source, &tx, want)
+            .offset_in(offset_i64(source_offset + position)?)
+            .await?;
+        if filled == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        let mut written = 0usize;
+        while written < filled {
+            let at = destination_offset + position + u64::try_from(written).unwrap_or(u64::MAX);
+            let moved = compio::fs::pipe::splice(&rx, destination, filled - written)
+                .offset_out(offset_i64(at)?)
+                .await?;
+            if moved == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            written += moved;
+        }
+        *done += u64::try_from(filled).unwrap_or(u64::MAX);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn offset_i64(offset: u64) -> std::io::Result<i64> {
+    i64::try_from(offset).map_err(|_| std::io::Error::other("copy offset exceeds i64"))
+}
+
+/// A filesystem without `splice_read`/`splice_write` refuses with `EINVAL`;
+/// that is the only refusal worth retrying as a block copy.
+#[cfg(target_os = "linux")]
+fn splice_unavailable(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error.raw_os_error() == Some(rustix::io::Errno::INVAL.raw_os_error())
+}
+
+/// Start the detached copy of one run's middle into its reserved hole. The
+/// destination handle is a clone of the canonical `segs`; the copy writes only
+/// inside the hole, while the DVR appends past it.
 pub(super) fn spawn_copy(
     run: u32,
     segs_path: PathBuf,
     source_offset: u64,
+    mut destination: File,
+    destination_offset: u64,
     len: u64,
     events: Sender<Event>,
 ) {
@@ -394,24 +499,25 @@ pub(super) fn spawn_copy(
             });
             return;
         };
-        let mut blocks = Blocks::new(&file, source_offset, len);
-        loop {
-            let buffer = match blocks.next().await {
-                Ok(Some(buffer)) => buffer,
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = events.send(Event::CopyFailed {
-                        run,
-                        error: error.to_string(),
-                    });
-                    return;
-                }
-            };
-            if events.send(Event::CopyPart { run, data: buffer }).is_err() {
-                return;
+        match copy_between(
+            &file,
+            source_offset,
+            &mut destination,
+            destination_offset,
+            len,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = events.send(Event::CopyDone { run });
+            }
+            Err(error) => {
+                let _ = events.send(Event::CopyFailed {
+                    run,
+                    error: error.to_string(),
+                });
             }
         }
-        let _ = events.send(Event::CopyDone { run });
     })
     .detach();
 }

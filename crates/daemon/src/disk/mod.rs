@@ -428,11 +428,9 @@ struct InFlightChunk {
 
 struct CopyJob {
     pub(super) run: u32,
-    pub(super) dst_segs: u64,
     pub(super) dst_index: u64,
     pub(super) segs_len: u64,
     pub(super) records: Vec<u8>,
-    pub(super) written: u64,
     pub(super) segs_path: PathBuf,
     pub(super) index_path: PathBuf,
 }
@@ -487,7 +485,6 @@ struct Disk {
 enum Event {
     ChunkPart(SlotView),
     ChunkDone(FetchOutcome),
-    CopyPart { run: u32, data: Vec<u8> },
     CopyDone { run: u32 },
     CopyFailed { run: u32, error: String },
     DvrUpdate,
@@ -772,7 +769,6 @@ impl Disk {
         match event {
             Event::ChunkPart(view) => self.on_chunk_part(view).await?,
             Event::ChunkDone(outcome) => self.on_chunk_done(outcome).await?,
-            Event::CopyPart { run, data } => self.on_copy_part(run, data).await?,
             Event::CopyDone { run } => self.on_copy_done(run).await?,
             Event::CopyFailed { run, error } => {
                 self.notify_error(format!("disk: run {run} copy failed: {error}"));
@@ -1318,23 +1314,6 @@ impl Disk {
         Ok(())
     }
 
-    async fn on_copy_part(&mut self, run: u32, data: Vec<u8>) -> Result<(), DiskOutputError> {
-        let Some(job) = self.copies.iter_mut().find(|job| job.run == run) else {
-            return Ok(());
-        };
-        let Some(canonical) = &mut self.canonical else {
-            return Ok(());
-        };
-        let len = data.len() as u64;
-        canonical
-            .segs
-            .write_all_at(data, job.dst_segs + job.written)
-            .await
-            .0?;
-        job.written += len;
-        Ok(())
-    }
-
     async fn on_copy_done(&mut self, run: u32) -> Result<(), DiskOutputError> {
         let Some(job) = self.copies.iter().position(|job| job.run == run) else {
             return Ok(());
@@ -1343,13 +1322,6 @@ impl Disk {
         let Some(canonical) = &mut self.canonical else {
             return Ok(());
         };
-        if job.written != job.segs_len {
-            self.notify_error(format!(
-                "disk: run {run} copy was short ({} of {} bytes)",
-                job.written, job.segs_len
-            ));
-            return Err(DiskOutputError::Io(std::io::Error::other("short copy")));
-        }
 
         canonical
             .index
@@ -1713,6 +1685,9 @@ impl Disk {
         };
         let dst_segs = canonical.segs_end;
         let dst_index = canonical.index_end;
+        // The detached copy owns its own handle: it writes only inside the hole,
+        // while the DVR keeps appending past it.
+        let segs = canonical.segs.clone();
 
         // Rebase and renumber the kept records before reserving the hole, so a
         // failure here cannot leave a half-reserved index.
@@ -1758,11 +1733,9 @@ impl Disk {
 
         self.copies.push(CopyJob {
             run: run.number,
-            dst_segs,
             dst_index,
             segs_len: plan.segs_len,
             records: rebased,
-            written: 0,
             segs_path: run.segs_path.clone(),
             index_path: run.index_path.clone(),
         });
@@ -1770,6 +1743,8 @@ impl Disk {
             run.number,
             run.segs_path.clone(),
             plan.source_segs_offset,
+            segs,
+            dst_segs,
             plan.segs_len,
             self.events_tx.clone(),
         );

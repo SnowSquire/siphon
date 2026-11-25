@@ -348,6 +348,96 @@ fn resume_redoes_a_pending_run_hole() {
 
 #[cfg(not(miri))]
 #[test]
+fn copies_fill_a_hole_without_touching_their_neighbours() {
+    use std::fs;
+
+    // The copy is longer than a block, so the reusable buffer is cycled and the
+    // last block is partial.
+    const PREFIX: usize = 1_003;
+    const SOURCE_OFFSET: usize = 1_234;
+    const LEN: usize = 600_000;
+    const HOLE: usize = 700_000;
+    const TAIL: usize = 1_000;
+
+    let source: Vec<u8> = (0..HOLE).map(|n| u8::try_from(n % 251).unwrap()).collect();
+    let mut destination = vec![0xAAu8; PREFIX];
+    destination.resize(PREFIX + HOLE, 0);
+    destination.extend_from_slice(&[0xBBu8; TAIL]);
+
+    // `true` runs the block copy (Windows' only path); `false` the splice one.
+    for blocks_only in [false, true] {
+        let dir = std::env::temp_dir().join(format!(
+            "twitch-disk-copy-{}-{}-{blocks_only}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("source"), &source).expect("source");
+        fs::write(dir.join("destination"), &destination).expect("destination");
+
+        compio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let source = OpenOptions::new()
+                    .read(true)
+                    .open(dir.join("source"))
+                    .await
+                    .expect("source");
+                let mut destination = OpenOptions::new()
+                    .write(true)
+                    .open(dir.join("destination"))
+                    .await
+                    .expect("destination");
+                // Unaligned on both sides, inside a hole with data after it.
+                let source_offset = SOURCE_OFFSET as u64;
+                let destination_offset = PREFIX as u64;
+                let len = LEN as u64;
+                if blocks_only {
+                    io::read_write_between(
+                        &source,
+                        source_offset,
+                        &mut destination,
+                        destination_offset,
+                        len,
+                    )
+                    .await
+                    .expect("blocks");
+                } else {
+                    copy_between(
+                        &source,
+                        source_offset,
+                        &mut destination,
+                        destination_offset,
+                        len,
+                    )
+                    .await
+                    .expect("splice");
+                }
+            });
+
+        let written = fs::read(dir.join("destination")).expect("destination");
+        assert_eq!(written.len(), destination.len());
+        assert_eq!(&written[..PREFIX], &[0xAAu8; PREFIX]);
+        assert_eq!(
+            &written[PREFIX..PREFIX + LEN],
+            &source[SOURCE_OFFSET..SOURCE_OFFSET + LEN]
+        );
+        assert!(
+            written[PREFIX + LEN..PREFIX + HOLE]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        assert_eq!(&written[PREFIX + HOLE..], &[0xBBu8; TAIL]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
 fn init_insertion_is_hash_gated_and_shifts_offsets() {
     use std::fs;
 

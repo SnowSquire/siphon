@@ -50,6 +50,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 webpki-roots = "1"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
+# `fcntl(F_SETPIPE_SZ)` sizes the copy pipe; the crate is already in the tree
+# through compio, so this only unlocks the feature.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["pipe"] }
+
 # `winreg` reads the install marker for the updater; `windows-sys` is DPAPI for
 # the token. The toasts and the AUMID live in the UI now.
 [target.'cfg(windows)'.dependencies]

@@ -1323,6 +1323,7 @@ dependencies = [
  "memchr",
  "mimalloc",
  "rand",
+ "rustix 1.1.4",
  "rustls",
  "semver",
  "serde",

@@ -83,7 +83,12 @@ pairs instead of deleting them.
    recording (see *Errors*).
 7. **Background copies.** Each run's uncovered middle is copied into its hole
    while the DVR keeps downloading.  Copies are independent of network
-   progress and independent of each other.
+   progress and independent of each other.  On Linux the copy is a `splice(2)`
+   loop through a 1 MiB pipe, so the bytes never enter userspace and nothing
+   is allocated per block; Windows, and any filesystem that rejects splice, use
+   the fixed-block read/write loop, which allocates one buffer per copy and
+   reuses it.  The detached copy owns a clone of the canonical `segs` handle
+   and writes only inside the hole.
 
 ## Holes and trimming
 
@@ -337,6 +342,12 @@ hash-verified (there are few), so a torn map is detected rather than played.
 
 ## Rejected alternatives
 
+- **`copy_file_range` / reflink for a hole fill**: the hole's two ends are sums
+  of packed record lengths, so `src_off ≢ dst_off (mod 4096)`; btrfs and XFS
+  only clone when the source offset, the destination offset and the length are
+  block-aligned, and they refuse otherwise. `copy_file_range` hides that by
+  falling back to `do_splice_direct` — an internal pipe copy — so the clone can
+  never fire here and the call is just the splice loop without an owned pipe.
 - **Merging at the DVR's published edge**: re-downloads the live window.
 - **Truncating the live tail to avoid a copy**: loses recorded bytes; the whole
   DVR chunk is written and the run's edges are trimmed instead.
