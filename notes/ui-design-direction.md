@@ -120,12 +120,14 @@ meaning, and functional first. Not pure brutalism, and not a web dashboard.
   overrides the family at runtime. The license allows embedding in the app but
   explicitly forbids distributing the font file through a repository, so it is
   **not** in git.
-- **Noto Color Emoji** (CBDT build, OFL 1.1) ships in `crates/ui/fonts/` and is
-  registered as `SiphonEmoji`. It is both the last entry in the root
-  `font-family` stack and bound to fontique's `Emoji` generic. The CBDT build
-  matters: the system COLRv1 font decodes as a monochrome outline in zgui's
-  swash 0.2.10. Verified with kwin-mcp that 😀/🎉/✅ render in color. `★` and
-  `✧` are not Unicode-emoji, so they stay monochrome by design.
+- **Colour emoji** come from the platform's emoji face. At startup the window
+  asks fontique for the `Emoji` generic's first family and names it ahead of
+  `sans-serif` in the root `font-family` stack: a `sans-serif` fallback reaches
+  the monochrome Noto Emoji before the colour face on a machine that has both.
+  zgui paints the face's COLR v1 graph, so Noto Color Emoji and Segoe UI Emoji
+  render in colour without an embedded font. Verified with kwin-mcp that
+  😀/🎉/✅ render in colour. `★` and `✧` are not Unicode-emoji, so they stay
+  monochrome by design.
 
 ## Header / activity ticker
 

@@ -306,11 +306,13 @@ binary:
 - writes it back into the PDB header **and** the executable's `RSDS` record.
 
 Both files are then byte-identical across builds and still match each other, so
-a Windows `.dmp` resolves its symbols. The shipped profile sets
-`CARGO_PROFILE_RELEASE_DEBUG=2`, so the PDB carries line tables, locals and types
-for every crate (the dependency layer as well as the binaries, since lld merges
-each rlib's `.debug$S`); `strip = true` keeps that out of the executable, so the
-only artifact that grows is the PDB. The PDBs ship in `result/symbols/`, out of
+a Windows `.dmp` resolves its symbols. The dependency layer is built with
+`CARGO_PROFILE_RELEASE_DEBUG=1` and the two binaries with `2`: lld merges the
+dependency rlibs' line tables into the PDB, so every frame resolves to a file
+and line, and the code this workspace owns also carries locals and types. Full
+debug info for the dependency layer is what pushed the fat-LTO link over the
+runner's memory and the action cache's 8 GiB cap. `strip = true` keeps all of it
+out of the executable, so the only artifact that grows is the PDB. The PDBs ship in `result/symbols/`, out of
 `result/bin/`, so the installer payload does not carry them, and the installer
 derivation zips them into `siphon-<version>-x64-symbols.zip` beside the setup. `llvm-pdbutil dump
 -summary` and `llvm-readobj --coff-debug-directory` are the structural check that

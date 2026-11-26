@@ -61,9 +61,8 @@ stdenvNoCC.mkDerivation {
     cp ${windows}/bin/libplacebo-*.dll "$stage/"
 
     cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
-    # Both shipped faces are OFL and the license text has to travel with them.
+    # The bundled face is OFL and its license text has to travel with it.
     cp crates/ui/fonts/Archivo-OFL.txt "$stage/LICENSE-Archivo-OFL.txt"
-    cp crates/ui/fonts/NotoColorEmoji-OFL.txt "$stage/LICENSE-NotoColorEmoji-OFL.txt"
     # The meson install does not carry libplacebo's license; take it from the
     # checkout the DLL was built from.
     cp ${sources.libplacebo}/LICENSE "$stage/LICENSE-libplacebo.txt"

@@ -74,15 +74,15 @@ let
       CARGO_PROFILE_RELEASE_LTO = "fat";
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";
 
-      # Full debug info, so a release minidump resolves to lines and locals, not
-      # just addresses. It goes in the PDB, not the executable: `strip = true`
-      # (Cargo.toml) still drops the COFF symbol table, and on MSVC the CodeView
-      # data has always been a separate file. Only the symbols zip grows.
+      # Line tables for the dependency layer. lld merges each rlib's `.debug$S`
+      # into the PDB, so this keeps a release minidump's dependency frames
+      # resolvable to a file and line. Full debug info here is what pushed the
+      # fat-LTO link over the runner's memory and the action cache's 8 GiB cap;
+      # the two binaries get `debug = 2` in `mkBin` below.
       #
-      # It is set for the dependency layer too, because lld merges each rlib's
-      # `.debug$S` into the PDB: debuginfo on the binary alone would leave every
-      # frame below `siphon-ui` as a bare address.
-      CARGO_PROFILE_RELEASE_DEBUG = "2";
+      # The data stays in the PDB: `strip = true` (Cargo.toml) still drops the
+      # COFF symbol table, and on MSVC the CodeView data is a separate file.
+      CARGO_PROFILE_RELEASE_DEBUG = "1";
 
       SIPHON_CHILLAX_TTF = "${sources.chillax}/Fonts/TTF/Chillax-Variable.ttf";
     };
@@ -121,6 +121,9 @@ let
         cargoExtraArgs = commonArgs.cargoExtraArgs + " -p ${package}";
         env = commonArgs.env // {
           SIPHON_COMMIT = commit;
+          # Locals and types for the code this workspace owns, on top of the
+          # dependency layer's line tables.
+          CARGO_PROFILE_RELEASE_DEBUG = "2";
         };
 
         # The install is spelled out instead of crane's log-driven default: the

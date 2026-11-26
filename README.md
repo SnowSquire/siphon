@@ -40,7 +40,8 @@ aler9 and Copyright (c) 2020 aler9 respectively.
 
 The window links [libplacebo](https://github.com/haasn/libplacebo)
 (LGPL-2.1-or-later) as a shared library; a binary that ships it must keep it
-replaceable and carry its license. Archivo and Noto Color Emoji are bundled under
-the SIL Open Font License ([`crates/ui/fonts/*-OFL.txt`](crates/ui/fonts)); the
-installer copies those texts beside the binaries. Chillax is fetched at build
-time under the ITF Free Font License and is not redistributed here.
+replaceable and carry its license. Archivo is bundled under the SIL Open Font
+License ([`crates/ui/fonts/Archivo-OFL.txt`](crates/ui/fonts/Archivo-OFL.txt))
+and the installer copies its text beside the binaries; colour emoji come from
+the platform's emoji face. Chillax is fetched at build time under the ITF Free
+Font License and is not redistributed here.
