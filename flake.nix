@@ -171,6 +171,15 @@
           linux = callPackage ./nix/linux.nix { };
           msvc = callPackage ./nix/msvc.nix { };
           windows = callPackage ./nix/windows.nix { inherit msvc; };
+          # The same payload with full debug info in the dependency layer too.
+          # Built by hand for a deep report: locally and in the PDBs it is the
+          # shipped payload plus locals and types below this workspace.
+          windows-full-debug = (
+            callPackage ./nix/windows.nix {
+              inherit msvc;
+              depsDebug = "2";
+            }
+          ).package;
           windows-installer = callPackage ./nix/windows-installer.nix {
             windows = windows.package;
           };
@@ -187,6 +196,7 @@
           packages = {
             linux = linux.package;
             windows = windows.package;
+            inherit windows-full-debug;
             inherit windows-installer;
             inherit windows-installer-sha;
             default = linux.package;

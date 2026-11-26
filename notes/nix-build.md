@@ -306,13 +306,24 @@ binary:
 - writes it back into the PDB header **and** the executable's `RSDS` record.
 
 Both files are then byte-identical across builds and still match each other, so
-a Windows `.dmp` resolves its symbols. The dependency layer is built with
+a Windows `.dmp` resolves its symbols. The other half of that is
+`SOURCE_DATE_EPOCH` in `commonArgs.env`: lld-link stamps the wall clock into the
+COFF header and the debug directory, and Nix does not set the variable, so
+without it two builds of the same derivation differ in those six bytes (measured
+between two CI runs of one commit: 14 bytes in a 32 MB `siphon.exe`, of which 8
+are the GUID, and `.text` and every other mapped section identical).
+
+The dependency layer is built with
 `CARGO_PROFILE_RELEASE_DEBUG=1` and the two binaries with `2`: lld merges the
 dependency rlibs' line tables into the PDB, so every frame resolves to a file
 and line, and the code this workspace owns also carries locals and types. Full
 debug info for the dependency layer is what pushed the fat-LTO link over the
-runner's memory and the action cache's 8 GiB cap. `strip = true` keeps all of it
-out of the executable, so the only artifact that grows is the PDB. The PDBs ship in `result/symbols/`, out of
+runner's memory and the action cache's 8 GiB cap. `.#windows-full-debug` is that
+payload with `depsDebug = "2"` — `debug = 2` all the way down, for a report that
+needs locals and types inside a dependency. It is built by hand: the link wants
+more memory than the CI runner has, and the cache entry is past the 8 GiB cap.
+`strip = true` keeps all of it out of the executable, so the only artifact that
+grows is the PDB. The PDBs ship in `result/symbols/`, out of
 `result/bin/`, so the installer payload does not carry them, and the installer
 derivation zips them into `siphon-<version>-x64-symbols.zip` beside the setup. `llvm-pdbutil dump
 -summary` and `llvm-readobj --coff-debug-directory` are the structural check that

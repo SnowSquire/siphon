@@ -23,6 +23,7 @@
   msvc,
   cargoSrc,
   depsSrc,
+  depsDebug ? "1",
 }:
 let
   # The debug normalizer needs xxhash: lld derives the CodeView GUID with it.
@@ -80,11 +81,22 @@ let
       # fat-LTO link over the runner's memory and the action cache's 8 GiB cap;
       # the two binaries get `debug = 2` in `mkBin` below.
       #
+      # `depsDebug = "2"` is `.#windows-full-debug`: the payload to build by
+      # hand when a report needs locals and types inside a dependency. It is not
+      # shipped, because it needs a runner with more memory and a cache entry
+      # the 8 GiB cap does not hold.
+      #
       # The data stays in the PDB: `strip = true` (Cargo.toml) still drops the
       # COFF symbol table, and on MSVC the CodeView data is a separate file.
-      CARGO_PROFILE_RELEASE_DEBUG = "1";
+      CARGO_PROFILE_RELEASE_DEBUG = depsDebug;
 
       SIPHON_CHILLAX_TTF = "${sources.chillax}/Fonts/TTF/Chillax-Variable.ttf";
+
+      # Nix leaves this unset for the derivation, so lld stamps the wall clock
+      # into the COFF header and the debug directory and two builds of identical
+      # code differ in those six bytes. lld-link does read SOURCE_DATE_EPOCH, so
+      # pin it to the epoch the installer's zip already uses.
+      SOURCE_DATE_EPOCH = "315532800";
     };
   };
 
