@@ -11,8 +11,8 @@ two that had to be kept in agreement.
 
 ```sh
 nix build .#linux              # siphon (Linux UI) + siphon-daemon in result/bin
-nix build .#windows            # siphon.exe + siphon-daemon.exe + libplacebo-*.dll
-nix build .#windows-zen4       # the same, built for Zen 4 with a static libplacebo
+nix build .#windows            # siphon.exe + siphon-daemon.exe, libplacebo linked in
+nix build .#windows-zen4       # the same, built for Zen 4
 nix build .#windows-installer  # the setup, the portable zip, the symbols zip
 nix build                      # .#linux
 nix develop                    # the Linux toolchain, without the -devel packages
@@ -110,9 +110,10 @@ Four pieces are Nix-only plumbing worth knowing about:
 
 ## A CPU-tuned, statically linked payload
 
-`.#windows-zen4` builds the same two executables for one machine rather than
-for a stranger's: `nix/msvc.nix` takes `cpu` and `libplaceboLink`, and the flake
-instantiates it as `cpu = "znver4"` with a static libplacebo.
+Every Windows payload links libplacebo statically: the flake instantiates
+`nix/msvc.nix` with `libplaceboLink = "static"`, so the executable carries the
+archive and the payload is two files. `.#windows-zen4` adds the one-machine
+choice on top, `cpu = "znver4"`.
 
 `cpu` is one choice reaching five flag lists, because tuning half a binary is
 worse than tuning none:

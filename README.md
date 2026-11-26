@@ -39,8 +39,27 @@ from [mediacommon](https://github.com/bluenviron/mediacommon) and
 aler9 and Copyright (c) 2020 aler9 respectively.
 
 The window links [libplacebo](https://github.com/haasn/libplacebo)
-(LGPL-2.1-or-later) as a shared library; a binary that ships it must keep it
-replaceable and carry its license. Archivo is bundled under the SIL Open Font
+(LGPL-2.1-or-later) into the executable. That is the LGPL's static-link case,
+so §6 applies: the recipient has to be able to replace the library and relink.
+The sources are here (MIT) with the pinned Nix flake that builds and links them,
+so replacing libplacebo and running `nix build .#windows` reproduces the payload
+against a modified one. libplacebo in turn links
+[shaderc](https://github.com/google/shaderc) as a static `shaderc_combined`
+(glslang, SPIRV-Tools and SPIRV-Headers inside it) and vendors fast_float and the
+Vulkan headers. Every text ships beside the binaries, and the installer copies
+them:
+
+| component | license | text |
+|---|---|---|
+| libplacebo | LGPL-2.1-or-later | `LICENSE-libplacebo.txt` |
+| shaderc | Apache-2.0 | `LICENSE-shaderc.txt` |
+| glslang | BSD-style (see the text) | `LICENSE-glslang.txt` |
+| SPIRV-Tools | Apache-2.0 | `LICENSE-SPIRV-Tools.txt` |
+| SPIRV-Headers | Apache-2.0 / MIT | `LICENSE-SPIRV-Headers.txt` |
+| fast_float | Apache-2.0 | `LICENSE-fast_float.txt` |
+| Vulkan-Headers | Apache-2.0 | `LICENSE-Vulkan-Headers.txt` |
+
+Archivo is bundled under the SIL Open Font
 License ([`crates/ui/fonts/Archivo-OFL.txt`](crates/ui/fonts/Archivo-OFL.txt))
 and the installer copies its text beside the binaries; colour emoji come from
 the platform's emoji face. Chillax is fetched at build time under the ITF Free

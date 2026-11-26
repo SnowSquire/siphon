@@ -169,7 +169,10 @@
           # Both Rust packages return `{ package, clippy }`: the lint shares the
           # dependency artifacts, so it does not recompile them.
           linux = callPackage ./nix/linux.nix { };
-          msvc = callPackage ./nix/msvc.nix { };
+          # Every Windows artifact links libplacebo's archive into the
+          # executable: no DLL beside it, and the payload is two files. The
+          # LGPL material for that is the source and this flake (README.md).
+          msvc = callPackage ./nix/msvc.nix { libplaceboLink = "static"; };
           windows = callPackage ./nix/windows.nix { inherit msvc; };
           # The same payload with full debug info in the dependency layer too.
           # Built by hand for a deep report: locally and in the PDBs it is the

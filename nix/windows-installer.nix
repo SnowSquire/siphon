@@ -56,16 +56,23 @@ stdenvNoCC.mkDerivation {
     mkdir -p "$stage" "$dist"
 
     cp ${windows}/bin/siphon.exe ${windows}/bin/siphon-daemon.exe "$stage/"
-    # `libplacebo-sys` copies the DLL it links next to the executable; a Windows
-    # process only finds it there.
-    cp ${windows}/bin/libplacebo-*.dll "$stage/"
 
     cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
     # The bundled face is OFL and its license text has to travel with it.
     cp crates/ui/fonts/Archivo-OFL.txt "$stage/LICENSE-Archivo-OFL.txt"
-    # The meson install does not carry libplacebo's license; take it from the
-    # checkout the DLL was built from.
+
+    # Everything linked into the executables travels with them. libplacebo is
+    # LGPL and its meson install carries no license text, and the GLSL compiler
+    # meson links into it is a static `shaderc_combined`: glslang, SPIRV-Tools
+    # and SPIRV-Headers are in the same image, as are the fast_float and Vulkan
+    # headers libplacebo vendors. README.md names each one and its text.
     cp ${sources.libplacebo}/LICENSE "$stage/LICENSE-libplacebo.txt"
+    cp ${sources.libplacebo}/3rdparty/Vulkan-Headers/LICENSE.md "$stage/LICENSE-Vulkan-Headers.txt"
+    cp ${sources.libplacebo}/3rdparty/fast_float/LICENSE-APACHE "$stage/LICENSE-fast_float.txt"
+    cp ${sources.shaderc}/LICENSE "$stage/LICENSE-shaderc.txt"
+    cp ${sources.shaderc}/third_party/glslang/LICENSE.txt "$stage/LICENSE-glslang.txt"
+    cp ${sources.shaderc}/third_party/spirv-tools/LICENSE "$stage/LICENSE-SPIRV-Tools.txt"
+    cp ${sources.shaderc}/third_party/spirv-headers/LICENSE "$stage/LICENSE-SPIRV-Headers.txt"
 
     # NSIS records the staged files' timestamps and zip stores them per entry,
     # so pin them: without this the setup differs in a handful of bytes and the

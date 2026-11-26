@@ -45,8 +45,9 @@ through `recordDir`; nothing records until a directory is configured.
 - Nix (both platforms from one host): `nix build .#linux` / `nix build
   .#windows` / `nix build .#windows-installer` / `nix develop` — hermetic Linux
   binaries, the cross-compiled Windows payload, and the setup + portable zip +
-  symbols zip. `.#windows-zen4` is the same payload with `-march=znver4` and a
-  statically linked libplacebo: one machine's build, not a shippable one.
+  symbols zip. libplacebo is linked into `siphon.exe` statically, so there is no
+  DLL; `.#windows-zen4` is the same payload with `-march=znver4`: one machine's
+  build, not a shippable one.
   The flake is the only build system for Windows: the release
   workflow installs Nix and calls it, so there are no xwin/shaderc/libplacebo
   shell scripts to keep in sync. `notes/nix-build.md` has the pieces and pins.

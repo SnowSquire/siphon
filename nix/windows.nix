@@ -1,6 +1,7 @@
-# The Windows payload: `siphon.exe`, `siphon-daemon.exe`, the libplacebo DLL
-# they load, and the release PDBs -- cross-built on Linux with clang-cl and
-# lld-link. A `libplaceboLink = "static"` cross environment drops the DLL.
+# The Windows payload: `siphon.exe`, `siphon-daemon.exe` and the release PDBs
+# -- cross-built on Linux with clang-cl and lld-link. The cross environment
+# links libplacebo into the UI (`libplaceboLink = "static"`), so the payload is
+# two files; a `shared` one would put `libplacebo-<api>.dll` beside them.
 #
 # Three derivations, so that editing one crate does not redo the others:
 #

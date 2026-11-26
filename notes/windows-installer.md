@@ -69,11 +69,13 @@ subset without extensions and without ICE validation.
 %LOCALAPPDATA%\Programs\Siphon\
   siphon.exe
   siphon-daemon.exe
-  libplacebo-<api>.dll
-  [av*.dll]                    only when libplacebo-sys/libav is on
   LICENSE-MIT  LICENSE-APACHE
   LICENSE-Archivo-OFL.txt
-  [LICENSE-FFmpeg.txt  LICENSE-libplacebo.txt]
+  LICENSE-libplacebo.txt  LICENSE-shaderc.txt  LICENSE-glslang.txt
+  LICENSE-SPIRV-Tools.txt  LICENSE-SPIRV-Headers.txt
+  LICENSE-fast_float.txt  LICENSE-Vulkan-Headers.txt
+  [av*.dll]                    only when libplacebo-sys/libav is on
+  [LICENSE-FFmpeg.txt]
   README.md
   uninstall.exe
 ```
@@ -92,12 +94,21 @@ autostart value), and leaves that data alone.
   what Explorer, the Start-menu shortcut, `DisplayIcon` and a pinned task-bar
   button show. The installer's own icon is the separate `MUI_ICON` in
   `installer/siphon.nsi`, which covers setup and uninstall.
-- **libplacebo.** `libplacebo-sys` copies `libplacebo-<api>.dll` next to the UI
-  for a dynamic build; the packager harvests it from the payload's `bin/`. The
-  DLL must be built with a shader compiler: `nix/msvc.nix` cross-builds shaderc
-  for MSVC (static `shaderc_combined`, so no extra DLL) and links it into
-  libplacebo. Without it libplacebo has no GLSL compiler, links, and then fails
-  at the first frame.
+- **libplacebo.** The UI links libplacebo's archive, because the flake asks
+  `nix/msvc.nix` for `libplaceboLink = "static"`. There is no DLL to harvest and
+  the payload stays two files; a `shared` cross environment still works —
+  `libplacebo-sys` copies `libplacebo-<api>.dll` next to the UI and the packager
+  would take it — but the shipped artifact is static. Under
+  LGPL-2.1-or-later that is §6, so the payload owes relink material: the sources
+  and the pinned flake are published (MIT), and `nix build .#windows` rebuilds
+  the executable against a replaced libplacebo. The build must have a shader
+  compiler: `nix/msvc.nix` cross-builds shaderc for MSVC (static
+  `shaderc_combined`, so no extra DLL) and links it into libplacebo. Without it
+  libplacebo has no GLSL compiler, links, and then fails at the first frame.
+  Because it is static, glslang, SPIRV-Tools, SPIRV-Headers, fast_float and the
+  Vulkan headers are in the same image too; every one of their texts lands in the
+  payload beside `LICENSE-libplacebo.txt`, and `README.md` has the component
+  table.
 - **FFmpeg.** Nothing links it until the UI enables libplacebo's `libav`
   feature, and the Nix payload ships none of it yet. When it does, the packaging
   derivation has to copy the `av*` DLLs from a Nix-built FFmpeg and the license
