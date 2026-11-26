@@ -47,8 +47,10 @@ on:
         required: false
         type: string
 
+# Read-only by default. Only the job that publishes a release elevates, so a
+# compromised step in `gate` or `deps` cannot write to the repository.
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 env:
@@ -114,7 +116,7 @@ jobs:
         with:
           ref: ${{ inputs.commit || github.sha }}
 
-      - uses: cachix/install-nix-action@v30
+      - uses: cachix/install-nix-action@v32
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -156,7 +158,17 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 40
+    # The one job that writes: publishing the draft release. Everything else
+    # stays at the workflow's read-only default.
+    permissions:
+      contents: write
+      actions: read
+    env:
+      # One un-archived file per artifact, so a download is the setup, the
+      # portable zip or the symbols zip itself rather than a wrapper around it.
+      ARTIFACT_ARCHIVE: "false"
+      ARTIFACT_RETENTION_DAYS: 14
     steps:
       - uses: actions/checkout@v7
         with:
@@ -187,7 +199,7 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - uses: cachix/install-nix-action@v30
+      - uses: cachix/install-nix-action@v32
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -229,15 +241,19 @@ jobs:
           free -h
 
       - name: build the artifacts
+        id: build
         run: |
           set -euo pipefail
           # A tag ships the release names the updater expects; anything else
           # carries the commit, so two builds of one version can be told apart.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            nix build .#windows-installer --print-out-paths
+            out="$(nix build .#windows-installer --print-out-paths)"
           else
-            nix build .#windows-installer-sha --print-out-paths
+            out="$(nix build .#windows-installer-sha --print-out-paths)"
           fi
+          # The store path rather than the `result` symlink, so the release and
+          # the uploads name the directory this step actually produced.
+          echo "out=$out" >> "$GITHUB_OUTPUT"
 
       - name: publish
         # `act` sets ACT=true for local runs; there is no token there and no
@@ -268,35 +284,41 @@ jobs:
             2015-2022 Redistributable (x64); the installer adds it when it is
             missing, the portable zip does not.
           files: |
-            result/*-setup.exe
-            result/*-portable.zip
-            result/*-symbols.zip
+            ${{ steps.build.outputs.out }}/*-setup.exe
+            ${{ steps.build.outputs.out }}/*-portable.zip
+            ${{ steps.build.outputs.out }}/*-symbols.zip
 
       # v7 can upload one file unzipped: each download is the setup, the
-      # portable zip or the symbols zip itself, not a wrapper artifact.
+      # portable zip or the symbols zip itself, not a wrapper artifact. A single
+      # file per artifact is what makes that three steps instead of one.
       - name: upload the installer
         if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v7
         with:
-          path: result/*-setup.exe
+          path: ${{ steps.build.outputs.out }}/*-setup.exe
           if-no-files-found: error
-          retention-days: 14
-          archive: false
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          archive: ${{ env.ARTIFACT_ARCHIVE }}
+          # The artifact name is the file name, which carries the commit: a
+          # re-run of the same commit would otherwise collide.
+          overwrite: true
 
       - name: upload the portable zip
         if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v7
         with:
-          path: result/*-portable.zip
+          path: ${{ steps.build.outputs.out }}/*-portable.zip
           if-no-files-found: error
-          retention-days: 14
-          archive: false
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          archive: ${{ env.ARTIFACT_ARCHIVE }}
+          overwrite: true
 
       - name: upload the symbols
         if: ${{ !env.ACT && !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v7
         with:
-          path: result/*-symbols.zip
+          path: ${{ steps.build.outputs.out }}/*-symbols.zip
           if-no-files-found: error
-          retention-days: 14
-          archive: false
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          archive: ${{ env.ARTIFACT_ARCHIVE }}
+          overwrite: true
