@@ -191,11 +191,6 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-            # The two binaries are separate derivations, and each fat-LTO link
-            # with full debug info peaks near 12 GiB. One at a time is what
-            # keeps the link inside the runner; they would otherwise run beside
-            # each other and be killed.
-            max-jobs = 1
 
       # Same key as the `deps` job: this restores the dependency layer and
       # saves nothing, so the entry stays small and stable.
