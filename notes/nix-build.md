@@ -367,10 +367,15 @@ build inserts 24 bytes into `.rdata`'s string pool, which shifts 53k
 RIP-relative displacements and every table pointer into it. Every global in that
 PDB would resolve to the wrong object.
 
-The cost is memory at link time, paid in the workflow rather than the
-derivation: one fat-LTO link with full debug info peaks near 12 GiB, so the
-payload job sets `max-jobs = 1` — the two binaries are separate derivations and
-would otherwise link beside each other — and adds an 8 GiB swapfile as slack. The PDBs ship in `result/symbols/`, out of
+The cost is memory at link time, and the runner is where it is paid. The image
+already ships a 3 GiB `/swapfile`, and `fallocate` on the active file fails with
+`ETXTBSY`, so the workflow reports `free -h` and `swapon --show`, then adds the
+difference up to an 8 GiB total as `/swapfile-extra`. That is what carries the
+build: with 15 GiB of RAM and 8 GiB of swap the two binaries link concurrently,
+as separate derivations, and the payload job takes about 11 minutes (measured
+10m46s); at the image's original 3 GiB of swap the same link was SIGKILLed.
+Serialising the two links with `max-jobs = 1` was the fallback and is not
+needed: it is green too, but the same payload job takes 15m44s. The PDBs ship in `result/symbols/`, out of
 `result/bin/`, so the installer payload does not carry them, and the installer
 derivation zips them into `siphon-<version>-x64-symbols.zip` beside the setup. `llvm-pdbutil dump
 -summary` and `llvm-readobj --coff-debug-directory` are the structural check that
