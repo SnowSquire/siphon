@@ -152,10 +152,9 @@ The release PDBs are kept, so every build also emits
 They stay out of the installer payload — a user never needs them — and are
 published beside it: a minidump is useless without the matching PDBs, and the
 GUID in each PDB is what the debugger matches against the dump. The dependency
-layer is built with `CARGO_PROFILE_RELEASE_DEBUG=1` and the binaries with `2`,
-so every frame resolves to a source line and the workspace's own code also keeps
-its locals and types; the executable is unaffected because the CodeView data
-lives in the PDB. The packaging derivation takes them
+layer and the binaries are both built with `CARGO_PROFILE_RELEASE_DEBUG=2`, so
+every frame resolves to a source line with its locals and types; the executable
+is unaffected because the CodeView data lives in the PDB. The packaging derivation takes them
 from the payload's `symbols/`, which is where
 `nix/windows.nix` puts the normalized copies. rustc names a PDB after its
 crate, so the daemon's file is `siphon_daemon.pdb`, not `siphon-daemon.pdb`.

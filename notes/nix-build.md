@@ -351,17 +351,26 @@ without it two builds of the same derivation differ in those six bytes (measured
 between two CI runs of one commit: 14 bytes in a 32 MB `siphon.exe`, of which 8
 are the GUID, and `.text` and every other mapped section identical).
 
-The dependency layer is built with
-`CARGO_PROFILE_RELEASE_DEBUG=1` and the two binaries with `2`: lld merges the
-dependency rlibs' line tables into the PDB, so every frame resolves to a file
-and line, and the code this workspace owns also carries locals and types. Full
-debug info for the dependency layer is what pushed the fat-LTO link over the
-runner's memory and the action cache's 8 GiB cap. `.#windows-full-debug` is that
-payload with `depsDebug = "2"` — `debug = 2` all the way down, for a report that
-needs locals and types inside a dependency. It is built by hand: the link wants
-more memory than the CI runner has, and the cache entry is past the 8 GiB cap.
-`strip = true` keeps all of it out of the executable, so the only artifact that
-grows is the PDB. The PDBs ship in `result/symbols/`, out of
+The dependency layer is built with `CARGO_PROFILE_RELEASE_DEBUG=2` as well:
+lld merges each rlib's `.debug$S` into the PDB, and a minidump is a snapshot of
+the shipped image, so anything left out of this build cannot be recovered for a
+report that arrives later — a build made afterwards reproduces a bug, it does
+not symbolize someone else's dump. `strip = true` keeps all of it out of the
+executable, so the only artifacts that grow are the PDBs (about 374 MB and
+80 MB) and the dependency layer (804 MB on disk, 2.1 GB of closure, well inside
+the action cache's 8 GiB).
+
+Patching a PDB's GUID onto another build does not rescue that: the debugger
+would accept it, and the function RVAs would even line up (`.pdata` is
+byte-identical between a `debug=1` and a `debug=2` link), but the full-debug
+build inserts 24 bytes into `.rdata`'s string pool, which shifts 53k
+RIP-relative displacements and every table pointer into it. Every global in that
+PDB would resolve to the wrong object.
+
+The cost is memory at link time, paid in the workflow rather than the
+derivation: one fat-LTO link with full debug info peaks near 12 GiB, so the
+payload job sets `max-jobs = 1` — the two binaries are separate derivations and
+would otherwise link beside each other — and adds an 8 GiB swapfile as slack. The PDBs ship in `result/symbols/`, out of
 `result/bin/`, so the installer payload does not carry them, and the installer
 derivation zips them into `siphon-<version>-x64-symbols.zip` beside the setup. `llvm-pdbutil dump
 -summary` and `llvm-readobj --coff-debug-directory` are the structural check that

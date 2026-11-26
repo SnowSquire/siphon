@@ -174,15 +174,6 @@
           # LGPL material for that is the source and this flake (README.md).
           msvc = callPackage ./nix/msvc.nix { libplaceboLink = "static"; };
           windows = callPackage ./nix/windows.nix { inherit msvc; };
-          # The same payload with full debug info in the dependency layer too.
-          # Built by hand for a deep report: locally and in the PDBs it is the
-          # shipped payload plus locals and types below this workspace.
-          windows-full-debug = (
-            callPackage ./nix/windows.nix {
-              inherit msvc;
-              depsDebug = "2";
-            }
-          ).package;
 
           # One machine's tuning: every C and Rust translation unit built for
           # Zen 4 (`-march=znver4`, so AVX-512 and the rest of what that core
@@ -209,7 +200,6 @@
           packages = {
             linux = linux.package;
             windows = windows.package;
-            inherit windows-full-debug;
             windows-zen4 = windows-zen4.package;
             inherit windows-installer;
             inherit windows-installer-sha;

@@ -24,7 +24,6 @@
   msvc,
   cargoSrc,
   depsSrc,
-  depsDebug ? "1",
 }:
 let
   # The debug normalizer needs xxhash: lld derives the CodeView GUID with it.
@@ -76,20 +75,15 @@ let
       CARGO_PROFILE_RELEASE_LTO = "fat";
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "1";
 
-      # Line tables for the dependency layer. lld merges each rlib's `.debug$S`
-      # into the PDB, so this keeps a release minidump's dependency frames
-      # resolvable to a file and line. Full debug info here is what pushed the
-      # fat-LTO link over the runner's memory and the action cache's 8 GiB cap;
-      # the two binaries get `debug = 2` in `mkBin` below.
-      #
-      # `depsDebug = "2"` is `.#windows-full-debug`: the payload to build by
-      # hand when a report needs locals and types inside a dependency. It is not
-      # shipped, because it needs a runner with more memory and a cache entry
-      # the 8 GiB cap does not hold.
+      # Full debug info, dependency layer included. lld merges each rlib's
+      # `.debug$S` into the PDB, so leaving the layer at line tables would make
+      # every dependency frame in a release minidump a bare address — and a
+      # minidump is a snapshot of the shipped image, so a different build's PDB
+      # cannot stand in for it later.
       #
       # The data stays in the PDB: `strip = true` (Cargo.toml) still drops the
       # COFF symbol table, and on MSVC the CodeView data is a separate file.
-      CARGO_PROFILE_RELEASE_DEBUG = depsDebug;
+      CARGO_PROFILE_RELEASE_DEBUG = "2";
 
       SIPHON_CHILLAX_TTF = "${sources.chillax}/Fonts/TTF/Chillax-Variable.ttf";
 
@@ -136,9 +130,6 @@ let
         cargoExtraArgs = commonArgs.cargoExtraArgs + " -p ${package}";
         env = commonArgs.env // {
           SIPHON_COMMIT = commit;
-          # Locals and types for the code this workspace owns, on top of the
-          # dependency layer's line tables.
-          CARGO_PROFILE_RELEASE_DEBUG = "2";
         };
 
         # The install is spelled out instead of crane's log-driven default: the
