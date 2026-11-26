@@ -214,15 +214,24 @@ jobs:
             nix-deps-${{ env.CACHE_VERSION }}-
           save: false
 
-      # `max-jobs = 1` serialises the two links; this is the slack for the one
-      # that does run, which sits close to the runner's memory rather than
-      # being killed just past it.
-      - name: add swap
+      # The runner image already has `/swapfile` active, so fallocate on it
+      # fails with ETXTBSY. Report what is there and top it up to 8 GiB.
+      - name: swap
         run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile > /dev/null
-          sudo swapon /swapfile
+          set -euo pipefail
+          free -h
+          swapon --show
+          total=$(swapon --show=SIZE --noheadings --bytes | awk '{ s += $1 } END { print s + 0 }')
+          need=$(( 8 * 1024 * 1024 * 1024 - total ))
+          echo "swap total: $total bytes, adding $need"
+          if [ "$need" -gt 0 ] && [ ! -e /swapfile-extra ]; then
+            sudo fallocate -l "$need" /swapfile-extra
+            sudo chmod 600 /swapfile-extra
+            sudo mkswap /swapfile-extra > /dev/null
+            sudo swapon /swapfile-extra
+          fi
+          swapon --show
+          free -h
 
       - name: build the artifacts
         run: |
